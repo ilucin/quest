@@ -410,3 +410,15 @@ fn config_get_json_always_has_a_remotes_key() {
     let assert = q().args(["config", "get", "--json"]).assert().success();
     assert!(json_of(&assert)["remotes"].is_array());
 }
+
+#[test]
+fn config_set_repairs_an_invalid_file() {
+    let mut cmd = q();
+    let path = cmd.dir.path().join("config.toml");
+    std::fs::write(&path, "[context]\nreset_strategy = \"nuke\"\n").unwrap();
+    cmd.args(["config", "set", "context.reset_strategy", "clear"])
+        .assert()
+        .success();
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.contains("reset_strategy = \"clear\""));
+}

@@ -120,5 +120,8 @@ fn run(args: &Cli) -> anyhow::Result<()> {
 }
 
 fn needs_valid_config(action: Option<&ConfigAction>) -> bool {
-    !matches!(action, Some(ConfigAction::Path) | Some(ConfigAction::Edit))
+    !matches!(
+        action,
+        Some(ConfigAction::Path) | Some(ConfigAction::Edit) | Some(ConfigAction::Set { .. })
+    )
 }
