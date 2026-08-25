@@ -2,6 +2,7 @@ mod cli;
 mod commands;
 mod config;
 mod db;
+mod doctor;
 mod error;
 mod model;
 mod output;
@@ -169,6 +170,12 @@ fn run(args: &Cli) -> anyhow::Result<()> {
                     detach: *detach,
                 },
             )
+        }
+        Command::Doctor { fix } => {
+            // Diagnosing a broken environment must not require a working one:
+            // doctor opens the config and the database itself, and reports
+            // whatever it finds.
+            doctor::run(&Ctx::lenient(args), *fix)
         }
         other => {
             // Every real command starts here: config, then an open database.

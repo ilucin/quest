@@ -736,6 +736,30 @@ fn absolutize(value: &str) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
+/// Every pane tmux knows about. No server means no panes; a missing binary is
+/// a real failure.
+pub fn live_panes(tmux: &dyn Tmux) -> anyhow::Result<Vec<Pane>> {
+    match tmux.list_panes() {
+        Ok(panes) => Ok(panes),
+        Err(e) if is_no_server(&e) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The sessions among `sessions` whose pane is gone. Keyed on the
+/// `(tmux_session, pane)` pair: tmux recycles pane ids, so `%1` in another
+/// tmux session is not this session's pane. Shared by `sweep` and `q doctor`.
+pub fn find_orphans(sessions: Vec<Session>, panes: &[Pane]) -> Vec<Session> {
+    let alive: HashSet<(&str, &str)> = panes
+        .iter()
+        .map(|p| (p.session_name.as_str(), p.pane_id.as_str()))
+        .collect();
+    sessions
+        .into_iter()
+        .filter(|s| !alive.contains(&(s.tmux_session.as_str(), s.tmux_pane.as_str())))
+        .collect()
+}
+
 /// Liveness (SPEC §6): a live session whose pane is gone has ended. Returns the
 /// sessions it marked, having appended a `session.end` event for each.
 pub fn sweep(db: &Db, tmux: &dyn Tmux) -> anyhow::Result<Vec<Session>> {
@@ -743,24 +767,10 @@ pub fn sweep(db: &Db, tmux: &dyn Tmux) -> anyhow::Result<Vec<Session>> {
     if live.is_empty() {
         return Ok(Vec::new());
     }
-    let panes = match tmux.list_panes() {
-        Ok(panes) => panes,
-        // No server means no panes; a missing binary is a real failure.
-        Err(e) if is_no_server(&e) => Vec::new(),
-        Err(e) => return Err(e),
-    };
-    // Keyed on the pair: tmux recycles pane ids, so `%1` in another tmux
-    // session is not this session's pane.
-    let alive: HashSet<(&str, &str)> = panes
-        .iter()
-        .map(|p| (p.session_name.as_str(), p.pane_id.as_str()))
-        .collect();
+    let panes = live_panes(tmux)?;
 
     let mut ended = Vec::new();
-    for session in live {
-        if alive.contains(&(session.tmux_session.as_str(), session.tmux_pane.as_str())) {
-            continue;
-        }
+    for session in find_orphans(live, &panes) {
         let row = db.mark_session_ended(&session.id, now())?;
         db.append_event(
             &row.quest_id,
@@ -1197,6 +1207,47 @@ mod tests {
             .insert_quest(&Quest::new("alpha", "/tmp/repo", "laptop"))
             .unwrap();
         (db, quest)
+    }
+
+    fn pane(session: &str, id: &str) -> Pane {
+        Pane {
+            pane_id: id.to_string(),
+            pane_pid: 1,
+            session_name: session.to_string(),
+            window_name: "w".to_string(),
+            window_index: 0,
+        }
+    }
+
+    fn session_on(label: &str, tmux_session: &str, pane_id: &str) -> Session {
+        Session::new("q-0001", SessionRole::Worker, label, tmux_session, pane_id)
+    }
+
+    #[test]
+    fn find_orphans_keys_on_the_session_and_pane_pair() {
+        let sessions = vec![
+            session_on("alive", "q-alpha", "%1"),
+            session_on("gone", "q-alpha", "%2"),
+            // Same pane id, different tmux session: tmux recycles ids, so this
+            // one is an orphan too.
+            session_on("recycled", "q-beta", "%1"),
+        ];
+        let panes = [pane("q-alpha", "%1"), pane("q-other", "%9")];
+
+        let orphans: Vec<String> = find_orphans(sessions.clone(), &panes)
+            .into_iter()
+            .map(|s| s.label)
+            .collect();
+        assert_eq!(orphans, ["gone", "recycled"]);
+
+        // No panes at all (a dead tmux server) orphans everything; every pane
+        // present orphans nothing.
+        assert_eq!(find_orphans(sessions.clone(), &[]).len(), 3);
+        let all: Vec<Pane> = sessions
+            .iter()
+            .map(|s| pane(&s.tmux_session, &s.tmux_pane))
+            .collect();
+        assert!(find_orphans(sessions, &all).is_empty());
     }
 
     #[test]
