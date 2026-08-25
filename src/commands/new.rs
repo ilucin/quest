@@ -16,7 +16,7 @@ const SLUG_MAX: usize = 40;
 /// `foo`, `foo-2` … `foo-99` — how far an auto slug will step aside.
 const SLUG_ATTEMPTS: u32 = 99;
 const SLUG_RULE: &str = "must match ^[a-z0-9]+(-[a-z0-9]+)*$ and be at most 40 characters";
-const MASTER: &str = "master";
+pub const MASTER: &str = "master";
 
 /// Branch names that say nothing about the work, so they never become a slug.
 const GENERIC_BRANCHES: [&str; 4] = ["main", "master", "develop", "HEAD"];
@@ -60,61 +60,15 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         }),
     )?;
 
-    // The session id goes into the window's environment, so it has to exist
-    // before the pane it will be stored against.
-    let session_id = fresh_session_id(db)?;
-    let spec = NewSession {
-        name: tmux_session.clone(),
-        window_name: MASTER.to_string(),
-        cwd: quest.cwd.clone(),
-        env: quest_env(
-            &quest.id,
-            &session_id,
-            SessionRole::Master,
-            &quest.machine,
-            db_override().as_deref(),
-            config_override().as_deref(),
-        ),
-        command: Some(claude_command(&quest.slug, MASTER, prompt.as_deref())),
-    };
-    let pane = match ctx.tmux().new_session(&spec) {
-        Ok(pane) => pane,
+    let master = match spawn_master(ctx, &quest, prompt) {
+        Ok(master) => master,
         // Nothing was started, so the Quest row would only be an orphan.
         Err(e) => {
             let _ = db.delete_quest(&quest.id);
             return Err(e);
         }
     };
-
-    let mut row = Session::new(
-        &quest.id,
-        SessionRole::Master,
-        MASTER,
-        &tmux_session,
-        &pane.pane_id,
-    );
-    row.id = session_id.clone();
-    row.status = SessionStatus::Starting;
-    row.workflow = quest.workflow.clone();
-    row.first_prompt = prompt;
-    let session = match db.insert_session(&row) {
-        // A regenerated id would no longer match `Q_SESSION` in the window.
-        Ok(session) if session.id != session_id => {
-            let _ = ctx.tmux().kill_session(&tmux_session);
-            let _ = db.delete_quest(&quest.id);
-            return Err(QError::Db(format!(
-                "session id `{session_id}` was taken between allocating and inserting it"
-            ))
-            .into());
-        }
-        Ok(session) => session,
-        Err(e) => {
-            let _ = ctx.tmux().kill_session(&tmux_session);
-            let _ = db.delete_quest(&quest.id);
-            return Err(e);
-        }
-    };
-    // `session.start` is the hook's to append once Claude comes up (M1).
+    let session = master.session;
 
     let attach = attach_mode(ctx, args.detach);
     if ctx.json || !ctx.quiet {
@@ -207,7 +161,71 @@ fn numbered(base: &str, n: u32) -> String {
     format!("{}{suffix}", head.trim_end_matches('-'))
 }
 
-fn resolve_dir(dir: Option<&str>) -> anyhow::Result<PathBuf> {
+/// The `master` window of `q-<slug>`, and the session row recording it.
+pub struct Master {
+    pub session: Session,
+    pub tmux_session: String,
+}
+
+/// Creates the Quest's tmux session with `master` in window 0, starts Claude
+/// there and records the session row (SPEC §5, §6). Shared by `q new` and
+/// `q resume`; the caller owns whatever else has to be undone on failure.
+pub fn spawn_master(ctx: &Ctx, quest: &Quest, prompt: Option<String>) -> anyhow::Result<Master> {
+    let db = ctx.db()?;
+    let tmux_session = session_name(&ctx.config, &quest.slug);
+    // The session id goes into the window's environment, so it has to exist
+    // before the pane it will be stored against.
+    let session_id = fresh_session_id(db)?;
+    let spec = NewSession {
+        name: tmux_session.clone(),
+        window_name: MASTER.to_string(),
+        cwd: quest.cwd.clone(),
+        env: quest_env(
+            &quest.id,
+            &session_id,
+            SessionRole::Master,
+            &quest.machine,
+            db_override().as_deref(),
+            config_override().as_deref(),
+        ),
+        command: Some(claude_command(&quest.slug, MASTER, prompt.as_deref())),
+    };
+    let pane = ctx.tmux().new_session(&spec)?;
+
+    let mut row = Session::new(
+        &quest.id,
+        SessionRole::Master,
+        MASTER,
+        &tmux_session,
+        &pane.pane_id,
+    );
+    row.id = session_id.clone();
+    row.status = SessionStatus::Starting;
+    row.workflow = quest.workflow.clone();
+    row.first_prompt = prompt;
+    // `session.start` is the hook's to append once Claude comes up (M1).
+    match db.insert_session(&row) {
+        // A regenerated id would no longer match `Q_SESSION` in the window.
+        Ok(session) if session.id != session_id => {
+            let _ = ctx.tmux().kill_session(&tmux_session);
+            Err(QError::Db(format!(
+                "session id `{session_id}` was taken between allocating and inserting it"
+            ))
+            .into())
+        }
+        Ok(session) => Ok(Master {
+            session,
+            tmux_session,
+        }),
+        Err(e) => {
+            let _ = ctx.tmux().kill_session(&tmux_session);
+            Err(e)
+        }
+    }
+}
+
+/// An existing directory, canonicalized. `None` is the current one.
+pub fn resolve_dir(dir: Option<&str>) -> anyhow::Result<PathBuf> {
     let raw = match dir {
         Some(d) => PathBuf::from(d),
         None => std::env::current_dir()
@@ -253,7 +271,7 @@ fn resolve_slug(name: Option<&str>, cwd: &Path) -> anyhow::Result<(String, NameS
     }
 }
 
-fn validate_slug(slug: &str) -> anyhow::Result<()> {
+pub fn validate_slug(slug: &str) -> anyhow::Result<()> {
     if slug.len() > SLUG_MAX || !is_slug(slug) {
         return Err(QError::Invalid(format!("invalid slug `{slug}`: it {SLUG_RULE}")).into());
     }

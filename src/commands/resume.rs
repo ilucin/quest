@@ -1,0 +1,72 @@
+//! `q resume` — a finished (or session-less) Quest gets a fresh master
+//! (SPEC §5). The old session rows stay behind as history.
+
+use std::io::Write;
+
+use crate::Ctx;
+use crate::commands::new::{MASTER, spawn_master};
+use crate::commands::{live, sweep_quiet};
+use crate::error::QError;
+use crate::model::QuestState;
+use crate::output;
+use crate::tmux::session_name;
+
+pub fn run(ctx: &Ctx, target: &str, prompt: Option<&str>, detach: bool) -> anyhow::Result<()> {
+    sweep_quiet(ctx)?;
+    let db = ctx.db()?;
+    let quest = db.resolve_quest(target)?;
+    let tmux_session = session_name(&ctx.config, &quest.slug);
+
+    if ctx.tmux().has_session(&tmux_session)? {
+        return Err(QError::Tmux(format!(
+            "tmux session `{tmux_session}` is still running; run `q enter {}`",
+            quest.slug
+        ))
+        .into());
+    }
+    // An active Quest whose master is gone is as resumable as a finished one.
+    if quest.state != QuestState::Finished {
+        let sessions = db.list_sessions_by_quest(&quest.id)?;
+        if live(&sessions).next().is_some() {
+            return Err(QError::Other(format!(
+                "quest {} is still active; run `q enter {}`",
+                quest.slug, quest.slug
+            ))
+            .into());
+        }
+    }
+
+    // TODO(M2): without `--prompt` the master should come up on its brief.
+    let master = spawn_master(ctx, &quest, prompt.map(str::to_string))?;
+    let quest = db.update_quest_state(&quest.id, QuestState::Active, None)?;
+    db.append_event(
+        &quest.id,
+        Some(&master.session.id),
+        "quest.resumed",
+        &serde_json::json!({ "session": master.session.id, "prompt": prompt }),
+    )?;
+
+    let attached = !detach;
+    if ctx.json || !ctx.quiet {
+        output::emit(
+            ctx.json,
+            &serde_json::json!({
+                "quest": quest,
+                "session": master.session,
+                "tmux_session": master.tmux_session,
+                "attached": attached,
+            }),
+            || {
+                format!(
+                    "resumed {} ({}) · tmux {} · run: q enter {}",
+                    quest.id, quest.slug, master.tmux_session, quest.slug
+                )
+            },
+        )?;
+    }
+    if attached {
+        std::io::stdout().flush()?;
+        ctx.tmux().attach(&master.tmux_session, Some(MASTER))?;
+    }
+    Ok(())
+}

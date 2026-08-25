@@ -15,6 +15,7 @@ const COLUMNS: &str = "id, slug, name_source, name_input_hash, goal, cwd, machin
 #[derive(Debug, Default, Clone)]
 pub struct QuestPatch {
     pub slug: Option<String>,
+    pub name_source: Option<NameSource>,
     pub goal: Option<String>,
     pub cwd: Option<String>,
     pub workflow: Option<String>,
@@ -24,6 +25,7 @@ pub struct QuestPatch {
 impl QuestPatch {
     fn is_empty(&self) -> bool {
         self.slug.is_none()
+            && self.name_source.is_none()
             && self.goal.is_none()
             && self.cwd.is_none()
             && self.workflow.is_none()
@@ -139,6 +141,10 @@ impl Db {
         if let Some(v) = &patch.slug {
             sets.push("slug = :slug");
             binds.push((":slug", v));
+        }
+        if let Some(v) = &patch.name_source {
+            sets.push("name_source = :name_source");
+            binds.push((":name_source", v));
         }
         if let Some(v) = &patch.goal {
             sets.push("goal = :goal");

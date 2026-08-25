@@ -30,6 +30,12 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// The machine to filter listings by, i.e. `--machine` only when it was
+    /// actually given.
+    pub fn machine_filter(&self) -> Option<&str> {
+        self.machine_override.as_deref()
+    }
+
     /// The targeted machine name for this invocation: `--machine` if given
     /// (validated, never written to the config), else the configured one.
     pub fn machine(&self) -> &str {
@@ -183,6 +189,42 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             // doctor opens the config and the database itself, and reports
             // whatever it finds.
             doctor::run(&Ctx::lenient(args), *fix)
+        }
+        Command::List { all, state } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::list::run(&ctx, *all, *state).map(|()| 0)
+        }
+        Command::Show { quest } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::show::run(&ctx, quest).map(|()| 0)
+        }
+        Command::Enter { quest, session } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::enter::run(&ctx, quest, session.as_deref()).map(|()| 0)
+        }
+        Command::Close { quest, force } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::close::run(&ctx, quest, *force).map(|()| 0)
+        }
+        Command::Resume {
+            quest,
+            prompt,
+            detach,
+        } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::resume::run(&ctx, quest, prompt.as_deref(), *detach).map(|()| 0)
+        }
+        Command::Rename { quest, slug } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::rename::run(&ctx, quest, slug).map(|()| 0)
+        }
+        Command::Set { quest, key, value } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::set::run(&ctx, quest, *key, value).map(|()| 0)
+        }
+        Command::Rm { quest, force } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::rm::run(&ctx, quest, *force).map(|()| 0)
         }
         other => {
             // Every real command starts here: config, then an open database.

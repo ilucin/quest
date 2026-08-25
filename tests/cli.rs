@@ -80,7 +80,7 @@ fn quiet_does_not_suppress_json_output() {
 
 #[test]
 fn stub_command_fails_with_not_implemented() {
-    q().arg("list")
+    q().arg("doctor")
         .assert()
         .code(1)
         .stderr(predicate::str::starts_with("error: "))
@@ -89,7 +89,7 @@ fn stub_command_fails_with_not_implemented() {
 
 #[test]
 fn stub_command_json_error_goes_to_stderr() {
-    let assert = q().args(["list", "--json"]).assert().code(1).stdout("");
+    let assert = q().args(["doctor", "--json"]).assert().code(1).stdout("");
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
     assert!(
@@ -490,9 +490,9 @@ fn a_command_creates_the_database_at_q_db_in_wal_mode() {
     let mut cmd = q();
     let path = db_path(&cmd);
     assert!(!path.exists());
-    // `list` is still a stub, but it goes through the same Ctx as every real
-    // command, so the database is opened and migrated.
-    cmd.arg("list").assert().code(1);
+    // `list` goes through the same Ctx as every real command, so the database
+    // is opened and migrated.
+    cmd.arg("list").assert().success();
     assert!(path.exists(), "{} was not created", path.display());
 
     let conn = rusqlite::Connection::open(&path).unwrap();
@@ -525,7 +525,7 @@ fn the_database_is_created_under_a_missing_directory() {
     let mut cmd = Command::cargo_bin("q").unwrap();
     cmd.env("Q_DB", &path)
         .env("Q_CONFIG", dir.path().join("config.toml"));
-    cmd.arg("list").assert().code(1);
+    cmd.arg("list").assert().success();
     assert!(path.exists());
 }
 
@@ -1486,4 +1486,366 @@ fn doctor_says_when_it_created_the_database() {
             .contains("created"),
         "{parsed}"
     );
+}
+// ------------------------------------------------------- lifecycle commands
+
+impl Env {
+    /// `q new -d --name <slug>` in a fresh work directory of the same name.
+    fn new_quest(&self, slug: &str) -> serde_json::Value {
+        let work = self.work(slug);
+        let assert = self
+            .cmd()
+            .args(["new", "--name", slug, "--dir", work.to_str().unwrap()])
+            .args(["-d", "--json"])
+            .assert()
+            .success();
+        json_of(&assert)
+    }
+
+    fn json(&self, args: &[&str]) -> serde_json::Value {
+        let mut cmd = self.cmd();
+        let assert = cmd.args(args).arg("--json").assert().success();
+        json_of(&assert)
+    }
+
+    fn count(&self, sql: &str) -> i64 {
+        self.conn().query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+}
+
+/// Rows of `event.kind` for a Quest, oldest first.
+fn event_kinds(env: &Env, quest_id: &str) -> Vec<String> {
+    env.conn()
+        .prepare("SELECT kind FROM event WHERE quest_id = ?1 ORDER BY id")
+        .unwrap()
+        .query_map([quest_id], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn the_full_quest_lifecycle() {
+    let env = Env::new();
+    let created = env.new_quest("foo");
+    let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
+
+    // list: the fresh master counts as an active session.
+    let list = env.json(&["list"]);
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["slug"], "foo");
+    assert_eq!(list[0]["display_state"], "active");
+    assert_eq!(list[0]["needs_you"], false);
+    assert_eq!(list[0]["live_sessions"], 1);
+
+    // show
+    let shown = env.json(&["show", "foo"]);
+    assert_eq!(shown["quest"]["id"], quest_id.as_str());
+    assert_eq!(shown["display_state"], "active");
+    assert_eq!(shown["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(shown["sessions"][0]["label"], "master");
+    assert_eq!(shown["events"][0]["kind"], "quest.created");
+
+    // enter
+    let entered = env.json(&["enter", "foo"]);
+    assert_eq!(entered["tmux_session"], "q-foo");
+    assert_eq!(entered["window"], "master");
+    assert_eq!(
+        env.fixture()["attached"],
+        serde_json::json!(["q-foo", "master"])
+    );
+    env.cmd()
+        .args(["enter", "foo", "--session", "nope"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("session `nope`"))
+        .stderr(predicate::str::contains("live: master"));
+
+    // close
+    let closed = env.json(&["close", "foo", "-f"]);
+    assert_eq!(closed["quest"]["state"], "finished");
+    assert_eq!(closed["sessions_ended"], 1);
+    assert!(closed["quest"]["finished_at"].is_i64());
+    assert!(
+        env.fixture()["panes"].as_array().unwrap().is_empty(),
+        "the tmux session outlived the close"
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE status = 'ended'"),
+        1
+    );
+    assert!(event_kinds(&env, &quest_id).contains(&"quest.closed".to_string()));
+
+    // a finished Quest is hidden unless asked for
+    assert!(env.json(&["list"]).as_array().unwrap().is_empty());
+    let all = env.json(&["list", "--all"]);
+    assert_eq!(all.as_array().unwrap().len(), 1);
+    assert_eq!(all[0]["display_state"], "finished");
+    assert_eq!(all[0]["live_sessions"], 0);
+    env.cmd()
+        .args(["enter", "foo"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("q resume foo"));
+
+    // resume
+    let resumed = env.json(&["resume", "foo", "-d"]);
+    assert_eq!(resumed["quest"]["state"], "active");
+    assert_eq!(resumed["quest"]["finished_at"], serde_json::Value::Null);
+    assert_eq!(resumed["attached"], false);
+    assert_ne!(resumed["session"]["id"], created["session"]["id"]);
+    assert_eq!(env.count("SELECT count(*) FROM session"), 2);
+    assert_eq!(pane_of(&env.fixture(), "q-foo")["window_name"], "master");
+    assert_eq!(env.json(&["list"])[0]["display_state"], "active");
+    assert!(event_kinds(&env, &quest_id).contains(&"quest.resumed".to_string()));
+
+    // rename
+    let renamed = env.json(&["rename", "foo", "bar"]);
+    assert_eq!(renamed["quest"]["slug"], "bar");
+    assert_eq!(renamed["quest"]["name_source"], "manual");
+    assert_eq!(renamed["tmux_session"], "q-bar");
+    assert_eq!(pane_of(&env.fixture(), "q-bar")["window_name"], "master");
+    assert_eq!(env.json(&["list"])[0]["slug"], "bar");
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE tmux_session = 'q-bar'"),
+        2
+    );
+    assert!(event_kinds(&env, &quest_id).contains(&"name.changed".to_string()));
+
+    // set
+    env.json(&["set", "bar", "goal", "x"]);
+    assert_eq!(env.json(&["show", "bar"])["quest"]["goal"], "x");
+    assert!(event_kinds(&env, &quest_id).contains(&"quest.updated".to_string()));
+
+    // rm
+    env.cmd()
+        .args(["rm", "bar", "-f"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed q-"))
+        .stdout(predicate::str::contains("(bar)"));
+    assert!(env.json(&["list", "--all"]).as_array().unwrap().is_empty());
+    assert_eq!(env.count("SELECT count(*) FROM quest"), 0);
+    assert_eq!(env.count("SELECT count(*) FROM session"), 0);
+    assert_eq!(env.count("SELECT count(*) FROM event"), 0);
+}
+
+#[test]
+fn list_is_a_table_and_says_when_it_is_empty() {
+    let env = Env::new();
+    env.cmd()
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no quests"));
+    env.new_quest("foo");
+    env.cmd()
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SLUG"))
+        .stdout(predicate::str::contains("foo"))
+        .stdout(predicate::str::contains("active"));
+}
+
+#[test]
+fn list_filters_by_derived_state() {
+    let env = Env::new();
+    env.new_quest("foo");
+    env.json(&["close", "foo", "-f"]);
+    env.new_quest("bar");
+    assert_eq!(
+        env.json(&["list", "--state", "active"])
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(env.json(&["list", "--state", "active"])[0]["slug"], "bar");
+    assert!(
+        env.json(&["list", "--state", "idle"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // `--state finished` implies `--all`.
+    let finished = env.json(&["list", "--state", "finished"]);
+    assert_eq!(finished.as_array().unwrap().len(), 1);
+    assert_eq!(finished[0]["slug"], "foo");
+}
+
+#[test]
+fn list_filters_by_machine_only_when_asked() {
+    let env = Env::new();
+    env.new_quest("foo");
+    assert_eq!(env.json(&["list"]).as_array().unwrap().len(), 1);
+    assert!(
+        env.json(&["--machine", "elsewhere", "list"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn close_without_force_and_without_a_tty_aborts() {
+    let env = Env::new();
+    env.new_quest("foo");
+    env.cmd()
+        .args(["close", "foo"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("aborted (use -f)"));
+    assert_eq!(env.json(&["list"])[0]["display_state"], "active");
+    assert_eq!(
+        env.count("SELECT count(*) FROM quest WHERE state = 'active'"),
+        1
+    );
+}
+
+#[test]
+fn closing_a_finished_quest_is_a_no_op() {
+    let env = Env::new();
+    env.new_quest("foo");
+    env.json(&["close", "foo", "-f"]);
+    // No `-f` needed the second time: there is nothing left to confirm.
+    let again = env.json(&["close", "foo"]);
+    assert_eq!(again["already_finished"], true);
+    assert_eq!(again["sessions_ended"], 0);
+    assert_eq!(
+        event_kinds(&env, again["quest"]["id"].as_str().unwrap())
+            .iter()
+            .filter(|k| *k == "quest.closed")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn rm_refuses_a_running_quest_without_force() {
+    let env = Env::new();
+    env.new_quest("foo");
+    env.cmd()
+        .args(["rm", "foo"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("still runs in tmux session q-foo"));
+    assert_eq!(env.count("SELECT count(*) FROM quest"), 1);
+}
+
+#[test]
+fn resume_refuses_a_quest_that_is_still_running() {
+    let env = Env::new();
+    env.new_quest("foo");
+    env.cmd()
+        .args(["resume", "foo", "-d"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("q enter foo"));
+}
+
+#[test]
+fn rename_refuses_a_slug_that_is_taken() {
+    let env = Env::new();
+    env.new_quest("foo");
+    env.new_quest("bar");
+    env.cmd()
+        .args(["rename", "foo", "bar"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("already taken by quest"));
+    env.cmd()
+        .args(["rename", "foo", "Not A Slug"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("invalid slug"));
+}
+
+#[test]
+fn set_validates_its_values() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let work = env.work("elsewhere");
+    let out = env.json(&["set", "foo", "cwd", work.to_str().unwrap()]);
+    assert_eq!(out["quest"]["cwd"], work.to_str().unwrap());
+
+    env.cmd()
+        .args(["set", "foo", "cwd", "/nope/nope"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("no such directory"));
+
+    assert_eq!(
+        env.json(&["set", "foo", "ctx_reset_pct", "42"])["quest"]["ctx_reset_pct"],
+        42
+    );
+    assert_eq!(
+        env.json(&["set", "foo", "ctx_reset_pct", "default"])["quest"]["ctx_reset_pct"],
+        serde_json::Value::Null
+    );
+    env.cmd()
+        .args(["set", "foo", "ctx_reset_pct", "0"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("expected 1-100"));
+    env.cmd()
+        .args(["set", "foo", "auto_reset", "on"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn an_ambiguous_target_lists_the_candidates() {
+    let env = Env::new();
+    let one = env.new_quest("alpha-one");
+    let two = env.new_quest("alpha-two");
+    let assert = env.cmd().args(["show", "alpha", "--json"]).assert().code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "ambiguous");
+    let message = parsed["error"].as_str().unwrap();
+    for id in [
+        one["quest"]["id"].as_str().unwrap(),
+        two["quest"]["id"].as_str().unwrap(),
+    ] {
+        assert!(message.contains(id), "{message}");
+    }
+    // A prefix that only one Quest answers to still resolves.
+    assert_eq!(env.json(&["show", "alpha-o"])["quest"]["slug"], "alpha-one");
+}
+
+#[test]
+fn an_unknown_target_is_not_found() {
+    let env = Env::new();
+    let assert = env.cmd().args(["show", "nope", "--json"]).assert().code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "not_found");
+}
+
+#[test]
+fn a_listing_sweeps_a_pane_that_is_gone() {
+    let env = Env::new();
+    let created = env.new_quest("foo");
+    let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
+    // The pane died without a hook ever reporting it.
+    env.write_fixture(serde_json::json!({ "next_pane": 1, "panes": [] }));
+
+    let list = env.json(&["list"]);
+    assert_eq!(list[0]["display_state"], "idle");
+    assert_eq!(list[0]["live_sessions"], 0);
+
+    let shown = env.json(&["show", "foo"]);
+    assert_eq!(shown["sessions"][0]["status"], "ended");
+    assert!(shown["sessions"][0]["ended_at"].is_i64());
+    assert!(event_kinds(&env, &quest_id).contains(&"session.end".to_string()));
+    let reason: String = env
+        .conn()
+        .query_row(
+            "SELECT json_extract(payload, '$.reason') FROM event WHERE kind = 'session.end'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "pane_gone");
 }

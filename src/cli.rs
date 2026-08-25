@@ -25,8 +25,6 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-/// Variant fields are wired up by the milestone that implements each command;
-/// the stubs below do not read them yet.
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Create a new Quest
@@ -58,7 +56,8 @@ pub enum Command {
         /// Include finished Quests
         #[arg(long)]
         all: bool,
-        #[arg(long, value_enum)]
+        /// Only Quests in this derived state
+        #[arg(long, value_enum, value_name = "STATE")]
         state: Option<QuestState>,
     },
 
@@ -75,17 +74,20 @@ pub enum Command {
     /// Close a Quest
     Close {
         quest: String,
+        /// Do not ask for confirmation
         #[arg(short, long)]
         force: bool,
-        #[arg(long)]
-        summarize: bool,
     },
 
-    /// Reopen a closed Quest
+    /// Reopen a closed Quest with a fresh master
     Resume {
         quest: String,
-        #[arg(long)]
+        /// First prompt for the new master
+        #[arg(long, value_name = "TEXT")]
         prompt: Option<String>,
+        /// Do not attach after resuming
+        #[arg(short = 'd', long)]
+        detach: bool,
     },
 
     /// Rename a Quest's slug
@@ -102,6 +104,7 @@ pub enum Command {
     /// Delete a Quest
     Rm {
         quest: String,
+        /// Do not ask for confirmation
         #[arg(short, long)]
         force: bool,
     },
@@ -143,15 +146,15 @@ pub enum QuestState {
     Finished,
 }
 
+/// TODO(M2): `auto_reset` has no column of its own in SPEC §4, and `brain`
+/// waits on the brain integration — neither is offered yet.
 #[derive(ValueEnum, Clone, Copy, Debug)]
 #[value(rename_all = "snake_case")]
 pub enum SetKey {
     Goal,
     Cwd,
     Workflow,
-    AutoReset,
     CtxResetPct,
-    Brain,
 }
 
 impl Command {

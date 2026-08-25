@@ -128,6 +128,20 @@ impl Db {
         self.require_session(id)
     }
 
+    /// Follows a `q rename`: the tmux session was renamed under these rows.
+    pub fn update_sessions_tmux_session(
+        &self,
+        quest_id: &str,
+        tmux_session: &str,
+    ) -> anyhow::Result<usize> {
+        self.conn
+            .execute(
+                "UPDATE session SET tmux_session = ?1, updated_at = ?2 WHERE quest_id = ?3",
+                params![tmux_session, now(), quest_id],
+            )
+            .map_err(db_err)
+    }
+
     /// The live session in that pane. Ended rows stay behind as history, and a
     /// pane can be reused, so they are skipped.
     pub fn find_session_by_pane(&self, tmux_pane: &str) -> anyhow::Result<Option<Session>> {
