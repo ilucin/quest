@@ -546,7 +546,10 @@ impl Env {
         let mut cmd = Command::cargo_bin("q").unwrap();
         cmd.env("Q_DB", self.dir.path().join("q.db"))
             .env("Q_CONFIG", self.dir.path().join("config.toml"))
-            .env("Q_FIXTURE", self.dir.path().join("tmux.json"));
+            .env("Q_FIXTURE", self.dir.path().join("tmux.json"))
+            // The attach mode depends on it, so it never leaks in from the
+            // terminal `cargo test` happens to run in.
+            .env_remove("TMUX");
         cmd
     }
 
@@ -602,7 +605,7 @@ fn new_creates_the_quest_the_tmux_session_and_the_master_window() {
     assert_eq!(out["quest"]["name_source"], "manual");
     assert_eq!(out["quest"]["cwd"], work.to_str().unwrap());
     assert_eq!(out["tmux_session"], "q-foo");
-    assert_eq!(out["attached"], false);
+    assert_eq!(out["attach"], "none");
     assert_eq!(out["session"]["role"], "master");
     assert_eq!(out["session"]["label"], "master");
     assert_eq!(out["session"]["status"], "starting");
@@ -655,6 +658,16 @@ fn new_creates_the_quest_the_tmux_session_and_the_master_window() {
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert_eq!(kinds, vec!["quest.created".to_string()]);
+    let payload: String = conn
+        .query_row(
+            "SELECT payload FROM event WHERE quest_id = ?1",
+            [&quest_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["goal"], "ship it");
+    assert_eq!(payload["slug"], "foo");
 }
 
 #[test]
@@ -727,11 +740,169 @@ fn new_attaches_to_the_master_window_unless_detached() {
         ])
         .assert()
         .success();
-    assert_eq!(json_of(&assert)["attached"], true);
+    assert_eq!(json_of(&assert)["attach"], "exec");
     assert_eq!(
         env.fixture()["attached"],
         serde_json::json!(["q-foo", "master"])
     );
+}
+
+#[test]
+fn new_inside_tmux_reports_a_switch_instead_of_an_exec() {
+    let env = Env::new();
+    let work = env.work("repo");
+    let assert = env
+        .cmd()
+        .env("TMUX", "/tmp/tmux-0/default,1,0")
+        .args(["new", "--name", "foo", "--dir", work.to_str().unwrap()])
+        .arg("--json")
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["attach"], "switch");
+}
+
+#[test]
+fn new_forwards_absolute_overrides_even_when_they_are_relative() {
+    let env = Env::new();
+    let work = env.work("repo");
+    Command::cargo_bin("q")
+        .unwrap()
+        .env("Q_DB", "state/q.db")
+        .env("Q_CONFIG", "state/config.toml")
+        .env("Q_FIXTURE", env.dir.path().join("tmux.json"))
+        .env_remove("TMUX")
+        .current_dir(env.dir.path())
+        .args([
+            "new",
+            "--name",
+            "foo",
+            "--dir",
+            work.to_str().unwrap(),
+            "-d",
+        ])
+        .assert()
+        .success();
+    let pane = pane_of(&env.fixture(), "q-foo");
+    for key in ["Q_DB", "Q_CONFIG"] {
+        let value = pane["env"][key].as_str().unwrap();
+        assert!(value.starts_with('/'), "{key} is relative: {value}");
+    }
+}
+
+#[test]
+fn new_without_a_dir_uses_the_current_one() {
+    let env = Env::new();
+    let work = env.work("cwd-repo");
+    let assert = env
+        .cmd()
+        .current_dir(&work)
+        .args(["new", "-d", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    assert_eq!(out["quest"]["slug"], "cwd-repo");
+    assert_eq!(out["quest"]["cwd"], work.to_str().unwrap());
+}
+
+#[test]
+fn new_names_an_auto_quest_after_the_git_branch() {
+    let env = Env::new();
+    let work = env.work("repo");
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(["-C", work.to_str().unwrap()])
+            .args(args)
+            .output()
+    };
+    let Ok(init) = git(&["init", "-q"]) else {
+        eprintln!("skipping: no git binary");
+        return;
+    };
+    assert!(init.status.success(), "git init failed: {init:?}");
+    for args in [
+        &["checkout", "-q", "-b", "feature/ABC-1"][..],
+        &[
+            "-c",
+            "user.email=q@example.com",
+            "-c",
+            "user.name=q",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ][..],
+    ] {
+        let out = git(args).unwrap();
+        assert!(out.status.success(), "`git {args:?}` failed: {out:?}");
+    }
+
+    let assert = env
+        .cmd()
+        .args(["new", "--dir", work.to_str().unwrap(), "-d", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    assert_eq!(out["quest"]["slug"], "feature-abc-1");
+    assert_eq!(out["quest"]["name_source"], "auto");
+}
+
+#[test]
+fn new_steps_an_auto_slug_aside_instead_of_failing() {
+    let env = Env::new();
+    let work = env.work("busy");
+    let mut slugs = Vec::new();
+    for _ in 0..3 {
+        let assert = env
+            .cmd()
+            .args(["new", "--dir", work.to_str().unwrap(), "-d", "--json"])
+            .assert()
+            .success();
+        let out = json_of(&assert);
+        assert_eq!(out["quest"]["name_source"], "auto");
+        slugs.push(out["quest"]["slug"].as_str().unwrap().to_string());
+    }
+    assert_eq!(slugs, vec!["busy", "busy-2", "busy-3"]);
+    assert!(env.fixture()["panes"].as_array().unwrap().len() == 3);
+}
+
+#[test]
+fn new_json_errors_carry_stable_codes() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.cmd()
+        .args(["new", "--name", "taken", "--dir", work.to_str().unwrap()])
+        .args(["-d", "--json"])
+        .assert()
+        .success();
+
+    let missing = env.dir.path().join("nope");
+    let cases = [
+        (
+            vec!["--name", "taken", "--dir", work.to_str().unwrap()],
+            "conflict",
+        ),
+        (
+            vec!["--name", "Not A Slug", "--dir", work.to_str().unwrap()],
+            "invalid",
+        ),
+        (
+            vec!["--name", "fresh", "--dir", missing.to_str().unwrap()],
+            "not_found",
+        ),
+    ];
+    for (args, code) in cases {
+        let assert = env
+            .cmd()
+            .arg("new")
+            .args(&args)
+            .args(["-d", "--json"])
+            .assert()
+            .code(1);
+        let err: serde_json::Value = serde_json::from_slice(&assert.get_output().stderr).unwrap();
+        assert_eq!(err["code"], code, "for `q new {args:?}`: {err}");
+        assert!(err["error"].is_string());
+    }
 }
 
 #[test]

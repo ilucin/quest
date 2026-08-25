@@ -714,12 +714,26 @@ pub fn quest_env(
 
 /// `$Q_DB` if the caller set one, for `quest_env`.
 pub fn db_override() -> Option<String> {
-    std::env::var("Q_DB").ok().filter(|v| !v.is_empty())
+    std::env::var("Q_DB")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| absolutize(&v))
 }
 
 /// `$Q_CONFIG` if the caller set one, for `quest_env`.
 pub fn config_override() -> Option<String> {
-    std::env::var("Q_CONFIG").ok().filter(|v| !v.is_empty())
+    std::env::var("Q_CONFIG")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| absolutize(&v))
+}
+
+/// The window runs in the Quest's cwd, so a relative override would resolve
+/// against the wrong directory there. Purely lexical — the path need not exist.
+fn absolutize(value: &str) -> String {
+    std::path::absolute(value)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| value.to_string())
 }
 
 /// Liveness (SPEC §6): a live session whose pane is gone has ended. Returns the
