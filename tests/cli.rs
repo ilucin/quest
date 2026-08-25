@@ -422,3 +422,83 @@ fn config_set_repairs_an_invalid_file() {
     let written = std::fs::read_to_string(&path).unwrap();
     assert!(written.contains("reset_strategy = \"clear\""));
 }
+
+/// `q()` builds the command; this returns the database path it points at.
+fn db_path(cmd: &TestCmd) -> std::path::PathBuf {
+    cmd.dir.path().join("q.db")
+}
+
+#[test]
+fn config_works_without_touching_the_database() {
+    let dir = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("q").unwrap();
+    // A path that cannot be created: `Cargo.toml` is a file, not a directory.
+    let unwritable = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("Cargo.toml")
+        .join("nested")
+        .join("q.db");
+    cmd.env("Q_DB", &unwritable)
+        .env("Q_CONFIG", dir.path().join("config.toml"));
+    cmd.args(["config", "path"]).assert().success();
+    assert!(!unwritable.exists());
+}
+
+#[test]
+fn a_command_that_needs_the_database_reports_a_bad_q_db() {
+    let dir = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("q").unwrap();
+    let unwritable = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("Cargo.toml")
+        .join("nested")
+        .join("q.db");
+    cmd.env("Q_DB", &unwritable)
+        .env("Q_CONFIG", dir.path().join("config.toml"));
+    let assert = cmd.args(["list", "--json"]).assert().code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "db");
+}
+
+#[test]
+fn a_command_creates_the_database_at_q_db_in_wal_mode() {
+    let mut cmd = q();
+    let path = db_path(&cmd);
+    assert!(!path.exists());
+    // `list` is still a stub, but it goes through the same Ctx as every real
+    // command, so the database is opened and migrated.
+    cmd.arg("list").assert().code(1);
+    assert!(path.exists(), "{} was not created", path.display());
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let mode: String = conn
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode.to_lowercase(), "wal");
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert!(
+        version >= 1,
+        "schema was not migrated (user_version {version})"
+    );
+    let tables: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' \
+             AND name IN ('quest','session','event','link','template','name_cache')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 6);
+}
+
+#[test]
+fn the_database_is_created_under_a_missing_directory() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("state").join("q").join("q.db");
+    let mut cmd = Command::cargo_bin("q").unwrap();
+    cmd.env("Q_DB", &path)
+        .env("Q_CONFIG", dir.path().join("config.toml"));
+    cmd.arg("list").assert().code(1);
+    assert!(path.exists());
+}

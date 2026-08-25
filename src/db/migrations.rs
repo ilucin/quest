@@ -1,0 +1,153 @@
+//! Versioned schema migrations, tracked in `PRAGMA user_version`.
+//!
+//! Append a `(version, sql)` pair — never edit a shipped one — and bump
+//! `SCHEMA_VERSION`. `q doctor` reports the version the database is on.
+
+use rusqlite::Connection;
+
+use crate::error::QError;
+
+/// The version this binary expects. Must equal the last entry in `MIGRATIONS`.
+pub const SCHEMA_VERSION: u32 = 1;
+
+const MIGRATIONS: &[(u32, &str)] = &[(1, V1)];
+
+const V1: &str = r#"
+CREATE TABLE quest (
+  id            TEXT PRIMARY KEY,          -- 'q-7f3a' (4 hex, collisions are retried)
+  slug          TEXT NOT NULL UNIQUE,      -- 'cdc-backfill-retry' (kebab, <=40)
+  name_source   TEXT NOT NULL,             -- 'manual' | 'auto' | 'template'
+  name_input_hash TEXT,                    -- hash of the auto-naming input (cache invalidation)
+  goal          TEXT,                      -- free text, 1-3 sentences
+  cwd           TEXT NOT NULL,
+  machine       TEXT NOT NULL,             -- from config [machine].name
+  state         TEXT NOT NULL,             -- 'active' | 'finished'  (idle is derived)
+  workflow      TEXT,                      -- workflow name
+  template_id   TEXT REFERENCES template(id),
+  beads_epic    TEXT,                      -- 'bd-123'
+  beads_repo    TEXT,                      -- value of the repo:<name> label
+  brain_session TEXT,                      -- brain session slug
+  ctx_reset_pct INTEGER,                   -- master threshold override (NULL = config)
+  created_at    INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  finished_at   INTEGER
+);
+
+CREATE TABLE session (
+  id            TEXT PRIMARY KEY,          -- 's-3b9c'
+  quest_id      TEXT NOT NULL REFERENCES quest(id),
+  role          TEXT NOT NULL,             -- 'master' | 'worker'
+  label         TEXT NOT NULL,             -- 'master' | 'w1-tests' (= tmux window name)
+  tmux_session  TEXT NOT NULL,             -- 'q-<slug>'
+  tmux_pane     TEXT NOT NULL,             -- '%42' — the identity
+  claude_pid    INTEGER,                   -- last known
+  claude_session_id TEXT,                  -- last known (changes across /clear)
+  claude_name   TEXT,
+  workflow      TEXT,                      -- when it differs from the quest's
+  phase         TEXT,                      -- self-reported: 'planning', 'implementing', …
+  status        TEXT NOT NULL,             -- 'starting'|'busy'|'idle'|'waiting'|'ended'
+  waiting_for   TEXT,                      -- 'permission' | 'input' | …
+  ctx_pct       INTEGER,                   -- last known context window %
+  ctx_updated_at INTEGER,
+  first_prompt  TEXT,
+  last_prompt   TEXT,
+  started_at    INTEGER NOT NULL, ended_at INTEGER, updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE event (
+  id        INTEGER PRIMARY KEY,
+  quest_id  TEXT NOT NULL,
+  session_id TEXT,
+  ts        INTEGER NOT NULL,
+  kind      TEXT NOT NULL,   -- 'quest.created','session.start','session.stop','session.waiting',
+                             -- 'session.prompt','session.compact','session.reset','session.end',
+                             -- 'phase','link.added','artifact.added','note','name.changed',…
+  payload   TEXT             -- JSON
+);
+CREATE INDEX event_quest_ts ON event(quest_id, ts);
+
+CREATE TABLE link (
+  id        INTEGER PRIMARY KEY,
+  quest_id  TEXT NOT NULL,
+  session_id TEXT,                 -- who added it (NULL = manual/CLI)
+  kind      TEXT NOT NULL,         -- 'pr'|'task'|'worktree'|'artifact'|'url'|'brain'|'beads'|'branch'
+  ref       TEXT NOT NULL,         -- URL or path
+  title     TEXT,                  -- enrichment cache
+  meta      TEXT,                  -- JSON enrichment (pr state, ci, task status…)
+  enriched_at INTEGER,
+  created_at INTEGER NOT NULL,
+  UNIQUE(quest_id, kind, ref)
+);
+
+CREATE TABLE template (
+  id          TEXT PRIMARY KEY,    -- 't-1a2b'
+  name        TEXT NOT NULL UNIQUE,
+  description TEXT,
+  cwd         TEXT,                -- NULL = the cwd at run time
+  workflow    TEXT,
+  goal        TEXT,                -- supports {{date}}, {{arg}} placeholders
+  master_prompt TEXT,              -- the master's first prompt
+  beads_repo  TEXT,
+  create_brain INTEGER NOT NULL DEFAULT 0,
+  tags        TEXT,                -- JSON array
+  run_count   INTEGER NOT NULL DEFAULT 0,
+  last_run_at INTEGER,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE name_cache (          -- auto-naming: input_hash -> slug
+  input_hash TEXT PRIMARY KEY, slug TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+"#;
+
+pub fn user_version(conn: &Connection) -> anyhow::Result<u32> {
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(super::db_err)?;
+    u32::try_from(version)
+        .map_err(|_| QError::Db(format!("nonsensical schema version {version}")).into())
+}
+
+/// Applies every migration newer than the database's `user_version`, in one
+/// transaction. A database from a newer binary is left untouched.
+pub fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
+    let current = user_version(conn)?;
+    if current > SCHEMA_VERSION {
+        return Err(QError::Db(format!(
+            "database schema is version {current}, but this q understands {SCHEMA_VERSION}; upgrade q"
+        ))
+        .into());
+    }
+    if current == SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let tx = conn.transaction().map_err(super::db_err)?;
+    for (version, sql) in MIGRATIONS {
+        if *version > current {
+            tx.execute_batch(sql)
+                .map_err(|e| QError::Db(format!("migration to version {version} failed: {e}")))?;
+        }
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(super::db_err)?;
+    tx.commit().map_err(super::db_err)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_version_matches_the_last_migration() {
+        let last = MIGRATIONS.last().expect("at least one migration").0;
+        assert_eq!(last, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_versions_are_contiguous_from_one() {
+        for (i, (version, _)) in MIGRATIONS.iter().enumerate() {
+            assert_eq!(*version, i as u32 + 1, "gap at index {i}");
+        }
+    }
+}
