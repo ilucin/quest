@@ -117,9 +117,17 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigAction {
-    Get { key: String },
-    Set { key: String, value: String },
+    /// Print one dotted key, or the whole effective config
+    Get { key: Option<String> },
+    /// Set one dotted key and rewrite the config file
+    Set {
+        key: String,
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
+    /// Open the config in $VISUAL/$EDITOR, then re-validate
     Edit,
+    /// Print the config file path
     Path,
 }
 
