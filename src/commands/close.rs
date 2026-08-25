@@ -30,10 +30,13 @@ pub fn run(ctx: &Ctx, target: &str, force: bool) -> anyhow::Result<()> {
     }
 
     if !force {
-        confirm(&format!(
-            "close quest {} (kills tmux session {tmux_session})?",
-            quest.slug
-        ))?;
+        confirm(
+            ctx,
+            &format!(
+                "close quest {} (kills tmux session {tmux_session})?",
+                quest.slug
+            ),
+        )?;
     }
 
     if ctx.tmux().has_session(&tmux_session)? {

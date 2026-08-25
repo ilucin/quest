@@ -18,16 +18,23 @@ pub fn run(ctx: &Ctx, target: &str, key: SetKey, value: &str) -> anyhow::Result<
     let quest = db.resolve_quest(target)?;
 
     let mut patch = QuestPatch::default();
-    let mut stored = value.to_string();
+    // What actually landed in the column, for the event and the payload.
+    let stored;
     match key {
-        SetKey::Goal => patch.goal = Some(value.to_string()),
+        SetKey::Goal => {
+            stored = value.trim().to_string();
+            patch.goal = Some(blank_to_null(&stored));
+        }
         SetKey::Cwd => {
             let dir = resolve_dir(Some(value))?;
             stored = dir.to_string_lossy().into_owned();
             patch.cwd = Some(stored.clone());
         }
         // TODO(M5): validate against the workflow registry.
-        SetKey::Workflow => patch.workflow = Some(value.to_string()),
+        SetKey::Workflow => {
+            stored = value.trim().to_string();
+            patch.workflow = Some(blank_to_null(&stored));
+        }
         SetKey::CtxResetPct => {
             let pct = parse_pct(value)?;
             stored = match pct {
@@ -54,6 +61,11 @@ pub fn run(ctx: &Ctx, target: &str, key: SetKey, value: &str) -> anyhow::Result<
         )?;
     }
     Ok(())
+}
+
+/// An empty value clears the column rather than storing `""`.
+fn blank_to_null(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// `1`..`100`, or one of `CLEAR` to fall back to `[context] master_reset_pct`.

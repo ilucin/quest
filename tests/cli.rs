@@ -548,9 +548,10 @@ impl Env {
         cmd.env("Q_DB", self.dir.path().join("q.db"))
             .env("Q_CONFIG", self.dir.path().join("config.toml"))
             .env("Q_FIXTURE", self.dir.path().join("tmux.json"))
-            // The attach mode depends on it, so it never leaks in from the
-            // terminal `cargo test` happens to run in.
-            .env_remove("TMUX");
+            // The attach mode and the confirm refusal depend on them, so
+            // neither leaks in from the terminal `cargo test` runs in.
+            .env_remove("TMUX")
+            .env_remove("Q_QUEST");
         cmd
     }
 
@@ -1540,7 +1541,9 @@ fn the_full_quest_lifecycle() {
 
     // show
     let shown = env.json(&["show", "foo"]);
-    assert_eq!(shown["quest"]["id"], quest_id.as_str());
+    assert_eq!(shown["id"], quest_id.as_str());
+    assert_eq!(shown["slug"], "foo");
+    assert_eq!(shown["live_sessions"], 1);
     assert_eq!(shown["display_state"], "active");
     assert_eq!(shown["sessions"].as_array().unwrap().len(), 1);
     assert_eq!(shown["sessions"][0]["label"], "master");
@@ -1550,6 +1553,7 @@ fn the_full_quest_lifecycle() {
     let entered = env.json(&["enter", "foo"]);
     assert_eq!(entered["tmux_session"], "q-foo");
     assert_eq!(entered["window"], "master");
+    assert_eq!(entered["attach"], "exec");
     assert_eq!(
         env.fixture()["attached"],
         serde_json::json!(["q-foo", "master"])
@@ -1592,7 +1596,7 @@ fn the_full_quest_lifecycle() {
     let resumed = env.json(&["resume", "foo", "-d"]);
     assert_eq!(resumed["quest"]["state"], "active");
     assert_eq!(resumed["quest"]["finished_at"], serde_json::Value::Null);
-    assert_eq!(resumed["attached"], false);
+    assert_eq!(resumed["attach"], "none");
     assert_ne!(resumed["session"]["id"], created["session"]["id"]);
     assert_eq!(env.count("SELECT count(*) FROM session"), 2);
     assert_eq!(pane_of(&env.fixture(), "q-foo")["window_name"], "master");
@@ -1606,15 +1610,20 @@ fn the_full_quest_lifecycle() {
     assert_eq!(renamed["tmux_session"], "q-bar");
     assert_eq!(pane_of(&env.fixture(), "q-bar")["window_name"], "master");
     assert_eq!(env.json(&["list"])[0]["slug"], "bar");
+    // Only the live session follows the rename; the closed one is history.
     assert_eq!(
         env.count("SELECT count(*) FROM session WHERE tmux_session = 'q-bar'"),
-        2
+        1
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE tmux_session = 'q-foo' AND status = 'ended'"),
+        1
     );
     assert!(event_kinds(&env, &quest_id).contains(&"name.changed".to_string()));
 
     // set
     env.json(&["set", "bar", "goal", "x"]);
-    assert_eq!(env.json(&["show", "bar"])["quest"]["goal"], "x");
+    assert_eq!(env.json(&["show", "bar"])["goal"], "x");
     assert!(event_kinds(&env, &quest_id).contains(&"quest.updated".to_string()));
 
     // rm
@@ -1767,6 +1776,7 @@ fn set_validates_its_values() {
     env.new_quest("foo");
     let work = env.work("elsewhere");
     let out = env.json(&["set", "foo", "cwd", work.to_str().unwrap()]);
+    assert_eq!(out["key"], "cwd");
     assert_eq!(out["quest"]["cwd"], work.to_str().unwrap());
 
     env.cmd()
@@ -1811,7 +1821,7 @@ fn an_ambiguous_target_lists_the_candidates() {
         assert!(message.contains(id), "{message}");
     }
     // A prefix that only one Quest answers to still resolves.
-    assert_eq!(env.json(&["show", "alpha-o"])["quest"]["slug"], "alpha-one");
+    assert_eq!(env.json(&["show", "alpha-o"])["slug"], "alpha-one");
 }
 
 #[test]
@@ -1836,6 +1846,7 @@ fn a_listing_sweeps_a_pane_that_is_gone() {
     assert_eq!(list[0]["live_sessions"], 0);
 
     let shown = env.json(&["show", "foo"]);
+    assert_eq!(shown["display_state"], "idle");
     assert_eq!(shown["sessions"][0]["status"], "ended");
     assert!(shown["sessions"][0]["ended_at"].is_i64());
     assert!(event_kinds(&env, &quest_id).contains(&"session.end".to_string()));
@@ -1848,4 +1859,194 @@ fn a_listing_sweeps_a_pane_that_is_gone() {
         )
         .unwrap();
     assert_eq!(reason, "pane_gone");
+}
+
+#[test]
+fn enter_refuses_a_quest_whose_master_window_is_gone() {
+    let env = Env::new();
+    env.new_quest("foo");
+    // The master window died; the tmux session lives on with another window.
+    env.write_fixture(serde_json::json!({
+        "next_pane": 2,
+        "panes": [{
+            "pane_id": "%2",
+            "session_name": "q-foo",
+            "window_name": "w1",
+            "window_index": 1,
+        }],
+    }));
+
+    let assert = env
+        .cmd()
+        .args(["enter", "foo", "--json"])
+        .assert()
+        .code(1)
+        .stdout("");
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    let message = parsed["error"].as_str().unwrap();
+    assert!(message.contains("master session of foo ended"), "{message}");
+    assert!(message.contains("q resume foo"), "{message}");
+    // Nothing was attached to.
+    assert_eq!(env.fixture()["attached"], serde_json::Value::Null);
+}
+
+#[test]
+fn resume_revives_an_active_quest_that_lost_its_sessions() {
+    let env = Env::new();
+    let created = env.new_quest("foo");
+    // Both the pane and the whole tmux session are gone, but the Quest was
+    // never closed.
+    env.write_fixture(serde_json::json!({ "next_pane": 1, "panes": [] }));
+
+    let resumed = env.json(&["resume", "foo", "-d"]);
+    assert_eq!(resumed["quest"]["state"], "active");
+    assert_eq!(resumed["attach"], "none");
+    assert_ne!(resumed["session"]["id"], created["session"]["id"]);
+    assert_eq!(pane_of(&env.fixture(), "q-foo")["window_name"], "master");
+    assert_eq!(env.json(&["list"])[0]["live_sessions"], 1);
+}
+
+#[test]
+fn resume_of_a_finished_quest_points_at_the_stray_tmux_session() {
+    let env = Env::new();
+    env.new_quest("foo");
+    env.json(&["close", "foo", "-f"]);
+    // Something recreated `q-foo` after the close.
+    env.write_fixture(serde_json::json!({
+        "next_pane": 1,
+        "panes": [{ "pane_id": "%1", "session_name": "q-foo", "window_name": "shell" }],
+    }));
+
+    env.cmd()
+        .args(["resume", "foo", "-d"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("still exists; kill it first"))
+        .stderr(predicate::str::contains("tmux kill-session -t =q-foo"))
+        .stderr(predicate::str::contains("q rm -f"));
+}
+
+#[test]
+fn rename_works_without_a_tmux_session() {
+    let env = Env::new();
+    env.new_quest("foo");
+    env.write_fixture(serde_json::json!({ "next_pane": 1, "panes": [] }));
+
+    let renamed = env.json(&["rename", "foo", "bar"]);
+    assert_eq!(renamed["quest"]["slug"], "bar");
+    assert_eq!(renamed["tmux_session"], "q-bar");
+    assert_eq!(renamed["changed"], true);
+    assert_eq!(env.json(&["list"])[0]["slug"], "bar");
+    // The swept session ended under the old name and keeps it.
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE tmux_session = 'q-foo'"),
+        1
+    );
+}
+
+#[test]
+fn renaming_to_the_same_slug_is_a_no_op_of_the_same_shape() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let out = env.json(&["rename", "foo", "foo"]);
+    assert_eq!(out["quest"]["slug"], "foo");
+    assert_eq!(out["from"], "foo");
+    assert_eq!(out["to"], "foo");
+    assert_eq!(out["tmux_session"], "q-foo");
+    assert_eq!(out["changed"], false);
+    assert!(
+        !event_kinds(&env, out["quest"]["id"].as_str().unwrap())
+            .contains(&"name.changed".to_string())
+    );
+}
+
+#[test]
+fn rm_without_force_and_without_a_tty_aborts() {
+    let env = Env::new();
+    env.new_quest("foo");
+    // No tmux session left, so `rm` reaches the confirmation instead of the
+    // "still runs in tmux" refusal.
+    env.write_fixture(serde_json::json!({ "next_pane": 1, "panes": [] }));
+
+    env.cmd()
+        .args(["rm", "foo"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("aborted (use -f)"));
+    assert_eq!(env.count("SELECT count(*) FROM quest"), 1);
+}
+
+#[test]
+fn a_json_caller_is_never_prompted() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let assert = env
+        .cmd()
+        .args(["close", "foo", "--json"])
+        .assert()
+        .code(1)
+        .stdout("");
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert!(
+        parsed["error"].as_str().unwrap().contains("-f"),
+        "unexpected payload: {parsed}"
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM quest WHERE state = 'active'"),
+        1
+    );
+}
+
+#[test]
+fn an_agent_inside_a_quest_pane_is_never_prompted() {
+    let env = Env::new();
+    env.new_quest("foo");
+    env.cmd()
+        .env("Q_QUEST", "q-7f3a")
+        .args(["close", "foo"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("aborted (use -f)"));
+    assert_eq!(
+        env.count("SELECT count(*) FROM quest WHERE state = 'active'"),
+        1
+    );
+}
+
+#[test]
+fn set_clears_goal_and_workflow_with_an_empty_value() {
+    let env = Env::new();
+    env.new_quest("foo");
+    env.json(&["set", "foo", "goal", "ship it"]);
+    env.json(&["set", "foo", "workflow", "tdd"]);
+
+    assert_eq!(
+        env.json(&["set", "foo", "goal", ""])["quest"]["goal"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        env.json(&["set", "foo", "workflow", "  "])["quest"]["workflow"],
+        serde_json::Value::Null
+    );
+    let shown = env.json(&["show", "foo"]);
+    assert_eq!(shown["goal"], serde_json::Value::Null);
+    assert_eq!(shown["workflow"], serde_json::Value::Null);
+}
+
+#[test]
+fn new_sweeps_before_it_creates() {
+    let env = Env::new();
+    let created = env.new_quest("foo");
+    let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
+    env.write_fixture(serde_json::json!({ "next_pane": 1, "panes": [] }));
+
+    // Creating an unrelated Quest still notices that `foo`'s pane is gone.
+    env.new_quest("bar");
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE status = 'ended'"),
+        1
+    );
+    assert!(event_kinds(&env, &quest_id).contains(&"session.end".to_string()));
 }

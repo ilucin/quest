@@ -4,7 +4,7 @@ use std::io::Write;
 
 use crate::Ctx;
 use crate::commands::new::MASTER;
-use crate::commands::{live, sweep_quiet};
+use crate::commands::{attach_mode, live, sweep_quiet};
 use crate::error::QError;
 use crate::model::QuestState;
 use crate::output;
@@ -32,7 +32,18 @@ pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
 
     let sessions = db.list_sessions_by_quest(&quest.id)?;
     let window = match label {
-        None => MASTER.to_string(),
+        // The tmux session can outlive its master window; attaching would then
+        // land on whatever window is left instead of the Quest's master.
+        None => {
+            if !live(&sessions).any(|s| s.label == MASTER) {
+                return Err(QError::Other(format!(
+                    "master session of {} ended; run `q resume {}`",
+                    quest.slug, quest.slug
+                ))
+                .into());
+            }
+            MASTER.to_string()
+        }
         Some(label) => {
             let known: Vec<&str> = live(&sessions).map(|s| s.label.as_str()).collect();
             if !known.contains(&label) {
@@ -58,7 +69,7 @@ pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
                 "quest": quest,
                 "tmux_session": tmux_session,
                 "window": window,
-                "attached": true,
+                "attach": attach_mode(ctx, true),
             }),
             || format!("attaching to {tmux_session}:{window}"),
         )?;

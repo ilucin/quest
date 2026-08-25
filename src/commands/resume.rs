@@ -5,7 +5,7 @@ use std::io::Write;
 
 use crate::Ctx;
 use crate::commands::new::{MASTER, spawn_master};
-use crate::commands::{live, sweep_quiet};
+use crate::commands::{NONE, attach_mode, live, sweep_quiet};
 use crate::error::QError;
 use crate::model::QuestState;
 use crate::output;
@@ -17,15 +17,25 @@ pub fn run(ctx: &Ctx, target: &str, prompt: Option<&str>, detach: bool) -> anyho
     let quest = db.resolve_quest(target)?;
     let tmux_session = session_name(&ctx.config, &quest.slug);
 
+    let finished = quest.state == QuestState::Finished;
     if ctx.tmux().has_session(&tmux_session)? {
-        return Err(QError::Tmux(format!(
-            "tmux session `{tmux_session}` is still running; run `q enter {}`",
-            quest.slug
-        ))
+        // A finished Quest has no sessions left to enter, so pointing at
+        // `q enter` would only bounce the caller back here.
+        return Err(if finished {
+            QError::Tmux(format!(
+                "tmux session `{tmux_session}` still exists; kill it first \
+                 (tmux kill-session -t ={tmux_session}) or `q rm -f`"
+            ))
+        } else {
+            QError::Tmux(format!(
+                "tmux session `{tmux_session}` is still running; run `q enter {}`",
+                quest.slug
+            ))
+        }
         .into());
     }
     // An active Quest whose master is gone is as resumable as a finished one.
-    if quest.state != QuestState::Finished {
+    if !finished {
         let sessions = db.list_sessions_by_quest(&quest.id)?;
         if live(&sessions).next().is_some() {
             return Err(QError::Other(format!(
@@ -46,7 +56,7 @@ pub fn run(ctx: &Ctx, target: &str, prompt: Option<&str>, detach: bool) -> anyho
         &serde_json::json!({ "session": master.session.id, "prompt": prompt }),
     )?;
 
-    let attached = !detach;
+    let attach = attach_mode(ctx, !detach);
     if ctx.json || !ctx.quiet {
         output::emit(
             ctx.json,
@@ -54,7 +64,7 @@ pub fn run(ctx: &Ctx, target: &str, prompt: Option<&str>, detach: bool) -> anyho
                 "quest": quest,
                 "session": master.session,
                 "tmux_session": master.tmux_session,
-                "attached": attached,
+                "attach": attach,
             }),
             || {
                 format!(
@@ -64,7 +74,8 @@ pub fn run(ctx: &Ctx, target: &str, prompt: Option<&str>, detach: bool) -> anyho
             },
         )?;
     }
-    if attached {
+    if attach != NONE {
+        // An exec attach replaces this process, so nothing buffered survives it.
         std::io::stdout().flush()?;
         ctx.tmux().attach(&master.tmux_session, Some(MASTER))?;
     }

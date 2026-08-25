@@ -23,10 +23,10 @@ pub fn run(ctx: &Ctx, target: &str, force: bool) -> anyhow::Result<()> {
         }
         ctx.tmux().kill_session(&tmux_session)?;
     } else if !force {
-        confirm(&format!(
-            "remove quest {} and all of its history?",
-            quest.slug
-        ))?;
+        confirm(
+            ctx,
+            &format!("remove quest {} and all of its history?", quest.slug),
+        )?;
     }
 
     db.delete_quest(&quest.id)?;

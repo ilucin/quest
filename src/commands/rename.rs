@@ -17,9 +17,16 @@ pub fn run(ctx: &Ctx, target: &str, slug: &str) -> anyhow::Result<()> {
     let from = quest.slug.clone();
     if from == slug {
         if ctx.json || !ctx.quiet {
+            let tmux_session = session_name(&ctx.config, slug);
             output::emit(
                 ctx.json,
-                &serde_json::json!({ "quest": quest, "from": from, "to": slug }),
+                &serde_json::json!({
+                    "quest": quest,
+                    "from": from,
+                    "to": slug,
+                    "tmux_session": tmux_session,
+                    "changed": false,
+                }),
                 || format!("{} is already named {slug}", quest.id),
             )?;
         }
@@ -74,6 +81,7 @@ pub fn run(ctx: &Ctx, target: &str, slug: &str) -> anyhow::Result<()> {
                 "from": from,
                 "to": quest.slug,
                 "tmux_session": new_session,
+                "changed": true,
             }),
             || {
                 format!(

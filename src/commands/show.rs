@@ -1,10 +1,22 @@
 //! `q show` — one Quest with its sessions and recent events (SPEC §16).
 
+use serde::Serialize;
+
 use crate::Ctx;
 use crate::commands::{QuestView, fmt, sweep_quiet};
 use crate::model::{Event, Session};
 use crate::output;
 use crate::tmux::session_name;
+
+/// `q list`'s object plus what only `q show` reads, so both renderings agree
+/// on the shape of a Quest (SPEC §16).
+#[derive(Debug, Serialize)]
+struct ShowView {
+    #[serde(flatten)]
+    view: QuestView,
+    sessions: Vec<Session>,
+    events: Vec<Event>,
+}
 
 const EVENTS: usize = 10;
 const PROMPT_WIDTH: usize = 40;
@@ -17,19 +29,21 @@ pub fn run(ctx: &Ctx, target: &str) -> anyhow::Result<()> {
     let sessions = db.list_sessions_by_quest(&quest.id)?;
     let events = db.list_events_by_quest(&quest.id, EVENTS)?;
     let tmux_session = session_name(&ctx.config, &quest.slug);
-    let view = QuestView::new(quest, &sessions);
+    let payload = ShowView {
+        view: QuestView::new(quest, &sessions),
+        sessions,
+        events,
+    };
 
     if ctx.json || !ctx.quiet {
         // TODO(M1/M2): links and beads progress belong in both renderings.
-        let payload = serde_json::json!({
-            "quest": view.quest,
-            "display_state": view.display_state,
-            "needs_you": view.needs_you,
-            "sessions": sessions,
-            "events": events,
-        });
         output::emit(ctx.json, &payload, || {
-            human(&view, &tmux_session, &sessions, &events)
+            human(
+                &payload.view,
+                &tmux_session,
+                &payload.sessions,
+                &payload.events,
+            )
         })?;
     }
     Ok(())

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::Ctx;
+use crate::commands::{NONE, attach_mode, sweep_quiet};
 use crate::db::{Db, ID_ATTEMPTS};
 use crate::error::QError;
 use crate::model::{NameSource, Quest, Session, SessionRole, SessionStatus, new_id};
@@ -33,6 +34,7 @@ pub struct Args<'a> {
 }
 
 pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
+    sweep_quiet(ctx)?;
     let db = ctx.db()?;
     let cwd = resolve_dir(args.dir)?;
     let prompt = resolve_prompt(args.prompt, args.prompt_file)?;
@@ -70,7 +72,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     };
     let session = master.session;
 
-    let attach = attach_mode(ctx, args.detach);
+    let attach = attach_mode(ctx, !args.detach);
     if ctx.json || !ctx.quiet {
         output::emit(
             ctx.json,
@@ -94,18 +96,6 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         ctx.tmux().attach(&tmux_session, Some(MASTER))?;
     }
     Ok(())
-}
-
-const NONE: &str = "none";
-
-/// What `q new` is about to do with the terminal: switch the surrounding tmux
-/// client, `exec` into `tmux attach` (this process is gone), or nothing.
-fn attach_mode(ctx: &Ctx, detach: bool) -> &'static str {
-    match (detach, ctx.tmux().in_tmux()) {
-        (true, _) => NONE,
-        (false, true) => "switch",
-        (false, false) => "exec",
-    }
 }
 
 /// The first free slug and the tmux session that goes with it. An auto slug

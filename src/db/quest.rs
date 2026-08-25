@@ -10,15 +10,15 @@ const COLUMNS: &str = "id, slug, name_source, name_input_hash, goal, cwd, machin
      workflow, template_id, beads_epic, beads_repo, brain_session, ctx_reset_pct, \
      created_at, updated_at, finished_at";
 
-/// Fields `q set` / `q rename` can change. `None` leaves a column alone;
-/// `ctx_reset_pct` nests so `Some(None)` can clear the override.
+/// Fields `q set` / `q rename` can change. `None` leaves a column alone; the
+/// nullable columns nest, so `Some(None)` clears them.
 #[derive(Debug, Default, Clone)]
 pub struct QuestPatch {
     pub slug: Option<String>,
     pub name_source: Option<NameSource>,
-    pub goal: Option<String>,
+    pub goal: Option<Option<String>>,
     pub cwd: Option<String>,
-    pub workflow: Option<String>,
+    pub workflow: Option<Option<String>>,
     pub ctx_reset_pct: Option<Option<u8>>,
 }
 
@@ -395,7 +395,7 @@ mod tests {
             .update_quest(
                 &q.id,
                 &QuestPatch {
-                    goal: Some("ship it".to_string()),
+                    goal: Some(Some("ship it".to_string())),
                     ctx_reset_pct: Some(Some(25)),
                     ..QuestPatch::default()
                 },
@@ -424,7 +424,7 @@ mod tests {
                 &QuestPatch {
                     slug: Some("omega".to_string()),
                     cwd: Some("/tmp/other".to_string()),
-                    workflow: Some("solo".to_string()),
+                    workflow: Some(Some("solo".to_string())),
                     ..QuestPatch::default()
                 },
             )
@@ -432,6 +432,19 @@ mod tests {
         assert_eq!(renamed.slug, "omega");
         assert_eq!(renamed.cwd, "/tmp/other");
         assert_eq!(renamed.workflow.as_deref(), Some("solo"));
+
+        let blanked = db
+            .update_quest(
+                &q.id,
+                &QuestPatch {
+                    goal: Some(None),
+                    workflow: Some(None),
+                    ..QuestPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(blanked.goal, None);
+        assert_eq!(blanked.workflow, None);
     }
 
     #[test]
