@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -24,8 +25,9 @@ pub struct Config {
     pub ui: Ui,
     pub brain: Brain,
     pub beads: Beads,
-    /// Array-of-tables; serialized last so plain values never fall into it.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Array-of-tables; declared last so plain values never fall into it.
+    /// toml hoists `remotes = []` above the preceding tables on its own, so
+    /// the round-trip stays valid without skipping serialization.
     pub remotes: Vec<Remote>,
 }
 
@@ -193,28 +195,25 @@ impl Config {
 
     /// A missing file is not an error — it yields the defaults, unwritten.
     pub fn load_from(path: &Path) -> anyhow::Result<Config> {
+        let config = Config::parse_unchecked(path)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Like `load_from`, but does not validate — lets `config set` repair an
+    /// invalid file by parsing it, applying the change, and validating only
+    /// the result.
+    fn parse_unchecked(path: &Path) -> anyhow::Result<Config> {
         match fs::read_to_string(path) {
-            Ok(text) => {
-                let config: Config = toml::from_str(&text)
-                    .map_err(|e| QError::Config(format!("{}: {}", path.display(), tidy(&e))))?;
-                config.validate()?;
-                Ok(config)
-            }
+            Ok(text) => toml::from_str(&text)
+                .map_err(|e| QError::Config(format!("{}: {}", path.display(), tidy(&e))).into()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(QError::Config(format!("{}: {e}", path.display())).into()),
         }
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.machine.name.is_empty() {
-            return Err(bad("machine.name must not be empty"));
-        }
-        if !is_machine_name(&self.machine.name) {
-            return Err(bad(&format!(
-                "machine.name `{}` must match ^[a-z0-9][a-z0-9-]*$",
-                self.machine.name
-            )));
-        }
+        validate_machine_name(&self.machine.name)?;
 
         for (key, pct) in [
             ("master_reset_pct", self.context.master_reset_pct),
@@ -254,6 +253,25 @@ impl Config {
 
         if self.tmux.session_prefix.is_empty() {
             return Err(bad("tmux.session_prefix must not be empty"));
+        }
+
+        if self.ui.tick_local < 1 {
+            return Err(bad(&format!(
+                "ui.tick_local must be at least 1, got {}",
+                self.ui.tick_local
+            )));
+        }
+        if self.ui.tick_remote < 1 {
+            return Err(bad(&format!(
+                "ui.tick_remote must be at least 1, got {}",
+                self.ui.tick_remote
+            )));
+        }
+        if !(2..=3).contains(&self.ui.rows) {
+            return Err(bad(&format!(
+                "ui.rows must be between 2 and 3, got {}",
+                self.ui.rows
+            )));
         }
 
         Ok(())
@@ -326,6 +344,20 @@ fn tidy(e: &impl std::fmt::Display) -> String {
         .join(" ")
 }
 
+/// Shared by `Config::validate` (for `machine.name`) and `--machine`
+/// (for the per-invocation override), which follows the same rules.
+pub(crate) fn validate_machine_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        return Err(bad("machine.name must not be empty"));
+    }
+    if !is_machine_name(name) {
+        return Err(bad(&format!(
+            "machine.name `{name}` must match ^[a-z0-9][a-z0-9-]*$",
+        )));
+    }
+    Ok(())
+}
+
 fn is_machine_name(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
@@ -337,13 +369,18 @@ fn is_machine_name(s: &str) -> bool {
 
 /// Hostname, reduced to the machine-name alphabet so the defaults validate.
 fn default_machine_name() -> String {
-    let raw = std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    normalize_machine_name(&raw)
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let raw = std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .unwrap_or_default();
+            normalize_machine_name(&raw)
+        })
+        .clone()
 }
 
 fn normalize_machine_name(raw: &str) -> String {
@@ -436,18 +473,21 @@ fn to_json(value: &toml::Value) -> anyhow::Result<serde_json::Value> {
 }
 
 fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
+    let io_err =
+        |op: &str, e: std::io::Error| QError::Config(format!("{}: {op}: {e}", path.display()));
+
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|e| io_err("create directory", e))?;
     }
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config.toml".to_string());
     let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-    fs::write(&tmp, contents)?;
-    fs::rename(&tmp, path)?;
+    fs::write(&tmp, contents).map_err(|e| io_err("write", e))?;
+    fs::rename(&tmp, path).map_err(|e| io_err("rename", e))?;
     Ok(())
 }
 
@@ -473,8 +513,12 @@ fn path_cmd(ctx: &Ctx) -> anyhow::Result<()> {
 
 fn get(ctx: &Ctx, key: Option<&str>) -> anyhow::Result<()> {
     let Some(key) = key else {
-        let toml_text = ctx.config.to_toml_string()?;
-        return output::emit(ctx.json, &ctx.config, || toml_text.trim_end().to_string());
+        return output::emit(ctx.json, &ctx.config, || {
+            ctx.config
+                .to_toml_string()
+                .map(|s| s.trim_end().to_string())
+                .unwrap_or_else(|e| e.to_string())
+        });
     };
     let value = ctx.config.get_key(key)?;
     let json = to_json(&value)?;
@@ -488,8 +532,10 @@ fn get(ctx: &Ctx, key: Option<&str>) -> anyhow::Result<()> {
 fn set(ctx: &Ctx, key: &str, raw: &str) -> anyhow::Result<()> {
     // Deliberately re-read the file rather than using `ctx.config`, so a
     // `--machine` override for this invocation is never persisted.
+    // Parsed without validating: an invalid file can still be repaired by
+    // setting the one key that fixes it — only the result is validated.
     let path = Config::path()?;
-    let current = Config::load_from(&path)?;
+    let current = Config::parse_unchecked(&path)?;
     let updated = current.set_key(key, raw)?;
     write_atomic(&path, &updated.to_toml_string()?)?;
 
@@ -697,10 +743,15 @@ mod tests {
             }])
             .contains("ssh")
         );
-        // 100 is the inclusive upper bound.
+        assert!(invalid(|c| c.ui.tick_local = 0).contains("tick_local"));
+        assert!(invalid(|c| c.ui.tick_remote = 0).contains("tick_remote"));
+        assert!(invalid(|c| c.ui.rows = 1).contains("rows"));
+        assert!(invalid(|c| c.ui.rows = 4).contains("rows"));
+        // 100 is the inclusive upper bound; 2 and 3 are both valid rows.
         let mut c = Config::default();
         c.context.master_reset_pct = 100;
         c.context.worker_warn_pct = 1;
+        c.ui.rows = 3;
         c.validate().unwrap();
     }
 

@@ -155,14 +155,14 @@ fn config_path_json_reports_existence() {
 
 #[test]
 fn config_get_without_a_file_prints_the_defaults_as_toml() {
-    q().args(["config", "get"])
+    let mut cmd = q();
+    let path = config_path(&cmd);
+    cmd.args(["config", "get"])
         .assert()
         .success()
         .stdout(predicate::str::contains("master_reset_pct = 35"))
         .stdout(predicate::str::contains("session_prefix = \"q-\""));
     // Reading must not create the file.
-    let cmd = q();
-    let path = config_path(&cmd);
     assert!(!path.exists());
 }
 
@@ -308,12 +308,20 @@ fn config_edit_reports_an_invalid_result() {
 }
 
 #[test]
-fn machine_flag_overrides_the_configured_name() {
+fn machine_flag_is_a_targeting_flag_not_reflected_by_config_get() {
+    // `--machine` targets a remote for this invocation (SPEC §15); it must
+    // not change what `config get` reports for `machine.name`.
+    let baseline = q()
+        .args(["config", "get", "machine.name", "--json"])
+        .assert()
+        .success();
+    let default_name = json_of(&baseline)["value"].clone();
+
     let assert = q()
         .args(["--machine", "ws", "config", "get", "machine.name", "--json"])
         .assert()
         .success();
-    assert_eq!(json_of(&assert)["value"], "ws");
+    assert_eq!(json_of(&assert)["value"], default_name);
 }
 
 #[test]
@@ -322,4 +330,83 @@ fn machine_flag_is_validated() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("machine.name"));
+}
+
+#[test]
+fn machine_flag_is_not_persisted_by_config_set() {
+    let mut cmd = q();
+    let path = config_path(&cmd);
+    cmd.args(["--machine", "ws", "config", "set", "ui.mouse", "false"])
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("name = \"ws\""), "{text}");
+    assert!(text.contains("mouse = false"), "{text}");
+}
+
+#[test]
+fn q_config_in_a_nonexistent_nested_dir_reads_defaults() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("a").join("b").join("config.toml");
+    let mut cmd = Command::cargo_bin("q").unwrap();
+    cmd.env("Q_CONFIG", &path)
+        .env("Q_DB", dir.path().join("q.db"));
+    cmd.args(["config", "get", "--json"]).assert().success();
+    assert!(!path.exists(), "reading must not create the nested dirs");
+}
+
+#[test]
+fn q_config_in_a_nonexistent_nested_dir_creates_it_on_set() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("a").join("b").join("config.toml");
+    let mut cmd = Command::cargo_bin("q").unwrap();
+    cmd.env("Q_CONFIG", &path)
+        .env("Q_DB", dir.path().join("q.db"));
+    cmd.args(["config", "set", "machine.name", "ws"])
+        .assert()
+        .success();
+    assert!(path.exists());
+    assert!(std::fs::read_to_string(&path).unwrap().contains("ws"));
+}
+
+#[test]
+fn remotes_table_survives_a_cli_config_set_of_another_key() {
+    let mut cmd = q();
+    let path = config_path(&cmd);
+    std::fs::write(&path, "[[remotes]]\nname = \"ws\"\nssh = \"ws.local\"\n").unwrap();
+    cmd.args(["config", "set", "ui.mouse", "false"])
+        .assert()
+        .success();
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("mouse = false"), "{text}");
+    assert!(text.contains("[[remotes]]"), "{text}");
+    assert!(text.contains("name = \"ws\""), "{text}");
+    assert!(text.contains("ssh = \"ws.local\""), "{text}");
+
+    let mut cmd = q();
+    cmd.env("Q_CONFIG", &path);
+    let assert = cmd
+        .args(["config", "get", "remotes", "--json"])
+        .assert()
+        .success();
+    assert_eq!(
+        json_of(&assert)["value"],
+        serde_json::json!([{ "name": "ws", "ssh": "ws.local" }])
+    );
+}
+
+#[test]
+fn config_get_remotes_defaults_to_an_empty_array() {
+    let assert = q()
+        .args(["config", "get", "remotes", "--json"])
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["value"], serde_json::json!([]));
+}
+
+#[test]
+fn config_get_json_always_has_a_remotes_key() {
+    let assert = q().args(["config", "get", "--json"]).assert().success();
+    assert!(json_of(&assert)["remotes"].is_array());
 }

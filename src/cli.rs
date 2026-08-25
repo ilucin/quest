@@ -120,7 +120,11 @@ pub enum ConfigAction {
     /// Print one dotted key, or the whole effective config
     Get { key: Option<String> },
     /// Set one dotted key and rewrite the config file
-    Set { key: String, value: String },
+    Set {
+        key: String,
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
     /// Open the config in $VISUAL/$EDITOR, then re-validate
     Edit,
     /// Print the config file path

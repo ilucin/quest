@@ -15,20 +15,31 @@ pub struct Ctx {
     pub json: bool,
     pub quiet: bool,
     pub config: Config,
+    machine_override: Option<String>,
 }
 
 impl Ctx {
+    /// The targeted machine name for this invocation: `--machine` if given
+    /// (validated, never written to the config), else the configured one.
+    pub fn machine(&self) -> &str {
+        self.machine_override
+            .as_deref()
+            .unwrap_or(&self.config.machine.name)
+    }
+
     fn new(args: &Cli, config: Config) -> anyhow::Result<Ctx> {
-        let mut config = config;
-        // `--machine` overrides the configured name for this invocation only.
-        if let Some(machine) = &args.machine {
-            machine.clone_into(&mut config.machine.name);
-            config.validate()?;
-        }
+        let machine_override = match &args.machine {
+            Some(m) => {
+                config::validate_machine_name(m)?;
+                Some(m.clone())
+            }
+            None => None,
+        };
         Ok(Ctx {
             json: args.json,
             quiet: args.quiet,
             config,
+            machine_override,
         })
     }
 
@@ -44,6 +55,7 @@ impl Ctx {
             json: args.json,
             quiet: args.quiet,
             config: Config::default(),
+            machine_override: None,
         })
     }
 }
