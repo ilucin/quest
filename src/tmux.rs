@@ -64,6 +64,8 @@ pub trait Tmux {
     fn rename_session(&self, old: &str, new: &str) -> anyhow::Result<()>;
     fn rename_window(&self, pane_id: &str, new: &str) -> anyhow::Result<()>;
     fn kill_session(&self, name: &str) -> anyhow::Result<()>;
+    /// Kills the window a pane belongs to, leaving the session alone.
+    fn kill_window(&self, pane_id: &str) -> anyhow::Result<()>;
     fn has_session(&self, name: &str) -> anyhow::Result<bool>;
     fn in_tmux(&self) -> bool;
     fn version(&self) -> anyhow::Result<String>;
@@ -87,16 +89,30 @@ fn args(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| (*s).to_string()).collect()
 }
 
+/// tmux matches `-t` targets by prefix unless they start with `=`; without it
+/// `q-a` would happily resolve to `q-alpha`.
+fn exact(target: &str) -> String {
+    format!("={target}")
+}
+
 fn args_list_panes() -> Vec<String> {
     args(&["list-panes", "-a", "-F", PANE_FORMAT])
 }
 
 fn args_display_pane(target: &str) -> Vec<String> {
-    args(&["display-message", "-p", "-t", target, PANE_FORMAT])
+    args(&["display-message", "-p", "-t", &exact(target), PANE_FORMAT])
 }
 
 fn args_new_session(spec: &NewSession) -> Vec<String> {
-    let mut out = args(&["new-session", "-d", "-s", &spec.name]);
+    let mut out = args(&[
+        "new-session",
+        "-d",
+        "-s",
+        &spec.name,
+        "-P",
+        "-F",
+        PANE_FORMAT,
+    ]);
     if !spec.window_name.is_empty() {
         out.extend(args(&["-n", &spec.window_name]));
     }
@@ -114,7 +130,7 @@ fn args_new_window(spec: &NewWindow) -> Vec<String> {
     let mut out = args(&[
         "new-window",
         "-t",
-        &format!("{}:", spec.session),
+        &exact(&format!("{}:", spec.session)),
         "-P",
         "-F",
         PANE_FORMAT,
@@ -160,31 +176,40 @@ fn args_capture_pane(pane_id: &str, lines: usize) -> Vec<String> {
 }
 
 fn args_rename_session(old: &str, new: &str) -> Vec<String> {
-    args(&["rename-session", "-t", old, new])
+    args(&["rename-session", "-t", &exact(old), new])
 }
 
+/// Pane ids are already unambiguous, so they need no `=`.
 fn args_rename_window(pane_id: &str, new: &str) -> Vec<String> {
     args(&["rename-window", "-t", pane_id, new])
 }
 
 fn args_kill_session(name: &str) -> Vec<String> {
-    args(&["kill-session", "-t", name])
+    args(&["kill-session", "-t", &exact(name)])
+}
+
+fn args_kill_window(pane_id: &str) -> Vec<String> {
+    args(&["kill-window", "-t", pane_id])
 }
 
 fn args_has_session(name: &str) -> Vec<String> {
-    args(&["has-session", "-t", name])
+    args(&["has-session", "-t", &exact(name)])
 }
 
 fn args_attach(session: &str) -> Vec<String> {
-    args(&["attach", "-t", session])
+    args(&["attach", "-t", &exact(session)])
 }
 
 fn args_switch_client(session: &str) -> Vec<String> {
-    args(&["switch-client", "-t", session])
+    args(&["switch-client", "-t", &exact(session)])
 }
 
 fn args_select_window(session: &str, window: &str) -> Vec<String> {
-    args(&["select-window", "-t", &format!("{session}:{window}")])
+    args(&[
+        "select-window",
+        "-t",
+        &exact(&format!("{session}:{window}")),
+    ])
 }
 
 fn parse_pane(line: &str) -> Option<Pane> {
@@ -254,13 +279,9 @@ impl Tmux for RealTmux {
     }
 
     fn new_session(&self, spec: &NewSession) -> anyhow::Result<Pane> {
-        run(&args_new_session(spec))?;
-        let window = if spec.window_name.is_empty() {
-            String::new()
-        } else {
-            spec.window_name.clone()
-        };
-        self.pane_at(&format!("{}:{window}", spec.name))
+        let out = run(&args_new_session(spec))?;
+        parse_pane(out.trim_end_matches('\n'))
+            .ok_or_else(|| QError::Tmux("cannot read the new session's pane".to_string()).into())
     }
 
     fn new_window(&self, spec: &NewWindow) -> anyhow::Result<Pane> {
@@ -294,7 +315,7 @@ impl Tmux for RealTmux {
     }
 
     fn capture_pane(&self, pane_id: &str, lines: usize) -> anyhow::Result<String> {
-        run(&args_capture_pane(pane_id, lines))
+        Ok(tail(&run(&args_capture_pane(pane_id, lines))?, lines))
     }
 
     fn rename_session(&self, old: &str, new: &str) -> anyhow::Result<()> {
@@ -307,6 +328,10 @@ impl Tmux for RealTmux {
 
     fn kill_session(&self, name: &str) -> anyhow::Result<()> {
         run(&args_kill_session(name)).map(|_| ())
+    }
+
+    fn kill_window(&self, pane_id: &str) -> anyhow::Result<()> {
+        run(&args_kill_window(pane_id)).map(|_| ())
     }
 
     fn has_session(&self, name: &str) -> anyhow::Result<bool> {
@@ -333,6 +358,9 @@ pub struct FixtureState {
     pub next_pane: u32,
     #[serde(default)]
     pub panes: Vec<FixturePane>,
+    /// The `(session, window)` of the last `attach`, so tests can assert on it.
+    #[serde(default)]
+    pub attached: Option<(String, Option<String>)>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -425,7 +453,9 @@ impl FixtureTmux {
         write_json(&self.path, state)
     }
 
+    /// Serialised against concurrent `q` processes sharing the fixture file.
     fn edit<T>(&self, f: impl FnOnce(&mut FixtureState) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let _lock = Lock::acquire(&self.path)?;
         let mut state = self.load()?;
         let out = f(&mut state)?;
         self.save(&state)?;
@@ -433,15 +463,67 @@ impl FixtureTmux {
     }
 }
 
-fn write_json(path: &Path, state: &FixtureState) -> anyhow::Result<()> {
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn ensure_parent(path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)
             .map_err(|e| QError::Tmux(format!("cannot create {}: {e}", parent.display())))?;
     }
+    Ok(())
+}
+
+/// An advisory lock held for the whole load → mutate → save cycle. Released on
+/// drop, so an error inside the cycle cannot strand it.
+struct Lock(PathBuf);
+
+const LOCK_ATTEMPTS: u32 = 500;
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+
+impl Lock {
+    fn acquire(path: &Path) -> anyhow::Result<Lock> {
+        ensure_parent(path)?;
+        let lock = suffixed(path, ".lock");
+        for _ in 0..LOCK_ATTEMPTS {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock)
+            {
+                Ok(_) => return Ok(Lock(lock)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(LOCK_WAIT)
+                }
+                Err(e) => {
+                    return Err(QError::Tmux(format!("cannot lock {}: {e}", lock.display())).into());
+                }
+            }
+        }
+        Err(QError::Tmux(format!("fixture lock is stuck: {}", lock.display())).into())
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Written to a sibling temp file and renamed, so a reader never sees a
+/// half-written fixture.
+fn write_json(path: &Path, state: &FixtureState) -> anyhow::Result<()> {
+    ensure_parent(path)?;
     let text = serde_json::to_string_pretty(state)?;
-    std::fs::write(path, text)
+    let tmp = suffixed(path, ".tmp");
+    std::fs::write(&tmp, text)
+        .map_err(|e| QError::Tmux(format!("cannot write {}: {e}", tmp.display())))?;
+    std::fs::rename(&tmp, path)
         .map_err(|e| QError::Tmux(format!("cannot write {}: {e}", path.display())).into())
 }
 
@@ -489,12 +571,24 @@ impl Tmux for FixtureTmux {
         })
     }
 
-    fn attach(&self, session: &str, _window: Option<&str>) -> anyhow::Result<()> {
-        if !self.has_session(session)? {
-            return Err(QError::Tmux(format!("can't find session: {session}")).into());
-        }
-        println!("[fixture] attach {session}");
-        Ok(())
+    fn attach(&self, session: &str, window: Option<&str>) -> anyhow::Result<()> {
+        self.edit(|state| {
+            let in_session: Vec<&FixturePane> = state
+                .panes
+                .iter()
+                .filter(|p| p.session_name == session)
+                .collect();
+            if in_session.is_empty() {
+                return Err(QError::Tmux(format!("can't find session: {session}")).into());
+            }
+            if let Some(w) = window
+                && !in_session.iter().any(|p| p.window_name == w)
+            {
+                return Err(QError::Tmux(format!("can't find window: {session}:{w}")).into());
+            }
+            state.attached = Some((session.to_string(), window.map(str::to_string)));
+            Ok(())
+        })
     }
 
     fn send_keys(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()> {
@@ -547,6 +641,17 @@ impl Tmux for FixtureTmux {
         })
     }
 
+    fn kill_window(&self, pane_id: &str) -> anyhow::Result<()> {
+        self.edit(|state| {
+            let before = state.panes.len();
+            state.panes.retain(|p| p.pane_id != pane_id);
+            if state.panes.len() == before {
+                return Err(QError::Tmux(format!("can't find pane: {pane_id}")).into());
+            }
+            Ok(())
+        })
+    }
+
     fn has_session(&self, name: &str) -> anyhow::Result<bool> {
         Ok(self.load()?.panes.iter().any(|p| p.session_name == name))
     }
@@ -560,14 +665,18 @@ impl Tmux for FixtureTmux {
     }
 }
 
-/// The last `lines` lines, mirroring `capture-pane -S -<lines>`.
+/// The last `lines` lines with trailing blank lines dropped. `capture-pane -S
+/// -<lines>` counts back from the *history* start, so it can return more than
+/// `lines` and pads the pane's unused rows with blanks.
 fn tail(buffer: &str, lines: usize) -> String {
-    if lines == 0 {
-        return buffer.to_string();
+    let mut all: Vec<&str> = buffer.lines().collect();
+    while all.last().is_some_and(|l| l.trim().is_empty()) {
+        all.pop();
     }
-    let all: Vec<&str> = buffer.lines().collect();
-    let start = all.len().saturating_sub(lines);
-    all[start..].join("\n")
+    if lines > 0 && all.len() > lines {
+        all.drain(..all.len() - lines);
+    }
+    all.join("\n")
 }
 
 // ------------------------------------------------------------------ helpers
@@ -578,13 +687,15 @@ pub fn session_name(config: &Config, slug: &str) -> String {
 }
 
 /// The environment `q` sets on a window; Claude and its hooks inherit it
-/// (SPEC §7). `Q_DB` is passed on only when this process runs on an override.
+/// (SPEC §7). `Q_DB` and `Q_CONFIG` are passed on only when this process itself
+/// runs on an override — otherwise the child would resolve them differently.
 pub fn quest_env(
     quest_id: &str,
     session_id: &str,
     role: SessionRole,
     machine: &str,
     db_path_override: Option<&str>,
+    config_path_override: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut env = vec![
         ("Q_QUEST".to_string(), quest_id.to_string()),
@@ -595,12 +706,20 @@ pub fn quest_env(
     if let Some(db) = db_path_override.filter(|d| !d.is_empty()) {
         env.push(("Q_DB".to_string(), db.to_string()));
     }
+    if let Some(config) = config_path_override.filter(|c| !c.is_empty()) {
+        env.push(("Q_CONFIG".to_string(), config.to_string()));
+    }
     env
 }
 
 /// `$Q_DB` if the caller set one, for `quest_env`.
 pub fn db_override() -> Option<String> {
     std::env::var("Q_DB").ok().filter(|v| !v.is_empty())
+}
+
+/// `$Q_CONFIG` if the caller set one, for `quest_env`.
+pub fn config_override() -> Option<String> {
+    std::env::var("Q_CONFIG").ok().filter(|v| !v.is_empty())
 }
 
 /// Liveness (SPEC §6): a live session whose pane is gone has ended. Returns the
@@ -616,11 +735,16 @@ pub fn sweep(db: &Db, tmux: &dyn Tmux) -> anyhow::Result<Vec<Session>> {
         Err(e) if is_no_server(&e) => Vec::new(),
         Err(e) => return Err(e),
     };
-    let alive: HashSet<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
+    // Keyed on the pair: tmux recycles pane ids, so `%1` in another tmux
+    // session is not this session's pane.
+    let alive: HashSet<(&str, &str)> = panes
+        .iter()
+        .map(|p| (p.session_name.as_str(), p.pane_id.as_str()))
+        .collect();
 
     let mut ended = Vec::new();
     for session in live {
-        if alive.contains(session.tmux_pane.as_str()) {
+        if alive.contains(&(session.tmux_session.as_str(), session.tmux_pane.as_str())) {
             continue;
         }
         let row = db.mark_session_ended(&session.id, now())?;
@@ -664,6 +788,9 @@ mod tests {
                 "-d",
                 "-s",
                 "q-alpha",
+                "-P",
+                "-F",
+                PANE_FORMAT,
                 "-n",
                 "master",
                 "-c",
@@ -685,7 +812,15 @@ mod tests {
         };
         assert_eq!(
             args_new_session(&spec),
-            ["new-session", "-d", "-s", "q-alpha"]
+            [
+                "new-session",
+                "-d",
+                "-s",
+                "q-alpha",
+                "-P",
+                "-F",
+                PANE_FORMAT
+            ]
         );
     }
 
@@ -703,7 +838,7 @@ mod tests {
             [
                 "new-window",
                 "-t",
-                "q-alpha:",
+                "=q-alpha:",
                 "-P",
                 "-F",
                 PANE_FORMAT,
@@ -719,11 +854,18 @@ mod tests {
     }
 
     #[test]
+    /// Every session target carries `=`, or `q-a` would resolve to `q-alpha`.
     fn the_remaining_operations_build_their_args() {
         assert_eq!(args_list_panes(), ["list-panes", "-a", "-F", PANE_FORMAT]);
         assert_eq!(
             args_display_pane("q-alpha:master"),
-            ["display-message", "-p", "-t", "q-alpha:master", PANE_FORMAT]
+            [
+                "display-message",
+                "-p",
+                "-t",
+                "=q-alpha:master",
+                PANE_FORMAT
+            ]
         );
         assert_eq!(
             args_capture_pane("%42", 200),
@@ -731,19 +873,20 @@ mod tests {
         );
         assert_eq!(
             args_rename_session("q-a", "q-b"),
-            ["rename-session", "-t", "q-a", "q-b"]
+            ["rename-session", "-t", "=q-a", "q-b"]
         );
         assert_eq!(
             args_rename_window("%42", "w1-tests"),
             ["rename-window", "-t", "%42", "w1-tests"]
         );
-        assert_eq!(args_kill_session("q-a"), ["kill-session", "-t", "q-a"]);
-        assert_eq!(args_has_session("q-a"), ["has-session", "-t", "q-a"]);
-        assert_eq!(args_attach("q-a"), ["attach", "-t", "q-a"]);
-        assert_eq!(args_switch_client("q-a"), ["switch-client", "-t", "q-a"]);
+        assert_eq!(args_kill_session("q-a"), ["kill-session", "-t", "=q-a"]);
+        assert_eq!(args_kill_window("%42"), ["kill-window", "-t", "%42"]);
+        assert_eq!(args_has_session("q-a"), ["has-session", "-t", "=q-a"]);
+        assert_eq!(args_attach("q-a"), ["attach", "-t", "=q-a"]);
+        assert_eq!(args_switch_client("q-a"), ["switch-client", "-t", "=q-a"]);
         assert_eq!(
             args_select_window("q-a", "master"),
-            ["select-window", "-t", "q-a:master"]
+            ["select-window", "-t", "=q-a:master"]
         );
     }
 
@@ -796,8 +939,15 @@ mod tests {
     }
 
     #[test]
-    fn quest_env_adds_the_db_only_when_overridden() {
-        let base = quest_env("q-7f3a", "s-1a2b", SessionRole::Master, "laptop", None);
+    fn quest_env_adds_the_paths_only_when_overridden() {
+        let base = quest_env(
+            "q-7f3a",
+            "s-1a2b",
+            SessionRole::Master,
+            "laptop",
+            None,
+            None,
+        );
         assert_eq!(
             base,
             [
@@ -807,17 +957,33 @@ mod tests {
                 ("Q_MACHINE".to_string(), "laptop".to_string()),
             ]
         );
-        let with_db = quest_env(
+        let overridden = quest_env(
             "q-7f3a",
             "s-1a2b",
             SessionRole::Worker,
             "laptop",
             Some("/tmp/q.db"),
+            Some("/tmp/q.toml"),
         );
-        assert_eq!(with_db[2].1, "worker");
-        assert_eq!(with_db[4], ("Q_DB".to_string(), "/tmp/q.db".to_string()));
+        assert_eq!(overridden[2].1, "worker");
+        assert_eq!(overridden[4], ("Q_DB".to_string(), "/tmp/q.db".to_string()));
         assert_eq!(
-            quest_env("q", "s", SessionRole::Worker, "m", Some("")).len(),
+            overridden[5],
+            ("Q_CONFIG".to_string(), "/tmp/q.toml".to_string())
+        );
+        // Only the config is set, and empty strings count as unset.
+        let config_only = quest_env(
+            "q",
+            "s",
+            SessionRole::Worker,
+            "m",
+            Some(""),
+            Some("/tmp/q.toml"),
+        );
+        assert_eq!(config_only.len(), 5);
+        assert_eq!(config_only[4].0, "Q_CONFIG");
+        assert_eq!(
+            quest_env("q", "s", SessionRole::Worker, "m", Some(""), Some("")).len(),
             4
         );
     }
@@ -903,6 +1069,69 @@ mod tests {
         assert_eq!(t.capture_pane(&a.pane_id, 2).unwrap(), "two\nthree");
         assert_eq!(t.capture_pane(&b.pane_id, 100).unwrap(), "elsewhere");
         assert!(t.capture_pane("%99", 10).is_err());
+    }
+
+    #[test]
+    fn capture_drops_the_blank_rows_tmux_pads_a_pane_with() {
+        assert_eq!(tail("one\ntwo\n\n   \n\n", 100), "one\ntwo");
+        assert_eq!(tail("one\ntwo\nthree\n\n", 2), "two\nthree");
+        // A blank line inside the output is content, not padding.
+        assert_eq!(tail("one\n\ntwo\n\n", 0), "one\n\ntwo");
+        assert_eq!(tail("\n\n", 10), "");
+    }
+
+    #[test]
+    fn the_fixture_records_the_attach_target() {
+        let (_dir, t) = fixture();
+        t.new_session(&NewSession {
+            name: "q-a".to_string(),
+            window_name: "master".to_string(),
+            ..NewSession::default()
+        })
+        .unwrap();
+
+        assert!(t.attach("q-nope", None).is_err(), "unknown session");
+        assert!(t.attach("q-a", Some("w9")).is_err(), "unknown window");
+        assert!(t.load().unwrap().attached.is_none());
+
+        t.attach("q-a", Some("master")).unwrap();
+        assert_eq!(
+            t.load().unwrap().attached,
+            Some(("q-a".to_string(), Some("master".to_string())))
+        );
+        t.attach("q-a", None).unwrap();
+        assert_eq!(t.load().unwrap().attached, Some(("q-a".to_string(), None)));
+    }
+
+    #[test]
+    fn the_fixture_kills_one_window_without_the_session() {
+        let (_dir, t) = fixture();
+        let master = t
+            .new_session(&NewSession {
+                name: "q-a".to_string(),
+                window_name: "master".to_string(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        let worker = t
+            .new_window(&NewWindow {
+                session: "q-a".to_string(),
+                window_name: "w1".to_string(),
+                ..NewWindow::default()
+            })
+            .unwrap();
+
+        t.kill_window(&worker.pane_id).unwrap();
+        assert_eq!(
+            t.list_panes()
+                .unwrap()
+                .iter()
+                .map(|p| p.pane_id.clone())
+                .collect::<Vec<_>>(),
+            [master.pane_id]
+        );
+        assert!(t.has_session("q-a").unwrap());
+        assert!(t.kill_window(&worker.pane_id).is_err());
     }
 
     #[test]
@@ -1059,12 +1288,26 @@ mod tests {
                 "%404",
             ))
             .unwrap();
+        // Same pane id, different tmux session — liveness is keyed on the pair.
+        let stale = db
+            .insert_session(&Session::new(
+                &quest.id,
+                SessionRole::Worker,
+                "master",
+                "q-elsewhere",
+                &master.pane_id,
+            ))
+            .unwrap();
 
-        let ended = sweep(&db, &t).unwrap();
-        assert_eq!(
-            ended.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
-            [ghost.id]
-        );
+        let mut ended: Vec<String> = sweep(&db, &t)
+            .unwrap()
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        ended.sort();
+        let mut expected = vec![ghost.id, stale.id];
+        expected.sort();
+        assert_eq!(ended, expected);
         assert_ne!(
             db.get_session(&kept.id).unwrap().unwrap().status,
             SessionStatus::Ended
@@ -1072,47 +1315,96 @@ mod tests {
     }
 
     #[test]
+    fn a_dead_tmux_server_ends_every_live_session() {
+        let (db, quest) = seeded_db();
+        db.insert_session(&Session::new(
+            &quest.id,
+            SessionRole::Master,
+            "master",
+            "q-alpha",
+            "%1",
+        ))
+        .unwrap();
+        let ended = sweep(
+            &db,
+            &Stub::Fails("`tmux list-panes` failed: no server running on /tmp/tmux-501"),
+        )
+        .unwrap();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].status, SessionStatus::Ended);
+    }
+
+    #[test]
+    fn a_missing_tmux_binary_fails_the_sweep() {
+        let (db, quest) = seeded_db();
+        db.insert_session(&Session::new(
+            &quest.id,
+            SessionRole::Master,
+            "master",
+            "q-alpha",
+            "%1",
+        ))
+        .unwrap();
+        let err = sweep(&db, &Stub::Fails(TMUX_MISSING)).unwrap_err();
+        assert!(format!("{err:#}").contains(TMUX_MISSING));
+    }
+
+    #[test]
     fn an_empty_database_needs_no_tmux_at_all() {
         let (db, _quest) = seeded_db();
-        struct Exploding;
-        impl Tmux for Exploding {
-            fn list_panes(&self) -> anyhow::Result<Vec<Pane>> {
-                panic!("tmux must not be consulted");
-            }
-            fn new_session(&self, _: &NewSession) -> anyhow::Result<Pane> {
-                unreachable!()
-            }
-            fn new_window(&self, _: &NewWindow) -> anyhow::Result<Pane> {
-                unreachable!()
-            }
-            fn attach(&self, _: &str, _: Option<&str>) -> anyhow::Result<()> {
-                unreachable!()
-            }
-            fn send_keys(&self, _: &str, _: &str, _: bool) -> anyhow::Result<()> {
-                unreachable!()
-            }
-            fn capture_pane(&self, _: &str, _: usize) -> anyhow::Result<String> {
-                unreachable!()
-            }
-            fn rename_session(&self, _: &str, _: &str) -> anyhow::Result<()> {
-                unreachable!()
-            }
-            fn rename_window(&self, _: &str, _: &str) -> anyhow::Result<()> {
-                unreachable!()
-            }
-            fn kill_session(&self, _: &str) -> anyhow::Result<()> {
-                unreachable!()
-            }
-            fn has_session(&self, _: &str) -> anyhow::Result<bool> {
-                unreachable!()
-            }
-            fn in_tmux(&self) -> bool {
-                false
-            }
-            fn version(&self) -> anyhow::Result<String> {
-                unreachable!()
+        assert!(sweep(&db, &Stub::Never).unwrap().is_empty());
+    }
+
+    /// A `Tmux` for `sweep`: only `list_panes` is ever reachable.
+    enum Stub {
+        /// Panics if consulted.
+        Never,
+        /// Fails `list_panes` with this message.
+        Fails(&'static str),
+    }
+
+    impl Tmux for Stub {
+        fn list_panes(&self) -> anyhow::Result<Vec<Pane>> {
+            match self {
+                Stub::Never => panic!("tmux must not be consulted"),
+                Stub::Fails(msg) => Err(QError::Tmux((*msg).to_string()).into()),
             }
         }
-        assert!(sweep(&db, &Exploding).unwrap().is_empty());
+        fn new_session(&self, _: &NewSession) -> anyhow::Result<Pane> {
+            unreachable!()
+        }
+        fn new_window(&self, _: &NewWindow) -> anyhow::Result<Pane> {
+            unreachable!()
+        }
+        fn attach(&self, _: &str, _: Option<&str>) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn send_keys(&self, _: &str, _: &str, _: bool) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn capture_pane(&self, _: &str, _: usize) -> anyhow::Result<String> {
+            unreachable!()
+        }
+        fn rename_session(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn rename_window(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn kill_session(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn kill_window(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn has_session(&self, _: &str) -> anyhow::Result<bool> {
+            unreachable!()
+        }
+        fn in_tmux(&self) -> bool {
+            false
+        }
+        fn version(&self) -> anyhow::Result<String> {
+            unreachable!()
+        }
     }
 }
