@@ -27,7 +27,6 @@ pub struct Cli {
 
 /// Variant fields are wired up by the milestone that implements each command;
 /// the stubs below do not read them yet.
-#[allow(dead_code)]
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Create a new Quest
@@ -116,7 +115,6 @@ pub enum Command {
     },
 }
 
-#[allow(dead_code)]
 #[derive(Subcommand, Debug)]
 pub enum ConfigAction {
     Get { key: String },

@@ -27,12 +27,29 @@ pub enum QError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("`q {0}` is not implemented yet")]
+    NotImplemented(String),
+
     #[error("{0}")]
     Other(String),
 }
 
 impl QError {
     pub fn not_implemented(what: &str) -> Self {
-        QError::Other(format!("`q {what}` is not implemented yet"))
+        QError::NotImplemented(what.to_string())
+    }
+
+    /// Stable, snake_case identifier used in `--json` error payloads.
+    pub fn code(&self) -> &'static str {
+        match self {
+            QError::NotFound(_) => "not_found",
+            QError::Ambiguous { .. } => "ambiguous",
+            QError::Tmux(_) => "tmux",
+            QError::Db(_) => "db",
+            QError::Config(_) => "config",
+            QError::Io(_) => "io",
+            QError::NotImplemented(_) => "not_implemented",
+            QError::Other(_) => "other",
+        }
     }
 }
