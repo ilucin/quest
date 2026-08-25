@@ -4,6 +4,7 @@ mod db;
 mod error;
 mod model;
 mod output;
+mod tmux;
 
 use clap::Parser;
 
@@ -11,6 +12,7 @@ use cli::{Cli, Command, ConfigAction};
 use config::Config;
 use db::Db;
 use error::QError;
+use tmux::Tmux;
 
 /// Everything a command needs beyond its own arguments. Built once by the
 /// dispatcher and handed to each command.
@@ -22,6 +24,7 @@ pub struct Ctx {
     /// Absent only for `q config`, which has to work before — and in order to
     /// fix — a broken environment.
     db: Option<Db>,
+    tmux: Box<dyn Tmux>,
 }
 
 impl Ctx {
@@ -47,6 +50,7 @@ impl Ctx {
             config,
             machine_override,
             db,
+            tmux: tmux::tmux(),
         })
     }
 
@@ -74,6 +78,7 @@ impl Ctx {
             config: Config::default(),
             machine_override: None,
             db: None,
+            tmux: tmux::tmux(),
         })
     }
 
@@ -81,6 +86,10 @@ impl Ctx {
         self.db
             .as_ref()
             .ok_or_else(|| QError::Db("this command runs without a database".to_string()).into())
+    }
+
+    pub fn tmux(&self) -> &dyn Tmux {
+        self.tmux.as_ref()
     }
 }
 
