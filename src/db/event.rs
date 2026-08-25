@@ -45,7 +45,10 @@ impl Db {
             ))
             .map_err(db_err)?;
         let rows = stmt
-            .query_map(params![quest_id, limit as i64], row_to_event)
+            .query_map(
+                params![quest_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+                row_to_event,
+            )
             .map_err(db_err)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
     }

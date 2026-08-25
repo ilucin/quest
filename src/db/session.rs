@@ -3,7 +3,7 @@
 
 use rusqlite::{Row, params};
 
-use super::{Db, ID_ATTEMPTS, db_err, enum_col, is_id_collision};
+use super::{Db, ID_ATTEMPTS, db_err, enum_col, is_id_collision, u8_col};
 use crate::error::QError;
 use crate::model::{Session, SessionRole, SessionStatus, new_id, now};
 
@@ -168,7 +168,7 @@ fn row_to_session(row: &Row) -> rusqlite::Result<Session> {
         phase: row.get("phase")?,
         status: enum_col::<SessionStatus>(row, "status")?,
         waiting_for: row.get("waiting_for")?,
-        ctx_pct: row.get("ctx_pct")?,
+        ctx_pct: u8_col(row, "ctx_pct")?,
         ctx_updated_at: row.get("ctx_updated_at")?,
         first_prompt: row.get("first_prompt")?,
         last_prompt: row.get("last_prompt")?,

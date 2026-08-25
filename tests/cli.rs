@@ -431,16 +431,39 @@ fn db_path(cmd: &TestCmd) -> std::path::PathBuf {
 #[test]
 fn config_works_without_touching_the_database() {
     let dir = TempDir::new().unwrap();
-    let mut cmd = Command::cargo_bin("q").unwrap();
-    // A path that cannot be created: `Cargo.toml` is a file, not a directory.
-    let unwritable = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("Cargo.toml")
-        .join("nested")
-        .join("q.db");
-    cmd.env("Q_DB", &unwritable)
-        .env("Q_CONFIG", dir.path().join("config.toml"));
-    cmd.args(["config", "path"]).assert().success();
-    assert!(!unwritable.exists());
+    // Nothing under `nope/` exists, and `Cargo.toml` is a file, so this path
+    // can neither be opened nor created — and opening it would leave the
+    // directory chain behind even where it can be created.
+    let db = dir.path().join("nope").join("x").join("q.db");
+    let config = dir.path().join("config.toml");
+
+    for args in [
+        vec!["config"],
+        vec!["config", "get"],
+        vec!["config", "get", "machine.name"],
+        vec!["config", "set", "machine.name", "laptop"],
+        vec!["config", "edit"],
+        vec!["config", "path"],
+    ] {
+        let mut cmd = Command::cargo_bin("q").unwrap();
+        cmd.env("Q_DB", &db)
+            .env("Q_CONFIG", &config)
+            // `q config edit` shells out; `true` is the do-nothing editor.
+            .env("EDITOR", "true")
+            .env_remove("VISUAL");
+        cmd.args(&args).assert().success();
+        assert!(
+            !db.exists(),
+            "`q {}` created {}",
+            args.join(" "),
+            db.display()
+        );
+        assert!(
+            !dir.path().join("nope").exists(),
+            "`q {}` created the Q_DB parent directory",
+            args.join(" ")
+        );
+    }
 }
 
 #[test]

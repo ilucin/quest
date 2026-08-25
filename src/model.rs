@@ -237,6 +237,24 @@ pub struct Link {
     pub created_at: i64,
 }
 
+impl Link {
+    /// A manual reference: no session, no enrichment yet. `id` is assigned by
+    /// the insert.
+    pub fn new(quest_id: &str, kind: &str, r#ref: &str) -> Link {
+        Link {
+            id: 0,
+            quest_id: quest_id.to_string(),
+            session_id: None,
+            kind: kind.to_string(),
+            r#ref: r#ref.to_string(),
+            title: None,
+            meta: None,
+            enriched_at: None,
+            created_at: now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Template {
     pub id: String,

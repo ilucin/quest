@@ -55,11 +55,11 @@ impl Db {
     }
 
     fn prepare(mut conn: Connection) -> anyhow::Result<Db> {
-        // In-memory databases stay on the "memory" journal; that is expected.
-        conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))
+        // Before anything that can contend, so every later statement waits its
+        // turn instead of failing.
+        conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)
             .map_err(db_err)?;
-        conn.pragma_update(None, "busy_timeout", 5000)
-            .map_err(db_err)?;
+        set_wal(&conn)?;
         conn.pragma_update(None, "foreign_keys", true)
             .map_err(db_err)?;
         migrations::migrate(&mut conn)?;
@@ -88,6 +88,38 @@ fn path_from(env: Option<std::ffi::OsString>) -> anyhow::Result<PathBuf> {
     Ok(home.join(".local").join("share").join("q").join("q.db"))
 }
 
+/// How long any statement waits on a lock held by another `q`.
+const BUSY_TIMEOUT_MS: u32 = 5000;
+
+/// Switches the file to WAL. In-memory databases stay on the "memory" journal;
+/// that is expected.
+///
+/// The mode change needs a brief exclusive lock and, unlike ordinary
+/// statements, is refused outright rather than routed through the busy handler
+/// — so N processes opening the same fresh file have to be retried by hand.
+fn set_wal(conn: &Connection) -> anyhow::Result<()> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(BUSY_TIMEOUT_MS));
+    loop {
+        match conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(())) {
+            Ok(()) => return Ok(()),
+            Err(e) if is_busy(&e) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(db_err(e)),
+        }
+    }
+}
+
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == rusqlite::ErrorCode::DatabaseBusy
+                || f.code == rusqlite::ErrorCode::DatabaseLocked
+    )
+}
+
 pub(crate) fn db_err(e: rusqlite::Error) -> anyhow::Error {
     QError::Db(e.to_string()).into()
 }
@@ -108,6 +140,45 @@ pub(crate) fn is_id_collision(e: &rusqlite::Error, table: &str) -> bool {
 /// Number of fresh ids tried before an insert gives up.
 pub(crate) const ID_ATTEMPTS: usize = 5;
 
+/// A `Row` does not expose its statement, so the column index rusqlite wants is
+/// out of reach; `usize::MAX` is its "unknown column" sentinel, which drops the
+/// index from the message and leaves the name below to identify the column.
+const UNKNOWN_COLUMN: usize = usize::MAX;
+
+/// Names the offending column in a row-conversion failure.
+#[derive(Debug)]
+struct ColumnError {
+    column: String,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl std::fmt::Display for ColumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "column `{}`: {}", self.column, self.source)
+    }
+}
+
+impl std::error::Error for ColumnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn column_err(
+    name: &str,
+    ty: Type,
+    e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        UNKNOWN_COLUMN,
+        ty,
+        Box::new(ColumnError {
+            column: name.to_string(),
+            source: e.into(),
+        }),
+    )
+}
+
 /// Reads a TEXT column into one of `model`'s enums.
 pub(crate) fn enum_col<T>(row: &Row, name: &str) -> rusqlite::Result<T>
 where
@@ -115,8 +186,14 @@ where
     T::Err: std::error::Error + Send + Sync + 'static,
 {
     let raw: String = row.get(name)?;
-    T::from_str(&raw)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e)))
+    T::from_str(&raw).map_err(|e| column_err(name, Type::Text, e))
+}
+
+/// Reads a nullable INTEGER column into a `u8` — the percentage columns.
+pub(crate) fn u8_col(row: &Row, name: &str) -> rusqlite::Result<Option<u8>> {
+    let raw: Option<i64> = row.get(name)?;
+    raw.map(|v| u8::try_from(v).map_err(|e| column_err(name, Type::Integer, e)))
+        .transpose()
 }
 
 /// Reads a nullable TEXT column holding JSON.
@@ -126,7 +203,7 @@ pub(crate) fn json_col<T: DeserializeOwned>(row: &Row, name: &str) -> rusqlite::
         None => Ok(None),
         Some(text) => serde_json::from_str(&text)
             .map(Some)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e))),
+            .map_err(|e| column_err(name, Type::Text, e)),
     }
 }
 
@@ -243,6 +320,26 @@ mod tests {
             let p = path_from(empty).unwrap();
             assert!(p.ends_with(".local/share/q/q.db"), "{}", p.display());
         }
+    }
+
+    #[test]
+    fn a_bad_column_value_names_the_column() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_quest(&crate::model::Quest::new("alpha", "/tmp", "laptop"))
+            .unwrap();
+
+        db.conn
+            .execute("UPDATE quest SET state = 'napping'", [])
+            .unwrap();
+        let e = db.list_quests(true).unwrap_err();
+        assert!(e.to_string().contains("column `state`"), "{e}");
+        assert!(e.to_string().contains("napping"), "{e}");
+
+        db.conn
+            .execute("UPDATE quest SET state = 'active', ctx_reset_pct = 999", [])
+            .unwrap();
+        let e = db.list_quests(true).unwrap_err();
+        assert!(e.to_string().contains("column `ctx_reset_pct`"), "{e}");
     }
 
     #[test]

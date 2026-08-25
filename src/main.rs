@@ -50,8 +50,18 @@ impl Ctx {
         })
     }
 
-    fn load(args: &Cli) -> anyhow::Result<Ctx> {
-        Ctx::new(args, Config::load()?, Some(Db::open_default()?))
+    /// Config only, strictly validated. Every `q config` action stops here:
+    /// the commands that inspect or repair the environment must not depend on
+    /// a database being openable.
+    fn config_only(args: &Cli) -> anyhow::Result<Ctx> {
+        Ctx::new(args, Config::load()?, None)
+    }
+
+    /// Config plus an open database — everything that is not `q config`.
+    fn with_db(args: &Cli) -> anyhow::Result<Ctx> {
+        let mut ctx = Ctx::config_only(args)?;
+        ctx.db = Some(Db::open_default()?);
+        Ok(ctx)
     }
 
     /// For commands that must work while the file is broken — that is the
@@ -119,8 +129,9 @@ fn run(args: &Cli) -> anyhow::Result<()> {
 
     match command {
         Command::Config { action } => {
+            // No database, whichever action it is.
             let ctx = if needs_valid_config(action.as_ref()) {
-                Ctx::load(args)?
+                Ctx::config_only(args)?
             } else {
                 Ctx::lenient(args)
             };
@@ -128,7 +139,7 @@ fn run(args: &Cli) -> anyhow::Result<()> {
         }
         other => {
             // Every real command starts here: config, then an open database.
-            let ctx = Ctx::load(args)?;
+            let ctx = Ctx::with_db(args)?;
             ctx.db()?;
             Err(QError::not_implemented(other.name()).into())
         }

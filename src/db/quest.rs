@@ -2,7 +2,7 @@
 
 use rusqlite::{Row, ToSql, params};
 
-use super::{Db, ID_ATTEMPTS, db_err, enum_col, is_id_collision};
+use super::{Db, ID_ATTEMPTS, db_err, enum_col, is_id_collision, u8_col};
 use crate::error::QError;
 use crate::model::{NameSource, Quest, QuestState, new_id, now};
 
@@ -182,18 +182,18 @@ impl Db {
         Ok(())
     }
 
-    /// SPEC §16 target resolution: exact id or slug, then unique prefix, then
-    /// unique substring. Candidates in an ambiguity are reported as slugs.
+    /// SPEC §16 target resolution: exact id, exact slug, then unique prefix,
+    /// then unique substring. An id is unambiguous by construction, so it wins
+    /// over a slug that happens to spell the same thing.
     pub fn resolve_quest(&self, target: &str) -> anyhow::Result<Quest> {
         if target.is_empty() {
             return Err(QError::NotFound("quest ``".to_string()).into());
         }
         let all = self.list_quests(true)?;
-        if let Some(hit) = all
-            .iter()
-            .find(|q| q.id == target || q.slug == target)
-            .cloned()
-        {
+        if let Some(hit) = all.iter().find(|q| q.id == target).cloned() {
+            return Ok(hit);
+        }
+        if let Some(hit) = all.iter().find(|q| q.slug == target).cloned() {
             return Ok(hit);
         }
         for matches in [
@@ -208,7 +208,10 @@ impl Db {
                 _ => {
                     return Err(QError::Ambiguous {
                         target: target.to_string(),
-                        candidates: matches.into_iter().map(|q| q.slug).collect(),
+                        candidates: matches
+                            .into_iter()
+                            .map(|q| format!("{} ({})", q.id, q.slug))
+                            .collect(),
                     }
                     .into());
                 }
@@ -267,7 +270,7 @@ fn row_to_quest(row: &Row) -> rusqlite::Result<Quest> {
         beads_epic: row.get("beads_epic")?,
         beads_repo: row.get("beads_repo")?,
         brain_session: row.get("brain_session")?,
-        ctx_reset_pct: row.get("ctx_reset_pct")?,
+        ctx_reset_pct: u8_col(row, "ctx_reset_pct")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         finished_at: row.get("finished_at")?,
@@ -470,6 +473,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_prefers_an_exact_id_over_an_exact_slug() {
+        let db = db();
+        let by_id = insert(&db, "alpha");
+        // A slug may legally spell another Quest's id; the id still wins.
+        let by_slug = db
+            .insert_quest(&Quest::new(&by_id.id, "/tmp/repo", "laptop"))
+            .unwrap();
+        assert_ne!(by_id.id, by_slug.id);
+        assert_eq!(db.resolve_quest(&by_id.id).unwrap().id, by_id.id);
+        assert_eq!(db.resolve_quest("alpha").unwrap().id, by_id.id);
+    }
+
+    #[test]
     fn resolve_falls_back_to_a_unique_prefix_then_a_substring() {
         let db = db();
         let q = insert(&db, "cdc-backfill-retry");
@@ -482,7 +498,7 @@ mod tests {
     #[test]
     fn resolve_reports_candidates_when_ambiguous() {
         let db = db();
-        insert(&db, "cdc-backfill");
+        let backfill = insert(&db, "cdc-backfill");
         insert(&db, "cdc-restore");
         let e = db.resolve_quest("cdc-").unwrap_err();
         assert_eq!(code_of(&e), "ambiguous");
@@ -490,8 +506,10 @@ mod tests {
             Some(QError::Ambiguous { target, candidates }) => {
                 assert_eq!(target, "cdc-");
                 assert_eq!(candidates.len(), 2);
+                // Both halves: the id is what the user retypes, the slug is
+                // what they recognise.
                 assert!(
-                    candidates.contains(&"cdc-backfill".to_string()),
+                    candidates.contains(&format!("{} (cdc-backfill)", backfill.id)),
                     "{candidates:?}"
                 );
             }

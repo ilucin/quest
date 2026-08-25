@@ -3,7 +3,7 @@
 //! Append a `(version, sql)` pair — never edit a shipped one — and bump
 //! `SCHEMA_VERSION`. `q doctor` reports the version the database is on.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 use crate::error::QError;
 
@@ -109,19 +109,23 @@ pub fn user_version(conn: &Connection) -> anyhow::Result<u32> {
 
 /// Applies every migration newer than the database's `user_version`, in one
 /// transaction. A database from a newer binary is left untouched.
+///
+/// Several `q` processes may open the same file at once, so the transaction
+/// takes its write lock up front (`IMMEDIATE`) and the version is re-read
+/// inside it: whatever a concurrent process already applied is skipped.
 pub fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
-    let current = user_version(conn)?;
-    if current > SCHEMA_VERSION {
-        return Err(QError::Db(format!(
-            "database schema is version {current}, but this q understands {SCHEMA_VERSION}; upgrade q"
-        ))
-        .into());
-    }
-    if current == SCHEMA_VERSION {
-        return Ok(());
+    if let Some(done) = settled(user_version(conn)?)? {
+        return Ok(done);
     }
 
-    let tx = conn.transaction().map_err(super::db_err)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(super::db_err)?;
+    let current = user_version(&tx)?;
+    if let Some(done) = settled(current)? {
+        return Ok(done);
+    }
+
     for (version, sql) in MIGRATIONS {
         if *version > current {
             tx.execute_batch(sql)
@@ -132,6 +136,18 @@ pub fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         .map_err(super::db_err)?;
     tx.commit().map_err(super::db_err)?;
     Ok(())
+}
+
+/// `Some(())` when `current` needs no migration, `None` when it does. A
+/// database from a newer binary is an error rather than something to downgrade.
+fn settled(current: u32) -> anyhow::Result<Option<()>> {
+    if current > SCHEMA_VERSION {
+        return Err(QError::Db(format!(
+            "database schema is version {current}, but this q understands {SCHEMA_VERSION}; upgrade q"
+        ))
+        .into());
+    }
+    Ok((current == SCHEMA_VERSION).then_some(()))
 }
 
 #[cfg(test)]
@@ -148,6 +164,33 @@ mod tests {
     fn migration_versions_are_contiguous_from_one() {
         for (i, (version, _)) in MIGRATIONS.iter().enumerate() {
             assert_eq!(*version, i as u32 + 1, "gap at index {i}");
+        }
+    }
+
+    #[test]
+    fn concurrent_opens_all_succeed_on_a_fresh_database() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        let gate = Arc::new(Barrier::new(6));
+
+        let racers: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    gate.wait();
+                    let db = crate::db::Db::open(&path)?;
+                    Ok::<_, anyhow::Error>((db.schema_version()?, db.journal_mode()?))
+                })
+            })
+            .collect();
+
+        for racer in racers {
+            let (version, journal) = racer.join().expect("thread panicked").expect("open failed");
+            assert_eq!(version, SCHEMA_VERSION);
+            assert_eq!(journal.to_lowercase(), "wal");
         }
     }
 }

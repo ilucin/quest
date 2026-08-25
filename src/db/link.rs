@@ -10,6 +10,8 @@ const COLUMNS: &str = "id, quest_id, session_id, kind, ref, title, meta, enriche
 impl Db {
     /// `UNIQUE(quest_id, kind, ref)` — re-adding the same reference is an error,
     /// not a silent duplicate.
+    ///
+    /// `link.id` is ignored: the returned row carries the rowid SQLite assigned.
     pub fn insert_link(&self, link: &Link) -> anyhow::Result<Link> {
         let meta = json_val(link.meta.as_ref())?;
         self.conn
@@ -66,17 +68,31 @@ mod tests {
     use crate::model::{Quest, now};
 
     fn link(quest_id: &str, kind: &str, reference: &str) -> Link {
-        Link {
-            id: 0,
-            quest_id: quest_id.to_string(),
-            session_id: None,
-            kind: kind.to_string(),
-            r#ref: reference.to_string(),
-            title: None,
-            meta: None,
-            enriched_at: None,
-            created_at: now(),
-        }
+        Link::new(quest_id, kind, reference)
+    }
+
+    #[test]
+    fn new_stamps_the_creation_time_and_leaves_the_rest_empty() {
+        let before = now();
+        let l = Link::new("q-0001", "pr", "https://x/1");
+        assert_eq!(l.id, 0);
+        assert_eq!(l.quest_id, "q-0001");
+        assert_eq!(l.kind, "pr");
+        assert_eq!(l.r#ref, "https://x/1");
+        assert!(l.session_id.is_none() && l.title.is_none() && l.meta.is_none());
+        assert!(l.enriched_at.is_none());
+        assert!(l.created_at >= before, "{} < {before}", l.created_at);
+    }
+
+    #[test]
+    fn insert_assigns_the_rowid_and_ignores_the_one_given() {
+        let db = Db::open_in_memory().unwrap();
+        let q = db
+            .insert_quest(&Quest::new("alpha", "/tmp/repo", "laptop"))
+            .unwrap();
+        let mut l = Link::new(&q.id, "url", "https://x");
+        l.id = 4242;
+        assert_eq!(db.insert_link(&l).unwrap().id, 1);
     }
 
     #[test]
