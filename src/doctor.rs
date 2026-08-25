@@ -5,7 +5,7 @@
 //! Every check is independent and swallows its own errors, so a broken
 //! environment still produces a full report instead of a single failure.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -58,8 +58,8 @@ impl Report {
     }
 
     /// A warning is not a failure — only `Fail` makes the process exit non-zero.
-    pub fn exit_code(&self) -> i32 {
-        i32::from(!self.ok)
+    pub fn exit_code(&self) -> u8 {
+        u8::from(!self.ok)
     }
 
     fn human(&self) -> String {
@@ -122,8 +122,13 @@ fn real(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn fixture() -> Option<OsString> {
-    std::env::var_os("Q_FIXTURE").filter(|v| !v.is_empty())
+/// `{e:#}` without a leading `<name>: `, so a line does not read
+/// "✗ tmux tmux: ..." when the error already names its subsystem.
+fn detail(name: &str, e: &anyhow::Error) -> String {
+    let text = format!("{e:#}");
+    text.strip_prefix(&format!("{name}: "))
+        .unwrap_or(&text)
+        .to_string()
 }
 
 // --------------------------------------------------------------------- checks
@@ -133,7 +138,7 @@ fn check_config() -> Check {
         Ok(path) => path,
         Err(e) => {
             return with_hint(
-                check("config", Status::Fail, format!("{e:#}")),
+                check("config", Status::Fail, detail("config", &e)),
                 "set Q_CONFIG to a writable path",
             );
         }
@@ -150,29 +155,49 @@ fn config_check(path: &Path) -> Check {
             format!("{} (defaults, file missing)", path.display()),
         ),
         Err(e) => with_hint(
-            check("config", Status::Fail, format!("{e:#}")),
+            check("config", Status::Fail, detail("config", &e)),
             "q config edit",
         ),
     }
 }
 
-fn check_tmux(tmux: &dyn Tmux) -> Check {
-    if fixture().is_some() {
-        return check("tmux", Status::Ok, "fixture backend");
+/// `q` needs `MIN_TMUX`; an unreadable version is not proof of an old one, so
+/// it only warns.
+fn evaluate_tmux_version(version: Option<(u32, u32)>) -> Status {
+    match version {
+        Some(v) if v >= tmux::MIN_TMUX => Status::Ok,
+        Some(_) => Status::Fail,
+        None => Status::Warn,
     }
-    match tmux.version() {
-        // `tmux -V` answers "tmux 3.6b"; the check is already named "tmux".
-        Ok(version) => check(
-            "tmux",
-            Status::Ok,
-            version
-                .strip_prefix("tmux ")
-                .unwrap_or(&version)
-                .to_string(),
+}
+
+fn check_tmux(tmux: &dyn Tmux) -> Check {
+    let (min_major, min_minor) = tmux::MIN_TMUX;
+    let version = match tmux.version() {
+        Ok(version) => version,
+        Err(e) => {
+            return with_hint(
+                check("tmux", Status::Fail, detail("tmux", &e)),
+                "install tmux (`brew install tmux`)",
+            );
+        }
+    };
+    // `tmux -V` answers "tmux 3.6b"; the check is already named "tmux".
+    let shown = version.strip_prefix("tmux ").unwrap_or(&version).trim();
+    match evaluate_tmux_version(tmux::parse_version(&version)) {
+        Status::Ok => check("tmux", Status::Ok, shown),
+        Status::Fail => with_hint(
+            check(
+                "tmux",
+                Status::Fail,
+                format!("{shown} is older than the required {min_major}.{min_minor}"),
+            ),
+            format!("upgrade tmux to {min_major}.{min_minor} or newer"),
         ),
-        Err(e) => with_hint(
-            check("tmux", Status::Fail, format!("{e:#}")),
-            "install tmux (`brew install tmux`)",
+        Status::Warn => check(
+            "tmux",
+            Status::Warn,
+            format!("{shown} (unrecognised version)"),
         ),
     }
 }
@@ -196,27 +221,33 @@ fn check_db() -> (Check, Option<Db>) {
         Err(e) => {
             return (
                 with_hint(
-                    check("db", Status::Fail, format!("{e:#}")),
+                    check("db", Status::Fail, detail("db", &e)),
                     "set Q_DB to a writable path",
                 ),
                 None,
             );
         }
     };
+    // Before `Db::open`, which creates the file it is asked about.
+    let created = !path.exists();
     match Db::open(&path) {
         Ok(db) => match db.schema_version() {
             Ok(version) => (
                 check(
                     "db",
                     Status::Ok,
-                    format!("schema v{version} at {}", path.display()),
+                    format!(
+                        "schema v{version} at {}{}",
+                        path.display(),
+                        if created { " (created)" } else { "" }
+                    ),
                 ),
                 Some(db),
             ),
-            Err(e) => (check("db", Status::Fail, format!("{e:#}")), None),
+            Err(e) => (check("db", Status::Fail, detail("db", &e)), None),
         },
         // A schema from a newer binary reports itself here, with its own hint.
-        Err(e) => (check("db", Status::Fail, format!("{e:#}")), None),
+        Err(e) => (check("db", Status::Fail, detail("db", &e)), None),
     }
 }
 
@@ -228,7 +259,8 @@ fn check_q_on_path(current: Option<&Path>, found: Option<&Path>) -> Check {
             "add the directory holding q to PATH",
         );
     };
-    let shown = found.display().to_string();
+    // The resolved path is the one that answers "which q would run?".
+    let shown = real(found).display().to_string();
     match current {
         Some(current) if real(current) != real(found) => with_hint(
             check(
@@ -248,10 +280,29 @@ fn check_orphans(db: Option<&Db>, tmux: &dyn Tmux, fix: bool, fixed: &mut Vec<St
     let Some(db) = db else {
         return check(NAME, Status::Warn, "skipped: the database is unreadable");
     };
+    // `sweep` does the finding and the ending in one pass, so `--fix` reports
+    // exactly what it changed rather than recomputing the set.
+    if fix {
+        let ended = match tmux::sweep(db, tmux) {
+            Ok(ended) => ended,
+            Err(e) => return check(NAME, Status::Fail, format!("{e:#}")),
+        };
+        if ended.is_empty() {
+            return check(NAME, Status::Ok, "none");
+        }
+        let names: Vec<String> = ended.iter().map(|s| describe(db, s)).collect();
+        fixed.extend(names.iter().map(|n| format!("ended orphan session {n}")));
+        return check(NAME, Status::Ok, format!("ended {}", names.join(", ")));
+    }
+
     let live = match db.list_live_sessions() {
         Ok(live) => live,
         Err(e) => return check(NAME, Status::Fail, format!("{e:#}")),
     };
+    // Nothing to be orphaned: answer without asking tmux anything.
+    if live.is_empty() {
+        return check(NAME, Status::Ok, "none");
+    }
     // A dead tmux server means every live session is an orphan; only a missing
     // binary lands here, and that is the tmux check's business.
     let panes = match tmux::live_panes(tmux) {
@@ -264,22 +315,14 @@ fn check_orphans(db: Option<&Db>, tmux: &dyn Tmux, fix: bool, fixed: &mut Vec<St
         return check(NAME, Status::Ok, "none");
     }
     let names: Vec<String> = orphans.iter().map(|s| describe(db, s)).collect();
-
-    if !fix {
-        return with_hint(
-            check(
-                NAME,
-                Status::Warn,
-                format!("{} live in the database: {}", names.len(), names.join(", ")),
-            ),
-            "q doctor --fix",
-        );
-    }
-    if let Err(e) = tmux::sweep(db, tmux) {
-        return check(NAME, Status::Fail, format!("{e:#}"));
-    }
-    fixed.extend(names.iter().map(|n| format!("ended orphan session {n}")));
-    check(NAME, Status::Ok, format!("ended {}", names.join(", ")))
+    with_hint(
+        check(
+            NAME,
+            Status::Warn,
+            format!("{} live in the database: {}", names.len(), names.join(", ")),
+        ),
+        "q doctor --fix",
+    )
 }
 
 /// `quest-slug/label`, falling back to the quest id when the row is unreadable.
@@ -312,13 +355,11 @@ fn report(ctx: &Ctx, fix: bool) -> Report {
     Report::new(checks, fixed)
 }
 
-pub fn run(ctx: &Ctx, fix: bool) -> anyhow::Result<()> {
+/// Returns the process exit code; a failing check is reported, not an error.
+pub fn run(ctx: &Ctx, fix: bool) -> anyhow::Result<u8> {
     let report = report(ctx, fix);
     output::emit(ctx.json, &report, || report.human())?;
-    if report.exit_code() != 0 {
-        std::process::exit(report.exit_code());
-    }
-    Ok(())
+    Ok(report.exit_code())
 }
 
 #[cfg(test)]
@@ -362,6 +403,24 @@ mod tests {
             report.human(),
             "✓ tmux tmux 3.6b\n✗ claude not found on PATH\n    → fix: install\nfixed: ended orphan session a/w1"
         );
+    }
+
+    #[test]
+    fn tmux_below_the_minimum_fails_and_an_unreadable_version_only_warns() {
+        assert_eq!(evaluate_tmux_version(Some((3, 0))), Status::Fail);
+        assert_eq!(evaluate_tmux_version(Some((2, 9))), Status::Fail);
+        assert_eq!(evaluate_tmux_version(Some((3, 1))), Status::Fail);
+        assert_eq!(evaluate_tmux_version(Some(tmux::MIN_TMUX)), Status::Ok);
+        assert_eq!(evaluate_tmux_version(Some((3, 6))), Status::Ok);
+        assert_eq!(evaluate_tmux_version(Some((4, 0))), Status::Ok);
+        assert_eq!(evaluate_tmux_version(None), Status::Warn);
+    }
+
+    #[test]
+    fn detail_drops_a_prefix_the_check_name_already_carries() {
+        let e: anyhow::Error = crate::error::QError::Tmux("not found on PATH".to_string()).into();
+        assert_eq!(detail("tmux", &e), "not found on PATH");
+        assert_eq!(detail("db", &e), "tmux: not found on PATH");
     }
 
     fn executable(path: &Path) {

@@ -1236,7 +1236,7 @@ fn doctor_passes_with_a_fixture_tmux_and_an_empty_database() {
     let parsed = json_of(&assert);
 
     assert_eq!(check(&parsed, "tmux")["status"], "ok");
-    assert_eq!(check(&parsed, "tmux")["detail"], "fixture backend");
+    assert_eq!(check(&parsed, "tmux")["detail"], "3.6 (fixture)");
     assert_eq!(check(&parsed, "claude")["status"], "ok");
     assert_eq!(check(&parsed, "config")["status"], "ok");
     assert_eq!(check(&parsed, "db")["status"], "ok");
@@ -1258,7 +1258,7 @@ fn doctor_human_output_marks_each_check() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("✓ tmux fixture backend"))
+        .stdout(predicate::str::contains("✓ tmux 3.6 (fixture)"))
         .stdout(predicate::str::contains("✓ orphan sessions none"));
 }
 
@@ -1393,6 +1393,97 @@ fn doctor_reports_a_database_from_a_newer_q() {
     assert_eq!(orphans["status"], "warn");
     assert!(
         orphans["detail"].as_str().unwrap().starts_with("skipped"),
+        "{parsed}"
+    );
+}
+
+#[test]
+fn doctor_fixes_orphans_even_when_another_check_fails() {
+    // An empty PATH: `claude` fails, so the run cannot end in success — the
+    // repair must happen anyway.
+    let mut cmd = doctor(&[]);
+    let db = db_path(&cmd);
+    let fixture = fixture_path(&cmd);
+    std::fs::write(&fixture, r#"{"next_pane":0,"panes":[]}"#).unwrap();
+    cmd.args(["doctor", "--json"]).assert().code(1);
+    seed_session(&db, "q-alpha", "%1");
+
+    let mut cmd = doctor(&[]);
+    cmd.env("Q_DB", &db).env("Q_FIXTURE", &fixture);
+    let assert = cmd.args(["doctor", "--fix", "--json"]).assert().code(1);
+    let parsed = json_of(&assert);
+    assert_eq!(parsed["ok"], false);
+    assert_eq!(check(&parsed, "claude")["status"], "fail");
+    assert_eq!(check(&parsed, "orphan sessions")["status"], "ok");
+    assert_eq!(
+        parsed["fixed"],
+        serde_json::json!(["ended orphan session alpha/w1"])
+    );
+
+    // Durable: the row itself is ended, not merely reported as such.
+    let status: String = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT status FROM session WHERE id = 's-0001'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "ended");
+}
+
+#[test]
+fn doctor_exits_non_zero_on_a_failure_in_human_mode() {
+    doctor(&[])
+        .arg("doctor")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("✗ claude not found on PATH"));
+}
+
+#[test]
+fn doctor_fails_on_a_tmux_older_than_the_minimum() {
+    let mut cmd = doctor(&["claude"]);
+    let fixture = fixture_path(&cmd);
+    std::fs::write(&fixture, r#"{"version":"tmux 3.0","panes":[]}"#).unwrap();
+    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    let parsed = json_of(&assert);
+    let tmux = check(&parsed, "tmux");
+    assert_eq!(tmux["status"], "fail");
+    assert!(tmux["detail"].as_str().unwrap().contains("3.2"), "{parsed}");
+    assert!(
+        tmux["fix_hint"].as_str().unwrap().contains("3.2"),
+        "{parsed}"
+    );
+}
+
+#[test]
+fn doctor_warns_about_an_unparsable_tmux_version() {
+    let mut cmd = doctor(&["claude"]);
+    let fixture = fixture_path(&cmd);
+    std::fs::write(&fixture, r#"{"version":"tmux master","panes":[]}"#).unwrap();
+    // A warning is not a failure, so the run still succeeds.
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    assert_eq!(check(&json_of(&assert), "tmux")["status"], "warn");
+}
+
+#[test]
+fn doctor_says_when_it_created_the_database() {
+    let mut cmd = doctor(&["claude"]);
+    let db = db_path(&cmd);
+    let fixture = fixture_path(&cmd);
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let detail = json_of(&assert);
+    let detail = check(&detail, "db")["detail"].as_str().unwrap().to_string();
+    assert!(detail.ends_with("(created)"), "{detail}");
+
+    let mut cmd = doctor(&["claude"]);
+    cmd.env("Q_DB", &db).env("Q_FIXTURE", &fixture);
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    assert!(
+        !check(&parsed, "db")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("created"),
         "{parsed}"
     );
 }
