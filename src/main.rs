@@ -1,12 +1,15 @@
 mod cli;
 mod config;
+mod db;
 mod error;
+mod model;
 mod output;
 
 use clap::Parser;
 
 use cli::{Cli, Command, ConfigAction};
 use config::Config;
+use db::Db;
 use error::QError;
 
 /// Everything a command needs beyond its own arguments. Built once by the
@@ -16,6 +19,9 @@ pub struct Ctx {
     pub quiet: bool,
     pub config: Config,
     machine_override: Option<String>,
+    /// Absent only for `q config`, which has to work before — and in order to
+    /// fix — a broken environment.
+    db: Option<Db>,
 }
 
 impl Ctx {
@@ -27,7 +33,7 @@ impl Ctx {
             .unwrap_or(&self.config.machine.name)
     }
 
-    fn new(args: &Cli, config: Config) -> anyhow::Result<Ctx> {
+    fn new(args: &Cli, config: Config, db: Option<Db>) -> anyhow::Result<Ctx> {
         let machine_override = match &args.machine {
             Some(m) => {
                 config::validate_machine_name(m)?;
@@ -40,23 +46,41 @@ impl Ctx {
             quiet: args.quiet,
             config,
             machine_override,
+            db,
         })
     }
 
-    fn load(args: &Cli) -> anyhow::Result<Ctx> {
-        Ctx::new(args, Config::load()?)
+    /// Config only, strictly validated. Every `q config` action stops here:
+    /// the commands that inspect or repair the environment must not depend on
+    /// a database being openable.
+    fn config_only(args: &Cli) -> anyhow::Result<Ctx> {
+        Ctx::new(args, Config::load()?, None)
+    }
+
+    /// Config plus an open database — everything that is not `q config`.
+    fn with_db(args: &Cli) -> anyhow::Result<Ctx> {
+        let mut ctx = Ctx::config_only(args)?;
+        ctx.db = Some(Db::open_default()?);
+        Ok(ctx)
     }
 
     /// For commands that must work while the file is broken — that is the
     /// state `q config path` and `q config edit` exist to get out of.
     fn lenient(args: &Cli) -> Ctx {
         let config = Config::load().unwrap_or_default();
-        Ctx::new(args, config).unwrap_or_else(|_| Ctx {
+        Ctx::new(args, config, None).unwrap_or_else(|_| Ctx {
             json: args.json,
             quiet: args.quiet,
             config: Config::default(),
             machine_override: None,
+            db: None,
         })
+    }
+
+    pub fn db(&self) -> anyhow::Result<&Db> {
+        self.db
+            .as_ref()
+            .ok_or_else(|| QError::Db("this command runs without a database".to_string()).into())
     }
 }
 
@@ -105,15 +129,18 @@ fn run(args: &Cli) -> anyhow::Result<()> {
 
     match command {
         Command::Config { action } => {
+            // No database, whichever action it is.
             let ctx = if needs_valid_config(action.as_ref()) {
-                Ctx::load(args)?
+                Ctx::config_only(args)?
             } else {
                 Ctx::lenient(args)
             };
             config::run(&ctx, action.as_ref())
         }
         other => {
-            let _ctx = Ctx::load(args)?;
+            // Every real command starts here: config, then an open database.
+            let ctx = Ctx::with_db(args)?;
+            ctx.db()?;
             Err(QError::not_implemented(other.name()).into())
         }
     }
