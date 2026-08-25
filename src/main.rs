@@ -1,4 +1,5 @@
 mod cli;
+mod commands;
 mod config;
 mod db;
 mod error;
@@ -145,6 +146,29 @@ fn run(args: &Cli) -> anyhow::Result<()> {
                 Ctx::lenient(args)
             };
             config::run(&ctx, action.as_ref())
+        }
+        Command::New {
+            name,
+            goal,
+            dir,
+            workflow,
+            prompt,
+            prompt_file,
+            detach,
+        } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::new::run(
+                &ctx,
+                &commands::new::Args {
+                    name: name.as_deref(),
+                    goal: goal.as_deref(),
+                    dir: dir.as_deref(),
+                    workflow: workflow.as_deref(),
+                    prompt: prompt.as_deref(),
+                    prompt_file: prompt_file.as_deref(),
+                    detach: *detach,
+                },
+            )
         }
         other => {
             // Every real command starts here: config, then an open database.

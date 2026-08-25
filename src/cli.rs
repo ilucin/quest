@@ -31,18 +31,23 @@ pub struct Cli {
 pub enum Command {
     /// Create a new Quest
     New {
-        #[arg(long)]
+        /// Slug: lowercase kebab-case, at most 40 characters
+        #[arg(long, value_name = "SLUG")]
         name: Option<String>,
-        #[arg(long)]
+        /// One line on what this Quest is for
+        #[arg(long, value_name = "TEXT")]
         goal: Option<String>,
+        /// Working directory for the agents (default: the current one)
         #[arg(long, value_name = "PATH")]
         dir: Option<String>,
-        #[arg(long)]
+        #[arg(long, value_name = "NAME")]
         workflow: Option<String>,
-        #[arg(long)]
-        template: Option<String>,
-        #[arg(long)]
+        /// First prompt for the master
+        #[arg(long, value_name = "TEXT")]
         prompt: Option<String>,
+        /// First prompt for the master, from a file (`-` reads stdin)
+        #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
+        prompt_file: Option<String>,
         /// Do not attach after creating
         #[arg(short = 'd', long)]
         detach: bool,
