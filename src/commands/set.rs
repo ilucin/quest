@@ -17,6 +17,8 @@ pub fn run(ctx: &Ctx, target: &str, key: SetKey, value: &str) -> anyhow::Result<
     sweep_quiet(ctx)?;
     let db = ctx.db()?;
     let quest = db.resolve_quest(target)?;
+    // The label the epic carries right now, before the column is overwritten.
+    let had_repo = quest.beads_repo.clone();
 
     let mut patch = QuestPatch::default();
     // What actually landed in the column, for the event and the payload.
@@ -54,6 +56,10 @@ pub fn run(ctx: &Ctx, target: &str, key: SetKey, value: &str) -> anyhow::Result<
         }
     }
     let quest = db.update_quest(&quest.id, &patch)?;
+    let relabelled = match key {
+        SetKey::BeadsRepo => relabel_epic(ctx, &quest, had_repo.as_deref(), &stored),
+        _ => false,
+    };
     let key = key_name(key);
     db.append_event(
         &quest.id,
@@ -65,11 +71,74 @@ pub fn run(ctx: &Ctx, target: &str, key: SetKey, value: &str) -> anyhow::Result<
     if ctx.json || !ctx.quiet {
         output::emit(
             ctx.json,
-            &serde_json::json!({ "quest": quest, "key": key, "value": stored }),
-            || format!("{} ({}) · {key} = {stored}", quest.id, quest.slug),
+            &serde_json::json!({
+                "quest": quest,
+                "key": key,
+                "value": stored,
+                "epic_relabelled": relabelled,
+            }),
+            || {
+                let moved = if relabelled {
+                    " · epic relabelled"
+                } else {
+                    ""
+                };
+                format!("{} ({}) · {key} = {stored}{moved}", quest.id, quest.slug)
+            },
         )?;
     }
     Ok(())
+}
+
+/// `beads_repo` is not q's property: the label lives on the epic, and agents
+/// are told to reuse it. Changing only q's copy would leave the two disagreeing
+/// with nothing to say so, so the epic is relabelled in the same breath —
+/// `bd update --remove-label … --add-label …`, one write. A `bd` that will not
+/// cooperate is a warning with the command to run by hand, never a failed
+/// `q set`: the column is already stored by then.
+fn relabel_epic(ctx: &Ctx, quest: &crate::model::Quest, old: Option<&str>, new: &str) -> bool {
+    let Some(epic) = beads::epic_of(quest) else {
+        return false;
+    };
+    let old = old.map(str::trim).filter(|o| !o.is_empty());
+    if new.is_empty() {
+        if let Some(old) = old {
+            eprintln!(
+                "note: quest {} no longer records a repo label, but epic {epic} still \
+                 carries repo:{old}; remove it with `bd label remove {epic} repo:{old}`",
+                quest.slug
+            );
+        }
+        return false;
+    }
+    // Re-setting the same value is how a label that drifted gets repaired, so
+    // there is nothing to remove in that case — only the label to (re)add.
+    let remove = old.filter(|o| *o != new);
+    match beads::client().relabel_repo(epic, remove, new) {
+        Ok(()) => {
+            let _ = ctx.db().and_then(|db| {
+                db.append_event(
+                    &quest.id,
+                    None,
+                    "beads.epic_relabelled",
+                    &serde_json::json!({ "epic": epic, "from": old, "to": new }),
+                )
+            });
+            true
+        }
+        Err(e) => {
+            let undo = match remove {
+                Some(old) => format!(" --remove-label repo:{old}"),
+                None => String::new(),
+            };
+            eprintln!(
+                "warning: epic {epic} could not be relabelled ({e}); it still carries \
+                 repo:{}; fix it with `bd update {epic}{undo} --add-label repo:{new}`",
+                old.unwrap_or("-")
+            );
+            false
+        }
+    }
 }
 
 /// An empty value clears the column rather than storing `""`.

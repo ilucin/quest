@@ -117,7 +117,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
 /// close it rather than leave a stray open epic in a shared tracker. A `bd`
 /// that will not cooperate is named, so the id is not simply lost.
 fn abandon_epic(bd: &dyn beads::Bd, quest: &Quest) {
-    let Some(epic) = quest.beads_epic.as_deref() else {
+    let Some(epic) = beads::epic_of(quest) else {
         return;
     };
     if let Err(err) = bd.close(epic, "quest creation failed") {
@@ -609,6 +609,9 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+        fn relabel_repo(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), String> {
+            unreachable!("a rollback never relabels")
         }
     }
 

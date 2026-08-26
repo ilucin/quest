@@ -16,6 +16,7 @@
 //! | `Q_FIXTURE_BD_CREATE` | stdout of `bd create … --json` |
 //! | `Q_FIXTURE_BD` | stdout of `bd list … --json` (shared with the brief) |
 //! | `Q_FIXTURE_BD_CLOSE` | `bd close` succeeds (content unused) |
+//! | `Q_FIXTURE_BD_RELABEL` | `bd update --add-label` succeeds (content unused) |
 //! | `Q_FIXTURE_BD_CREATE_TIMEOUT` | `bd create` is killed mid-write (content unused) |
 //! | `Q_FIXTURE_BD_LOG` | appended one line per call, the argv verbatim |
 
@@ -44,17 +45,30 @@ const SLOW_WRITE: Duration = Duration::from_secs(2);
 pub const CACHE_TTL: i64 = 30;
 /// `bd list` defaults to 50 rows; counts have to see all of them.
 const NO_LIMIT: &[&str] = &["--all", "-n", "0", "--no-pager", "--json"];
+/// A listing's stdout is a *document*, so [`proc`]'s default 64 KiB capture
+/// cap is not enough: at roughly a kilobyte an issue it would truncate a
+/// tracker mid-object a few dozen issues in, and the JSON would then parse as
+/// nothing — every count silently zero. Big enough for any real tracker,
+/// still bounded.
+const READ_CAPTURE: usize = 8 * 1024 * 1024;
+/// A killed `bd create` may still have committed: a dolt write can land a
+/// moment after the kill, so the recovery read is retried once after this.
+const RECOVERY_WAIT: Duration = Duration::from_secs(1);
 
 // ------------------------------------------------------------------- progress
 
 /// The counts SPEC §13 asks for. `total` is every issue carrying the Quest's
-/// label except the epic itself; statuses `bd` has and this does not name
-/// (`deferred`, …) land in `total` only.
+/// label except the epic itself.
 ///
-/// `blocked` is an **overlay**, not a fifth disjoint bucket: `bd` has no
-/// `blocked` status (verified against bd 1.2.2 — `bd blocked` returns rows
+/// **The buckets do not partition `total`.** Two reasons, both deliberate:
+/// statuses `bd` has and this does not name (`deferred`, …) land in `total`
+/// only, so `open + in_progress + closed` can be less than `total`; and
+/// `blocked` is an **overlay** rather than a fifth disjoint bucket — `bd` has
+/// no `blocked` status (verified against bd 1.2.2: `bd blocked` returns rows
 /// stored `open`/`deferred`), so it is derived from the dependencies in the
-/// same payload and its issues are also counted in `open`/`in_progress`.
+/// same payload and its issues are *also* counted in `open`/`in_progress`.
+/// Anything rendering these numbers has to say so or stay vague; nothing may
+/// present them as a breakdown that adds up.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Progress {
     pub open: usize,
@@ -70,7 +84,9 @@ impl Progress {
         format!("{}/{}", self.closed, self.total)
     }
 
-    /// `3/7 closed · 2 open · 1 in progress · 1 blocked`
+    /// `3/7 closed · 2 open · 1 in progress · 1 blocked`. Empty buckets are
+    /// left out, and the ones printed need not add up to the total — see the
+    /// type's own docs for why.
     pub fn summary(&self) -> String {
         let mut out = format!("{} closed", self.cell());
         for (n, label) in [
@@ -86,22 +102,57 @@ impl Progress {
     }
 }
 
-/// Counts `bd list --json` output for one Quest. Rows are filtered by the
-/// Quest's own label (the same way [`count_by_quest`] buckets a batch), so a
-/// payload wider than it was asked for cannot inflate one Quest's numbers.
-/// The `epic` is skipped: it carries its own `quest:<id>` label and would
+/// A Quest's work in a `bd list --json` payload: the rows carrying its own
+/// `quest:<id>` label, the epic excluded — it carries that label too and would
 /// otherwise count against itself.
+///
+/// The one definition of "this Quest's issues" in `q`. Filtering by the label
+/// rather than trusting the payload means a listing wider than it was asked
+/// for cannot inflate one Quest's numbers, and everything that *renders* those
+/// issues — `q show`, `q list`, `q brief` — selects them here, so no two views
+/// can disagree about what the Quest's work is.
+fn selected<'a>(all: &'a [Value], quest_id: &str, epic: Option<&str>) -> Vec<&'a Value> {
+    all.iter()
+        .filter(|i| quest_labels(i).any(|q| q == quest_id))
+        .filter(|i| !epic.is_some_and(|e| field(i, "id") == e))
+        .collect()
+}
+
+/// Counts `bd list --json` output for one Quest.
 pub fn count(raw: &str, quest_id: &str, epic: Option<&str>) -> Option<Progress> {
     let all = issues(raw)?;
     let statuses = status_index(&all);
-    let mine: Vec<&Value> = all
-        .iter()
-        .filter(|i| quest_labels(i).any(|q| q == quest_id))
-        .collect();
-    Some(tally(&mine, epic, &statuses))
+    Some(tally(&selected(&all, quest_id, epic), &statuses))
 }
 
-/// Buckets one multi-label `bd list` payload by Quest id, so a whole listing
+/// One issue of a Quest, for a renderer that wants the rows and not just the
+/// tally. Exactly what [`count`] counted, in the same order `bd` returned.
+pub struct Row {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    /// The `blocked` overlay for this row — see [`Progress`].
+    pub blocked: bool,
+}
+
+/// The Quest's issues, epic excluded: the rows behind [`count`]'s numbers.
+pub fn rows(raw: &str, quest_id: &str, epic: Option<&str>) -> Option<Vec<Row>> {
+    let all = issues(raw)?;
+    let statuses = status_index(&all);
+    Some(
+        selected(&all, quest_id, epic)
+            .into_iter()
+            .map(|i| Row {
+                id: field(i, "id").to_string(),
+                title: field(i, "title").to_string(),
+                status: field(i, "status").to_string(),
+                blocked: is_blocked(i, &statuses),
+            })
+            .collect(),
+    )
+}
+
+/// Counts one multi-label `bd list` payload per Quest, so a whole listing
 /// costs a single `bd` call.
 fn count_by_quest(
     raw: &str,
@@ -109,18 +160,12 @@ fn count_by_quest(
 ) -> Option<Vec<(String, Progress)>> {
     let all = issues(raw)?;
     let statuses = status_index(&all);
-    let mut buckets: HashMap<&str, Vec<&Value>> = HashMap::new();
-    for issue in &all {
-        for quest_id in quest_labels(issue) {
-            buckets.entry(quest_id).or_default().push(issue);
-        }
-    }
     Some(
         epics
             .iter()
             .map(|(quest_id, epic)| {
-                let mine = buckets.get(quest_id.as_str()).cloned().unwrap_or_default();
-                (quest_id.clone(), tally(&mine, epic.as_deref(), &statuses))
+                let mine = selected(&all, quest_id, epic.as_deref());
+                (quest_id.clone(), tally(&mine, &statuses))
             })
             .collect(),
     )
@@ -136,12 +181,9 @@ fn status_index(issues: &[Value]) -> HashMap<&str, &str> {
         .collect()
 }
 
-fn tally(issues: &[&Value], epic: Option<&str>, statuses: &HashMap<&str, &str>) -> Progress {
+fn tally(issues: &[&Value], statuses: &HashMap<&str, &str>) -> Progress {
     let mut p = Progress::default();
     for issue in issues {
-        if epic.is_some_and(|e| field(issue, "id") == e) {
-            continue;
-        }
         p.total += 1;
         let status = field(issue, "status");
         match status {
@@ -159,13 +201,19 @@ fn tally(issues: &[&Value], epic: Option<&str>, statuses: &HashMap<&str, &str>) 
     p
 }
 
-/// An issue is blocked when something it depends on is not closed.
+/// An issue is blocked when something it depends on is known to be unclosed.
 ///
 /// Only `blocks` dependencies count. `bd blocked` also treats `parent-child`
 /// as blocking, which makes it useless here: every issue under a live epic has
 /// exactly that dependency, so a Quest in progress would report all of its
 /// work blocked (22 of 28 rows in the real tracker were parent-child only).
-/// A dependency whose target `bd` did not return is assumed unfinished.
+///
+/// A dependency on an issue *outside* this payload — a blocker in another
+/// repo, or one `bd` did not return — does **not** count. `q` cannot see
+/// whether it is closed, and guessing "open" is the worse guess: the row
+/// would then read blocked for as long as the dependency exists, with nothing
+/// a person could do to clear it. An unknown blocker is reported as not
+/// blocking, so `blocked` is a floor rather than a guess.
 fn is_blocked(issue: &Value, statuses: &HashMap<&str, &str>) -> bool {
     let id = field(issue, "id");
     deps(issue).any(|dep| {
@@ -174,9 +222,7 @@ fn is_blocked(issue: &Value, statuses: &HashMap<&str, &str>) -> bool {
             && field(dep, "type") == "blocks"
             && statuses
                 .get(field(dep, "depends_on_id"))
-                .copied()
-                .unwrap_or("open")
-                != "closed"
+                .is_some_and(|status| *status != "closed")
     })
 }
 
@@ -242,6 +288,9 @@ pub trait Bd {
     fn list_quests(&self, quest_ids: &[&str]) -> Option<String>;
     /// `bd close <id> --reason <why>`.
     fn close(&self, id: &str, reason: &str) -> Result<(), String>;
+    /// `bd update <epic> --remove-label repo:<old> --add-label repo:<new>` —
+    /// one write, so the epic is never left carrying both labels or neither.
+    fn relabel_repo(&self, epic: &str, old: Option<&str>, new: &str) -> Result<(), String>;
 
     /// The Quest's epic as `bd` has it, if any.
     fn find_epic(&self, quest_id: &str) -> Option<String> {
@@ -274,6 +323,23 @@ fn close_argv<'a>(id: &'a str, reason: &'a str) -> Vec<&'a str> {
     vec!["close", id, "--reason", reason]
 }
 
+/// Owned, because the labels are built here. `old` is dropped when there is
+/// nothing to remove.
+fn relabel_argv(epic: &str, old: Option<&str>, new: &str) -> Vec<String> {
+    let mut args = vec!["update".to_string(), epic.to_string()];
+    if let Some(old) = old.map(str::trim).filter(|o| !o.is_empty()) {
+        args.push("--remove-label".to_string());
+        args.push(format!("repo:{old}"));
+    }
+    args.push("--add-label".to_string());
+    args.push(format!("repo:{new}"));
+    args
+}
+
+fn as_argv(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
 struct RealBd;
 
 impl Bd for RealBd {
@@ -293,7 +359,7 @@ impl Bd for RealBd {
             Err(BdFail::Spawn) => Err(unavailable()),
             // The write was killed, not refused: it may have committed. Look
             // the epic up rather than orphan it with nothing pointing at it.
-            Err(BdFail::Timeout) => self.find_epic(quest_id).ok_or_else(|| {
+            Err(BdFail::Timeout) => self.recover_epic(quest_id).ok_or_else(|| {
                 format!(
                     "`bd create` did not finish within {}s",
                     WRITE_TIMEOUT.as_secs()
@@ -304,7 +370,7 @@ impl Bd for RealBd {
 
     fn list_quest(&self, quest_id: &str) -> Option<String> {
         let label = format!("quest:{quest_id}");
-        proc::run_capped("bd", &list_argv("-l", &label), READ_TIMEOUT)
+        proc::run_capped_bounded("bd", &list_argv("-l", &label), READ_TIMEOUT, READ_CAPTURE)
     }
 
     fn list_quests(&self, quest_ids: &[&str]) -> Option<String> {
@@ -313,7 +379,12 @@ impl Bd for RealBd {
             .map(|id| format!("quest:{id}"))
             .collect::<Vec<_>>()
             .join(",");
-        proc::run_capped("bd", &list_argv("--label-any", &labels), READ_TIMEOUT)
+        proc::run_capped_bounded(
+            "bd",
+            &list_argv("--label-any", &labels),
+            READ_TIMEOUT,
+            READ_CAPTURE,
+        )
     }
 
     fn close(&self, id: &str, reason: &str) -> Result<(), String> {
@@ -327,6 +398,33 @@ impl Bd for RealBd {
                 WRITE_TIMEOUT.as_secs()
             )),
         }
+    }
+
+    fn relabel_repo(&self, epic: &str, old: Option<&str>, new: &str) -> Result<(), String> {
+        let notice = Some((SLOW_WRITE, "waiting on bd to relabel the epic…"));
+        let args = relabel_argv(epic, old, new);
+        match bd(&as_argv(&args), WRITE_TIMEOUT, notice) {
+            Ok(out) if out.success() => Ok(()),
+            Ok(out) => Err(out.message()),
+            Err(BdFail::Spawn) => Err(unavailable()),
+            Err(BdFail::Timeout) => Err(format!(
+                "`bd update` did not finish within {}s",
+                WRITE_TIMEOUT.as_secs()
+            )),
+        }
+    }
+}
+
+impl RealBd {
+    /// A killed `bd create` may have committed anyway. The dolt write can land
+    /// slightly after the kill, so the label is looked up twice — once at once,
+    /// once after [`RECOVERY_WAIT`] — before the epic is declared lost.
+    fn recover_epic(&self, quest_id: &str) -> Option<String> {
+        if let Some(id) = self.find_epic(quest_id) {
+            return Some(id);
+        }
+        std::thread::sleep(RECOVERY_WAIT);
+        self.find_epic(quest_id)
     }
 }
 
@@ -416,6 +514,14 @@ impl Bd for FixtureBd {
             .map(|_| ())
             .ok_or_else(unavailable)
     }
+
+    fn relabel_repo(&self, epic: &str, old: Option<&str>, new: &str) -> Result<(), String> {
+        let args = relabel_argv(epic, old, new);
+        log(&as_argv(&args));
+        fixture_file("Q_FIXTURE_BD_RELABEL")
+            .map(|_| ())
+            .ok_or_else(unavailable)
+    }
 }
 
 fn fixture_file(var: &str) -> Option<String> {
@@ -435,6 +541,18 @@ fn log(parts: &[&str]) {
     {
         let _ = writeln!(f, "{}", parts.join(" "));
     }
+}
+
+/// The Quest's epic, if it really has one. An empty or blank column is *not*
+/// an id: `bd close` and `bd update` with no id act on "the last touched
+/// issue", so handing one of those an empty string would close or relabel a
+/// stranger's work.
+pub fn epic_of(quest: &Quest) -> Option<&str> {
+    quest
+        .beads_epic
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
 }
 
 /// `q set <quest> beads_epic <id>`: an issue id `bd` could have minted, or a
@@ -631,14 +749,14 @@ pub fn progress(quest: &Quest) -> Option<Progress> {
 }
 
 pub fn progress_with(bd: &dyn Bd, quest: &Quest) -> Option<Progress> {
-    quest.beads_epic.as_deref()?;
+    let epic = epic_of(quest)?;
     let cached = read_cache(&quest.id);
     if let Some(hit) = cached.as_ref().filter(|c| fresh(c)) {
         return Some(hit.progress);
     }
     let fetched = bd
         .list_quest(&quest.id)
-        .and_then(|raw| count(&raw, &quest.id, quest.beads_epic.as_deref()));
+        .and_then(|raw| count(&raw, &quest.id, Some(epic)));
     match fetched {
         Some(progress) => {
             write_cache(&quest.id, &progress);
@@ -657,8 +775,7 @@ pub fn progress_all(quests: &[&Quest]) -> HashMap<String, Progress> {
 pub fn progress_all_with(bd: &dyn Bd, quests: &[&Quest]) -> HashMap<String, Progress> {
     let epics: HashMap<String, Option<String>> = quests
         .iter()
-        .filter(|q| q.beads_epic.is_some())
-        .map(|q| (q.id.clone(), q.beads_epic.clone()))
+        .filter_map(|q| epic_of(q).map(|e| (q.id.clone(), Some(e.to_string()))))
         .collect();
     if epics.is_empty() {
         return HashMap::new();
@@ -783,7 +900,8 @@ mod tests {
             ),
             // Its blocker is done, so it is not blocked any more.
             dependent("bd-3", "in_progress", "q-1", &[("blocks", "bd-done")]),
-            // A blocker `bd` did not return is assumed unfinished.
+            // A blocker `bd` did not return cannot be judged, so it does
+            // not block — see `is_blocked`.
             dependent("bd-4", "open", "q-1", &[("blocks", "bd-elsewhere")]),
             // Closed work is never reported blocked.
             dependent("bd-5", "closed", "q-1", &[("blocks", "bd-1")]),
@@ -792,7 +910,7 @@ mod tests {
         .to_string();
         let p = count(&raw, "q-1", Some("bd-e")).unwrap();
         assert_eq!(p.total, 6);
-        assert_eq!(p.blocked, 2, "bd-2 and bd-4 only");
+        assert_eq!(p.blocked, 1, "bd-2 only");
         // The overlay does not move an issue out of its own status bucket.
         assert_eq!(p.open, 3);
         assert_eq!(p.in_progress, 1);
@@ -908,17 +1026,31 @@ mod tests {
         assert!(validate_repo_label(&"x".repeat(65)).is_err());
     }
 
+    /// A directory `git` refuses to look above: a `.git` *file* pointing
+    /// nowhere makes `rev-parse` fail outright instead of walking up, so the
+    /// "no repository here" case is the same whether or not `$TMPDIR` itself
+    /// happens to sit inside a checkout.
+    fn no_repo_here(dir: &Path) -> PathBuf {
+        let plain = dir.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join(".git"), "gitdir: nowhere-at-all").unwrap();
+        plain
+    }
+
     #[test]
     fn the_repo_label_prefers_the_flag_then_git_then_the_config() {
         let config = Config::default();
         let dir = tempfile::tempdir().unwrap();
+        let plain = no_repo_here(dir.path());
+        assert_eq!(repo_label(&config, Some("explicit"), &plain), "explicit");
+        // A blank flag is not a label, and with no repository to name the
+        // configured default is what is left.
         assert_eq!(
-            repo_label(&config, Some("explicit"), dir.path()),
-            "explicit"
+            repo_label(&config, Some("  "), &plain),
+            config.beads.default_repo_label
         );
-        // A blank flag is not a label.
         assert_eq!(
-            repo_label(&config, Some("  "), dir.path()),
+            repo_label(&config, None, &plain),
             config.beads.default_repo_label
         );
     }
@@ -1028,6 +1160,124 @@ mod tests {
         fn close(&self, _: &str, _: &str) -> Result<(), String> {
             unreachable!()
         }
+        fn relabel_repo(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn a_blocker_outside_the_payload_does_not_block_forever() {
+        // bd returned the dependency but not the issue it points at (another
+        // repo, a narrower filter): q cannot know it is open, and calling it
+        // blocked would leave a row nobody can unblock.
+        let raw = serde_json::json!([
+            dependent("bd-1", "open", "q-1", &[("blocks", "bd-elsewhere")]),
+            dependent("bd-2", "open", "q-1", &[("blocks", "bd-3")]),
+            issue("bd-3", "open", &["q-1"]),
+        ])
+        .to_string();
+        let p = count(&raw, "q-1", None).unwrap();
+        assert_eq!(p.blocked, 1, "only the resolvable blocker counts");
+        let rows = rows(&raw, "q-1", None).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(!rows[0].blocked);
+        assert!(rows[1].blocked);
+    }
+
+    #[test]
+    fn the_rows_are_exactly_what_the_counts_counted() {
+        let raw = serde_json::json!([
+            issue("bd-e", "open", &["q-1"]),
+            issue("bd-1", "closed", &["q-1"]),
+            issue("bd-2", "open", &["q-1"]),
+            issue("bd-9", "open", &["q-2"]),
+        ])
+        .to_string();
+        let p = count(&raw, "q-1", Some("bd-e")).unwrap();
+        let rows = rows(&raw, "q-1", Some("bd-e")).unwrap();
+        // The epic is in neither, the other Quest's issue is in neither, and
+        // the two agree on the total — the guarantee `q brief` leans on.
+        assert_eq!(p.total, rows.len());
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["bd-1", "bd-2"]
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.status == "closed").count(),
+            p.closed
+        );
+    }
+
+    /// A payload past [`proc`]'s default capture cap really does have to come
+    /// back whole: truncated JSON parses as nothing, so the counts would be
+    /// silently absent rather than wrong.
+    #[test]
+    fn a_listing_larger_than_the_default_capture_cap_survives_the_read() {
+        let big: Vec<Value> = (0..200)
+            .map(|n| {
+                serde_json::json!({
+                    "id": format!("bd-{n}"),
+                    "status": if n % 2 == 0 { "closed" } else { "open" },
+                    "title": "x".repeat(400),
+                    "labels": ["quest:q-1"],
+                })
+            })
+            .collect();
+        let payload = serde_json::to_string(&big).unwrap();
+        assert!(
+            payload.len() > proc::MAX_CAPTURE,
+            "the fixture must exceed the default cap: {}",
+            payload.len()
+        );
+        assert!(READ_CAPTURE > payload.len());
+        // Through the very call `RealBd::list_quest` makes, cap included.
+        let script = format!("cat <<'EOF'\n{payload}\nEOF");
+        let read = proc::run_capped_bounded("sh", &["-c", &script], READ_TIMEOUT, READ_CAPTURE)
+            .expect("the read succeeded");
+        let p = count(&read, "q-1", None).expect("a whole payload parses");
+        assert_eq!(p.total, 200);
+        assert_eq!(p.closed, 100);
+        // And this is what the default cap would have done to it.
+        let truncated = proc::run_capped("sh", &["-c", &script], READ_TIMEOUT).unwrap();
+        assert!(count(&truncated, "q-1", None).is_none());
+    }
+
+    #[test]
+    fn relabelling_the_epic_is_one_write() {
+        assert_eq!(
+            relabel_argv("bd-e", Some("old"), "new"),
+            [
+                "update",
+                "bd-e",
+                "--remove-label",
+                "repo:old",
+                "--add-label",
+                "repo:new"
+            ]
+        );
+        // Nothing to remove: only the new label goes on.
+        assert_eq!(
+            relabel_argv("bd-e", None, "new"),
+            ["update", "bd-e", "--add-label", "repo:new"]
+        );
+        assert_eq!(
+            relabel_argv("bd-e", Some("  "), "new"),
+            ["update", "bd-e", "--add-label", "repo:new"]
+        );
+    }
+
+    #[test]
+    fn a_blank_epic_column_is_not_an_epic() {
+        // `bd close` with no id closes "the last touched issue", so an empty
+        // column must never reach it.
+        let mut quest = Quest::new("slug", "cwd", "m");
+        assert_eq!(epic_of(&quest), None);
+        quest.beads_epic = Some(String::new());
+        assert_eq!(epic_of(&quest), None);
+        quest.beads_epic = Some("   ".to_string());
+        assert_eq!(epic_of(&quest), None);
+        quest.beads_epic = Some(" bd-e ".to_string());
+        assert_eq!(epic_of(&quest), Some("bd-e"));
     }
 
     #[test]

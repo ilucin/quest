@@ -16,9 +16,13 @@ const POLL: Duration = Duration::from_millis(20);
 /// already have — no more. A grandchild may still hold the write end, so this
 /// window is all the caller can ever be asked to wait for the pipes.
 const DRAIN_FLOOR: Duration = Duration::from_millis(250);
-/// Hard cap on what one pipe contributes. q shows a line or two of this; a
-/// chatty child must not be able to grow the buffer without bound.
-const MAX_CAPTURE: usize = 64 * 1024;
+/// Default cap on what one pipe contributes. q shows a line or two of most of
+/// this output, and a chatty child must not be able to grow the buffer without
+/// bound — but a caller that really does want a whole payload (a `bd list
+/// --json` of a busy tracker) passes its own cap to [`run_bounded`] /
+/// [`run_capped_bounded`], because a JSON document truncated mid-object parses
+/// as nothing at all.
+pub const MAX_CAPTURE: usize = 64 * 1024;
 
 pub struct Outcome {
     /// `None` when the child was killed for outliving the timeout.
@@ -79,7 +83,7 @@ fn text(bytes: &[u8]) -> String {
 /// pipes are captured; a child that overruns is killed — process group and
 /// all — and its partial output kept. Only a failure to spawn is an error.
 pub fn run(cmd: &mut Command, input: &[u8], timeout: Duration) -> std::io::Result<Outcome> {
-    run_noticed(cmd, input, timeout, None)
+    run_bounded(cmd, input, timeout, None, MAX_CAPTURE)
 }
 
 /// [`run`] that also prints `notice.1` to stderr, once, if the child is still
@@ -89,6 +93,19 @@ pub fn run_noticed(
     input: &[u8],
     timeout: Duration,
     notice: Option<(Duration, &str)>,
+) -> std::io::Result<Outcome> {
+    run_bounded(cmd, input, timeout, notice, MAX_CAPTURE)
+}
+
+/// [`run_noticed`] with an explicit per-pipe capture cap, for the one caller
+/// whose output is a document rather than a line: past the cap the bytes are
+/// dropped, which would leave a JSON payload unparseable.
+pub fn run_bounded(
+    cmd: &mut Command,
+    input: &[u8],
+    timeout: Duration,
+    notice: Option<(Duration, &str)>,
+    max_capture: usize,
 ) -> std::io::Result<Outcome> {
     use std::os::unix::process::CommandExt;
 
@@ -110,8 +127,8 @@ pub fn run_noticed(
             let _ = stdin.write_all(&input);
         });
     }
-    let out_rx = child.stdout.take().map(drain);
-    let err_rx = child.stderr.take().map(drain);
+    let out_rx = child.stdout.take().map(|p| drain(p, max_capture));
+    let err_rx = child.stderr.take().map(|p| drain(p, max_capture));
 
     let started = Instant::now();
     let mut status = None;
@@ -156,9 +173,19 @@ pub fn run_noticed(
 /// `Some(stdout)` only when `program` ran to a successful exit inside the cap.
 /// The argv shorthand for the many read-only probes that want nothing else.
 pub fn run_capped(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    run_capped_bounded(program, args, timeout, MAX_CAPTURE)
+}
+
+/// [`run_capped`] with an explicit per-pipe capture cap.
+pub fn run_capped_bounded(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    max_capture: usize,
+) -> Option<String> {
     let mut cmd = Command::new(program);
     cmd.args(args);
-    run(&mut cmd, b"", timeout)
+    run_bounded(&mut cmd, b"", timeout, None, max_capture)
         .ok()
         .filter(Outcome::success)
         .map(|out| out.text())
@@ -186,7 +213,7 @@ struct Draining {
     eof: mpsc::Receiver<()>,
 }
 
-fn drain(mut pipe: impl Read + Send + 'static) -> Draining {
+fn drain(mut pipe: impl Read + Send + 'static, max_capture: usize) -> Draining {
     let buf: Arc<Mutex<Vec<u8>>> = Arc::default();
     let (tx, eof) = mpsc::channel();
     let sink = Arc::clone(&buf);
@@ -197,7 +224,7 @@ fn drain(mut pipe: impl Read + Send + 'static) -> Draining {
                 Ok(0) => break,
                 Ok(n) => {
                     let mut buf = lock(&sink);
-                    let room = MAX_CAPTURE.saturating_sub(buf.len());
+                    let room = max_capture.saturating_sub(buf.len());
                     buf.extend_from_slice(&chunk[..n.min(room)]);
                     // Past the cap the bytes are dropped but the pipe is still
                     // read, so the child never blocks on a full pipe.
@@ -315,6 +342,24 @@ mod tests {
         let out = sh("yes qqqqqqqq | head -c 200000", b"", 5000);
         assert!(out.success());
         assert_eq!(out.stdout.len(), MAX_CAPTURE);
+    }
+
+    #[test]
+    fn a_caller_that_wants_a_whole_document_can_raise_the_cap() {
+        // 200 KB is past the default cap, so the default truncates and a
+        // caller that needs the payload intact has to ask for more room.
+        let script = "yes qqqqqqqq | head -c 200000";
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script);
+        let big = run_bounded(&mut cmd, b"", Duration::from_secs(5), None, 1 << 20).unwrap();
+        assert_eq!(big.stdout.len(), 200_000);
+        assert_eq!(
+            run_capped_bounded("sh", &["-c", script], Duration::from_secs(5), 1 << 20)
+                .map(|s| s.len()),
+            Some(200_000)
+        );
+        // The default is still the default.
+        assert_eq!(sh(script, b"", 5000).stdout.len(), MAX_CAPTURE);
     }
 
     #[test]
