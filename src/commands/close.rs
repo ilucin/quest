@@ -109,7 +109,7 @@ fn close_the_epic(ctx: &Ctx, quest: &crate::model::Quest) -> bool {
         );
         return false;
     };
-    match beads::client().close(epic) {
+    match beads::client().close(epic, "quest closed") {
         Ok(()) => {
             let _ = ctx.db().and_then(|db| {
                 db.append_event(

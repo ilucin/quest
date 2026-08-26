@@ -5138,6 +5138,21 @@ impl Env {
         self.with_bd_log(cmd);
     }
 
+    /// `bd create` is killed mid-write, so `q` has to recover the epic id
+    /// from `bd list` the way a real timed-out write does.
+    fn with_bd_create_timeout(&self, cmd: &mut Command) {
+        cmd.env("Q_FIXTURE_BD_CREATE_TIMEOUT", "1");
+        self.with_bd_log(cmd);
+    }
+
+    /// The progress cache file `q` keeps beside the database.
+    fn cache_file(&self, quest_id: &str) -> std::path::PathBuf {
+        self.dir
+            .path()
+            .join("cache")
+            .join(format!("beads-{quest_id}.json"))
+    }
+
     /// `bd close` succeeds.
     fn with_bd_close(&self, cmd: &mut Command) {
         let path = self.dir.path().join("bd-close");
@@ -5169,10 +5184,17 @@ fn bd_issues(quest_id: &str, statuses: &[(&str, &str)]) -> serde_json::Value {
                 "id": id,
                 "title": *id,
                 "status": status,
+                "issue_type": if *id == "bd-epic" { "epic" } else { "task" },
                 "labels": [format!("quest:{quest_id}"), "repo:quest"],
             })
         })
         .collect()
+}
+
+/// The argv the fixture `bd` logs for a listing of one Quest — the same one
+/// `RealBd` runs, `--all -n 0` included.
+fn bd_list_call(quest_id: &str) -> String {
+    format!("list -l quest:{quest_id} --all -n 0 --no-pager --json")
 }
 
 #[test]
@@ -5195,7 +5217,9 @@ fn new_creates_the_beads_epic_and_stores_it() {
     // Title and labels are exactly what SPEC §13 asks for.
     assert_eq!(
         env.bd_calls(),
-        vec![format!("create epic-quest: ship it repo:quest,quest:{id}")]
+        vec![format!(
+            "create epic-quest: ship it --type epic -l repo:quest,quest:{id} --json"
+        )]
     );
     assert!(event_kinds(&env, &id).contains(&"beads.epic".to_string()));
 }
@@ -5207,7 +5231,9 @@ fn new_without_a_goal_titles_the_epic_with_the_slug() {
     let id = quest["quest"]["id"].as_str().unwrap();
     assert_eq!(
         env.bd_calls(),
-        vec![format!("create bare repo:quest,quest:{id}")]
+        vec![format!(
+            "create bare --type epic -l repo:quest,quest:{id} --json"
+        )]
     );
 }
 
@@ -5358,12 +5384,9 @@ fn a_quest_without_an_epic_has_no_progress() {
     env.with_bd_list(&mut cmd, &bd_issues("q-other", &[("bd-1", "open")]));
     let out = json_of(&cmd.args(["show", "plain", "--json"]).assert().success());
     assert!(out["progress"].is_null(), "{out}");
-    // Nothing to count means nothing to ask `bd` about.
-    assert!(
-        env.bd_calls().iter().all(|c| c.starts_with("create")),
-        "{:?}",
-        env.bd_calls()
-    );
+    // `--no-beads` skipped the create, and a Quest with no epic is never
+    // counted — so `bd` was never run at all.
+    assert!(env.bd_calls().is_empty(), "{:?}", env.bd_calls());
 
     let assert = env.cmd().args(["show", "plain"]).assert().success();
     let human = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
@@ -5410,7 +5433,8 @@ fn close_epic_closes_the_epic_through_bd() {
     assert_eq!(out["epic_closed"], true);
     assert_eq!(out["quest"]["state"], "finished");
     assert!(
-        env.bd_calls().contains(&"close bd-epic".to_string()),
+        env.bd_calls()
+            .contains(&"close bd-epic --reason quest closed".to_string()),
         "{:?}",
         env.bd_calls()
     );
@@ -5495,6 +5519,188 @@ fn set_links_and_unlinks_the_beads_epic() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("invalid beads epic id"));
+}
+
+#[test]
+fn blocked_is_derived_from_dependencies_not_from_a_status() {
+    let env = Env::new();
+    let quest = env.quest_with_epic("depending", "bd-epic");
+    let id = quest["quest"]["id"].as_str().unwrap().to_string();
+    // The real shape: every child of a live epic carries a `parent-child`
+    // dependency on it, which is not being blocked. Only `blocks` is.
+    let dep = |id: &str, kind: &str, on: &str| serde_json::json!({ "issue_id": id, "depends_on_id": on, "type": kind });
+    let issues = serde_json::json!([
+        {
+            "id": "bd-epic", "status": "open", "issue_type": "epic",
+            "labels": [format!("quest:{id}")],
+        },
+        {
+            "id": "bd-1", "status": "open", "issue_type": "task",
+            "labels": [format!("quest:{id}")],
+            "dependencies": [dep("bd-1", "parent-child", "bd-epic")],
+        },
+        {
+            "id": "bd-2", "status": "open", "issue_type": "task",
+            "labels": [format!("quest:{id}")],
+            "dependencies": [
+                dep("bd-2", "parent-child", "bd-epic"),
+                dep("bd-2", "blocks", "bd-1"),
+            ],
+        },
+    ]);
+
+    let mut cmd = env.cmd();
+    env.with_bd_list(&mut cmd, &issues);
+    let out = json_of(&cmd.args(["show", "depending", "--json"]).assert().success());
+    assert_eq!(out["progress"]["total"], 2);
+    assert_eq!(out["progress"]["blocked"], 1, "{out}");
+    // The overlay leaves both issues in their own status bucket.
+    assert_eq!(out["progress"]["open"], 2);
+}
+
+#[test]
+fn a_timed_out_create_looks_for_the_epic_before_giving_up() {
+    let env = Env::new();
+    let work = env.work("repo");
+    let mut cmd = env.cmd();
+    // The write is killed mid-flight, so `q` cannot know whether it committed.
+    env.with_bd_create_timeout(&mut cmd);
+    // The tracker holds an epic, but not one labelled for this Quest — so
+    // there is nothing to adopt and the Quest is created without one.
+    let list = env.dir.path().join("bd-list.json");
+    std::fs::write(
+        &list,
+        serde_json::json!([
+            {"id": "bd-someone-else", "status": "open", "issue_type": "epic",
+             "labels": ["quest:q-other"]},
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let assert = cmd
+        .env("Q_FIXTURE_BD", &list)
+        .args([
+            "new",
+            "--name",
+            "recovered",
+            "--dir",
+            work.to_str().unwrap(),
+        ])
+        .args(["--repo", "quest", "-d", "--json"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("warning: no beads epic"))
+        .stderr(predicate::str::contains("did not finish within"));
+    let out = json_of(&assert);
+    let id = out["quest"]["id"].as_str().unwrap().to_string();
+    assert!(out["quest"]["beads_epic"].is_null(), "{out}");
+    // It did try, and it did go looking afterwards.
+    assert_eq!(
+        env.bd_calls(),
+        vec![
+            format!("create recovered --type epic -l repo:quest,quest:{id} --json"),
+            bd_list_call(&id),
+        ]
+    );
+}
+
+#[test]
+fn the_repo_flag_is_validated() {
+    let env = Env::new();
+    let work = env.work("repo");
+    // A comma would silently mint a second label.
+    env.cmd()
+        .args(["new", "--name", "evil", "--dir", work.to_str().unwrap()])
+        .args(["--repo", "evil,repo:other", "-d"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid beads repo label"));
+    // So would whitespace, differently.
+    env.cmd()
+        .args(["new", "--name", "spaced", "--dir", work.to_str().unwrap()])
+        .args(["--repo", "two words", "-d"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid beads repo label"));
+    // Nothing was created by either.
+    let out = json_of(&env.cmd().args(["list", "--json"]).assert().success());
+    assert_eq!(out.as_array().unwrap().len(), 0, "{out}");
+}
+
+#[test]
+fn repo_and_no_beads_together_are_a_usage_error() {
+    let env = Env::new();
+    let work = env.work("repo");
+    let mut cmd = env.cmd();
+    env.with_bd_create(&mut cmd, "bd-1");
+    cmd.args(["new", "--name", "both", "--dir", work.to_str().unwrap()])
+        .args(["--repo", "quest", "--no-beads", "-d"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--no-beads"));
+    assert!(env.bd_calls().is_empty(), "{:?}", env.bd_calls());
+}
+
+#[test]
+fn set_fixes_a_wrong_repo_label() {
+    let env = Env::new();
+    let quest = env.quest_with_epic("mislabelled", "bd-epic");
+    assert_eq!(quest["quest"]["beads_repo"], "quest");
+
+    let out = env.json(&["set", "mislabelled", "beads_repo", "other-repo"]);
+    assert_eq!(out["quest"]["beads_repo"], "other-repo");
+    assert_eq!(out["key"], "beads_repo");
+
+    let assert = env.cmd().args(["show", "mislabelled"]).assert().success();
+    let human = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(human.contains("bd-epic (repo other-repo)"), "{human}");
+
+    // The same validation `--repo` gets.
+    env.cmd()
+        .args(["set", "mislabelled", "beads_repo", "a,b"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid beads repo label"));
+}
+
+#[test]
+fn rm_deletes_the_progress_cache_with_the_quest() {
+    let env = Env::new();
+    let quest = env.quest_with_epic("disposable", "bd-epic");
+    let id = quest["quest"]["id"].as_str().unwrap().to_string();
+
+    let mut cmd = env.cmd();
+    env.with_bd_list(&mut cmd, &bd_issues(&id, &[("bd-1", "closed")]));
+    cmd.args(["show", "disposable", "--json"])
+        .assert()
+        .success();
+    assert!(env.cache_file(&id).exists(), "nothing was cached");
+
+    env.cmd()
+        .args(["rm", "disposable", "-f"])
+        .assert()
+        .success();
+    assert!(
+        !env.cache_file(&id).exists(),
+        "the cache outlived the quest it belonged to"
+    );
+}
+
+#[test]
+fn the_brief_asks_bd_the_same_question_the_listing_does() {
+    let env = Env::new();
+    let quest = env.quest_with_epic("consistent", "bd-epic");
+    let id = quest["quest"]["id"].as_str().unwrap().to_string();
+    let mut cmd = env.cmd();
+    env.with_bd_list(&mut cmd, &bd_issues(&id, &[("bd-1", "open")]));
+    cmd.args(["brief", "consistent"]).assert().success();
+    // `--all -n 0`: a brief truncated at bd's default 50 rows, or one hiding
+    // closed issues, would contradict `q show`.
+    assert!(
+        env.bd_calls().contains(&bd_list_call(&id)),
+        "{:?}",
+        env.bd_calls()
+    );
 }
 
 #[test]

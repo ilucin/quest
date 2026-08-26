@@ -40,6 +40,9 @@ pub struct Args<'a> {
 pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     sweep_quiet(ctx)?;
     let db = ctx.db()?;
+    // Both before anything is written: a bad label or a contradictory pair of
+    // flags is the user's typo, not a half-created Quest.
+    let repo = repo_flag(args)?;
     let cwd = resolve_dir(args.dir)?;
     let prompt = resolve_prompt(args.prompt, args.prompt_file)?;
     let (base, name_source) = resolve_slug(args.name, &cwd)?;
@@ -69,12 +72,15 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     // The epic goes in before the master starts, so the brief its SessionStart
     // hook injects already names it. A failing `bd` is a warning, never a
     // failed `q new` (SPEC §13).
-    let quest = create_epic(ctx, quest, args);
+    let quest = create_epic(ctx, quest, args, repo.as_deref());
 
     let master = match spawn_master(ctx, &quest, prompt) {
         Ok(master) => master,
-        // Nothing was started, so the Quest row would only be an orphan.
+        // Nothing was started, so the Quest row would only be an orphan — and
+        // so would the epic, which lives in a tracker this row was the only
+        // pointer to.
         Err(e) => {
+            abandon_epic(beads::client().as_ref(), &quest);
             let _ = db.delete_quest(&quest.id);
             return Err(e);
         }
@@ -107,14 +113,45 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The Quest row is about to be deleted, so its epic loses its only pointer:
+/// close it rather than leave a stray open epic in a shared tracker. A `bd`
+/// that will not cooperate is named, so the id is not simply lost.
+fn abandon_epic(bd: &dyn beads::Bd, quest: &Quest) {
+    let Some(epic) = quest.beads_epic.as_deref() else {
+        return;
+    };
+    if let Err(err) = bd.close(epic, "quest creation failed") {
+        eprintln!(
+            "warning: quest creation failed and beads epic {epic} could not be closed \
+             ({err}); close it with `bd close {epic}`"
+        );
+    }
+}
+
+/// `--repo` as a label, once: it is rejected outright when it cannot be one,
+/// and refused as a contradiction alongside `--no-beads` (there is no epic for
+/// it to label).
+fn repo_flag(args: &Args) -> anyhow::Result<Option<String>> {
+    let Some(repo) = args.repo else {
+        return Ok(None);
+    };
+    if args.no_beads {
+        return Err(QError::Invalid(
+            "--repo labels the beads epic, which --no-beads skips; drop one of them".to_string(),
+        )
+        .into());
+    }
+    Ok(Some(beads::validate_repo_label(repo)?))
+}
+
 /// Creates the Quest's beads epic and stores it on the row. Returns the Quest
 /// unchanged when `--no-beads` was given or `bd` could not be reached — the
 /// warning goes to stderr so `--json` stdout stays a single payload.
-fn create_epic(ctx: &Ctx, quest: Quest, args: &Args) -> Quest {
+fn create_epic(ctx: &Ctx, quest: Quest, args: &Args, repo: Option<&str>) -> Quest {
     if args.no_beads {
         return quest;
     }
-    let repo = beads::repo_label(&ctx.config, args.repo, Path::new(&quest.cwd));
+    let repo = beads::repo_label(&ctx.config, repo, Path::new(&quest.cwd));
     let labels = format!("repo:{repo},quest:{}", quest.id);
     let title = match quest
         .goal
@@ -125,7 +162,7 @@ fn create_epic(ctx: &Ctx, quest: Quest, args: &Args) -> Quest {
         Some(goal) => format!("{}: {goal}", quest.slug),
         None => quest.slug.clone(),
     };
-    match beads::client().create_epic(&title, &labels) {
+    match beads::client().create_epic(&title, &labels, &quest.id) {
         Ok(epic) => store_epic(ctx, quest, &epic, &repo),
         Err(e) => {
             eprintln!(
@@ -544,5 +581,91 @@ mod tests {
             Some("hi".to_string())
         );
         assert_eq!(resolve_prompt(Some("   "), None).unwrap(), None);
+    }
+
+    /// Records the `bd close` calls a rollback makes.
+    #[derive(Default)]
+    struct SpyBd {
+        closed: std::cell::RefCell<Vec<(String, String)>>,
+        refuse: bool,
+    }
+
+    impl beads::Bd for SpyBd {
+        fn create_epic(&self, _: &str, _: &str, _: &str) -> Result<String, String> {
+            unreachable!("a rollback never creates")
+        }
+        fn list_quest(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn list_quests(&self, _: &[&str]) -> Option<String> {
+            None
+        }
+        fn close(&self, id: &str, reason: &str) -> Result<(), String> {
+            self.closed
+                .borrow_mut()
+                .push((id.to_string(), reason.to_string()));
+            if self.refuse {
+                Err("bd is wedged".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn quest_with_epic(epic: Option<&str>) -> Quest {
+        let mut quest = Quest::new("slug", "/tmp", "machine");
+        quest.beads_epic = epic.map(str::to_string);
+        quest
+    }
+
+    #[test]
+    fn a_rolled_back_quest_closes_the_epic_it_had_already_minted() {
+        let bd = SpyBd::default();
+        abandon_epic(&bd, &quest_with_epic(Some("bd-7fx")));
+        assert_eq!(
+            bd.closed.borrow().as_slice(),
+            [("bd-7fx".to_string(), "quest creation failed".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_rollback_with_no_epic_asks_bd_for_nothing() {
+        let bd = SpyBd::default();
+        abandon_epic(&bd, &quest_with_epic(None));
+        assert!(bd.closed.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_bd_that_refuses_the_rollback_is_survivable() {
+        let bd = SpyBd {
+            refuse: true,
+            ..SpyBd::default()
+        };
+        abandon_epic(&bd, &quest_with_epic(Some("bd-7fx")));
+        assert_eq!(bd.closed.borrow().len(), 1);
+    }
+
+    #[test]
+    fn the_repo_flag_is_validated_and_refused_alongside_no_beads() {
+        let args = Args {
+            repo: Some("  quest "),
+            ..Args::default()
+        };
+        assert_eq!(repo_flag(&args).unwrap(), Some("quest".to_string()));
+        assert!(repo_flag(&Args::default()).unwrap().is_none());
+
+        let bad = Args {
+            repo: Some("evil,repo:other"),
+            ..Args::default()
+        };
+        assert!(repo_flag(&bad).is_err());
+
+        let contradictory = Args {
+            repo: Some("quest"),
+            no_beads: true,
+            ..Args::default()
+        };
+        let err = repo_flag(&contradictory).unwrap_err().to_string();
+        assert!(err.contains("--no-beads"), "{err}");
     }
 }

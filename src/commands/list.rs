@@ -134,13 +134,6 @@ mod tests {
             view("waiting", Q::Active, 1, &[S::Waiting]),
         ];
         sort(&mut views);
-        // One `bd` call for the whole listing, capped and cache-backed, so a slow
-        // or missing `bd` can never hold up `q list` (SPEC §13).
-        let quests: Vec<&crate::model::Quest> = views.iter().map(|v| &v.quest).collect();
-        let progress = beads::progress_all(&quests);
-        for view in &mut views {
-            view.progress = progress.get(&view.quest.id).copied();
-        }
         let order: Vec<&str> = views.iter().map(|v| v.quest.slug.as_str()).collect();
         assert_eq!(
             order,

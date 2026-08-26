@@ -1,6 +1,7 @@
 //! `q rm` — delete a Quest and everything hanging off it (SPEC §5).
 
 use crate::Ctx;
+use crate::beads;
 use crate::commands::{confirm, sweep_quiet};
 use crate::error::QError;
 use crate::output;
@@ -30,6 +31,7 @@ pub fn run(ctx: &Ctx, target: &str, force: bool) -> anyhow::Result<()> {
     }
 
     db.delete_quest(&quest.id)?;
+    beads::forget(&quest.id);
     if ctx.json || !ctx.quiet {
         output::emit(
             ctx.json,

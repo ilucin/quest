@@ -85,9 +85,15 @@ pub fn default_target(arg: Option<&str>) -> anyhow::Result<String> {
 /// What sections 4 and 8 shell out to. Stubbed in tests and under `Q_FIXTURE`.
 pub trait External {
     /// `bd list -l quest:<id> --json`; `None` when `bd` is missing or failed.
-    fn bd_list(&self, quest_id: &str) -> Option<String>;
     /// `brain show <slug>`; `None` when `brain` is missing or failed.
     fn brain_show(&self, slug: &str) -> Option<String>;
+
+    /// The Quest's issues, always through `beads.rs` — the very call `q show`
+    /// makes, so the brief cannot show a shorter or differently filtered list.
+    /// `$Q_FIXTURE` is honoured in there, not here.
+    fn bd_list(&self, quest_id: &str) -> Option<String> {
+        crate::beads::client().list_quest(quest_id)
+    }
 }
 
 /// The real tools, or — under `$Q_FIXTURE` — canned output from the files
@@ -104,13 +110,6 @@ pub fn external() -> Box<dyn External> {
 struct RealExternal;
 
 impl External for RealExternal {
-    fn bd_list(&self, quest_id: &str) -> Option<String> {
-        proc::run_capped(
-            "bd",
-            &["list", "-l", &format!("quest:{quest_id}"), "--json"],
-            EXTERNAL_TIMEOUT,
-        )
-    }
     fn brain_show(&self, slug: &str) -> Option<String> {
         proc::run_capped("brain", &["show", slug], EXTERNAL_TIMEOUT)
     }
@@ -119,9 +118,6 @@ impl External for RealExternal {
 struct FixtureExternal;
 
 impl External for FixtureExternal {
-    fn bd_list(&self, _quest_id: &str) -> Option<String> {
-        fixture_file("Q_FIXTURE_BD")
-    }
     fn brain_show(&self, _slug: &str) -> Option<String> {
         fixture_file("Q_FIXTURE_BRAIN")
     }
@@ -137,10 +133,11 @@ pub struct NoExternal;
 
 #[cfg(test)]
 impl External for NoExternal {
-    fn bd_list(&self, _quest_id: &str) -> Option<String> {
+    fn brain_show(&self, _slug: &str) -> Option<String> {
         None
     }
-    fn brain_show(&self, _slug: &str) -> Option<String> {
+    /// Never the real `bd`: a unit test runs without `$Q_FIXTURE`.
+    fn bd_list(&self, _quest_id: &str) -> Option<String> {
         None
     }
 }

@@ -40,6 +40,10 @@ pub fn run(ctx: &Ctx, target: &str, key: SetKey, value: &str) -> anyhow::Result<
             stored = beads::validate_epic_id(value)?;
             patch.beads_epic = Some(blank_to_null(&stored));
         }
+        SetKey::BeadsRepo => {
+            stored = beads::validate_repo_label(value)?;
+            patch.beads_repo = Some(blank_to_null(&stored));
+        }
         SetKey::CtxResetPct => {
             let pct = parse_pct(value)?;
             stored = match pct {
@@ -98,6 +102,7 @@ fn key_name(key: SetKey) -> &'static str {
         SetKey::Workflow => "workflow",
         SetKey::CtxResetPct => "ctx_reset_pct",
         SetKey::BeadsEpic => "beads_epic",
+        SetKey::BeadsRepo => "beads_repo",
     }
 }
 

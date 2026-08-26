@@ -400,6 +400,7 @@ pub enum SetKey {
     Workflow,
     CtxResetPct,
     BeadsEpic,
+    BeadsRepo,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
