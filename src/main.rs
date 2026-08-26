@@ -12,7 +12,7 @@ mod tmux;
 
 use clap::Parser;
 
-use cli::{Cli, Command, ConfigAction, HookAction};
+use cli::{ArtifactAction, Cli, Command, ConfigAction, HookAction, LinkAction};
 use config::Config;
 use db::Db;
 use error::QError;
@@ -283,6 +283,54 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             // TODO(M2, SPEC §12): link auto-capture; until then drain stdin, exit 0.
             HookAction::PostToolUse => commands::hook::noop(),
         },
+
+        // Agent self-report (bd-8lz.2.5).
+        Command::Phase { text, quest } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::phase::run(&ctx, text, quest.as_deref()).map(|()| 0)
+        }
+        Command::Note {
+            text,
+            blocker,
+            quest,
+        } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::note::run(&ctx, text, *blocker, quest.as_deref()).map(|()| 0)
+        }
+        Command::Link { action } => {
+            let ctx = Ctx::with_db(args)?;
+            match action {
+                LinkAction::Add {
+                    r#ref,
+                    kind,
+                    title,
+                    quest,
+                } => commands::link::add(
+                    &ctx,
+                    &commands::link::AddArgs {
+                        r#ref,
+                        kind: *kind,
+                        title: title.as_deref(),
+                        quest: quest.as_deref(),
+                    },
+                ),
+                LinkAction::Rm { id, quest } => commands::link::rm(&ctx, *id, quest.as_deref()),
+            }
+            .map(|()| 0)
+        }
+        Command::Links { quest, refresh } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::link::list(&ctx, quest.as_deref(), *refresh).map(|()| 0)
+        }
+        Command::Artifact { action } => {
+            let ctx = Ctx::with_db(args)?;
+            match action {
+                ArtifactAction::Add { path, note, quest } => {
+                    commands::link::add_artifact(&ctx, path, note.as_deref(), quest.as_deref())
+                }
+            }
+            .map(|()| 0)
+        }
     }
 }
 

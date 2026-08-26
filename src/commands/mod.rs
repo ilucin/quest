@@ -14,6 +14,12 @@ pub mod rm;
 pub mod set;
 pub mod show;
 
+// Agent self-report (bd-8lz.2.5).
+pub mod link;
+pub mod note;
+pub mod phase;
+pub mod report;
+
 use std::io::{BufRead, IsTerminal, Write};
 
 use serde::Serialize;
