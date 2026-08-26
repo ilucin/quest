@@ -47,7 +47,7 @@ fn help_lists_subcommands() {
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     for sub in [
         "new", "list", "show", "enter", "close", "resume", "rename", "set", "rm", "brief",
-        "doctor", "config",
+        "doctor", "config", "phase", "note", "link", "links", "artifact",
     ] {
         assert!(out.contains(sub), "`{sub}` missing from --help:\n{out}");
     }
@@ -2166,4 +2166,584 @@ fn brief_reads_bd_and_brain_from_fixtures() {
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(out.contains("unavailable (bd missing or failed)"), "{out}");
     assert!(out.contains("_(brain note unavailable)_"), "{out}");
+}
+
+// ------------------------------------------------ agent self-report (bd-8lz.2.5)
+
+/// A Quest with its master session, and a command pre-wired with the env a
+/// Quest pane would carry (`Q_QUEST`, `Q_SESSION`).
+struct Pane {
+    env: Env,
+    quest_id: String,
+    session_id: String,
+}
+
+impl Pane {
+    fn new() -> Pane {
+        let env = Env::new();
+        let created = env.new_quest("alpha");
+        Pane {
+            quest_id: created["quest"]["id"].as_str().unwrap().to_string(),
+            session_id: created["session"]["id"].as_str().unwrap().to_string(),
+            env,
+        }
+    }
+
+    fn cmd(&self) -> Command {
+        let mut cmd = self.env.cmd();
+        cmd.env("Q_QUEST", &self.quest_id)
+            .env("Q_SESSION", &self.session_id);
+        cmd
+    }
+
+    fn json(&self, args: &[&str]) -> serde_json::Value {
+        let mut cmd = self.cmd();
+        let assert = cmd.args(args).arg("--json").assert().success();
+        json_of(&assert)
+    }
+
+    /// `(kind, session_id, payload)` of every event, oldest first.
+    fn events(&self) -> Vec<(String, Option<String>, serde_json::Value)> {
+        self.env
+            .conn()
+            .prepare("SELECT kind, session_id, payload FROM event WHERE quest_id = ?1 ORDER BY id")
+            .unwrap()
+            .query_map([&self.quest_id], |r| {
+                let payload: Option<String> = r.get(2)?;
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    payload
+                        .map(|p| serde_json::from_str(&p).unwrap())
+                        .unwrap_or(serde_json::Value::Null),
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn last_event(&self) -> (String, Option<String>, serde_json::Value) {
+        self.events().pop().unwrap()
+    }
+}
+
+fn error_json(assert: &assert_cmd::assert::Assert) -> serde_json::Value {
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    serde_json::from_str(stderr.trim()).unwrap_or_else(|e| panic!("not JSON ({e}): {stderr}"))
+}
+
+#[test]
+fn phase_updates_the_session_and_logs_an_event() {
+    let pane = Pane::new();
+    pane.cmd()
+        .args(["phase", "implementing"])
+        .assert()
+        .success()
+        .stdout("phase set: implementing\n");
+
+    let phase: String = pane
+        .env
+        .conn()
+        .query_row(
+            "SELECT phase FROM session WHERE id = ?1",
+            [&pane.session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(phase, "implementing");
+    let (kind, session, payload) = pane.last_event();
+    assert_eq!(kind, "phase");
+    assert_eq!(session.as_deref(), Some(pane.session_id.as_str()));
+    assert_eq!(payload, serde_json::json!({ "text": "implementing" }));
+
+    let out = pane.json(&["phase", "reviewing"]);
+    assert_eq!(out["phase"], "reviewing");
+    assert_eq!(out["session_id"], pane.session_id.as_str());
+    assert_eq!(out["quest_id"], pane.quest_id.as_str());
+}
+
+#[test]
+fn phase_requires_a_session() {
+    let pane = Pane::new();
+    let assert = pane
+        .cmd()
+        .env_remove("Q_SESSION")
+        .args(["phase", "planning", "--json"])
+        .assert()
+        .code(1);
+    assert!(
+        error_json(&assert)["error"]
+            .as_str()
+            .unwrap()
+            .contains("Q_SESSION")
+    );
+    assert!(pane.events().iter().all(|(k, _, _)| k != "phase"));
+}
+
+#[test]
+fn self_report_needs_a_quest_from_env_or_flag() {
+    let pane = Pane::new();
+    let assert = pane
+        .cmd()
+        .env_remove("Q_QUEST")
+        .env_remove("Q_SESSION")
+        .args(["note", "hello", "--json"])
+        .assert()
+        .code(1);
+    assert!(
+        error_json(&assert)["error"]
+            .as_str()
+            .unwrap()
+            .contains("--quest")
+    );
+
+    // `--quest` resolves through the usual target rules (slug here) and works
+    // without a session: the event is attributed to nobody.
+    let out = {
+        let mut cmd = pane.env.cmd();
+        let assert = cmd
+            .args(["note", "from outside", "--quest", "alpha", "--json"])
+            .assert()
+            .success();
+        json_of(&assert)
+    };
+    assert_eq!(out["quest_id"], pane.quest_id.as_str());
+    assert!(out["session_id"].is_null());
+    let (kind, session, _) = pane.last_event();
+    assert_eq!(kind, "note");
+    assert_eq!(session, None);
+}
+
+#[test]
+fn stale_session_env_is_an_error() {
+    let pane = Pane::new();
+    let assert = pane
+        .cmd()
+        .env("Q_SESSION", "s-dead")
+        .args(["note", "hello", "--json"])
+        .assert()
+        .code(1);
+    assert_eq!(error_json(&assert)["code"], "not_found");
+}
+
+#[test]
+fn note_payload_carries_blocker_only_when_set() {
+    let pane = Pane::new();
+    pane.cmd()
+        .args(["note", "all good"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match(r"^note #\d+ all good\n$").unwrap());
+    let (kind, session, payload) = pane.last_event();
+    assert_eq!(kind, "note");
+    assert_eq!(session.as_deref(), Some(pane.session_id.as_str()));
+    assert_eq!(payload, serde_json::json!({ "text": "all good" }));
+
+    pane.cmd()
+        .args(["note", "--blocker", "DB is locked"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match(r"^note #\d+ \[blocker\] DB is locked\n$").unwrap());
+    let (_, _, payload) = pane.last_event();
+    assert_eq!(
+        payload,
+        serde_json::json!({ "text": "DB is locked", "blocker": true })
+    );
+
+    let out = pane.json(&["note", "x", "--blocker"]);
+    assert_eq!(out["blocker"], true);
+    assert_eq!(out["text"], "x");
+    assert!(out["event_id"].is_i64());
+}
+
+#[test]
+fn link_add_detects_the_kind_and_is_idempotent() {
+    let pane = Pane::new();
+    let url = "https://github.com/acme/api/pull/42";
+    pane.cmd()
+        .args(["link", "add", url, "--title", "Fix it"])
+        .assert()
+        .success()
+        .stdout(format!("link #1 pr {url} — Fix it\n"));
+    let (kind, session, payload) = pane.last_event();
+    assert_eq!(kind, "link.added");
+    assert_eq!(session.as_deref(), Some(pane.session_id.as_str()));
+    assert_eq!(
+        payload,
+        serde_json::json!({ "id": 1, "kind": "pr", "ref": url })
+    );
+
+    // Same ref again: the existing row, no new event.
+    let out = pane.json(&["link", "add", url]);
+    assert_eq!(out["created"], false);
+    assert_eq!(out["link"]["id"], 1);
+    assert_eq!(out["link"]["title"], "Fix it");
+    assert_eq!(
+        pane.events()
+            .iter()
+            .filter(|(k, _, _)| k == "link.added")
+            .count(),
+        1
+    );
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 1);
+
+    let out = pane.json(&["link", "add", "https://app.productive.io/1-acme/tasks/123"]);
+    assert_eq!(out["created"], true);
+    assert_eq!(out["link"]["kind"], "task");
+    assert_eq!(out["link"]["session_id"], pane.session_id.as_str());
+    let out = pane.json(&["link", "add", "bd-8lz.2.5"]);
+    assert_eq!(out["link"]["kind"], "beads");
+    let out = pane.json(&["link", "add", "https://example.com/docs"]);
+    assert_eq!(out["link"]["kind"], "url");
+}
+
+#[test]
+fn link_add_detects_worktrees_and_files_by_absolute_path() {
+    let pane = Pane::new();
+    let wt = pane.env.work("wt");
+    std::fs::write(wt.join(".git"), "gitdir: elsewhere").unwrap();
+    let out = pane.json(&["link", "add", wt.to_str().unwrap()]);
+    assert_eq!(out["link"]["kind"], "worktree");
+    assert_eq!(out["link"]["ref"], wt.to_str().unwrap());
+
+    // Relative to the cwd, stored absolute.
+    let out_dir = pane.env.work("out");
+    std::fs::write(out_dir.join("report.md"), "# hi").unwrap();
+    let mut cmd = pane.cmd();
+    cmd.current_dir(&out_dir);
+    let assert = cmd
+        .args(["link", "add", "report.md", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    assert_eq!(out["link"]["kind"], "artifact");
+    assert_eq!(
+        out["link"]["ref"],
+        out_dir.join("report.md").to_str().unwrap()
+    );
+}
+
+#[test]
+fn link_add_asks_for_a_kind_it_cannot_detect() {
+    let pane = Pane::new();
+    let assert = pane
+        .cmd()
+        .args(["link", "add", "feat/some-branch", "--json"])
+        .assert()
+        .code(1);
+    let err = error_json(&assert);
+    assert_eq!(err["code"], "invalid");
+    assert!(err["error"].as_str().unwrap().contains("--kind"), "{err}");
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 0);
+
+    let out = pane.json(&["link", "add", "feat/some-branch", "--kind", "branch"]);
+    assert_eq!(out["link"]["kind"], "branch");
+    assert_eq!(out["link"]["ref"], "feat/some-branch");
+}
+
+#[test]
+fn link_rm_deletes_and_logs() {
+    let pane = Pane::new();
+    let id = pane.json(&["link", "add", "https://example.com"])["link"]["id"]
+        .as_i64()
+        .unwrap();
+    pane.cmd()
+        .args(["link", "rm", &id.to_string()])
+        .assert()
+        .success()
+        .stdout(format!("link #{id} removed\n"));
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 0);
+    let (kind, _, payload) = pane.last_event();
+    assert_eq!(kind, "link.removed");
+    assert_eq!(
+        payload,
+        serde_json::json!({ "id": id, "kind": "url", "ref": "https://example.com" })
+    );
+
+    let assert = pane
+        .cmd()
+        .args(["link", "rm", "999", "--json"])
+        .assert()
+        .code(1);
+    assert_eq!(error_json(&assert)["code"], "not_found");
+}
+
+#[test]
+fn link_rm_refuses_another_quests_link() {
+    let pane = Pane::new();
+    let other = pane.env.new_quest("beta")["quest"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut cmd = pane.env.cmd();
+    let assert = cmd
+        .args([
+            "link",
+            "add",
+            "https://example.com",
+            "--quest",
+            &other,
+            "--json",
+        ])
+        .assert()
+        .success();
+    let id = json_of(&assert)["link"]["id"].as_i64().unwrap();
+    pane.cmd()
+        .args(["link", "rm", &id.to_string()])
+        .assert()
+        .code(1);
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 1);
+}
+
+#[test]
+fn links_lists_grouped_by_kind_or_as_json() {
+    let pane = Pane::new();
+    pane.cmd()
+        .args(["links"])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("no links on"));
+
+    pane.json(&["link", "add", "https://example.com/b"]);
+    pane.json(&[
+        "link",
+        "add",
+        "https://github.com/acme/api/pull/1",
+        "--title",
+        "One",
+    ]);
+    pane.json(&["link", "add", "https://example.com/a"]);
+
+    pane.cmd().args(["links"]).assert().success().stdout(
+        "pr\n  #2 https://github.com/acme/api/pull/1 — One\nurl\n  #1 https://example.com/b\n  #3 https://example.com/a\n",
+    );
+
+    let out = pane.json(&["links"]);
+    let arr = out.as_array().unwrap();
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[1]["kind"], "pr");
+    assert_eq!(arr[1]["title"], "One");
+
+    // Positional target, from outside any pane.
+    let mut cmd = pane.env.cmd();
+    let assert = cmd.args(["links", "alpha", "--json"]).assert().success();
+    assert_eq!(json_of(&assert).as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn artifact_add_stores_the_note_in_meta() {
+    let pane = Pane::new();
+    let out_dir = pane.env.work("out");
+    let file = out_dir.join("report.html");
+    std::fs::write(&file, "<h1/>").unwrap();
+
+    let mut cmd = pane.cmd();
+    cmd.current_dir(&out_dir);
+    cmd.args(["artifact", "add", "report.html", "--note", "the report"])
+        .assert()
+        .success()
+        .stdout(format!("link #1 artifact {}\n", file.to_str().unwrap()));
+
+    let out = pane.json(&["links"]);
+    let link = &out.as_array().unwrap()[0];
+    assert_eq!(link["kind"], "artifact");
+    assert_eq!(link["ref"], file.to_str().unwrap());
+    assert_eq!(link["meta"], serde_json::json!({ "note": "the report" }));
+
+    let (kind, session, payload) = pane.last_event();
+    assert_eq!(kind, "artifact.added");
+    assert_eq!(session.as_deref(), Some(pane.session_id.as_str()));
+    assert_eq!(
+        payload,
+        serde_json::json!({
+            "id": 1,
+            "kind": "artifact",
+            "ref": file.to_str().unwrap(),
+            "note": "the report",
+        })
+    );
+
+    // A file that does not exist yet is accepted (artifacts are promised
+    // before they are written) as long as its directory does.
+    let later = out_dir.join("later.md");
+    let out = pane.json(&["artifact", "add", later.to_str().unwrap()]);
+    assert_eq!(out["link"]["ref"], later.to_str().unwrap());
+    assert!(out["link"]["meta"].is_null());
+}
+
+#[test]
+fn artifact_add_rejects_urls_and_missing_directories() {
+    let pane = Pane::new();
+    for path in ["https://example.com/report.html", "/nope/deeper/later.md"] {
+        let assert = pane
+            .cmd()
+            .args(["artifact", "add", path, "--json"])
+            .assert()
+            .code(1);
+        assert_eq!(error_json(&assert)["code"], "invalid", "{path}");
+    }
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 0);
+}
+
+#[test]
+fn artifact_add_fills_a_missing_note_but_keeps_an_existing_one() {
+    let pane = Pane::new();
+    let file = pane.env.work("out").join("r.md");
+    let path = file.to_str().unwrap();
+    pane.json(&["artifact", "add", path]);
+    pane.cmd()
+        .args(["artifact", "add", path, "--note", "first"])
+        .assert()
+        .success()
+        .stdout(predicate::str::ends_with("(already linked; note set)\n"));
+    let out = pane.json(&["artifact", "add", path, "--note", "second"]);
+    assert_eq!(out["created"], false);
+    assert_eq!(out["link"]["meta"]["note"], "first");
+    pane.cmd()
+        .args(["artifact", "add", path, "--note", "second"])
+        .assert()
+        .success()
+        .stdout(predicate::str::ends_with(
+            "(already linked; kept existing note)\n",
+        ));
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 1);
+    assert_eq!(
+        pane.events()
+            .iter()
+            .filter(|(k, _, _)| k == "artifact.added")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn paths_expand_a_leading_tilde() {
+    let pane = Pane::new();
+    let home = pane.env.work("home");
+    std::fs::create_dir_all(home.join("out")).unwrap();
+    let mut cmd = pane.cmd();
+    let assert = cmd
+        .env("HOME", &home)
+        .args(["artifact", "add", "~/out/report.md", "--json"])
+        .assert()
+        .success();
+    assert_eq!(
+        json_of(&assert)["link"]["ref"],
+        home.join("out/report.md").to_str().unwrap()
+    );
+
+    let mut cmd = pane.cmd();
+    let assert = cmd
+        .env("HOME", &home)
+        .args(["link", "add", "~/out/report.md", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    // Same file already linked as an artifact: the row is reused.
+    assert_eq!(out["created"], false);
+    assert_eq!(out["link"]["kind"], "artifact");
+}
+
+#[test]
+fn link_add_normalises_pr_urls_and_dedupes_across_kinds() {
+    let pane = Pane::new();
+    let canonical = "https://github.com/acme/api/pull/42";
+    let out = pane.json(&[
+        "link",
+        "add",
+        "http://www.github.com/acme/api/pull/42/files?diff=split#r1",
+    ]);
+    assert_eq!(out["link"]["kind"], "pr");
+    assert_eq!(out["link"]["ref"], canonical);
+    let out = pane.json(&[
+        "link",
+        "add",
+        "https://github.com/acme/api/pull/42#issuecomment-1",
+    ]);
+    assert_eq!(out["created"], false);
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 1);
+
+    // Added as a plain url first, autodetected later: still one row.
+    let docs = "https://example.com/docs";
+    pane.json(&["link", "add", docs, "--kind", "url"]);
+    let out = pane.json(&["link", "add", docs]);
+    assert_eq!(out["created"], false);
+    assert_eq!(out["link"]["kind"], "url");
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 2);
+    // An explicit different kind is a deliberate second row.
+    let out = pane.json(&["link", "add", docs, "--kind", "brain"]);
+    assert_eq!(out["created"], true);
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 3);
+}
+
+#[test]
+fn link_add_sets_a_missing_title_but_keeps_an_existing_one() {
+    let pane = Pane::new();
+    let url = "https://example.com";
+    pane.json(&["link", "add", url]);
+    pane.cmd()
+        .args(["link", "add", url, "--title", "Docs"])
+        .assert()
+        .success()
+        .stdout(format!(
+            "link #1 url {url} — Docs (already linked; title set)\n"
+        ));
+    pane.cmd()
+        .args(["link", "add", url, "--title", "Other"])
+        .assert()
+        .success()
+        .stdout(format!(
+            "link #1 url {url} — Docs (already linked; kept existing title)\n"
+        ));
+    let out = pane.json(&["links"]);
+    assert_eq!(out[0]["title"], "Docs");
+    assert_eq!(
+        pane.events()
+            .iter()
+            .filter(|(k, _, _)| k == "link.added")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn links_is_read_only_and_ignores_the_pane_session() {
+    let pane = Pane::new();
+    let other = pane.env.new_quest("beta");
+    let other_id = other["quest"]["id"].as_str().unwrap();
+    let mut cmd = pane.env.cmd();
+    cmd.args(["link", "add", "https://example.com", "--quest", other_id])
+        .assert()
+        .success();
+
+    // From alpha's pane, listing beta works…
+    let out = pane.json(&["links", "beta"]);
+    assert_eq!(out.as_array().unwrap().len(), 1);
+    // …but writing to beta from alpha's session does not.
+    let assert = pane
+        .cmd()
+        .args(["note", "x", "--quest", "beta", "--json"])
+        .assert()
+        .code(1);
+    assert_eq!(error_json(&assert)["code"], "invalid");
+}
+
+#[test]
+fn ended_session_env_is_rejected_for_writes() {
+    let pane = Pane::new();
+    pane.env
+        .conn()
+        .execute(
+            "UPDATE session SET status = 'ended' WHERE id = ?1",
+            [&pane.session_id],
+        )
+        .unwrap();
+    let assert = pane.cmd().args(["note", "late", "--json"]).assert().code(1);
+    let err = error_json(&assert);
+    assert_eq!(err["code"], "invalid");
+    assert!(err["error"].as_str().unwrap().contains("ended"), "{err}");
+    assert!(pane.events().iter().all(|(k, _, _)| k != "note"));
+    // Reads still work.
+    pane.cmd().args(["links"]).assert().success();
 }
