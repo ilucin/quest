@@ -12,9 +12,13 @@ use std::time::{Duration, Instant};
 
 /// How often the wait loop polls the child.
 const POLL: Duration = Duration::from_millis(20);
-/// Reading the pipes still gets this long after the deadline, so a child that
-/// used up its whole budget does not also lose its output.
+/// Once the child is gone the readers get this long to hand over what they
+/// already have — no more. A grandchild may still hold the write end, so this
+/// window is all the caller can ever be asked to wait for the pipes.
 const DRAIN_FLOOR: Duration = Duration::from_millis(250);
+/// Hard cap on what one pipe contributes. q shows a line or two of this; a
+/// chatty child must not be able to grow the buffer without bound.
+const MAX_CAPTURE: usize = 64 * 1024;
 
 pub struct Outcome {
     /// `None` when the child was killed for outliving the timeout.
@@ -96,9 +100,13 @@ pub fn run(cmd: &mut Command, input: &[u8], timeout: Duration) -> std::io::Resul
             }
         }
     }
-    // Never join the readers: a survivor we failed to kill could hold a pipe
-    // open forever, and a hot path may not wait for it.
-    let until = Instant::now() + timeout.saturating_sub(started.elapsed()).max(DRAIN_FLOOR);
+    // Every way out of that loop leaves the child reaped or killed, so the
+    // only writer that can still hold a pipe is a survivor of the group kill.
+    // Waiting out the rest of the budget for one would charge a child that
+    // finished in 10ms for its background `sleep 30`: the drain window is
+    // always just the floor. Joining the readers is never an option either —
+    // a survivor could hold the pipe open forever.
+    let until = Instant::now() + DRAIN_FLOOR;
     Ok(Outcome {
         status,
         stdout: collect(out_rx, until),
@@ -134,11 +142,19 @@ fn drain(mut pipe: impl Read + Send + 'static) -> Draining {
     let sink = Arc::clone(&buf);
     thread::spawn(move || {
         let mut chunk = [0u8; 8192];
-        while let Ok(n) = pipe.read(&mut chunk) {
-            if n == 0 {
-                break;
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut buf = lock(&sink);
+                    let room = MAX_CAPTURE.saturating_sub(buf.len());
+                    buf.extend_from_slice(&chunk[..n.min(room)]);
+                    // Past the cap the bytes are dropped but the pipe is still
+                    // read, so the child never blocks on a full pipe.
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
             }
-            lock(&sink).extend_from_slice(&chunk[..n]);
         }
         let _ = tx.send(());
     });
@@ -214,16 +230,41 @@ mod tests {
     fn a_forking_child_leaves_no_survivor() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("survived");
-        // The grandchild outlives the timeout by design; if the group kill
-        // missed it, it wakes up and writes the marker.
+        // The grandchild's write is a whole second out — an order of magnitude
+        // past the budget — and we then wait half again as long, so no amount
+        // of scheduler jitter can make a killed grandchild look alive or a
+        // surviving one look dead.
         let out = sh(
-            &format!("(sleep 0.3; : > {}) & echo partial; wait", marker.display()),
+            &format!("(sleep 1; : > {}) & echo partial; wait", marker.display()),
             b"",
             100,
         );
         assert_eq!(out.text(), "partial");
-        thread::sleep(Duration::from_millis(700));
+        thread::sleep(Duration::from_millis(1500));
         assert!(!marker.exists(), "the grandchild survived the group kill");
+    }
+
+    #[test]
+    fn a_background_grandchild_does_not_hold_up_a_child_that_finished() {
+        // `sh` exits at once, but its background `sleep` inherited the stdout
+        // pipe, so EOF never comes. The drain window, not the remaining
+        // budget, is what the caller waits for.
+        let started = Instant::now();
+        let out = sh("echo hi; sleep 30 &", b"", 30_000);
+        let elapsed = started.elapsed();
+        assert_eq!(out.text(), "hi");
+        assert_eq!(out.code(), Some(0));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the surviving `sleep` held up the return: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_flood_of_output_is_capped() {
+        let out = sh("yes qqqqqqqq | head -c 200000", b"", 5000);
+        assert!(out.success());
+        assert_eq!(out.stdout.len(), MAX_CAPTURE);
     }
 
     #[test]
