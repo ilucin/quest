@@ -58,6 +58,10 @@ pub struct State {
     links: Vec<Vec<Link>>,
     /// The selected Quest's most recent events; only the selection needs them.
     events: Vec<Event>,
+    /// Which Quest [`State::events`] was read for. Selection keys move faster
+    /// than any reload, so the pairing is carried explicitly rather than
+    /// assumed: the panel shows nothing before it shows the wrong Quest's.
+    events_for: Option<String>,
     /// Index into the *visible* rows.
     selected: usize,
     /// The selected Quest's id, so a reload that reorders keeps the selection
@@ -80,6 +84,47 @@ impl State {
     /// bare-letter keys, so typing `q` into the box does not quit.
     pub fn capturing(&self) -> bool {
         self.searching
+    }
+
+    /// Give the keyboard back and drop the half-typed query. Leaving the tab
+    /// is the one way out of the box that is not Esc or Enter, and an armed
+    /// capture behind another tab is invisible: every bare letter would be
+    /// swallowed as text on return, with no box on screen to explain it.
+    pub fn cancel_capture(&mut self) {
+        if self.searching {
+            self.searching = false;
+            self.query.clear();
+        }
+    }
+
+    /// The filters currently hiding (or revealing) rows, for the chrome line.
+    /// A committed `/` or `m` has no other trace on screen, and a transient
+    /// status message is not a mode indicator — the next one erases it.
+    pub fn filters(&self) -> String {
+        let mut on: Vec<String> = Vec::new();
+        // While the box is open it *is* the indicator, in the status bar, with
+        // a cursor and a match count; a second copy of the query would only
+        // repeat it.
+        if !self.query.is_empty() && !self.searching {
+            on.push(format!("/{}", self.query));
+        }
+        if let Some(m) = self.machine.as_deref() {
+            on.push(format!("m {m}"));
+        }
+        if self.show_finished {
+            on.push("+finished".to_string());
+        }
+        on.join(" ")
+    }
+
+    /// The selected Quest's events — empty unless they were read *for* that
+    /// Quest, so a selection the reload has not caught up with shows nothing
+    /// rather than the previous Quest's history under the new one's title.
+    fn selected_events(&self) -> &[Event] {
+        match (self.events_for.as_deref(), self.selected_id.as_deref()) {
+            (Some(loaded), Some(selected)) if loaded == selected => &self.events,
+            _ => &[],
+        }
     }
 
     /// The rows actually on screen, after the `f`, `m` and `/` filters.
@@ -201,13 +246,41 @@ pub fn refresh(ctx: &Ctx, app: &mut App) -> anyhow::Result<()> {
     app.quests.rows = rows;
     app.quests.links = links;
     app.quests.resync();
+    // A reload can reorder the list under the selection, so the viewport is
+    // re-settled rather than only clamped: `resync` alone can scroll up but
+    // never down, which leaves the highlight below the fold.
+    settle_view(app);
 
+    // The events are re-read even for an unchanged selection: this is the
+    // reload, and the tail is exactly what has changed since the last one.
+    // Cleared as well as unpaired, so an emptied listing (no selection left to
+    // read for) drops them rather than keeping the last Quest's.
+    app.quests.events.clear();
+    app.quests.events_for = None;
+    sync(ctx, app)
+}
+
+/// Bring the selection's own data in line, without the full reload a tick
+/// does. Runs before every redraw and is a no-op unless the selection moved,
+/// which is what keeps `j`/`k` off the tmux sweep and off `bd`.
+pub fn sync(ctx: &Ctx, app: &mut App) -> anyhow::Result<()> {
+    if app.quests.events_for == app.quests.selected_id {
+        return Ok(());
+    }
     // Only the selection's events are read: the panel shows one Quest's.
     app.quests.events = match app.quests.selected_id.as_deref() {
-        Some(id) => db.list_events_by_quest(id, EVENTS)?,
+        Some(id) => ctx.db()?.list_events_by_quest(id, EVENTS)?,
         None => Vec::new(),
     };
+    app.quests.events_for = app.quests.selected_id.clone();
     Ok(())
+}
+
+/// Scroll the selection back into view for the current terminal size — after a
+/// reload that reordered the rows, and after a resize.
+pub fn settle_view(app: &mut App) {
+    let page = viewport(app);
+    app.quests.settle(page);
 }
 
 // ------------------------------------------------------------------- keymap
@@ -424,10 +497,15 @@ fn selection_todo(app: &mut App, what: &str, bead: &str) -> Action {
 
 // -------------------------------------------------------------------- render
 
-pub fn render(frame: &mut Frame, area: Rect, app: &App) {
+pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     if area.height == 0 || area.width == 0 {
         return;
     }
+    // The size the shell has just published is the one this frame is drawn
+    // for, so a resize scrolls the selection back into view before it is
+    // missed rather than on the next keypress.
+    settle_view(app);
+    let app = &*app;
     let (list, panel) = split(area, app.detail && app.quests.selected_row().is_some());
     if let Some(list) = list {
         render_list(frame, list, app);
@@ -588,7 +666,9 @@ fn pack(left: &str, right: &str, width: usize) -> String {
 /// The facts SPEC §17 puts at the right end of the first line.
 fn right_facts(row: &QuestRow) -> String {
     let mut parts = vec![row.view.quest.machine.clone()];
-    if let Some(p) = row.view.progress {
+    // An epic with no issues yet has nothing to report: `0/0 ░░░░░░░` is a
+    // row's worth of noise saying only that the Quest is new.
+    if let Some(p) = row.view.progress.filter(|p| p.total > 0) {
         parts.push(format!("{} {}", p.cell(), p.bar(BAR)));
     }
     if let Some(ctx) = row.view.master_ctx_pct {
@@ -699,7 +779,11 @@ fn render_panel(frame: &mut Frame, area: Rect, app: &App) {
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    let lines = panel_lines(row, app.quests.selected_links(), &app.quests.events);
+    let lines = panel_lines(
+        row,
+        app.quests.selected_links(),
+        app.quests.selected_events(),
+    );
     let width = inner.width as usize;
     let shown: Vec<Line> = lines
         .into_iter()
@@ -1478,6 +1562,157 @@ mod tests {
             line_of(&lines, "needs-me") < line_of(&lines, "resting"),
             "{text}"
         );
+    }
+
+    /// The panel's events are the *selection's* — not the ones the last reload
+    /// happened to read. Selection keys move between reloads, and a tick is
+    /// 2 s locally and 10 s remote: a whole conversation's worth of a Quest's
+    /// history shown under another Quest's name.
+    #[test]
+    fn the_detail_panel_never_shows_another_quests_events() {
+        let db = Db::open_in_memory().unwrap();
+        let mut first = Quest::new("aaa-quest", "/tmp/work", "laptop");
+        first.goal = Some("the first".to_string());
+        let first = db.insert_quest(&first).unwrap();
+        let mut master = Session::new(&first.id, SessionRole::Master, "master", "q-x", "%1");
+        master.status = SessionStatus::Waiting;
+        db.insert_session(&master).unwrap();
+        db.append_event(&first.id, None, "event.for.aaa", &serde_json::json!({}))
+            .unwrap();
+
+        let mut second = Quest::new("bbb-quest", "/tmp/work", "laptop");
+        second.goal = Some("the second".to_string());
+        let second = db.insert_quest(&second).unwrap();
+        db.append_event(&second.id, None, "event.for.bbb", &serde_json::json!({}))
+            .unwrap();
+
+        let (_tmux_dir, tmux) = tmux_with(&[("q-x", "%1")]);
+        let ctx = Ctx::for_tests(Config::default(), db, tmux);
+        let mut app = App::new(&ctx.config, "laptop");
+        app.set_size(120, 30);
+        refresh(&ctx, &mut app).unwrap();
+        app.detail = true;
+
+        assert_eq!(
+            app.quests.selected_row().unwrap().view.quest.slug,
+            "aaa-quest"
+        );
+        let text = screen(&mut app, 120, 30);
+        assert!(text.contains("event.for.aaa"), "{text}");
+
+        // Move down. Before anything reloads, the panel may show nothing —
+        // but it may never show the previous Quest's events under this title.
+        handle(&mut app, Input::Char('j'));
+        assert_eq!(
+            app.quests.selected_row().unwrap().view.quest.slug,
+            "bbb-quest"
+        );
+        let text = screen(&mut app, 120, 30);
+        assert!(
+            !text.contains("event.for.aaa"),
+            "the previous selection's events are still on screen\n{text}"
+        );
+
+        // And the loop's redraw preamble fills in the right ones without
+        // paying for a whole reload.
+        sync(&ctx, &mut app).unwrap();
+        let text = screen(&mut app, 120, 30);
+        assert!(text.contains("event.for.bbb"), "{text}");
+        assert!(!text.contains("event.for.aaa"), "{text}");
+
+        // Back up again: the same guarantee in the other direction.
+        handle(&mut app, Input::Char('k'));
+        sync(&ctx, &mut app).unwrap();
+        let text = screen(&mut app, 120, 30);
+        assert!(text.contains("event.for.aaa"), "{text}");
+        assert!(!text.contains("event.for.bbb"), "{text}");
+    }
+
+    /// A reload can move the selected Quest below the fold — `resync` alone
+    /// only ever scrolls up, so the highlight would vanish until a keypress.
+    #[test]
+    fn a_reload_that_reorders_scrolls_the_selection_back_into_view() {
+        let rows: Vec<QuestRow> = (0..40)
+            .map(|n| {
+                row(
+                    quest(&format!("quest-{n:02}"), QuestState::Active, 100 - n),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let mut app = app_with(rows);
+        app.set_size(120, 26);
+        handle(&mut app, Input::Char('g'));
+        let selected = app.quests.selected_row().unwrap().view.quest.slug.clone();
+        assert_eq!(selected, "quest-00");
+
+        // The Quest the user is looking at drops to the bottom of the listing
+        // (its group changed, or every other Quest was touched since).
+        app.quests.rows.rotate_left(1);
+        app.quests.resync();
+        settle_view(&mut app);
+        assert!(
+            app.quests.selected >= app.quests.offset
+                && app.quests.selected < app.quests.offset + viewport(&app),
+            "selected {} outside [{}, {}) after the reorder",
+            app.quests.selected,
+            app.quests.offset,
+            app.quests.offset + viewport(&app)
+        );
+        let lines = draw(&mut app, 120, 26);
+        assert!(line_of(&lines, &selected).is_some(), "{lines:#?}");
+
+        // A resize is the same problem: the viewport shrinks under a selection
+        // that was comfortably on screen.
+        let lines = draw(&mut app, 120, 10);
+        assert!(line_of(&lines, &selected).is_some(), "{lines:#?}");
+        let lines = draw(&mut app, 120, 8);
+        assert!(line_of(&lines, &selected).is_some(), "{lines:#?}");
+    }
+
+    /// A committed filter hides rows for as long as it is on; a one-shot
+    /// status message is gone by the next keypress.
+    #[test]
+    fn an_active_filter_stays_on_screen_after_the_message_that_set_it() {
+        let mut app = grouped();
+        app.handle(Input::Char('/'));
+        for c in "run".chars() {
+            app.handle(Input::Char(c));
+        }
+        app.handle(Input::Enter);
+        // Another key speaks, and the search feedback is gone.
+        handle(&mut app, Input::Char('n'));
+        assert!(!app.status.contains("/run"), "{}", app.status);
+        let text = screen(&mut app, 120, 30);
+        assert!(text.contains("[/run]"), "the filter is invisible\n{text}");
+        assert!(!text.contains("resting"), "{text}");
+
+        // A refresh failure outranks the message and still does not hide it.
+        crate::tui::report_refresh(&mut app, Err(anyhow::anyhow!("database is locked")));
+        let text = screen(&mut app, 120, 30);
+        assert!(text.contains("[/run]"), "{text}");
+        crate::tui::report_refresh(&mut app, Ok(()));
+
+        // The machine filter is announced the same way.
+        app.handle(Input::Esc);
+        handle(&mut app, Input::Char('m'));
+        handle(&mut app, Input::Char('n'));
+        let text = screen(&mut app, 120, 30);
+        assert!(text.contains("[m laptop]"), "{text}");
+    }
+
+    /// An epic nobody has filed an issue against yet has nothing to say.
+    #[test]
+    fn an_empty_epic_draws_no_bar_at_all() {
+        let mut q = quest("fresh", QuestState::Active, 5);
+        q.beads_epic = Some("bd-42".to_string());
+        let mut r = row(q, Vec::new());
+        r.view.progress = Some(crate::beads::Progress::default());
+        let mut app = app_with(vec![r]);
+        let text = screen(&mut app, 120, 30);
+        assert!(text.contains("fresh"), "{text}");
+        assert!(!text.contains("0/0"), "{text}");
+        assert!(!text.contains('░'), "{text}");
     }
 
     #[test]

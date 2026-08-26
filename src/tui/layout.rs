@@ -4,7 +4,8 @@
 #![allow(dead_code)]
 
 use ratatui::layout::Rect;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// At or above this width a Quest row fits on two lines (SPEC §17).
 pub const WIDE_COLS: u16 = 100;
@@ -112,9 +113,13 @@ pub fn width(s: &str) -> usize {
 
 /// Truncate to `max` display columns, ellipsising when anything was cut.
 ///
-/// Column-aware rather than char-aware, so CJK and emoji do not overflow, and
-/// zero-width characters travel with the character they modify: cutting
-/// between `e` and its combining acute would leave the accent on the ellipsis.
+/// Measured the same way [`width`] measures — whole grapheme clusters, each
+/// costed with `UnicodeWidthStr` — because a per-`char` sum disagrees with the
+/// string width on exactly the sequences a name is likely to carry: `❤\u{FE0F}`
+/// sums to one column and paints two, so a per-`char` budget overflows the row.
+/// Cutting between clusters is also the only cut that leaves whole glyphs: a
+/// flag is a pair of regional indicators and half of one is a stray letter, and
+/// a ZWJ sequence cut mid-join leaves the joiner dangling on the ellipsis.
 pub fn truncate(s: &str, max: usize) -> String {
     if width(s) <= max {
         return s.to_string();
@@ -122,24 +127,15 @@ pub fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    let budget = max.saturating_sub(1);
+    let budget = max - 1;
     let mut out = String::new();
     let mut used = 0;
-    for c in s.chars() {
-        let cw = c.width().unwrap_or(0);
-        // A zero-width char belongs to the cluster already emitted; dropping it
-        // would change the glyph and keeping it costs no columns. With nothing
-        // emitted yet there is no cluster to join, so it is skipped.
-        if cw == 0 {
-            if !out.is_empty() {
-                out.push(c);
-            }
-            continue;
-        }
+    for cluster in s.graphemes(true) {
+        let cw = width(cluster);
         if used + cw > budget {
             break;
         }
-        out.push(c);
+        out.push_str(cluster);
         used += cw;
     }
     out.push('…');
@@ -237,6 +233,49 @@ mod tests {
         assert_eq!(width(&truncate(s, 3)), 3);
         // A string that is only marks has no cluster to join.
         assert_eq!(truncate("\u{301}\u{301}", 5), "\u{301}\u{301}");
+    }
+
+    /// The cases a per-`char` budget gets wrong: they measure one way and
+    /// paint another, and they are the ones real Quest names and PR titles
+    /// actually carry.
+    #[test]
+    fn truncate_keeps_emoji_sequences_whole() {
+        // An emoji-presentation selector: one column by char sum, two painted.
+        assert_eq!(width("❤\u{FE0F}"), 2);
+        let heart = "ship it ❤\u{FE0F} now, and it has to be cut somewhere";
+        for max in 0..=width(heart) + 2 {
+            let cut = truncate(heart, max);
+            assert!(
+                width(&cut) <= max,
+                "{max}: {cut:?} measures {}",
+                width(&cut)
+            );
+        }
+
+        // A flag is a pair of regional indicators; half of one is a letter in
+        // a box, not a flag.
+        let flag = "a🇭🇷b🇭🇷c";
+        for max in 0..=width(flag) + 2 {
+            let cut = truncate(flag, max);
+            assert!(width(&cut) <= max, "{max}: {cut:?}");
+            let halves = cut
+                .chars()
+                .filter(|c| ('\u{1F1E6}'..='\u{1F1FF}').contains(c))
+                .count();
+            assert_eq!(halves % 2, 0, "{max}: {cut:?} split a flag");
+        }
+        assert_eq!(truncate(flag, 3), "a…");
+
+        // A ZWJ sequence cut mid-join leaves the joiner on the ellipsis.
+        let family = "x👨\u{200D}👩\u{200D}👧y and a tail to cut into";
+        for max in 0..=width(family) + 2 {
+            let cut = truncate(family, max);
+            assert!(width(&cut) <= max, "{max}: {cut:?}");
+            assert!(
+                !cut.contains('\u{200D}') || cut.contains("👧"),
+                "{max}: {cut:?} carries a dangling joiner"
+            );
+        }
     }
 
     #[test]

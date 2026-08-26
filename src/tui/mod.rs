@@ -281,6 +281,7 @@ fn event_loop(
         // an idle mouse crossing the window costs a full render pass per
         // report.
         if dirty {
+            sync_now(ctx, app);
             terminal.draw(|frame| render(frame, app))?;
             dirty = false;
         }
@@ -321,6 +322,23 @@ fn event_loop(
 fn refresh_now(ctx: &Ctx, app: &mut App) {
     let result = refresh(ctx, app);
     report_refresh(app, result);
+}
+
+/// The redraw preamble: bring the active tab's per-selection data in line with
+/// the selection before it is drawn. Cheap by design — a no-op unless a key
+/// moved the selection since the last frame — so moving down a list costs one
+/// indexed query rather than the whole reload a tick does.
+///
+/// A failure only *sets* the error: it must not clear a reload failure that is
+/// the actual reason the screen is stale.
+fn sync_now(ctx: &Ctx, app: &mut App) {
+    let result = match app.tab {
+        Tab::Quests => quests::sync(ctx, app),
+        _ => Ok(()),
+    };
+    if let Err(e) = result {
+        app.refresh_error = Some(format!("refresh failed: {e:#}"));
+    }
 }
 
 /// A failed reload belongs in the status bar, not in `main`'s error path: a
@@ -418,16 +436,24 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let hint = " ? help · x refresh · q quit ";
     // A reload that failed outranks a keypress's feedback: it is the reason
     // what is on screen may be stale.
-    let left = match (app.refresh_error.as_deref(), app.status.as_str()) {
+    let left = match (app.refresh_error.as_deref(), app.current_status()) {
         (Some(e), _) => format!(" {e}"),
-        (None, "") => format!(
+        (None, Some(status)) => format!(" {status}"),
+        (None, None) => format!(
             " {} · rows {} · tick {}s · mouse {}",
             app.machine,
             app.row_mode().lines(),
             app.tick_secs,
             if app.mouse { "on" } else { "off" },
         ),
-        (None, status) => format!(" {status}"),
+    };
+    // The filters are a mode, not a message: they lead the line and stay there
+    // until they are turned off, whatever else has something to say.
+    let filters = app.filters();
+    let left = if filters.is_empty() {
+        left
+    } else {
+        format!(" [{filters}]{left}")
     };
 
     let [l, r] = Layout::horizontal([

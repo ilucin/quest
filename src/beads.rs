@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,15 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const SLOW_WRITE: Duration = Duration::from_secs(2);
 /// How long a cached progress reading counts as fresh.
 pub const CACHE_TTL: i64 = 30;
+/// How long a *failed* read is remembered before `bd` is tried again.
+///
+/// A failure writes no cache, so without this the "nothing fresh" test is true
+/// again immediately and the next caller re-spawns `bd`. On the TUI's 2 s tick
+/// that means a `bd` present but slow costs up to [`READ_TIMEOUT`] on the UI
+/// thread every tick — longer than the tick itself — and the keyboard goes
+/// dead. Matching [`CACHE_TTL`] keeps the two paths on the same cadence: at
+/// most one `bd` call per Quest listing per half-minute, succeed or fail.
+pub const FAILURE_TTL: i64 = CACHE_TTL;
 /// `bd list` defaults to 50 rows; counts have to see all of them.
 const NO_LIMIT: &[&str] = &["--all", "-n", "0", "--no-pager", "--json"];
 /// A listing's stdout is a *document*, so [`proc`]'s default 64 KiB capture
@@ -786,6 +796,16 @@ pub fn progress_all(quests: &[&Quest]) -> HashMap<String, Progress> {
     progress_all_with(client().as_ref(), quests)
 }
 
+/// When the last whole-listing read failed, as a unix timestamp; 0 is never.
+/// Process-local on purpose: it exists to protect a long-lived TUI from its own
+/// tick, and a one-shot `q list` should not inherit an older process's bad luck.
+static LAST_FAILURE: AtomicI64 = AtomicI64::new(0);
+
+fn backing_off(now: i64) -> bool {
+    let last = LAST_FAILURE.load(Ordering::Relaxed);
+    last != 0 && (now - last).abs() < FAILURE_TTL
+}
+
 pub fn progress_all_with(bd: &dyn Bd, quests: &[&Quest]) -> HashMap<String, Progress> {
     let epics: HashMap<String, Option<String>> = quests
         .iter()
@@ -798,8 +818,15 @@ pub fn progress_all_with(bd: &dyn Bd, quests: &[&Quest]) -> HashMap<String, Prog
         .keys()
         .filter_map(|id| read_cache(id).map(|c| (id.clone(), c)))
         .collect();
-    if epics.keys().all(|id| cached.get(id).is_some_and(fresh)) {
-        return cached.into_iter().map(|(k, c)| (k, c.progress)).collect();
+    let stale = || -> HashMap<String, Progress> {
+        // Stale beats blank: a listing shows the last reading it had.
+        cached
+            .iter()
+            .map(|(k, c)| (k.clone(), c.progress))
+            .collect()
+    };
+    if epics.keys().all(|id| cached.get(id).is_some_and(fresh)) || backing_off(now()) {
+        return stale();
     }
     let ids: Vec<&str> = epics.keys().map(String::as_str).collect();
     match bd
@@ -807,13 +834,16 @@ pub fn progress_all_with(bd: &dyn Bd, quests: &[&Quest]) -> HashMap<String, Prog
         .and_then(|raw| count_by_quest(&raw, &epics))
     {
         Some(counted) => {
+            LAST_FAILURE.store(0, Ordering::Relaxed);
             for (id, progress) in &counted {
                 write_cache(id, progress);
             }
             counted.into_iter().collect()
         }
-        // Stale beats blank: a listing shows the last reading it had.
-        None => cached.into_iter().map(|(k, c)| (k, c.progress)).collect(),
+        None => {
+            LAST_FAILURE.store(now(), Ordering::Relaxed);
+            stale()
+        }
     }
 }
 
@@ -1196,6 +1226,55 @@ mod tests {
         fn relabel_repo(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), String> {
             unreachable!()
         }
+    }
+
+    /// A `bd` that never answers, and counts how often it was asked.
+    #[derive(Default)]
+    struct FailingBd(std::cell::Cell<usize>);
+
+    impl Bd for FailingBd {
+        fn create_epic(&self, _: &str, _: &str, _: &str) -> Result<String, String> {
+            unreachable!()
+        }
+        fn list_quest(&self, _: &str) -> Option<String> {
+            self.0.set(self.0.get() + 1);
+            None
+        }
+        fn list_quests(&self, _: &[&str]) -> Option<String> {
+            self.0.set(self.0.get() + 1);
+            None
+        }
+        fn close(&self, _: &str, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+        fn relabel_repo(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+    }
+
+    /// A failed read writes no cache, so nothing stops the next caller asking
+    /// again — and on the TUI's 2 s tick a `bd` that is present but slow then
+    /// costs `READ_TIMEOUT` on the UI thread every tick, which is longer than
+    /// the tick. The keyboard goes dead while the process looks idle.
+    #[test]
+    fn a_failing_bd_is_not_respawned_on_every_tick() {
+        LAST_FAILURE.store(0, Ordering::Relaxed);
+        let mut quest = Quest::new("slow", "/tmp/work", "laptop");
+        quest.beads_epic = Some("bd-42".to_string());
+        let bd = FailingBd::default();
+
+        assert!(progress_all_with(&bd, &[&quest]).is_empty());
+        assert_eq!(bd.0.get(), 1);
+        for _ in 0..10 {
+            assert!(progress_all_with(&bd, &[&quest]).is_empty());
+        }
+        assert_eq!(bd.0.get(), 1, "bd was respawned inside the backoff window");
+
+        // The window is not a lockout: once it has passed, bd is asked again.
+        LAST_FAILURE.store(now() - FAILURE_TTL, Ordering::Relaxed);
+        assert!(progress_all_with(&bd, &[&quest]).is_empty());
+        assert_eq!(bd.0.get(), 2);
+        LAST_FAILURE.store(0, Ordering::Relaxed);
     }
 
     #[test]
