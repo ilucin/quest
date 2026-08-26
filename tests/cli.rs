@@ -80,6 +80,17 @@ fn bare_invocation_succeeds() {
         .stdout(predicate::str::contains("--help"));
 }
 
+/// Bare `q` is the TUI (SPEC §16) — but only on a terminal. Under a pipe (and
+/// so under every test and every script) it must fall back to the banner
+/// rather than reaching for the alternate screen.
+#[test]
+fn bare_invocation_off_a_terminal_does_not_launch_the_tui() {
+    let assert = q().arg("--json").assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["tui"], serde_json::Value::Bool(false), "{parsed}");
+}
+
 #[test]
 fn quiet_suppresses_bare_output() {
     // `--quiet` only silences human output; without `--json` that leaves

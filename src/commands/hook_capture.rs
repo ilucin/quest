@@ -244,12 +244,12 @@ fn extract_bash(
             let segment = segment.trim();
             if let Some(m) = cd_re().captures(segment) {
                 base = PathBuf::from(resolve(&base, m[1].trim_matches(['"', '\''])));
-            } else if let Some(m) = worktree_re().captures(segment) {
-                if let Some((path, branch)) = parse_worktree_add(m[1].trim_end_matches(')')) {
-                    push(Capture::new(LinkKind::Worktree, resolve(&base, &path)));
-                    if let Some(b) = branch {
-                        push(Capture::new(LinkKind::Branch, b));
-                    }
+            } else if let Some(m) = worktree_re().captures(segment)
+                && let Some((path, branch)) = parse_worktree_add(m[1].trim_end_matches(')'))
+            {
+                push(Capture::new(LinkKind::Worktree, resolve(&base, &path)));
+                if let Some(b) = branch {
+                    push(Capture::new(LinkKind::Branch, b));
                 }
             }
         }
