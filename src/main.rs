@@ -234,8 +234,10 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             HookAction::Status { command } => {
                 commands::hook::status(&Ctx::config_only(args)?, command.as_deref())
             }
-            // TODO(bd-8lz.2.2, bd-8lz.2.3): real handlers; until then every
-            // hook drains stdin and exits 0 so Claude Code never blocks on us.
+            // Lenient: a broken config must never break the statusline.
+            HookAction::Statusline => commands::hook::statusline(&Ctx::lenient(args)),
+            // TODO(bd-8lz.2.2): real handlers; until then every hook drains
+            // stdin and exits 0 so Claude Code never blocks on us.
             _ => commands::hook::noop(),
         },
     }

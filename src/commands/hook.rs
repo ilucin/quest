@@ -3,8 +3,10 @@
 //! entries. The event handlers themselves live in later beads.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -71,6 +73,11 @@ const EVENTS: [Event; 7] = [
 
 const STATUSLINE_SUB: &str = "statusline";
 const CHAIN_KEY: &str = "statusline.chain";
+const CHAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn known_sub(sub: &str) -> bool {
+    sub == STATUSLINE_SUB || EVENTS.iter().any(|e| e.sub == sub)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -123,48 +130,73 @@ struct Status {
     actual_hash: String,
 }
 
-/// `$Q_CLAUDE_SETTINGS`, else `~/.claude/settings.json`.
+/// `$Q_CLAUDE_SETTINGS`, else `~/.claude/settings.json`. Symlinks are
+/// followed so the atomic rename replaces the target, not the link.
 pub fn settings_path() -> anyhow::Result<PathBuf> {
-    if let Some(raw) = std::env::var_os("Q_CLAUDE_SETTINGS")
-        && !raw.is_empty()
-    {
-        return Ok(PathBuf::from(raw));
-    }
-    let home = dirs::home_dir()
-        .ok_or_else(|| QError::Config("cannot determine the home directory".to_string()))?;
-    Ok(home.join(".claude").join("settings.json"))
+    let path = match std::env::var_os("Q_CLAUDE_SETTINGS") {
+        Some(raw) if !raw.is_empty() => PathBuf::from(raw),
+        _ => {
+            let home = dirs::home_dir()
+                .ok_or_else(|| QError::Config("cannot determine the home directory".to_string()))?;
+            home.join(".claude").join("settings.json")
+        }
+    };
+    Ok(fs::canonicalize(&path).unwrap_or(path))
 }
 
 /// The command hooks invoke q with: `--command` if given, else the absolute
-/// path of the running binary — `q` might not be on Claude's PATH.
+/// path of the running binary — `q` might not be on Claude's PATH. The path
+/// is not canonicalized: a symlinked install (homebrew) must keep pointing at
+/// the link so upgrades don't strand the hooks on an old version.
 fn q_command(override_cmd: Option<&str>) -> anyhow::Result<String> {
-    if let Some(c) = override_cmd {
-        let c = c.trim();
-        if c.is_empty() {
-            return Err(QError::Invalid("--command must not be empty".to_string()).into());
+    let cmd = match override_cmd {
+        Some(c) => {
+            let c = c.trim();
+            if c.is_empty() {
+                return Err(QError::Invalid("--command must not be empty".to_string()).into());
+            }
+            c.to_string()
         }
-        return Ok(c.to_string());
+        None => {
+            let exe = std::env::current_exe().map_err(QError::Io)?;
+            let exe = if exe.is_absolute() {
+                exe
+            } else {
+                std::env::current_dir().map_err(QError::Io)?.join(exe)
+            };
+            shell_quote(&exe.to_string_lossy())
+        }
+    };
+    if owned_sub(&statusline_command(&cmd)) != Some(STATUSLINE_SUB) {
+        return Err(QError::Invalid(format!(
+            "--command {cmd:?} would produce hook entries q cannot recognise as its own"
+        ))
+        .into());
     }
-    let exe = std::env::current_exe().map_err(QError::Io)?;
-    let exe = exe.canonicalize().unwrap_or(exe);
-    Ok(exe.to_string_lossy().into_owned())
+    Ok(cmd)
 }
 
-/// Ownership marker: `<bin> hook <sub>` where `<bin>` is a binary named `q`.
-/// `<bin>` may be any path, so a reinstall from a moved binary still finds
+/// Single-quotes a path when it contains whitespace so `sh` keeps it as one
+/// argument; a bare path passes through untouched.
+fn shell_quote(path: &str) -> String {
+    if path.chars().any(char::is_whitespace) {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    } else {
+        path.to_string()
+    }
+}
+
+/// Ownership marker: any command whose last two words are `hook <sub>` for
+/// a sub q handles. Everything before is the binary — any name, any path,
+/// quoted or not — so a reinstall from a moved or renamed binary still finds
 /// the old entries.
 fn owned_sub(command: &str) -> Option<&str> {
-    let mut parts = command.split_whitespace();
-    let bin = parts.next()?;
-    if parts.next()? != "hook" {
+    let mut words = command.split_whitespace().rev();
+    let sub = words.next()?;
+    if words.next()? != "hook" || words.next().is_none() {
         return None;
     }
-    let sub = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    let is_q = Path::new(bin).file_name().is_some_and(|n| n == "q");
-    is_q.then_some(sub)
+    known_sub(sub).then_some(sub)
 }
 
 fn is_owned(hook: &Value) -> bool {
@@ -287,10 +319,24 @@ fn prune_empty(settings: &mut Value) {
     }
 }
 
+/// Same value with object keys sorted at every level, so the hash doesn't
+/// depend on the order a hand-edited file happens to use.
+fn canonical(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => {
+            let sorted: std::collections::BTreeMap<_, _> =
+                m.iter().map(|(k, v)| (k.clone(), canonical(v))).collect();
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(a) => Value::Array(a.iter().map(canonical).collect()),
+        _ => v.clone(),
+    }
+}
+
 fn hash(values: &[Value]) -> String {
     let mut h = Sha256::new();
     for v in values {
-        h.update(v.to_string());
+        h.update(canonical(v).to_string());
         h.update([0]);
     }
     let out = h.finalize();
@@ -389,6 +435,13 @@ pub fn install(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
     let before = read_settings(&path)?;
     let mut settings = before.clone();
 
+    // `null` counts as absent; anything else of the wrong shape is an error.
+    if !matches!(before["statusLine"], Value::Null | Value::Object(_)) {
+        return Err(
+            QError::Config(format!("{}: `statusLine` is not an object", path.display())).into(),
+        );
+    }
+
     for ev in &EVENTS {
         let want = expected_group(&cmd, ev);
         let at = remove_owned(&mut settings, ev.name);
@@ -396,7 +449,10 @@ pub fn install(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
             .as_object_mut()
             .expect("settings is an object")
             .entry("hooks")
-            .or_insert_with(|| json!({}));
+            .or_insert(Value::Null);
+        if hooks.is_null() {
+            *hooks = json!({});
+        }
         if !hooks.is_object() {
             return Err(
                 QError::Config(format!("{}: `hooks` is not an object", path.display())).into(),
@@ -406,7 +462,10 @@ pub fn install(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
             .as_object_mut()
             .expect("checked above")
             .entry(ev.name)
-            .or_insert_with(|| json!([]));
+            .or_insert(Value::Null);
+        if groups.is_null() {
+            *groups = json!([]);
+        }
         let Some(groups) = groups.as_array_mut() else {
             return Err(QError::Config(format!(
                 "{}: `hooks.{}` is not an array",
@@ -426,12 +485,7 @@ pub fn install(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
         .as_str()
         .map(str::trim)
         .filter(|c| !c.is_empty() && owned_sub(c).is_none());
-    if let Some(foreign) = existing
-        && foreign != chain
-    {
-        chain = foreign.to_string();
-        config::set_and_write(CHAIN_KEY, &chain)?;
-    }
+    let new_chain = existing.filter(|foreign| *foreign != chain);
     let mut sl = before["statusLine"]
         .as_object()
         .cloned()
@@ -440,9 +494,15 @@ pub fn install(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
     sl.insert("command".to_string(), json!(statusline_command(&cmd)));
     settings["statusLine"] = Value::Object(sl);
 
+    // Settings first: if that write fails the config must not already claim
+    // a chain that nothing calls.
     let changed = settings != before;
     if changed {
         write_settings(&path, &settings)?;
+    }
+    if let Some(foreign) = new_chain {
+        chain = foreign.to_string();
+        config::set_and_write(CHAIN_KEY, &chain)?;
     }
 
     let status = compute_status(&settings, path.clone(), &cmd, &chain);
@@ -473,10 +533,13 @@ pub fn uninstall(ctx: &Ctx) -> anyhow::Result<u8> {
     }
     prune_empty(&mut settings);
 
+    // The chain is only ours to restore (and forget) while statusLine still
+    // points at us; if the user replaced it, leave both alone.
     let chain = ctx.config.statusline.chain.clone();
     let ours = settings["statusLine"]["command"]
         .as_str()
         .is_some_and(|c| owned_sub(c).is_some());
+    let restored = ours && !chain.is_empty();
     if ours {
         let obj = settings.as_object_mut().expect("settings is an object");
         if chain.is_empty() {
@@ -491,13 +554,12 @@ pub fn uninstall(ctx: &Ctx) -> anyhow::Result<u8> {
             obj.insert("statusLine".to_string(), Value::Object(sl));
         }
     }
-    if !chain.is_empty() {
-        config::set_and_write(CHAIN_KEY, "")?;
-    }
-
     let changed = settings != before;
     if changed {
         write_settings(&path, &settings)?;
+    }
+    if restored {
+        config::set_and_write(CHAIN_KEY, "")?;
     }
     if ctx.json || !ctx.quiet {
         output::emit(
@@ -506,7 +568,7 @@ pub fn uninstall(ctx: &Ctx) -> anyhow::Result<u8> {
                 "action": "uninstall",
                 "changed": changed,
                 "settings": path,
-                "restored_statusline": (!chain.is_empty()).then_some(&chain),
+                "restored_statusline": restored.then_some(&chain),
             }),
             || {
                 let verb = if changed {
@@ -515,7 +577,7 @@ pub fn uninstall(ctx: &Ctx) -> anyhow::Result<u8> {
                     "nothing to remove:"
                 };
                 let mut s = format!("{verb} q hooks from {}", path.display());
-                if !chain.is_empty() {
+                if restored {
                     s.push_str(&format!("\nrestored statusLine: {chain}"));
                 }
                 s
@@ -542,22 +604,97 @@ pub fn noop() -> anyhow::Result<u8> {
     Ok(0)
 }
 
+/// Pass-through statusline: forwards Claude's payload to the chained
+/// command and prints whatever it prints. Never fails and never hangs —
+/// a broken or slow chain just yields an empty statusline.
+// TODO(bd-8lz.2.3): parse ctx_pct from the payload and render q's own segment.
+pub fn statusline(ctx: &Ctx) -> anyhow::Result<u8> {
+    let mut input = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut input);
+    let chain = ctx.config.statusline.chain.trim();
+    if chain.is_empty() {
+        return Ok(0);
+    }
+    if let Some(out) = run_chain(chain, &input) {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(&out);
+        let _ = stdout.flush();
+    }
+    Ok(0)
+}
+
+fn run_chain(chain: &str, input: &[u8]) -> Option<Vec<u8>> {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(chain)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input);
+    }
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + CHAIN_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    reader.join().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn ownership_needs_a_q_binary_and_the_hook_shape() {
+    fn ownership_is_any_binary_followed_by_a_known_hook_sub() {
         assert_eq!(owned_sub("q hook stop"), Some("stop"));
         assert_eq!(
             owned_sub("/usr/local/bin/q hook session-start"),
             Some("session-start")
         );
         assert_eq!(owned_sub("  q   hook statusline "), Some("statusline"));
-        assert_eq!(owned_sub("qq hook stop"), None);
+        assert_eq!(owned_sub("/opt/quest-bin hook stop"), Some("stop"));
+        assert_eq!(owned_sub("'/opt/my q/q' hook stop"), Some("stop"));
+        assert_eq!(owned_sub("q --db x hook pre-compact"), Some("pre-compact"));
+        assert_eq!(owned_sub("hook stop"), None);
         assert_eq!(owned_sub("q hooks stop"), None);
         assert_eq!(owned_sub("q hook stop --now"), None);
+        assert_eq!(owned_sub("q hook unknown"), None);
         assert_eq!(owned_sub("npx ccusage statusline"), None);
+    }
+
+    #[test]
+    fn shell_quote_only_when_needed() {
+        assert_eq!(shell_quote("/usr/bin/q"), "/usr/bin/q");
+        assert_eq!(shell_quote("/opt/my q/q"), "'/opt/my q/q'");
+        assert_eq!(shell_quote("/it's q/q"), "'/it'\\''s q/q'");
+    }
+
+    #[test]
+    fn hash_ignores_key_order() {
+        let a =
+            json!({ "hooks": [{ "type": "command", "command": "q hook stop" }], "matcher": "X" });
+        let b =
+            json!({ "matcher": "X", "hooks": [{ "command": "q hook stop", "type": "command" }] });
+        assert_eq!(hash(std::slice::from_ref(&a)), hash(&[b]));
+        assert_ne!(hash(&[a]), hash(&[json!({ "matcher": "Y" })]));
     }
 
     #[test]

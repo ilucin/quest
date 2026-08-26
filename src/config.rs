@@ -487,6 +487,10 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
         .unwrap_or_else(|| "config.toml".to_string());
     let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
     fs::write(&tmp, contents).map_err(|e| io_err("write", e))?;
+    // Keep the original mode (e.g. 600) instead of the tmp file's umask default.
+    if let Ok(meta) = fs::metadata(path) {
+        fs::set_permissions(&tmp, meta.permissions()).map_err(|e| io_err("chmod", e))?;
+    }
     fs::rename(&tmp, path).map_err(|e| io_err("rename", e))?;
     Ok(())
 }
