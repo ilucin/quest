@@ -33,7 +33,7 @@ pub enum Command {
         #[arg(long, value_name = "SLUG")]
         name: Option<String>,
         /// One line on what this Quest is for
-        #[arg(long, value_name = "TEXT")]
+        #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
         goal: Option<String>,
         /// Working directory for the agents (default: the current one)
         #[arg(long, value_name = "PATH")]
@@ -41,7 +41,7 @@ pub enum Command {
         #[arg(long, value_name = "NAME")]
         workflow: Option<String>,
         /// First prompt for the master
-        #[arg(long, value_name = "TEXT")]
+        #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
         prompt: Option<String>,
         /// First prompt for the master, from a file (`-` reads stdin)
         #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
@@ -93,7 +93,8 @@ pub enum Command {
     /// Spawn a worker agent in a new window of the Quest's tmux session
     Spawn {
         quest: String,
-        /// First prompt for the worker
+        /// First prompt for the worker; a leading `-` is text, not a flag
+        #[arg(allow_hyphen_values = true)]
         prompt: String,
         /// Session label: lowercase kebab-case, unique among live sessions
         #[arg(long, value_name = "LABEL")]
@@ -132,6 +133,8 @@ pub enum Command {
     Send {
         /// `<quest>/<label>`, a session id, or `<label>` inside a Quest
         session: String,
+        /// Free text; a leading `-` is text, not a flag
+        #[arg(allow_hyphen_values = true)]
         text: String,
         /// Send even though the session is busy, waiting or starting
         #[arg(long)]
@@ -155,6 +158,8 @@ pub enum Command {
         quest: String,
         #[arg(value_enum)]
         key: SetKey,
+        /// Free text for `goal`; a leading `-` is text, not a flag
+        #[arg(allow_hyphen_values = true)]
         value: String,
     },
 
@@ -226,6 +231,8 @@ pub enum Command {
 
     /// Leave a note on the Quest's timeline
     Note {
+        /// Free text; a leading `-` is text, not a flag
+        #[arg(allow_hyphen_values = true)]
         text: String,
         /// Mark the note as a blocker the master must resolve
         #[arg(long)]
