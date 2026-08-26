@@ -3688,7 +3688,9 @@ fn spawn_selects_the_new_window_only_from_inside_the_quests_session() {
         .assert()
         .success();
     let out = json_of(&assert);
-    assert_eq!(out["attach"], "switch");
+    // `select`, not `switch`: the client stays in the session it is already in
+    // and only the active window changes.
+    assert_eq!(out["attach"], "select");
     assert_eq!(out["window"], "w3-inside");
     let worker_pane = out["session"]["tmux_pane"].as_str().unwrap().to_string();
     assert_eq!(env.fixture()["selected"], worker_pane.as_str());
@@ -3724,7 +3726,7 @@ fn spawn_falls_back_to_q_quest_when_the_pane_id_is_missing() {
         .args(["spawn", "foo", "a", "--label", "tests", "--json"])
         .assert()
         .success();
-    assert_eq!(json_of(&assert)["attach"], "switch");
+    assert_eq!(json_of(&assert)["attach"], "select");
 }
 
 #[test]

@@ -5,7 +5,7 @@ use std::io::Write;
 
 use crate::Ctx;
 use crate::commands::new::{MASTER, claude_command, fresh_session_id, resolve_dir, validate_label};
-use crate::commands::{attach_mode, live, sweep_quiet};
+use crate::commands::{AttachMode, live, sweep_quiet};
 use crate::error::QError;
 use crate::model::{QuestState, Session, SessionRole, SessionStatus};
 use crate::output;
@@ -139,10 +139,15 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         }),
     )?;
 
-    // `new-window -d` left the caller's client alone; only the same-session
-    // case selects the worker's window, and `attach_mode` calls that `switch`.
+    // `new-window -d` left the caller's client alone. Only the same-session
+    // case selects the worker's window, and that is `Select`, not an attach:
+    // no client ever changes session here.
     let attaching = !args.no_attach && in_tmux_session(ctx, &quest.id, &tmux_session);
-    let attach = attach_mode(ctx, attaching);
+    let attach = if attaching {
+        AttachMode::Select
+    } else {
+        AttachMode::None
+    };
     if ctx.json || !ctx.quiet {
         output::emit(
             ctx.json,

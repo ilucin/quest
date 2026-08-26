@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::Ctx;
-use crate::commands::{NONE, attach_mode, sweep_quiet};
+use crate::commands::{AttachMode, attach_mode, sweep_quiet};
 use crate::db::{Db, ID_ATTEMPTS};
 use crate::error::QError;
 use crate::model::{NameSource, Quest, Session, SessionRole, SessionStatus, new_id};
@@ -90,7 +90,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
             },
         )?;
     }
-    if attach != NONE {
+    if attach != AttachMode::None {
         // An exec attach replaces this process, so nothing buffered survives it.
         std::io::stdout().flush()?;
         ctx.tmux().attach(&tmux_session, Some(&session.tmux_pane))?;
