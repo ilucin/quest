@@ -153,8 +153,11 @@ fn session_start(db: &Db, session: &Session, payload: &Value) -> Option<String> 
     let source = str_field(payload, "source");
     let claude_session_id = str_field(payload, "session_id");
     let pid = claude_pid();
+    // `/clear` and `/compact` start a new context window, so the last
+    // statusline reading is about a window that no longer exists (SPEC §8).
+    let fresh_window = matches!(source, Some("clear") | Some("compact"));
     let _ = db.transaction(|db| {
-        db.record_session_start(&session.id, claude_session_id, pid)?;
+        db.record_session_start(&session.id, claude_session_id, pid, fresh_window)?;
         append(db, session, "session.start", json!({ "source": source }))
     });
 
@@ -169,10 +172,21 @@ fn session_start(db: &Db, session: &Session, payload: &Value) -> Option<String> 
         session: Some(session.id.clone()),
         ..Opts::default()
     };
-    if let Ok(markdown) = brief::render(db, &quest, &opts) {
+    // Rendering the brief shells out to `bd`/`brain`, so it can take seconds —
+    // which is exactly why `q reset` waits for the marker below rather than for
+    // `session.start`: only now is the fresh context actually on its way back
+    // to Claude, and only now may the follow-up prompt be typed.
+    let brief = brief::render(db, &quest, &opts).ok();
+    if let Some(markdown) = &brief {
         context.push_str("\n\n");
-        context.push_str(&markdown);
+        context.push_str(markdown);
     }
+    let _ = append(
+        db,
+        session,
+        "session.brief_injected",
+        json!({ "source": source, "brief": brief.is_some() }),
+    );
     Some(
         json!({
             "hookSpecificOutput": {

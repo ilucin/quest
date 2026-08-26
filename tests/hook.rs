@@ -873,9 +873,17 @@ fn session_start_records_identity_and_injects_the_brief() {
     assert_eq!(s["claude_session_id"], "cs-42");
     assert!(s["claude_pid"].as_i64().unwrap() > 0);
     assert!(s["updated_at"].as_i64().unwrap() > 1);
+    // The brief marker comes *after* the render: `q reset` waits on it, so the
+    // ordering is the contract (SPEC §8).
     assert_eq!(
         env.events(),
-        [("session.start".to_string(), json!({ "source": "startup" }))]
+        [
+            ("session.start".to_string(), json!({ "source": "startup" })),
+            (
+                "session.brief_injected".to_string(),
+                json!({ "source": "startup", "brief": true })
+            )
+        ]
     );
 }
 
@@ -954,7 +962,8 @@ fn session_start_after_clear_overwrites_the_claude_session_id() {
     env.hook("session-start", &json!({ "source": "resume" }))
         .success();
     assert_eq!(env.session()["claude_session_id"], "cs-2");
-    assert_eq!(env.events().len(), 3);
+    // A `session.start` and a `session.brief_injected` per start.
+    assert_eq!(env.events().len(), 6);
 }
 
 #[test]
@@ -1181,11 +1190,31 @@ impl Env {
         .unwrap();
         conn.execute(
             "INSERT INTO session (id, quest_id, role, label, tmux_session, tmux_pane, \
-             status, ctx_pct, started_at, updated_at) VALUES ('s-0001', 'q-0001', 'master', \
-             'master', 'q-alpha', '%7', 'busy', ?1, 1, 1)",
+             status, ctx_pct, ctx_updated_at, started_at, updated_at) VALUES ('s-0001', \
+             'q-0001', 'master', 'master', 'q-alpha', '%7', 'busy', ?1, 1, 1, 1)",
             [ctx_pct],
         )
         .unwrap();
+    }
+
+    /// `(ctx_pct, ctx_updated_at)` of the seeded session.
+    fn ctx(&self) -> (Option<i64>, Option<i64>) {
+        self.conn()
+            .query_row(
+                "SELECT ctx_pct, ctx_updated_at FROM session WHERE id = 's-0001'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn set_ctx(&self, pct: i64, updated_at: i64) {
+        self.conn()
+            .execute(
+                "UPDATE session SET ctx_pct = ?1, ctx_updated_at = ?2 WHERE id = 's-0001'",
+                [pct, updated_at],
+            )
+            .unwrap();
     }
 
     fn set_quest(&self, sql: &str) {
@@ -1231,7 +1260,8 @@ fn stop_schedules_a_reset_once_the_master_crosses_the_threshold() {
         ]
     );
 
-    // The cooldown means the next turn does not schedule a second one.
+    // The next turn does not schedule a second one: `ctx_pct` still reads
+    // high, but the reading predates the reset.
     env.hook("stop", &json!({})).success();
     assert_eq!(
         env.kinds(),
@@ -1301,4 +1331,64 @@ fn the_quest_threshold_overrides_the_configured_one() {
     env.set_quest("UPDATE quest SET ctx_reset_pct = 45 WHERE id = 'q-0001'");
     env.hook("stop", &json!({})).success();
     assert_eq!(env.events()[2].1["threshold"], 45);
+}
+
+/// SPEC §8: `/clear` and `/compact` open a new window, so the last statusline
+/// reading is about one that no longer exists. Kept for every other start —
+/// a resume walks back into the same context.
+#[test]
+fn a_cleared_or_compacted_session_forgets_its_context_reading() {
+    let env = Env::new();
+    env.seed("idle");
+    env.set_ctx(88, 5);
+    env.hook("session-start", &json!({ "source": "resume" }))
+        .success();
+    assert_eq!(env.ctx(), (Some(88), Some(5)));
+
+    for source in ["clear", "compact"] {
+        env.set_ctx(88, 5);
+        env.hook("session-start", &json!({ "source": source }))
+            .success();
+        assert_eq!(env.ctx(), (None, None), "{source}");
+    }
+}
+
+/// The loop the freshness check exists to break: `ctx_pct` only drops when the
+/// statusline next refreshes, so a reading older than the reset is no evidence
+/// of anything.
+#[test]
+fn a_stale_context_reading_never_schedules_a_second_reset() {
+    let env = Env::new();
+    env.seed_master(Some(90));
+    env.hook("stop", &json!({})).success();
+    assert_eq!(env.kinds(), ["session.stop", "session.reset_scheduled"]);
+
+    // Well past the cooldown, so the freshness of the reading is the only
+    // thing left that can stop the next `Stop`.
+    env.conn()
+        .execute("UPDATE event SET ts = ts - 600", [])
+        .unwrap();
+    env.hook("stop", &json!({})).success();
+    assert_eq!(
+        env.kinds(),
+        ["session.stop", "session.reset_scheduled", "session.stop"]
+    );
+
+    // The statusline refreshed and the window is full again: a reset is due.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    env.set_ctx(90, now);
+    env.hook("stop", &json!({})).success();
+    assert_eq!(
+        env.kinds(),
+        [
+            "session.stop",
+            "session.reset_scheduled",
+            "session.stop",
+            "session.stop",
+            "session.reset_scheduled"
+        ]
+    );
 }

@@ -6047,12 +6047,13 @@ fn reset_clears_and_then_types_the_follow_up() {
 
     let payload = fleet.env.last_event(&fleet.quest_id, "session.reset");
     assert_eq!(payload["strategy"], "clear");
+    assert_eq!(payload["keys"], "/clear");
     assert_eq!(payload["ctx_pct"], 61);
     assert_eq!(payload["scheduled"], true);
     assert_eq!(payload["follow_up"], FOLLOW_UP);
-    // No real Claude under the fixture, so no `SessionStart(source=clear)`
-    // ever arrives and the wait is bounded to nothing.
-    assert_eq!(payload["cleared"], false);
+    // No real Claude under the fixture, so no `session.brief_injected` ever
+    // arrives and the wait is bounded to nothing.
+    assert_eq!(payload["brief_injected"], false);
 }
 
 #[test]
@@ -6079,15 +6080,19 @@ fn reset_compact_sends_the_quest_goal_as_the_focus() {
 
     let out = env.json(&["reset", "alpha/master", "--strategy", "compact"]);
     assert_eq!(out["strategy"], "compact");
+    // `/compact` also leaves an empty window behind, so it gets the same
+    // follow-up as `/clear` — otherwise the master idles there forever.
     let buffer = env.buffer(&pane);
-    assert!(
-        buffer.contains("/compact make the backfill idempotent"),
-        "{buffer}"
-    );
-    assert!(!buffer.contains(FOLLOW_UP), "{buffer}");
+    let compact = buffer
+        .find("/compact make the backfill idempotent")
+        .expect(&buffer);
+    let follow = buffer.find(FOLLOW_UP).expect(&buffer);
+    assert!(compact < follow, "{buffer}");
 
     let payload = env.last_event(&quest_id, "session.reset");
     assert_eq!(payload["focus"], "make the backfill idempotent");
+    assert_eq!(payload["keys"], "/compact make the backfill idempotent");
+    assert_eq!(payload["follow_up"], FOLLOW_UP);
     // No `--delay`: a manual reset.
     assert_eq!(payload["scheduled"], false);
 }
@@ -6102,7 +6107,9 @@ fn reset_without_a_goal_sends_a_bare_compact() {
     fleet
         .env
         .json(&["reset", "alpha/master", "--strategy", "compact"]);
-    assert_eq!(fleet.env.buffer(&pane).trim(), "/compact");
+    let buffer = fleet.env.buffer(&pane);
+    assert!(buffer.starts_with("/compact\n"), "{buffer}");
+    assert!(buffer.contains(FOLLOW_UP), "{buffer}");
     assert_eq!(
         fleet.env.last_event(&fleet.quest_id, "session.reset")["focus"],
         serde_json::Value::Null
@@ -6234,31 +6241,53 @@ fn new_can_opt_a_quest_out_of_auto_reset() {
     assert_eq!(plain["quest"]["auto_reset"], serde_json::Value::Null);
 }
 
+impl Env {
+    /// `q reset` in its own process, with a generous poll budget, so a marker
+    /// event can be seeded while it waits.
+    fn reset_in_background(
+        &self,
+        session_id: &str,
+        extra: &[&str],
+    ) -> std::thread::JoinHandle<std::process::Output> {
+        let mut args: Vec<String> = ["reset", session_id, "--delay", "0", "--json"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        args.extend(extra.iter().map(|a| a.to_string()));
+        let db = self.dir.path().join("q.db");
+        let config = self.dir.path().join("config.toml");
+        let fixture = self.dir.path().join("tmux.json");
+        let registry = self.dir.path().join("registry");
+        std::thread::spawn(move || {
+            std::process::Command::new(assert_cmd::cargo::cargo_bin("q"))
+                .args(&args)
+                .env("Q_DB", db)
+                .env("Q_CONFIG", config)
+                .env("Q_FIXTURE", fixture)
+                .env("Q_CLAUDE_SESSIONS_DIR", registry)
+                .env("Q_RESET_ITERATIONS", "40")
+                .env_remove("Q_QUEST")
+                .output()
+                .unwrap()
+        })
+    }
+}
+
+/// `session.brief_injected` — not `session.start` — is the signal that the
+/// fresh brief is on its way back to Claude: the `SessionStart` hook writes
+/// `session.start` before rendering it and the marker after.
 #[test]
-fn a_clear_waits_for_the_session_start_the_hook_records() {
+fn a_reset_waits_for_the_brief_marker_before_the_follow_up() {
     let fleet = Fleet::new();
     let quest_id = fleet.quest_id.clone();
-    let master_id = fleet.master_id.clone();
-    let db = fleet.env.dir.path().join("q.db");
-    let config = fleet.env.dir.path().join("config.toml");
-    let fixture = fleet.env.dir.path().join("tmux.json");
-    let registry = fleet.env.dir.path().join("registry");
+    let pane = fleet.env.json(&["peek", "alpha/master"])["pane"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let reset = fleet.env.reset_in_background(&fleet.master_id, &[]);
 
-    // A generous poll budget, so the event below lands inside it.
-    let reset = std::thread::spawn(move || {
-        std::process::Command::new(assert_cmd::cargo::cargo_bin("q"))
-            .args(["reset", &master_id, "--delay", "0", "--json"])
-            .env("Q_DB", db)
-            .env("Q_CONFIG", config)
-            .env("Q_FIXTURE", fixture)
-            .env("Q_CLAUDE_SESSIONS_DIR", registry)
-            .env("Q_RESET_ITERATIONS", "40")
-            .env_remove("Q_QUEST")
-            .output()
-            .unwrap()
-    });
-
-    // Stand in for the `SessionStart` hook the `/clear` would have fired.
+    // The order a real hook writes in: the start event lands early, the brief
+    // marker only once `brief::render` has returned.
     std::thread::sleep(std::time::Duration::from_millis(400));
     fleet.env.seed_event(
         &quest_id,
@@ -6266,15 +6295,107 @@ fn a_clear_waits_for_the_session_start_the_hook_records() {
         "session.start",
         r#"{"source":"clear"}"#,
     );
+    // While only `session.start` is in, the follow-up must not have been typed.
+    assert!(!fleet.env.buffer(&pane).contains(FOLLOW_UP));
+    fleet.env.seed_event(
+        &quest_id,
+        Some(&fleet.master_id),
+        "session.brief_injected",
+        r#"{"source":"clear","brief":true}"#,
+    );
 
     let out = reset.join().unwrap();
     assert!(out.status.success(), "{out:?}");
     let parsed: serde_json::Value =
         serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {out:?}"));
     assert_eq!(parsed["action"], "reset");
-    assert_eq!(parsed["detail"]["cleared"], true);
+    assert_eq!(parsed["detail"]["brief_injected"], true);
     assert_eq!(
-        fleet.env.last_event(&quest_id, "session.reset")["cleared"],
+        fleet.env.last_event(&quest_id, "session.reset")["brief_injected"],
         true
     );
+    assert!(fleet.env.buffer(&pane).contains(FOLLOW_UP));
+}
+
+/// The marker of the window that was just thrown away must not be mistaken
+/// for the new one's: only events appended after the keystroke count.
+#[test]
+fn a_brief_marker_from_before_the_reset_does_not_confirm_it() {
+    let fleet = Fleet::new();
+    fleet.env.seed_event(
+        &fleet.quest_id,
+        Some(&fleet.master_id),
+        "session.start",
+        r#"{"source":"clear"}"#,
+    );
+    fleet.env.seed_event(
+        &fleet.quest_id,
+        Some(&fleet.master_id),
+        "session.brief_injected",
+        r#"{"source":"clear","brief":true}"#,
+    );
+    let out = fleet.env.json(&["reset", "alpha/master", "--delay", "0"]);
+    assert_eq!(out["action"], "reset");
+    assert_eq!(out["detail"]["brief_injected"], false);
+}
+
+#[test]
+fn a_compact_waits_for_its_own_source() {
+    let fleet = Fleet::new();
+    let quest_id = fleet.quest_id.clone();
+    let reset = fleet
+        .env
+        .reset_in_background(&fleet.master_id, &["--strategy", "compact"]);
+
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    // A `clear` marker is the wrong window: `/compact` fires
+    // `SessionStart(source=compact)`.
+    fleet.env.seed_event(
+        &quest_id,
+        Some(&fleet.master_id),
+        "session.brief_injected",
+        r#"{"source":"clear","brief":true}"#,
+    );
+    fleet.env.seed_event(
+        &quest_id,
+        Some(&fleet.master_id),
+        "session.brief_injected",
+        r#"{"source":"compact","brief":true}"#,
+    );
+
+    let out = reset.join().unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed["strategy"], "compact");
+    assert_eq!(parsed["detail"]["brief_injected"], true);
+}
+
+#[test]
+fn a_scheduled_reset_that_fails_leaves_an_event_and_exits_zero() {
+    let fleet = Fleet::new();
+    // A tmux fixture q cannot read. The failure lands after the target has
+    // resolved, so there is a session to record it against.
+    std::fs::write(fleet.env.dir.path().join("tmux.json"), "not json").unwrap();
+
+    fleet
+        .env
+        .cmd()
+        .args(["reset", "alpha/master", "--delay", "0", "--json"])
+        .assert()
+        .success()
+        .stdout("");
+    let payload = fleet
+        .env
+        .last_event(&fleet.quest_id, "session.reset_failed");
+    assert_eq!(payload["stage"], "run");
+    assert_eq!(payload["scheduled"], true);
+    assert!(!payload["error"].as_str().unwrap().is_empty(), "{payload}");
+
+    // Typed by hand the same failure is an error, with a message.
+    fleet
+        .env
+        .cmd()
+        .args(["reset", "alpha/master"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::is_empty().not());
 }

@@ -9,7 +9,9 @@
 //!   and hand a detached `q reset <session> --delay 2` to the OS.
 //! * `run` is that detached process. The delay exists so Claude has finished
 //!   settling after the turn; the idle gate is then re-taken, because between
-//!   scheduling and waking the user may well have typed something.
+//!   scheduling and waking the user may well have typed something. Every
+//!   failure there is a `session.reset_failed` event and exit 0 — nobody is
+//!   reading its exit code, and its stderr goes to /dev/null.
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -23,23 +25,25 @@ use crate::model::{Session, SessionRole, SessionStatus};
 use crate::output;
 use crate::{commands::sweep_quiet, commands::target};
 
-/// Typed after `/clear`, once the `SessionStart` hook has re-injected the
-/// brief: the brief is complete, so the master only needs to be told to go on.
+/// Typed after `/clear` or `/compact`, once the `SessionStart` hook has
+/// re-injected the brief: the brief is complete, so the master only needs to
+/// be told to go on. Without it the fresh window sits idle forever.
 pub const FOLLOW_UP: &str = "Nastavi rad na questu prema briefu.";
 
 /// The delay a scheduled reset is spawned with (SPEC §8).
 const SCHEDULED_DELAY: u64 = 2;
 
-/// How long a scheduled reset suppresses the next one for the same session.
-/// The cheapest guard against double scheduling that still works: `ctx_pct`
-/// only drops once the statusline refreshes after the `/clear`, so between the
-/// reset and that refresh every `Stop` would otherwise schedule again.
-const COOLDOWN: Duration = Duration::from_secs(120);
+/// A backstop against scheduling twice in the same breath. The real guard is
+/// the `ctx_updated_at` freshness check in `schedule`; this only covers the
+/// window before the reset has written anything at all.
+const COOLDOWN: Duration = Duration::from_secs(30);
 
-/// How long `clear` waits for `SessionStart(source=clear)` before sending the
-/// follow-up anyway — a missing hook must not strand the master silently.
+/// How long a reset waits for the fresh brief before sending the follow-up
+/// anyway — a missing hook must not strand the master silently. `/compact`
+/// summarises the transcript through a model first, so it gets much longer.
 const CLEAR_TIMEOUT: Duration = Duration::from_secs(15);
-const CLEAR_POLL: Duration = Duration::from_millis(250);
+const COMPACT_TIMEOUT: Duration = Duration::from_secs(180);
+const POLL: Duration = Duration::from_millis(250);
 
 /// Cap on the `/compact` focus line, which is a tmux keystroke payload.
 const FOCUS_CHARS: usize = 200;
@@ -55,6 +59,25 @@ impl Strategy {
         match self {
             Strategy::Clear => "clear",
             Strategy::Compact => "compact",
+        }
+    }
+
+    /// The keystrokes that start the new context window. `/compact` is given
+    /// the Quest goal as its focus; `/clear` needs nothing (SPEC §8).
+    fn keys(self, goal: Option<&str>) -> (String, Option<String>) {
+        match self {
+            Strategy::Clear => ("/clear".to_string(), None),
+            Strategy::Compact => match focus_of(goal) {
+                Some(focus) => (format!("/compact {focus}"), Some(focus)),
+                None => ("/compact".to_string(), None),
+            },
+        }
+    }
+
+    fn timeout(self) -> Duration {
+        match self {
+            Strategy::Clear => CLEAR_TIMEOUT,
+            Strategy::Compact => COMPACT_TIMEOUT,
         }
     }
 
@@ -82,6 +105,38 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<u8> {
     if let Some(secs) = args.delay.filter(|d| *d > 0) {
         std::thread::sleep(Duration::from_secs(secs));
     }
+    match attempt(ctx, args, scheduled) {
+        Ok(code) => Ok(code),
+        // Nobody reads the scheduled path's exit code, and its stderr goes to
+        // /dev/null: a failure that appends no event leaves no trace at all.
+        Err(e) if scheduled => {
+            record_failure(ctx, args.session, &e);
+            Ok(0)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Best effort: re-resolves the target purely to have somewhere to log. A
+/// failure that was itself the resolution failing has no Quest to belong to.
+fn record_failure(ctx: &Ctx, session: &str, error: &anyhow::Error) {
+    let Ok(db) = ctx.db() else { return };
+    let Ok(found) = target::resolve(ctx, session) else {
+        return;
+    };
+    let _ = db.append_event(
+        &found.quest.id,
+        Some(&found.session.id),
+        "session.reset_failed",
+        &serde_json::json!({
+            "stage": "run",
+            "error": error.to_string(),
+            "scheduled": true,
+        }),
+    );
+}
+
+fn attempt(ctx: &Ctx, args: &Args, scheduled: bool) -> anyhow::Result<u8> {
     // Resolved after the sleep: the session may have ended while we waited.
     sweep_quiet(ctx)?;
     let found = target::resolve(ctx, args.session)?;
@@ -127,32 +182,24 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<u8> {
     }
 
     let ctx_pct = session.ctx_pct;
+    let (keys, focus) = strategy.keys(found.quest.goal.as_deref());
     let mut payload = serde_json::json!({
         "strategy": strategy.as_str(),
         "ctx_pct": ctx_pct,
         "scheduled": scheduled,
+        "keys": keys,
+        "focus": focus,
+        "follow_up": FOLLOW_UP,
     });
+    // Both strategies end in a fresh, empty window, and Claude will sit there
+    // idle forever unless it is told to go on (SPEC §8) — so the follow-up is
+    // typed either way, once the `SessionStart` hook has injected the brief.
     let tmux = ctx.tmux();
-    match strategy {
-        Strategy::Clear => {
-            let baseline = db.last_event_id(&found.quest.id)?;
-            tmux.send_keys(&session.tmux_pane, "/clear", true)?;
-            let confirmed = await_clear(db, &found.quest.id, &session.id, baseline)?;
-            payload["cleared"] = serde_json::json!(confirmed);
-            payload["follow_up"] = serde_json::json!(FOLLOW_UP);
-            tmux.send_keys(&session.tmux_pane, FOLLOW_UP, true)?;
-        }
-        Strategy::Compact => {
-            let focus = focus_of(found.quest.goal.as_deref());
-            let keys = match &focus {
-                Some(text) => format!("/compact {text}"),
-                None => "/compact".to_string(),
-            };
-            payload["focus"] = serde_json::json!(focus);
-            payload["keys"] = serde_json::json!(keys);
-            tmux.send_keys(&session.tmux_pane, &keys, true)?;
-        }
-    }
+    let baseline = db.last_event_id(&found.quest.id)?;
+    tmux.send_keys(&session.tmux_pane, &keys, true)?;
+    let injected = await_brief(db, &found.quest.id, &session.id, baseline, strategy)?;
+    payload["brief_injected"] = serde_json::json!(injected);
+    tmux.send_keys(&session.tmux_pane, FOLLOW_UP, true)?;
     db.append_event(
         &found.quest.id,
         Some(&session.id),
@@ -201,7 +248,7 @@ fn schedule(
     db: &Db,
     session: &Session,
     config: &Config,
-    launch: &dyn Fn(&[String]) -> bool,
+    launch: &dyn Fn(&[String]) -> Launch,
 ) -> Option<Vec<String>> {
     if session.role != SessionRole::Master {
         return None;
@@ -221,27 +268,69 @@ fn schedule(
         .ctx_reset_pct
         .unwrap_or(config.context.master_reset_pct);
     let ctx_pct = row.ctx_pct.filter(|p| *p >= threshold)?;
+    // The reading has to postdate the last reset. `/clear` empties the window
+    // immediately but `ctx_pct` only drops when the statusline next refreshes,
+    // so acting on an older reading resets the same session over and over
+    // (SPEC §8) — and it is the only thing that would.
+    if !reading_is_fresh(row.ctx_updated_at, last_reset_ts(db, &quest.id, &row.id)) {
+        return None;
+    }
     if recently_scheduled(db, &quest.id, &row.id) {
         return None;
     }
 
     let strategy = Strategy::from_config(config);
     let argv = argv(&row.id, strategy)?;
-    let spawned = launch(&argv);
+    let mut payload = serde_json::json!({
+        "ctx_pct": ctx_pct,
+        "threshold": threshold,
+        "strategy": strategy.as_str(),
+        "delay": SCHEDULED_DELAY,
+        "argv": argv,
+    });
+    // A reset that was never handed to the OS is not scheduled: it must not
+    // start a cooldown, or a transient fork failure would leave the master
+    // sitting on a full context window until it expires.
+    let outcome = launch(&argv);
+    if outcome == Launch::Failed {
+        payload["stage"] = serde_json::json!("spawn");
+        let _ = db.append_event(&quest.id, Some(&row.id), "session.reset_failed", &payload);
+        return None;
+    }
+    payload["spawned"] = serde_json::json!(outcome == Launch::Spawned);
     let _ = db.append_event(
         &quest.id,
         Some(&row.id),
         "session.reset_scheduled",
-        &serde_json::json!({
-            "ctx_pct": ctx_pct,
-            "threshold": threshold,
-            "strategy": strategy.as_str(),
-            "delay": SCHEDULED_DELAY,
-            "argv": argv,
-            "spawned": spawned,
-        }),
+        &payload,
     );
     Some(argv)
+}
+
+/// A `ctx_pct` reading is only worth acting on when it was taken after the
+/// last reset. A session that has never been reset has nothing to be stale
+/// against; one that has, and whose reading has no timestamp at all, does.
+fn reading_is_fresh(ctx_updated_at: Option<i64>, last_reset: Option<i64>) -> bool {
+    match last_reset {
+        None => true,
+        Some(last) => ctx_updated_at.is_some_and(|ts| ts > last),
+    }
+}
+
+/// When this session was last reset, or had one scheduled — the point after
+/// which a `ctx_pct` reading is believable. `None` when it never was.
+fn last_reset_ts(db: &Db, quest_id: &str, session_id: &str) -> Option<i64> {
+    let filter = EventFilter {
+        kinds: vec![
+            KindPattern::Exact("session.reset".to_string()),
+            KindPattern::Exact("session.reset_scheduled".to_string()),
+        ],
+        session_id: Some(session_id.to_string()),
+    };
+    db.list_events_latest(quest_id, &filter, 1)
+        .ok()?
+        .first()
+        .map(|e| e.ts)
 }
 
 /// True when this session already has a `session.reset_scheduled` inside
@@ -256,7 +345,7 @@ fn recently_scheduled(db: &Db, quest_id: &str, session_id: &str) -> bool {
         return true;
     };
     let cutoff = crate::model::now() - COOLDOWN.as_secs() as i64;
-    events.last().is_some_and(|e| e.ts >= cutoff)
+    events.first().is_some_and(|e| e.ts >= cutoff)
 }
 
 /// The detached command line, or `None` when this binary's own path is
@@ -275,49 +364,79 @@ fn argv(session_id: &str, strategy: Strategy) -> Option<Vec<String>> {
     ])
 }
 
+/// What became of the detached child. `Suppressed` is a decision, not a
+/// failure: the reset was scheduled, the OS was simply not involved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Launch {
+    Spawned,
+    Suppressed,
+    Failed,
+}
+
 /// Spawns `argv` fully detached — its own process group, no streams — and does
 /// not wait: the hook returns while the reset sleeps out its delay.
 ///
 /// Never under `$Q_FIXTURE` or `$Q_NO_DETACH`: tests assert on the
 /// `session.reset_scheduled` payload's `argv` instead of racing a real child.
-fn detach(argv: &[String]) -> bool {
-    if env_set("Q_FIXTURE") || env_set("Q_NO_DETACH") {
-        return false;
+fn detach(argv: &[String]) -> Launch {
+    if suppressed() {
+        return Launch::Suppressed;
     }
     let Some((program, rest)) = argv.split_first() else {
-        return false;
+        return Launch::Failed;
     };
     use std::os::unix::process::CommandExt;
-    Command::new(program)
+    let spawned = Command::new(program)
         .args(rest)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()
-        .is_ok()
+        .is_ok();
+    if spawned {
+        Launch::Spawned
+    } else {
+        Launch::Failed
+    }
+}
+
+fn suppressed() -> bool {
+    env_set("Q_FIXTURE") || env_set("Q_NO_DETACH")
 }
 
 fn env_set(key: &str) -> bool {
     std::env::var_os(key).is_some_and(|v| !v.is_empty())
 }
 
-/// Waits for the `SessionStart(source=clear)` the `/clear` should trigger, so
-/// the follow-up prompt lands on a Claude that already has the fresh brief.
-/// `false` when it never arrived — the follow-up is sent regardless.
-fn await_clear(db: &Db, quest_id: &str, session_id: &str, after: i64) -> anyhow::Result<bool> {
+/// Waits until the fresh brief is actually on its way back to Claude, so the
+/// follow-up prompt lands on a Claude that has it.
+///
+/// The marker is `session.brief_injected`, which the `SessionStart` hook
+/// appends *after* `brief::render` returns — `session.start` is written before
+/// it, and rendering shells out to `bd`/`brain`, so it can be seconds behind.
+/// Only events newer than `after` count, so the previous window's start cannot
+/// be mistaken for this one's. `false` when it never arrived — the follow-up is
+/// sent regardless, rather than strand the master.
+fn await_brief(
+    db: &Db,
+    quest_id: &str,
+    session_id: &str,
+    after: i64,
+    strategy: Strategy,
+) -> anyhow::Result<bool> {
     let filter = EventFilter {
-        kinds: vec![KindPattern::Exact("session.start".to_string())],
+        kinds: vec![KindPattern::Exact("session.brief_injected".to_string())],
         session_id: Some(session_id.to_string()),
     };
-    for _ in 0..clear_polls() {
-        std::thread::sleep(CLEAR_POLL);
+    for _ in 0..polls(strategy) {
+        std::thread::sleep(POLL);
         let fresh = db.list_events_after(quest_id, after, &filter, 16)?;
         if fresh.iter().any(|e| {
             e.payload
                 .as_ref()
                 .and_then(|p| p["source"].as_str())
-                .is_some_and(|s| s == "clear")
+                .is_some_and(|s| s == strategy.as_str())
         }) {
             return Ok(true);
         }
@@ -325,29 +444,33 @@ fn await_clear(db: &Db, quest_id: &str, session_id: &str, after: i64) -> anyhow:
     Ok(false)
 }
 
-/// How many times `await_clear` polls. Under `$Q_FIXTURE` no real Claude can
+/// How many times `await_brief` polls. Under `$Q_FIXTURE` no real Claude can
 /// ever fire the hook, so the wait is bounded by `$Q_RESET_ITERATIONS`
 /// (default 0 — proceed straight to the follow-up) the way `q events --follow`
 /// is bounded by `$Q_FOLLOW_ITERATIONS`.
-fn clear_polls() -> u32 {
+fn polls(strategy: Strategy) -> u32 {
     if env_set("Q_FIXTURE") {
         return std::env::var("Q_RESET_ITERATIONS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
     }
-    (CLEAR_TIMEOUT.as_millis() / CLEAR_POLL.as_millis()) as u32
+    (strategy.timeout().as_millis() / POLL.as_millis()) as u32
 }
 
 /// The Quest goal as a single short line, for `/compact <focus>`. `None` for a
 /// Quest without one, which sends a bare `/compact`.
 fn focus_of(goal: Option<&str>) -> Option<String> {
+    // The focus is a tmux keystroke payload, and a control character typed into
+    // a TUI is a key of its own (ESC leaves the prompt, CR submits) — so they
+    // count as whitespace here and collapse away with the rest.
     let flat = goal?
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_string();
+        .join(" ");
     if flat.is_empty() {
         return None;
     }
@@ -376,6 +499,7 @@ mod tests {
         let mut row = Session::new(&quest.id, SessionRole::Master, "master", "q-alpha", "%1");
         row.status = status;
         row.ctx_pct = ctx_pct;
+        row.ctx_updated_at = ctx_pct.map(|_| crate::model::now());
         let session = db.insert_session(&row).unwrap();
         (db, quest, session)
     }
@@ -392,10 +516,10 @@ mod tests {
             self.0.get()
         }
 
-        fn as_fn(&self) -> impl Fn(&[String]) -> bool + '_ {
+        fn as_fn(&self) -> impl Fn(&[String]) -> Launch + '_ {
             |_argv| {
                 self.0.set(self.0.get() + 1);
-                true
+                Launch::Spawned
             }
         }
     }
@@ -424,11 +548,61 @@ mod tests {
         assert_eq!(payload["spawned"], true);
         assert_eq!(payload["argv"], serde_json::json!(argv));
 
-        // The cooldown keeps the next `Stop` from scheduling again while
-        // `ctx_pct` still reads high.
+        // The next `Stop` does not schedule again: `ctx_pct` still reads high
+        // but the reading predates the reset.
         assert!(schedule(&db, &session, &config, &launcher.as_fn()).is_none());
         assert_eq!(launcher.calls(), 1);
         assert_eq!(scheduled_events(&db, &quest.id).len(), 1);
+    }
+
+    #[test]
+    fn only_a_reading_taken_after_the_last_reset_counts() {
+        // Never reset: nothing to be stale against.
+        assert!(reading_is_fresh(None, None));
+        assert!(reading_is_fresh(Some(10), None));
+        // The reading has to be strictly newer than the reset.
+        assert!(reading_is_fresh(Some(101), Some(100)));
+        assert!(!reading_is_fresh(Some(100), Some(100)));
+        assert!(!reading_is_fresh(Some(99), Some(100)));
+        // A reading whose age is unknown is not evidence of a full window.
+        assert!(!reading_is_fresh(None, Some(100)));
+    }
+
+    #[test]
+    fn a_failed_spawn_neither_counts_as_scheduled_nor_starts_a_cooldown() {
+        let (db, quest, session) = fleet(Some(90), SessionStatus::Idle);
+        let config = Config::default();
+        assert!(schedule(&db, &session, &config, &|_| Launch::Failed).is_none());
+        assert!(scheduled_events(&db, &quest.id).is_empty());
+
+        let failed = db
+            .list_events_by_kinds(&quest.id, &["session.reset_failed"], 10)
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        let payload = failed[0].payload.as_ref().unwrap();
+        assert_eq!(payload["stage"], "spawn");
+        assert_eq!(payload["strategy"], "clear");
+        assert!(payload["argv"].is_array(), "{payload}");
+        assert!(payload["spawned"].is_null(), "{payload}");
+
+        // Nothing was suppressed, so the very next `Stop` tries again.
+        let launcher = Launcher::new();
+        assert!(schedule(&db, &session, &config, &launcher.as_fn()).is_some());
+        assert_eq!(launcher.calls(), 1);
+    }
+
+    #[test]
+    fn a_suppressed_spawn_still_counts_as_scheduled() {
+        let (db, quest, session) = fleet(Some(90), SessionStatus::Idle);
+        assert!(
+            schedule(&db, &session, &Config::default(), &|_| {
+                Launch::Suppressed
+            })
+            .is_some()
+        );
+        let events = scheduled_events(&db, &quest.id);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload.as_ref().unwrap()["spawned"], false);
     }
 
     #[test]
@@ -445,14 +619,14 @@ mod tests {
         }
         // The threshold is inclusive.
         let (db, _, session) = fleet(Some(35), SessionStatus::Idle);
-        assert!(schedule(&db, &session, &Config::default(), &|_| true).is_some());
+        assert!(schedule(&db, &session, &Config::default(), &|_| Launch::Spawned).is_some());
     }
 
     #[test]
     fn a_worker_is_never_reset_however_full_it_is() {
         let (db, quest, mut session) = fleet(Some(99), SessionStatus::Idle);
         session.role = SessionRole::Worker;
-        assert!(schedule(&db, &session, &Config::default(), &|_| true).is_none());
+        assert!(schedule(&db, &session, &Config::default(), &|_| Launch::Spawned).is_none());
         assert!(scheduled_events(&db, &quest.id).is_empty());
     }
 
@@ -468,7 +642,7 @@ mod tests {
         ] {
             let (db, quest, session) = fleet(Some(90), status);
             assert!(
-                schedule(&db, &session, &Config::default(), &|_| true).is_none(),
+                schedule(&db, &session, &Config::default(), &|_| Launch::Spawned).is_none(),
                 "{status}"
             );
             assert!(scheduled_events(&db, &quest.id).is_empty(), "{status}");
@@ -481,7 +655,7 @@ mod tests {
         off.context.auto_reset = false;
 
         let (db, _, session) = fleet(Some(90), SessionStatus::Idle);
-        assert!(schedule(&db, &session, &off, &|_| true).is_none());
+        assert!(schedule(&db, &session, &off, &|_| Launch::Spawned).is_none());
 
         // A Quest that says `on` overrides a config that says off, and vice
         // versa: NULL is the only value that follows the config.
@@ -495,7 +669,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(patched.auto_reset, Some(true));
-        assert!(schedule(&db, &session, &off, &|_| true).is_some());
+        assert!(schedule(&db, &session, &off, &|_| Launch::Spawned).is_some());
 
         let (db, _, session) = fleet(Some(90), SessionStatus::Idle);
         db.update_quest(
@@ -506,7 +680,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(schedule(&db, &session, &Config::default(), &|_| true).is_none());
+        assert!(schedule(&db, &session, &Config::default(), &|_| Launch::Spawned).is_none());
     }
 
     #[test]
@@ -515,7 +689,7 @@ mod tests {
         let mut config = Config::default();
         config.context.master_reset_pct = 80;
         config.context.reset_strategy = "compact".to_string();
-        assert!(schedule(&db, &session, &config, &|_| true).is_none());
+        assert!(schedule(&db, &session, &config, &|_| Launch::Spawned).is_none());
 
         db.update_quest(
             &quest.id,
@@ -525,7 +699,7 @@ mod tests {
             },
         )
         .unwrap();
-        let argv = schedule(&db, &session, &config, &|_| true).unwrap();
+        let argv = schedule(&db, &session, &config, &|_| Launch::Spawned).unwrap();
         assert!(argv.contains(&"compact".to_string()), "{argv:?}");
         let payload = scheduled_events(&db, &quest.id)[0].payload.clone().unwrap();
         assert_eq!(payload["threshold"], 45);
@@ -551,6 +725,12 @@ mod tests {
             focus_of(Some("  make the\n backfill\tidempotent ")),
             Some("make the backfill idempotent".to_string())
         );
+        // Every control character is a keystroke of its own once typed into a
+        // TUI, so none may reach send-keys.
+        let focus = focus_of(Some("ship\u{1b}[A it\u{7}\u{0}now\r\n")).unwrap();
+        assert_eq!(focus, "ship [A it now");
+        assert!(!focus.chars().any(char::is_control), "{focus:?}");
+        assert_eq!(focus_of(Some("\u{1b}\u{7}\r\n\t")), None);
         let long = "ž".repeat(FOCUS_CHARS + 50);
         let focus = focus_of(Some(&long)).unwrap();
         assert_eq!(focus.chars().count(), FOCUS_CHARS);

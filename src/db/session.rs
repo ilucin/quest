@@ -246,17 +246,31 @@ impl Db {
 
     /// A Claude session (re)started in this pane: new identity, back to
     /// `idle`. An `ended` row resumes — `ended_at` is cleared.
+    ///
+    /// `fresh_window` for the starts that threw the context window away
+    /// (`/clear`, `/compact`): the last statusline reading describes a window
+    /// that no longer exists, and a stale high `ctx_pct` would schedule reset
+    /// after reset (SPEC §8). Forgotten rather than guessed at — the next
+    /// statusline refresh fills it in.
     pub fn record_session_start(
         &self,
         id: &str,
         claude_session_id: Option<&str>,
         claude_pid: Option<i64>,
+        fresh_window: bool,
     ) -> anyhow::Result<Session> {
+        let forget_ctx = if fresh_window {
+            "ctx_pct = NULL, ctx_updated_at = NULL, "
+        } else {
+            ""
+        };
         self.conn
             .execute(
-                "UPDATE session SET status = 'idle', waiting_for = NULL, ended_at = NULL, \
-                 claude_session_id = COALESCE(?1, claude_session_id), \
-                 claude_pid = COALESCE(?2, claude_pid), updated_at = ?3 WHERE id = ?4",
+                &format!(
+                    "UPDATE session SET status = 'idle', waiting_for = NULL, ended_at = NULL, \
+                     {forget_ctx}claude_session_id = COALESCE(?1, claude_session_id), \
+                     claude_pid = COALESCE(?2, claude_pid), updated_at = ?3 WHERE id = ?4"
+                ),
                 params![claude_session_id, claude_pid, now(), id],
             )
             .map_err(db_err)?;
@@ -486,16 +500,32 @@ mod tests {
         db.mark_session_ended(&s.id, 7).unwrap();
 
         let started = db
-            .record_session_start(&s.id, Some("cs-1"), Some(42))
+            .record_session_start(&s.id, Some("cs-1"), Some(42), false)
             .unwrap();
         assert_eq!(started.status, SessionStatus::Idle);
         assert_eq!(started.ended_at, None);
         assert_eq!(started.claude_session_id.as_deref(), Some("cs-1"));
         assert_eq!(started.claude_pid, Some(42));
 
-        let again = db.record_session_start(&s.id, None, None).unwrap();
+        let again = db.record_session_start(&s.id, None, None, false).unwrap();
         assert_eq!(again.claude_session_id.as_deref(), Some("cs-1"));
         assert_eq!(again.claude_pid, Some(42));
+    }
+
+    #[test]
+    fn a_fresh_window_forgets_the_context_reading_and_a_resume_keeps_it() {
+        let db = db();
+        let q = quest(&db, "alpha");
+        let s = session(&db, &q.id, "w1", "%1");
+        db.update_session_ctx(&s.id, 88, None).unwrap();
+
+        let resumed = db.record_session_start(&s.id, None, None, false).unwrap();
+        assert_eq!(resumed.ctx_pct, Some(88));
+        assert!(resumed.ctx_updated_at.is_some());
+
+        let cleared = db.record_session_start(&s.id, None, None, true).unwrap();
+        assert_eq!(cleared.ctx_pct, None);
+        assert_eq!(cleared.ctx_updated_at, None);
     }
 
     #[test]
