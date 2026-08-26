@@ -267,10 +267,23 @@ fn parse_panes(stdout: &str) -> Vec<Pane> {
     stdout.lines().filter_map(parse_pane).collect()
 }
 
+/// The pane line of a `-P -F` or `display-message` run. tmux can print a
+/// warning ahead of it, so the format output is the last line, not the whole
+/// of stdout.
+fn last_line(stdout: &str) -> &str {
+    stdout.lines().next_back().unwrap_or("")
+}
+
 /// True when tmux failed only because no server is running — for a liveness
 /// sweep that is indistinguishable from "no panes".
 pub fn is_no_server(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("no server running")
+}
+
+/// True when tmux refused only because the session has no client to move —
+/// the normal state of a Quest started with `-d` or since detached.
+pub fn is_no_client(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("no current client")
 }
 
 /// An empty target is not "the current pane" as far as q is concerned: it means
@@ -314,8 +327,18 @@ fn run_bool(argv: &[String]) -> anyhow::Result<bool> {
 impl RealTmux {
     fn pane_at(&self, target: &str) -> anyhow::Result<Pane> {
         let out = run(&args_display_pane(target))?;
-        parse_pane(out.trim_end_matches('\n'))
+        parse_pane(last_line(&out))
             .ok_or_else(|| QError::Tmux(format!("cannot read pane of `{target}`")).into())
+    }
+
+    /// The tmux session this process's own pane sits in, when it has one.
+    /// `$TMUX_PANE` is the only thing that survives a shell inside tmux.
+    fn current_session(&self) -> Option<String> {
+        let pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty())?;
+        self.list_panes()
+            .ok()?
+            .into_iter()
+            .find_map(|p| (p.pane_id == pane).then_some(p.session_name))
     }
 }
 
@@ -326,7 +349,7 @@ impl Tmux for RealTmux {
 
     fn new_session(&self, spec: &NewSession) -> anyhow::Result<Pane> {
         let out = run(&args_new_session(spec))?;
-        let line = out.trim_end_matches('\n');
+        let line = last_line(&out);
         parse_pane(line).ok_or_else(|| {
             // The session is up, but without its pane id nothing can address
             // it; a stray Claude is worse than no session at all.
@@ -337,7 +360,7 @@ impl Tmux for RealTmux {
 
     fn new_window(&self, spec: &NewWindow) -> anyhow::Result<Pane> {
         let out = run(&args_new_window(spec))?;
-        let line = out.trim_end_matches('\n');
+        let line = last_line(&out);
         parse_pane(line).ok_or_else(|| {
             // Same as above, but only this window is ours to take down. The
             // leading field is the pane id even when the rest is unreadable.
@@ -358,7 +381,22 @@ impl Tmux for RealTmux {
             self.select_window(p)?;
         }
         if in_tmux() {
-            run(&args_switch_client(session))?;
+            // Already inside the target session: the window is selected and
+            // there is no client to move. `switch-client` would either be a
+            // no-op or fail on a session nobody is attached to.
+            if self.current_session().as_deref() == Some(session) {
+                return Ok(());
+            }
+            if let Err(e) = run(&args_switch_client(session)) {
+                // A detached session (`q new -d`, or the user let go of it) has
+                // no client to switch. The window is selected, so the next real
+                // attach lands on it — not worth failing the command over.
+                if is_no_client(&e) {
+                    eprintln!("warning: {e:#}");
+                    return Ok(());
+                }
+                return Err(e);
+            }
             return Ok(());
         }
         use std::os::unix::process::CommandExt;
@@ -1357,6 +1395,25 @@ mod tests {
         // Selecting is not attaching.
         assert!(state.attached.is_none());
         assert_ne!(state.selected, Some(master.pane_id));
+    }
+
+    #[test]
+    fn the_pane_line_is_the_last_line_of_stdout() {
+        // tmux can warn ahead of the `-P -F` output; the format line is last.
+        assert_eq!(last_line("%42\t1\tq-a\tw\t0\n"), "%42\t1\tq-a\tw\t0");
+        assert_eq!(last_line("sessions should be nested\n%42\t1\n"), "%42\t1");
+        assert_eq!(last_line(""), "");
+        assert_eq!(last_line("\n"), "");
+    }
+
+    #[test]
+    fn a_clientless_session_is_told_apart_from_a_real_failure() {
+        let no_client: anyhow::Error =
+            QError::Tmux("`tmux switch-client` failed: no current client".to_string()).into();
+        let other: anyhow::Error =
+            QError::Tmux("`tmux switch-client` failed: can\'t find session".to_string()).into();
+        assert!(is_no_client(&no_client));
+        assert!(!is_no_client(&other));
     }
 
     #[test]

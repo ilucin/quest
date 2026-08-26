@@ -124,7 +124,16 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    let session = db.update_session_pane(&session_id, &pane.pane_id)?;
+    let session = match db.update_session_pane(&session_id, &pane.pane_id) {
+        Ok(session) => session,
+        // Without its pane the row can never be addressed, entered or swept —
+        // and the window would outlive it as a Claude nobody owns.
+        Err(e) => {
+            let _ = ctx.tmux().kill_window(&pane.pane_id);
+            let _ = db.delete_session(&session_id);
+            return Err(e);
+        }
+    };
     db.append_event(
         &quest.id,
         Some(&session.id),
