@@ -128,6 +128,22 @@ impl Db {
         self.require_session(id)
     }
 
+    /// Follows a `q rename`: the tmux session was renamed under these rows.
+    /// Ended sessions are history and keep the name they actually ran under.
+    pub fn update_sessions_tmux_session(
+        &self,
+        quest_id: &str,
+        tmux_session: &str,
+    ) -> anyhow::Result<usize> {
+        self.conn
+            .execute(
+                "UPDATE session SET tmux_session = ?1, updated_at = ?2 \
+                 WHERE quest_id = ?3 AND status != 'ended'",
+                params![tmux_session, now(), quest_id],
+            )
+            .map_err(db_err)
+    }
+
     /// The live session in that pane. Ended rows stay behind as history, and a
     /// pane can be reused, so they are skipped.
     pub fn find_session_by_pane(&self, tmux_pane: &str) -> anyhow::Result<Option<Session>> {
@@ -326,6 +342,26 @@ mod tests {
             Some("not_found"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn a_rename_moves_only_the_live_sessions() {
+        let db = db();
+        let a = quest(&db, "alpha");
+        let b = quest(&db, "beta");
+        let live = session(&db, &a.id, "master", "%1");
+        let ended = session(&db, &a.id, "w1", "%2");
+        let other = session(&db, &b.id, "master", "%3");
+        db.mark_session_ended(&ended.id, 1).unwrap();
+
+        assert_eq!(
+            db.update_sessions_tmux_session(&a.id, "q-omega").unwrap(),
+            1
+        );
+        let name = |id: &str| db.get_session(id).unwrap().unwrap().tmux_session;
+        assert_eq!(name(&live.id), "q-omega");
+        assert_eq!(name(&ended.id), "q-alpha");
+        assert_eq!(name(&other.id), "q-alpha");
     }
 
     #[test]

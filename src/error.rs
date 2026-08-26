@@ -43,10 +43,6 @@ pub enum QError {
 }
 
 impl QError {
-    pub fn not_implemented(what: &str) -> Self {
-        QError::NotImplemented(what.to_string())
-    }
-
     /// Stable, snake_case identifier used in `--json` error payloads.
     pub fn code(&self) -> &'static str {
         match self {
