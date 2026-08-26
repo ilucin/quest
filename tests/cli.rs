@@ -2166,6 +2166,8 @@ fn brief_reads_bd_and_brain_from_fixtures() {
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(out.contains("unavailable (bd missing or failed)"), "{out}");
     assert!(out.contains("_(brain note unavailable)_"), "{out}");
+}
+
 // ------------------------------------------------ agent self-report (bd-8lz.2.5)
 
 /// A Quest with its master session, and a command pre-wired with the env a
@@ -2562,9 +2564,186 @@ fn artifact_add_stores_the_note_in_meta() {
         })
     );
 
-    // A path that does not exist yet is still accepted: artifacts are often
-    // promised before they are written.
-    let out = pane.json(&["artifact", "add", "/nope/later.md"]);
-    assert_eq!(out["link"]["ref"], "/nope/later.md");
+    // A file that does not exist yet is accepted (artifacts are promised
+    // before they are written) as long as its directory does.
+    let later = out_dir.join("later.md");
+    let out = pane.json(&["artifact", "add", later.to_str().unwrap()]);
+    assert_eq!(out["link"]["ref"], later.to_str().unwrap());
     assert!(out["link"]["meta"].is_null());
+}
+
+#[test]
+fn artifact_add_rejects_urls_and_missing_directories() {
+    let pane = Pane::new();
+    for path in ["https://example.com/report.html", "/nope/deeper/later.md"] {
+        let assert = pane
+            .cmd()
+            .args(["artifact", "add", path, "--json"])
+            .assert()
+            .code(1);
+        assert_eq!(error_json(&assert)["code"], "invalid", "{path}");
+    }
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 0);
+}
+
+#[test]
+fn artifact_add_fills_a_missing_note_but_keeps_an_existing_one() {
+    let pane = Pane::new();
+    let file = pane.env.work("out").join("r.md");
+    let path = file.to_str().unwrap();
+    pane.json(&["artifact", "add", path]);
+    pane.cmd()
+        .args(["artifact", "add", path, "--note", "first"])
+        .assert()
+        .success()
+        .stdout(predicate::str::ends_with("(already linked; note set)\n"));
+    let out = pane.json(&["artifact", "add", path, "--note", "second"]);
+    assert_eq!(out["created"], false);
+    assert_eq!(out["link"]["meta"]["note"], "first");
+    pane.cmd()
+        .args(["artifact", "add", path, "--note", "second"])
+        .assert()
+        .success()
+        .stdout(predicate::str::ends_with(
+            "(already linked; kept existing note)\n",
+        ));
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 1);
+    assert_eq!(
+        pane.events()
+            .iter()
+            .filter(|(k, _, _)| k == "artifact.added")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn paths_expand_a_leading_tilde() {
+    let pane = Pane::new();
+    let home = pane.env.work("home");
+    std::fs::create_dir_all(home.join("out")).unwrap();
+    let mut cmd = pane.cmd();
+    let assert = cmd
+        .env("HOME", &home)
+        .args(["artifact", "add", "~/out/report.md", "--json"])
+        .assert()
+        .success();
+    assert_eq!(
+        json_of(&assert)["link"]["ref"],
+        home.join("out/report.md").to_str().unwrap()
+    );
+
+    let mut cmd = pane.cmd();
+    let assert = cmd
+        .env("HOME", &home)
+        .args(["link", "add", "~/out/report.md", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    // Same file already linked as an artifact: the row is reused.
+    assert_eq!(out["created"], false);
+    assert_eq!(out["link"]["kind"], "artifact");
+}
+
+#[test]
+fn link_add_normalises_pr_urls_and_dedupes_across_kinds() {
+    let pane = Pane::new();
+    let canonical = "https://github.com/acme/api/pull/42";
+    let out = pane.json(&[
+        "link",
+        "add",
+        "http://www.github.com/acme/api/pull/42/files?diff=split#r1",
+    ]);
+    assert_eq!(out["link"]["kind"], "pr");
+    assert_eq!(out["link"]["ref"], canonical);
+    let out = pane.json(&[
+        "link",
+        "add",
+        "https://github.com/acme/api/pull/42#issuecomment-1",
+    ]);
+    assert_eq!(out["created"], false);
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 1);
+
+    // Added as a plain url first, autodetected later: still one row.
+    let docs = "https://example.com/docs";
+    pane.json(&["link", "add", docs, "--kind", "url"]);
+    let out = pane.json(&["link", "add", docs]);
+    assert_eq!(out["created"], false);
+    assert_eq!(out["link"]["kind"], "url");
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 2);
+    // An explicit different kind is a deliberate second row.
+    let out = pane.json(&["link", "add", docs, "--kind", "brain"]);
+    assert_eq!(out["created"], true);
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 3);
+}
+
+#[test]
+fn link_add_sets_a_missing_title_but_keeps_an_existing_one() {
+    let pane = Pane::new();
+    let url = "https://example.com";
+    pane.json(&["link", "add", url]);
+    pane.cmd()
+        .args(["link", "add", url, "--title", "Docs"])
+        .assert()
+        .success()
+        .stdout(format!(
+            "link #1 url {url} — Docs (already linked; title set)\n"
+        ));
+    pane.cmd()
+        .args(["link", "add", url, "--title", "Other"])
+        .assert()
+        .success()
+        .stdout(format!(
+            "link #1 url {url} — Docs (already linked; kept existing title)\n"
+        ));
+    let out = pane.json(&["links"]);
+    assert_eq!(out[0]["title"], "Docs");
+    assert_eq!(
+        pane.events()
+            .iter()
+            .filter(|(k, _, _)| k == "link.added")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn links_is_read_only_and_ignores_the_pane_session() {
+    let pane = Pane::new();
+    let other = pane.env.new_quest("beta");
+    let other_id = other["quest"]["id"].as_str().unwrap();
+    let mut cmd = pane.env.cmd();
+    cmd.args(["link", "add", "https://example.com", "--quest", other_id])
+        .assert()
+        .success();
+
+    // From alpha's pane, listing beta works…
+    let out = pane.json(&["links", "beta"]);
+    assert_eq!(out.as_array().unwrap().len(), 1);
+    // …but writing to beta from alpha's session does not.
+    let assert = pane
+        .cmd()
+        .args(["note", "x", "--quest", "beta", "--json"])
+        .assert()
+        .code(1);
+    assert_eq!(error_json(&assert)["code"], "invalid");
+}
+
+#[test]
+fn ended_session_env_is_rejected_for_writes() {
+    let pane = Pane::new();
+    pane.env
+        .conn()
+        .execute(
+            "UPDATE session SET status = 'ended' WHERE id = ?1",
+            [&pane.session_id],
+        )
+        .unwrap();
+    let assert = pane.cmd().args(["note", "late", "--json"]).assert().code(1);
+    let err = error_json(&assert);
+    assert_eq!(err["code"], "invalid");
+    assert!(err["error"].as_str().unwrap().contains("ended"), "{err}");
+    assert!(pane.events().iter().all(|(k, _, _)| k != "note"));
+    // Reads still work.
+    pane.cmd().args(["links"]).assert().success();
 }

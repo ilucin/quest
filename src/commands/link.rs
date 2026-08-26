@@ -19,15 +19,25 @@ pub struct AddArgs<'a> {
 }
 
 pub fn add(ctx: &Ctx, args: &AddArgs) -> anyhow::Result<()> {
-    let reference = args.r#ref.trim();
+    let reference = expand_tilde(args.r#ref.trim());
     if reference.is_empty() {
         return Err(QError::Invalid("reference must not be empty".to_string()).into());
     }
     let target = report::resolve(ctx, args.quest)?;
     let cwd = std::env::current_dir()?;
+    let db = ctx.db()?;
+
+    // Without --kind the same ref under any kind is the same link: a PR first
+    // added as `url` must not become a second row once autodetected.
+    if args.kind.is_none()
+        && let Some(existing) = db.find_link_by_ref(&target.quest.id, &reference)?
+    {
+        return report_existing(ctx, existing, args.title, None);
+    }
+
     let kind = match args.kind {
         Some(k) => k,
-        None => detect_kind(reference, &probe(&cwd)).ok_or_else(|| {
+        None => detect_kind(&reference, &probe(&cwd)).ok_or_else(|| {
             QError::Invalid(format!(
                 "cannot tell what `{reference}` is; pass --kind <pr|task|worktree|url|branch|beads|brain|artifact>"
             ))
@@ -35,12 +45,13 @@ pub fn add(ctx: &Ctx, args: &AddArgs) -> anyhow::Result<()> {
     };
     // Paths are stored absolute so every session and machine reads the same ref.
     let reference = match kind {
-        LinkKind::Worktree | LinkKind::Artifact => absolute(&cwd, reference),
-        _ => reference.to_string(),
+        LinkKind::Worktree | LinkKind::Artifact => absolute(&cwd, &reference),
+        LinkKind::Pr => normalize_pr_url(&reference),
+        _ => reference,
     };
     let mut link = Link::new(&target.quest.id, kind.as_str(), &reference);
     link.title = args.title.map(str::to_string);
-    insert(ctx, &target, link, "link.added", None)
+    insert(ctx, &target, link, "link.added", None, args.title, None)
 }
 
 pub fn add_artifact(
@@ -49,57 +60,100 @@ pub fn add_artifact(
     note: Option<&str>,
     quest: Option<&str>,
 ) -> anyhow::Result<()> {
-    let path = path.trim();
+    let path = expand_tilde(path.trim());
     if path.is_empty() {
         return Err(QError::Invalid("path must not be empty".to_string()).into());
     }
     let target = report::resolve(ctx, quest)?;
     let cwd = std::env::current_dir()?;
-    let mut link = Link::new(&target.quest.id, "artifact", &absolute(&cwd, path));
+    let mut link = Link::new(&target.quest.id, "artifact", &artifact_path(&cwd, &path)?);
     let note = note.map(str::trim).filter(|n| !n.is_empty());
     if let Some(n) = note {
         link.meta = Some(serde_json::json!({ "note": n }));
     }
-    insert(ctx, &target, link, "artifact.added", note)
+    insert(ctx, &target, link, "artifact.added", note, None, note)
 }
 
 /// Idempotent on `UNIQUE(quest_id, kind, ref)`: an existing row is returned as
-/// is and no event is written.
+/// is and no event is written. `title`/`note` fill blanks on the existing row.
+#[allow(clippy::too_many_arguments)]
 fn insert(
     ctx: &Ctx,
     target: &Target,
     mut link: Link,
     event_kind: &str,
+    event_note: Option<&str>,
+    title: Option<&str>,
     note: Option<&str>,
 ) -> anyhow::Result<()> {
     let db = ctx.db()?;
-    let existing = db.find_link(&target.quest.id, &link.kind, &link.r#ref)?;
-    let (link, created) = match existing {
-        Some(l) => (l, false),
-        None => {
-            link.session_id = target.session_id().map(str::to_string);
-            let stored = db.insert_link(&link)?;
-            let mut payload = serde_json::json!({
-                "id": stored.id,
-                "kind": stored.kind,
-                "ref": stored.r#ref,
-            });
-            if let Some(n) = note {
-                payload["note"] = serde_json::Value::String(n.to_string());
-            }
-            db.append_event(&target.quest.id, target.session_id(), event_kind, &payload)?;
-            (stored, true)
-        }
-    };
+    if let Some(existing) = db.find_link(&target.quest.id, &link.kind, &link.r#ref)? {
+        return report_existing(ctx, existing, title, note);
+    }
 
+    link.session_id = target.session_id().map(str::to_string);
+    let stored = db.insert_link(&link)?;
+    let mut payload = serde_json::json!({
+        "id": stored.id,
+        "kind": stored.kind,
+        "ref": stored.r#ref,
+    });
+    if let Some(n) = event_note {
+        payload["note"] = serde_json::Value::String(n.to_string());
+    }
+    db.append_event(&target.quest.id, target.session_id(), event_kind, &payload)?;
+    emit_link(ctx, &stored, true, "")
+}
+
+/// The row already exists: set `title`/`note` where the row has none, keep
+/// what is there otherwise, and say which happened. No event either way.
+fn report_existing(
+    ctx: &Ctx,
+    mut link: Link,
+    title: Option<&str>,
+    note: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut notes: Vec<&str> = vec!["already linked"];
+    let mut changed = false;
+    if let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) {
+        if link.title.as_deref().is_some_and(|c| !c.is_empty()) {
+            notes.push("kept existing title");
+        } else {
+            link.title = Some(t.to_string());
+            notes.push("title set");
+            changed = true;
+        }
+    }
+    if let Some(n) = note {
+        let has_note = link
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("note"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty());
+        if has_note {
+            notes.push("kept existing note");
+        } else {
+            let mut meta = link.meta.take().unwrap_or_else(|| serde_json::json!({}));
+            meta["note"] = serde_json::Value::String(n.to_string());
+            link.meta = Some(meta);
+            notes.push("note set");
+            changed = true;
+        }
+    }
+    if changed {
+        ctx.db()?.update_link_details(&link)?;
+    }
+    let suffix = format!(" ({})", notes.join("; "));
+    emit_link(ctx, &link, false, &suffix)
+}
+
+fn emit_link(ctx: &Ctx, link: &Link, created: bool, suffix: &str) -> anyhow::Result<()> {
     if ctx.json || !ctx.quiet {
         output::emit(
             ctx.json,
             &serde_json::json!({ "link": link, "created": created }),
-            || {
-                let suffix = if created { "" } else { " (already linked)" };
-                format!("{}{suffix}", line(&link))
-            },
+            || format!("{}{suffix}", line(link)),
         )?;
     }
     Ok(())
@@ -135,12 +189,13 @@ pub fn list(ctx: &Ctx, quest: Option<&str>, refresh: bool) -> anyhow::Result<()>
         // TODO(M2): enrichment; the flag is accepted so scripts can start using it.
         eprintln!("note: --refresh is not implemented yet; showing stored links");
     }
-    let target = report::resolve(ctx, quest)?;
-    let links = ctx.db()?.list_links_by_quest(&target.quest.id)?;
+    // Read-only: any Quest may be listed from any pane.
+    let quest = report::resolve_quest(ctx, quest)?;
+    let links = ctx.db()?.list_links_by_quest(&quest.id)?;
 
     output::emit(ctx.json, &links, || {
         if links.is_empty() {
-            return format!("no links on {} ({})", target.quest.id, target.quest.slug);
+            return format!("no links on {} ({})", quest.id, quest.slug);
         }
         let mut groups: BTreeMap<&str, Vec<&Link>> = BTreeMap::new();
         for l in &links {
@@ -169,6 +224,25 @@ fn line(link: &Link) -> String {
     }
 }
 
+/// `~` and `~/x` become the home directory; anything else is returned as is.
+fn expand_tilde(reference: &str) -> String {
+    let Some(rest) = reference.strip_prefix('~') else {
+        return reference.to_string();
+    };
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return reference.to_string();
+    }
+    let Some(home) = dirs::home_dir() else {
+        return reference.to_string();
+    };
+    match rest.trim_start_matches('/') {
+        "" => home.to_string_lossy().into_owned(),
+        tail => home.join(tail).to_string_lossy().into_owned(),
+    }
+}
+
+/// Absolute path with the deepest existing ancestor canonicalised (so `/tmp/x`
+/// and `/private/tmp/x` are one ref on macOS) and the rest joined verbatim.
 fn absolute(cwd: &Path, path: &str) -> String {
     let p = Path::new(path);
     let joined: PathBuf = if p.is_absolute() {
@@ -176,11 +250,74 @@ fn absolute(cwd: &Path, path: &str) -> String {
     } else {
         cwd.join(p)
     };
-    joined
-        .canonicalize()
-        .unwrap_or(joined)
-        .to_string_lossy()
-        .into_owned()
+    if let Ok(c) = joined.canonicalize() {
+        return c.to_string_lossy().into_owned();
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut head = joined.as_path();
+    while let Some(parent) = head.parent() {
+        if let Ok(c) = parent.canonicalize() {
+            let mut out = c;
+            if let Some(name) = head.file_name() {
+                out.push(name);
+            }
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return out.to_string_lossy().into_owned();
+        }
+        if let Some(name) = head.file_name() {
+            tail.push(name.to_os_string());
+        }
+        head = parent;
+    }
+    joined.to_string_lossy().into_owned()
+}
+
+/// An artifact is a file path: URLs are refused and the parent directory must
+/// exist (the file itself may still be on its way).
+fn artifact_path(cwd: &Path, path: &str) -> anyhow::Result<String> {
+    if path.contains("://") {
+        return Err(QError::Invalid(format!(
+            "`{path}` looks like a URL; artifacts are files — use `q link add` for URLs"
+        ))
+        .into());
+    }
+    let p = Path::new(path);
+    let joined: PathBuf = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
+    let parent = joined.parent().filter(|d| !d.as_os_str().is_empty());
+    match parent {
+        Some(d) if d.is_dir() => {}
+        _ => {
+            return Err(
+                QError::Invalid(format!("parent directory of `{path}` does not exist")).into(),
+            );
+        }
+    }
+    Ok(absolute(cwd, path))
+}
+
+/// `https://github.com/<org>/<repo>/pull/<n>` — everything after the number
+/// (`/files`, `?diff=`, `#issuecomment`) is dropped, `http`/`www.` unified.
+fn normalize_pr_url(reference: &str) -> String {
+    let Some(rest) = strip_scheme(reference) else {
+        return reference.to_string();
+    };
+    if !is_github_pr(rest) {
+        return reference.to_string();
+    }
+    let rest = rest.strip_prefix("www.").unwrap_or(rest);
+    let path = rest.trim_start_matches("github.com/");
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let parts: Vec<&str> = path.split('/').collect();
+    format!(
+        "https://github.com/{}/{}/pull/{}",
+        parts[0], parts[1], parts[3]
+    )
 }
 
 // ------------------------------------------------------------ kind detection
@@ -381,8 +518,62 @@ mod tests {
 
     #[test]
     fn absolute_paths_stay_and_relative_ones_join_cwd() {
-        let cwd = Path::new("/tmp/work");
+        let cwd = Path::new("/nope/work");
         assert_eq!(absolute(cwd, "/nope/hosts"), "/nope/hosts");
-        assert_eq!(absolute(cwd, "nope/report.md"), "/tmp/work/nope/report.md");
+        assert_eq!(absolute(cwd, "nope/report.md"), "/nope/work/nope/report.md");
+    }
+
+    #[test]
+    fn absolute_canonicalises_the_existing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap();
+        let got = absolute(dir.path(), "later/report.md");
+        assert_eq!(got, real.join("later/report.md").to_string_lossy());
+        let got = absolute(Path::new("/"), &dir.path().join("x.md").to_string_lossy());
+        assert_eq!(got, real.join("x.md").to_string_lossy());
+    }
+
+    #[test]
+    fn artifact_path_rejects_urls_and_missing_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = artifact_path(dir.path(), "https://example.com/x").unwrap_err();
+        assert!(e.to_string().contains("URL"), "{e}");
+        let e = artifact_path(dir.path(), "nope/deeper/x.md").unwrap_err();
+        assert!(e.to_string().contains("parent directory"), "{e}");
+        let ok = artifact_path(dir.path(), "x.md").unwrap();
+        assert!(ok.ends_with("/x.md"), "{ok}");
+    }
+
+    #[test]
+    fn pr_urls_are_normalised_others_untouched() {
+        for (input, want) in [
+            (
+                "http://www.github.com/acme/api/pull/42/files?diff=split#r1",
+                "https://github.com/acme/api/pull/42",
+            ),
+            (
+                "https://github.com/acme/api/pull/42",
+                "https://github.com/acme/api/pull/42",
+            ),
+            (
+                "https://github.com/acme/api/issues/42",
+                "https://github.com/acme/api/issues/42",
+            ),
+            ("bd-1", "bd-1"),
+        ] {
+            assert_eq!(normalize_pr_url(input), want, "{input}");
+        }
+    }
+
+    #[test]
+    fn tilde_expands_only_as_a_home_prefix() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_tilde("~"), home.to_string_lossy());
+        assert_eq!(
+            expand_tilde("~/out/a.md"),
+            home.join("out/a.md").to_string_lossy()
+        );
+        assert_eq!(expand_tilde("~user/x"), "~user/x");
+        assert_eq!(expand_tilde("a/~/b"), "a/~/b");
     }
 }
