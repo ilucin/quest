@@ -23,8 +23,9 @@ const LAST_PROMPT_CHARS: usize = 500;
 /// Stored in the `session.prompt` event payload.
 const EVENT_PROMPT_CHARS: usize = 200;
 
-/// Lock budgets, well inside Claude's 10s hook timeout: a hook that cannot
-/// get the write lock drops its write rather than stall the user.
+/// Lock budgets, well inside the 10s/15s timeouts `q hook install` sets for
+/// these hooks in Claude's settings (Claude's own default is 60s): a hook
+/// that cannot get the write lock drops its write rather than stall the user.
 const BUSY_MS: u32 = 3000;
 /// SessionStart also renders the brief and runs once; it may wait longer.
 const SESSION_START_BUSY_MS: u32 = 8000;
@@ -222,6 +223,11 @@ fn notification(db: &Db, session: &Session, payload: &Value) {
     let kind = str_field(payload, "notification_type");
     let message = str_field(payload, "message");
     let waiting_for = waiting_for(kind, message);
+    let event_kind = if waiting_for.is_some() {
+        "session.waiting"
+    } else {
+        "session.notification"
+    };
     let _ = db.transaction(|db| {
         if let Some(waiting_for) = waiting_for {
             db.update_session_status(&session.id, SessionStatus::Waiting, Some(waiting_for))?;
@@ -229,7 +235,7 @@ fn notification(db: &Db, session: &Session, payload: &Value) {
         append(
             db,
             session,
-            "session.waiting",
+            event_kind,
             json!({ "type": kind, "waiting_for": waiting_for, "message": message }),
         )
     });

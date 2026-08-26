@@ -983,8 +983,11 @@ fn non_blocking_notifications_only_log_an_event() {
 
     let events = env.events();
     assert_eq!(events.len(), 3);
+    assert_eq!(events[0].0, "session.notification");
     assert_eq!(events[0].1["type"], "auth_success");
     assert_eq!(events[0].1["waiting_for"], Value::Null);
+    assert_eq!(events[1].0, "session.notification");
+    assert_eq!(events[2].0, "session.waiting");
     assert_eq!(events[2].1["waiting_for"], "input");
 }
 
