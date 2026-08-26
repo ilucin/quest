@@ -2,6 +2,7 @@
 //! (SPEC §16).
 
 use crate::Ctx;
+use crate::beads;
 use crate::cli::SetKey;
 use crate::commands::new::resolve_dir;
 use crate::commands::sweep_quiet;
@@ -34,6 +35,10 @@ pub fn run(ctx: &Ctx, target: &str, key: SetKey, value: &str) -> anyhow::Result<
         SetKey::Workflow => {
             stored = value.trim().to_string();
             patch.workflow = Some(blank_to_null(&stored));
+        }
+        SetKey::BeadsEpic => {
+            stored = beads::validate_epic_id(value)?;
+            patch.beads_epic = Some(blank_to_null(&stored));
         }
         SetKey::CtxResetPct => {
             let pct = parse_pct(value)?;
@@ -92,6 +97,7 @@ fn key_name(key: SetKey) -> &'static str {
         SetKey::Cwd => "cwd",
         SetKey::Workflow => "workflow",
         SetKey::CtxResetPct => "ctx_reset_pct",
+        SetKey::BeadsEpic => "beads_epic",
     }
 }
 

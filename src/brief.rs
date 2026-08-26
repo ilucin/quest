@@ -5,10 +5,7 @@
 //! trimmed, which is why `MAX_CHARS` leaves headroom under the 32k budget.
 
 use std::collections::BTreeMap;
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -16,6 +13,7 @@ use crate::commands::fmt;
 use crate::db::Db;
 use crate::error::QError;
 use crate::model::{Event, Link, Quest, Session, SessionRole, SessionStatus, display_state};
+use crate::proc;
 
 /// Default for section 9.
 pub const DEFAULT_EVENTS: usize = 30;
@@ -107,13 +105,14 @@ struct RealExternal;
 
 impl External for RealExternal {
     fn bd_list(&self, quest_id: &str) -> Option<String> {
-        run_capped(
+        proc::run_capped(
             "bd",
             &["list", "-l", &format!("quest:{quest_id}"), "--json"],
+            EXTERNAL_TIMEOUT,
         )
     }
     fn brain_show(&self, slug: &str) -> Option<String> {
-        run_capped("brain", &["show", slug])
+        proc::run_capped("brain", &["show", slug], EXTERNAL_TIMEOUT)
     }
 }
 
@@ -144,46 +143,6 @@ impl External for NoExternal {
     fn brain_show(&self, _slug: &str) -> Option<String> {
         None
     }
-}
-
-/// Runs `program` with a wall-clock cap; `None` on any failure, non-zero exit
-/// or timeout. Output is drained on a thread and handed back over a channel,
-/// so neither a chatty child nor a grandchild holding the pipe open (a `bd`
-/// dolt server) can block past the cap; a late reader thread is simply
-/// abandoned.
-fn run_capped(program: &str, args: &[&str]) -> Option<String> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = tx.send(stdout.read_to_string(&mut buf).ok().map(|_| buf));
-    });
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() < EXTERNAL_TIMEOUT => {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-        }
-    };
-    if !status.is_some_and(|s| s.success()) {
-        return None;
-    }
-    let remaining = EXTERNAL_TIMEOUT.saturating_sub(started.elapsed());
-    rx.recv_timeout(remaining).ok().flatten()
 }
 
 /// Brief timestamps are UTC so a brief reads the same on every machine it is

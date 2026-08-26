@@ -1138,13 +1138,7 @@ fn new_help_only_lists_the_implemented_flags() {
             "`{flag}` missing from `q new --help`:\n{out}"
         );
     }
-    for later in [
-        "--repo",
-        "--brain",
-        "--no-beads",
-        "--template",
-        "--from-brief",
-    ] {
+    for later in ["--brain", "--template", "--from-brief"] {
         assert!(
             !out.contains(later),
             "`{later}` is not implemented yet:\n{out}"
@@ -1301,6 +1295,7 @@ fn doctor_json_reports_every_check() {
             "claude login",
             "db",
             "q on PATH",
+            "bd",
             "hook SessionStart",
             "hook UserPromptSubmit",
             "hook Stop",
@@ -5101,4 +5096,420 @@ fn an_ambiguous_bare_label_lists_the_candidates() {
         .success();
     assert_eq!(json_of(&assert)["quest"], "alpha");
     assert_eq!(fleet.env.json(&["peek", "beta/tests"])["quest"], "beta");
+}
+
+// -------------------------------------------------------------------- q beads
+
+/// The fixture `bd` (SPEC §13): canned output per subcommand, plus the log
+/// every call appends to. A subcommand with no file armed counts as "`bd` is
+/// unavailable", which is how the missing-`bd` path is exercised.
+impl Env {
+    fn bd_log(&self) -> std::path::PathBuf {
+        self.dir.path().join("bd.log")
+    }
+
+    /// One line per fixture `bd` call, in order.
+    fn bd_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.bd_log())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Records every `bd` call this command makes.
+    fn with_bd_log(&self, cmd: &mut Command) {
+        cmd.env("Q_FIXTURE_BD_LOG", self.bd_log());
+    }
+
+    /// `bd create` answers with `epic`.
+    fn with_bd_create(&self, cmd: &mut Command, epic: &str) {
+        let path = self.dir.path().join("bd-create.json");
+        std::fs::write(&path, serde_json::json!({ "id": epic }).to_string()).unwrap();
+        cmd.env("Q_FIXTURE_BD_CREATE", path);
+        self.with_bd_log(cmd);
+    }
+
+    /// `bd list` answers with `issues`.
+    fn with_bd_list(&self, cmd: &mut Command, issues: &serde_json::Value) {
+        let path = self.dir.path().join("bd-list.json");
+        std::fs::write(&path, issues.to_string()).unwrap();
+        cmd.env("Q_FIXTURE_BD", path);
+        self.with_bd_log(cmd);
+    }
+
+    /// `bd close` succeeds.
+    fn with_bd_close(&self, cmd: &mut Command) {
+        let path = self.dir.path().join("bd-close");
+        std::fs::write(&path, "ok").unwrap();
+        cmd.env("Q_FIXTURE_BD_CLOSE", path);
+        self.with_bd_log(cmd);
+    }
+
+    /// A Quest whose epic came from the fixture `bd`.
+    fn quest_with_epic(&self, slug: &str, epic: &str) -> serde_json::Value {
+        let work = self.work(slug);
+        let mut cmd = self.cmd();
+        self.with_bd_create(&mut cmd, epic);
+        let assert = cmd
+            .args(["new", "--name", slug, "--dir", work.to_str().unwrap()])
+            .args(["--repo", "quest", "-d", "--json"])
+            .assert()
+            .success();
+        json_of(&assert)
+    }
+}
+
+/// Issues for the fixture `bd list`, all labelled for `quest_id`.
+fn bd_issues(quest_id: &str, statuses: &[(&str, &str)]) -> serde_json::Value {
+    statuses
+        .iter()
+        .map(|(id, status)| {
+            serde_json::json!({
+                "id": id,
+                "title": *id,
+                "status": status,
+                "labels": [format!("quest:{quest_id}"), "repo:quest"],
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn new_creates_the_beads_epic_and_stores_it() {
+    let env = Env::new();
+    let work = env.work("repo");
+    let mut cmd = env.cmd();
+    env.with_bd_create(&mut cmd, "bd-7fx");
+    let assert = cmd
+        .args(["new", "--name", "epic-quest", "--goal", "ship it"])
+        .args(["--dir", work.to_str().unwrap(), "--repo", "quest"])
+        .args(["-d", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    let id = out["quest"]["id"].as_str().unwrap().to_string();
+    assert_eq!(out["quest"]["beads_epic"], "bd-7fx");
+    assert_eq!(out["quest"]["beads_repo"], "quest");
+
+    // Title and labels are exactly what SPEC §13 asks for.
+    assert_eq!(
+        env.bd_calls(),
+        vec![format!("create epic-quest: ship it repo:quest,quest:{id}")]
+    );
+    assert!(event_kinds(&env, &id).contains(&"beads.epic".to_string()));
+}
+
+#[test]
+fn new_without_a_goal_titles_the_epic_with_the_slug() {
+    let env = Env::new();
+    let quest = env.quest_with_epic("bare", "bd-1");
+    let id = quest["quest"]["id"].as_str().unwrap();
+    assert_eq!(
+        env.bd_calls(),
+        vec![format!("create bare repo:quest,quest:{id}")]
+    );
+}
+
+#[test]
+fn no_beads_skips_bd_entirely() {
+    let env = Env::new();
+    let work = env.work("repo");
+    let mut cmd = env.cmd();
+    env.with_bd_create(&mut cmd, "bd-7fx");
+    let assert = cmd
+        .args(["new", "--name", "plain", "--dir", work.to_str().unwrap()])
+        .args(["--no-beads", "-d", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    assert!(out["quest"]["beads_epic"].is_null());
+    assert!(env.bd_calls().is_empty(), "{:?}", env.bd_calls());
+}
+
+#[test]
+fn a_missing_bd_warns_on_stderr_and_still_creates_the_quest() {
+    let env = Env::new();
+    let work = env.work("repo");
+    // No `Q_FIXTURE_BD_CREATE`: the fixture `bd` is unavailable.
+    let mut cmd = env.cmd();
+    env.with_bd_log(&mut cmd);
+    let assert = cmd
+        .args(["new", "--name", "beadless", "--dir", work.to_str().unwrap()])
+        .args(["-d", "--json"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("warning: no beads epic"))
+        .stderr(predicate::str::contains("q set beadless beads_epic"));
+    let out = json_of(&assert);
+    assert!(out["quest"]["beads_epic"].is_null());
+    // It really did try.
+    assert_eq!(env.bd_calls().len(), 1);
+}
+
+#[test]
+fn the_repo_label_falls_back_to_the_git_root_then_to_the_config() {
+    let env = Env::new();
+    // A git checkout: the label is its root's basename, not the cwd's.
+    let root = env.work("some-repo");
+    let inited = std::process::Command::new("git")
+        .args(["-C", root.to_str().unwrap(), "init", "-q"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if inited {
+        let nested = root.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let mut cmd = env.cmd();
+        env.with_bd_create(&mut cmd, "bd-1");
+        let out = json_of(
+            &cmd.args([
+                "new",
+                "--name",
+                "from-git",
+                "--dir",
+                nested.to_str().unwrap(),
+            ])
+            .args(["-d", "--json"])
+            .assert()
+            .success(),
+        );
+        assert_eq!(out["quest"]["beads_repo"], "some-repo");
+    }
+
+    // No git root above a bare temp directory: the configured default.
+    let plain = env.work("plain");
+    let mut cmd = env.cmd();
+    env.with_bd_create(&mut cmd, "bd-2");
+    let out = json_of(
+        &cmd.args([
+            "new",
+            "--name",
+            "from-config",
+            "--dir",
+            plain.to_str().unwrap(),
+        ])
+        .args(["-d", "--json"])
+        .assert()
+        .success(),
+    );
+    let label = out["quest"]["beads_repo"].as_str().unwrap();
+    // `TMPDIR` may itself sit inside a checkout, so accept either the default
+    // or whatever git root that would be — never nothing.
+    assert!(!label.is_empty(), "{out}");
+}
+
+#[test]
+fn show_and_list_report_beads_progress() {
+    let env = Env::new();
+    let quest = env.quest_with_epic("tracked", "bd-epic");
+    let id = quest["quest"]["id"].as_str().unwrap().to_string();
+    let issues = bd_issues(
+        &id,
+        &[
+            ("bd-epic", "open"),
+            ("bd-1", "closed"),
+            ("bd-2", "in_progress"),
+            ("bd-3", "blocked"),
+            ("bd-4", "open"),
+        ],
+    );
+
+    let mut cmd = env.cmd();
+    env.with_bd_list(&mut cmd, &issues);
+    let out = json_of(&cmd.args(["show", "tracked", "--json"]).assert().success());
+    // The epic does not count against itself: four issues, not five.
+    assert_eq!(out["progress"]["total"], 4);
+    assert_eq!(out["progress"]["closed"], 1);
+    assert_eq!(out["progress"]["open"], 1);
+    assert_eq!(out["progress"]["in_progress"], 1);
+    assert_eq!(out["progress"]["blocked"], 1);
+
+    let mut cmd = env.cmd();
+    env.with_bd_list(&mut cmd, &issues);
+    let assert = cmd.args(["show", "tracked"]).assert().success();
+    let human = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(human.contains("bd-epic (repo quest)"), "{human}");
+    assert!(human.contains("1/4 closed"), "{human}");
+
+    let mut cmd = env.cmd();
+    env.with_bd_list(&mut cmd, &issues);
+    let assert = cmd.args(["list"]).assert().success();
+    let human = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(human.contains("BEADS"), "{human}");
+    assert!(human.contains("1/4"), "{human}");
+
+    let mut cmd = env.cmd();
+    env.with_bd_list(&mut cmd, &issues);
+    let out = json_of(&cmd.args(["list", "--json"]).assert().success());
+    assert_eq!(out[0]["progress"]["total"], 4);
+}
+
+#[test]
+fn a_quest_without_an_epic_has_no_progress() {
+    let env = Env::new();
+    let mut cmd = env.cmd();
+    env.with_bd_list(&mut cmd, &serde_json::json!([]));
+    cmd.args(["new", "--name", "plain", "--no-beads", "-d"])
+        .assert()
+        .success();
+
+    let mut cmd = env.cmd();
+    env.with_bd_list(&mut cmd, &bd_issues("q-other", &[("bd-1", "open")]));
+    let out = json_of(&cmd.args(["show", "plain", "--json"]).assert().success());
+    assert!(out["progress"].is_null(), "{out}");
+    // Nothing to count means nothing to ask `bd` about.
+    assert!(
+        env.bd_calls().iter().all(|c| c.starts_with("create")),
+        "{:?}",
+        env.bd_calls()
+    );
+
+    let assert = env.cmd().args(["show", "plain"]).assert().success();
+    let human = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(human.contains("beads    -"), "{human}");
+}
+
+#[test]
+fn progress_falls_back_to_the_cache_when_bd_stops_answering() {
+    let env = Env::new();
+    let quest = env.quest_with_epic("cached", "bd-epic");
+    let id = quest["quest"]["id"].as_str().unwrap().to_string();
+    let issues = bd_issues(&id, &[("bd-1", "closed"), ("bd-2", "open")]);
+
+    let mut cmd = env.cmd();
+    env.with_bd_list(&mut cmd, &issues);
+    let out = json_of(&cmd.args(["show", "cached", "--json"]).assert().success());
+    assert_eq!(out["progress"]["total"], 2);
+
+    // `bd` is gone; the last reading is still what a listing shows.
+    let out = json_of(&env.cmd().args(["list", "--json"]).assert().success());
+    assert_eq!(out[0]["progress"]["total"], 2);
+    assert_eq!(out[0]["progress"]["closed"], 1);
+
+    // A fresh cache means `bd` is not asked again at all.
+    let before = env.bd_calls().len();
+    let mut cmd = env.cmd();
+    env.with_bd_list(&mut cmd, &issues);
+    cmd.args(["show", "cached", "--json"]).assert().success();
+    assert_eq!(env.bd_calls().len(), before);
+}
+
+#[test]
+fn close_epic_closes_the_epic_through_bd() {
+    let env = Env::new();
+    env.quest_with_epic("closing", "bd-epic");
+
+    let mut cmd = env.cmd();
+    env.with_bd_close(&mut cmd);
+    let out = json_of(
+        &cmd.args(["close", "closing", "-f", "--close-epic", "--json"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(out["epic_closed"], true);
+    assert_eq!(out["quest"]["state"], "finished");
+    assert!(
+        env.bd_calls().contains(&"close bd-epic".to_string()),
+        "{:?}",
+        env.bd_calls()
+    );
+}
+
+#[test]
+fn close_without_close_epic_leaves_bd_alone() {
+    let env = Env::new();
+    env.quest_with_epic("untouched", "bd-epic");
+    let mut cmd = env.cmd();
+    env.with_bd_close(&mut cmd);
+    let out = json_of(
+        &cmd.args(["close", "untouched", "-f", "--json"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(out["epic_closed"], false);
+    assert!(
+        !env.bd_calls().iter().any(|c| c.starts_with("close")),
+        "{:?}",
+        env.bd_calls()
+    );
+}
+
+#[test]
+fn a_failing_close_epic_warns_but_still_closes_the_quest() {
+    let env = Env::new();
+    env.quest_with_epic("stubborn", "bd-epic");
+    // No `Q_FIXTURE_BD_CLOSE`: `bd close` is unavailable.
+    let mut cmd = env.cmd();
+    env.with_bd_log(&mut cmd);
+    let assert = cmd
+        .args(["close", "stubborn", "-f", "--close-epic", "--json"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("`bd close bd-epic` failed"));
+    let out = json_of(&assert);
+    assert_eq!(out["epic_closed"], false);
+    assert_eq!(out["quest"]["state"], "finished");
+}
+
+#[test]
+fn close_epic_on_a_quest_without_one_warns() {
+    let env = Env::new();
+    env.cmd()
+        .args(["new", "--name", "bare", "--no-beads", "-d"])
+        .assert()
+        .success();
+    let mut cmd = env.cmd();
+    env.with_bd_close(&mut cmd);
+    cmd.args(["close", "bare", "-f", "--close-epic"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("has no beads epic"));
+    assert!(env.bd_calls().is_empty(), "{:?}", env.bd_calls());
+}
+
+#[test]
+fn set_links_and_unlinks_the_beads_epic() {
+    let env = Env::new();
+    env.cmd()
+        .args(["new", "--name", "linkable", "--no-beads", "-d"])
+        .assert()
+        .success();
+
+    let out = env.json(&["set", "linkable", "beads_epic", "bd-9"]);
+    assert_eq!(out["quest"]["beads_epic"], "bd-9");
+    assert_eq!(out["key"], "beads_epic");
+
+    // An epic `bd` cannot be asked about is still shown, without counts.
+    let assert = env.cmd().args(["show", "linkable"]).assert().success();
+    let human = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(human.contains("bd-9 · progress unavailable"), "{human}");
+    let out = env.json(&["show", "linkable"]);
+    assert!(out["progress"].is_null(), "{out}");
+
+    let out = env.json(&["set", "linkable", "beads_epic", ""]);
+    assert!(out["quest"]["beads_epic"].is_null(), "{out}");
+
+    env.cmd()
+        .args(["set", "linkable", "beads_epic", "not a bd id"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid beads epic id"));
+}
+
+#[test]
+fn the_brief_names_the_epic_and_the_labels_agents_must_use() {
+    let env = Env::new();
+    let quest = env.quest_with_epic("briefed", "bd-epic");
+    let id = quest["quest"]["id"].as_str().unwrap().to_string();
+    let mut cmd = env.cmd();
+    env.with_bd_list(&mut cmd, &bd_issues(&id, &[("bd-1", "open")]));
+    let assert = cmd.args(["brief", "briefed"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains(&format!("-l repo:quest,quest:{id}")),
+        "the brief must spell out the labels:\n{out}"
+    );
+    assert!(out.contains("**epic**: `bd-epic`"), "{out}");
+    assert!(out.contains("[open] `bd-1`"), "{out}");
 }

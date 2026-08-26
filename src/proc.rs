@@ -51,6 +51,24 @@ impl Outcome {
     pub fn stderr_text(&self) -> String {
         text(&self.stderr)
     }
+
+    /// The child's own complaint, first line only, for a one-line warning.
+    /// Its stderr if it said anything there, else its stdout, else the status.
+    pub fn message(&self) -> String {
+        let stderr = self.stderr_text();
+        let said = if stderr.is_empty() {
+            self.text()
+        } else {
+            stderr
+        };
+        match said.lines().find(|l| !l.trim().is_empty()) {
+            Some(line) => line.trim().to_string(),
+            None => match self.status {
+                Some(status) => format!("exited with {status}"),
+                None => "timed out".to_string(),
+            },
+        }
+    }
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -61,6 +79,17 @@ fn text(bytes: &[u8]) -> String {
 /// pipes are captured; a child that overruns is killed — process group and
 /// all — and its partial output kept. Only a failure to spawn is an error.
 pub fn run(cmd: &mut Command, input: &[u8], timeout: Duration) -> std::io::Result<Outcome> {
+    run_noticed(cmd, input, timeout, None)
+}
+
+/// [`run`] that also prints `notice.1` to stderr, once, if the child is still
+/// going after `notice.0` — so a slow write does not read as a hang.
+pub fn run_noticed(
+    cmd: &mut Command,
+    input: &[u8],
+    timeout: Duration,
+    notice: Option<(Duration, &str)>,
+) -> std::io::Result<Outcome> {
     use std::os::unix::process::CommandExt;
 
     let mut child = cmd
@@ -86,13 +115,23 @@ pub fn run(cmd: &mut Command, input: &[u8], timeout: Duration) -> std::io::Resul
 
     let started = Instant::now();
     let mut status = None;
+    let mut announced = false;
     loop {
         match child.try_wait() {
             Ok(Some(s)) => {
                 status = Some(s);
                 break;
             }
-            Ok(None) if started.elapsed() < timeout => thread::sleep(POLL),
+            Ok(None) if started.elapsed() < timeout => {
+                if let Some((after, text)) = notice
+                    && !announced
+                    && started.elapsed() >= after
+                {
+                    eprintln!("{text}");
+                    announced = true;
+                }
+                thread::sleep(POLL);
+            }
             // Timed out, or the child became unwaitable: either way, stop it.
             _ => {
                 kill_group(&mut child);
@@ -112,6 +151,17 @@ pub fn run(cmd: &mut Command, input: &[u8], timeout: Duration) -> std::io::Resul
         stdout: collect(out_rx, until),
         stderr: collect(err_rx, until),
     })
+}
+
+/// `Some(stdout)` only when `program` ran to a successful exit inside the cap.
+/// The argv shorthand for the many read-only probes that want nothing else.
+pub fn run_capped(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    run(&mut cmd, b"", timeout)
+        .ok()
+        .filter(Outcome::success)
+        .map(|out| out.text())
 }
 
 /// SIGKILL to the child's whole process group, then reap it. `process_group(0)`
@@ -271,5 +321,58 @@ mod tests {
     fn a_missing_binary_is_the_only_error() {
         let mut cmd = Command::new("q-definitely-not-a-binary");
         assert!(run(&mut cmd, b"", Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn only_a_successful_run_yields_capped_output() {
+        let cap = Duration::from_secs(5);
+        assert_eq!(
+            run_capped("sh", &["-c", "echo hi"], cap).as_deref(),
+            Some("hi")
+        );
+        assert!(run_capped("sh", &["-c", "echo x; exit 3"], cap).is_none());
+        assert!(run_capped("q-definitely-not-a-binary", &[], cap).is_none());
+        assert!(run_capped("sh", &["-c", "sleep 30"], Duration::from_millis(200)).is_none());
+    }
+
+    #[test]
+    fn the_message_prefers_stderr_then_stdout_then_the_status() {
+        assert_eq!(
+            sh("echo out; echo err >&2; exit 1", b"", 5000).message(),
+            "err"
+        );
+        assert_eq!(
+            sh("echo only-stdout; exit 1", b"", 5000).message(),
+            "only-stdout"
+        );
+        let quiet = sh("exit 1", b"", 5000).message();
+        assert!(quiet.contains("exit"), "{quiet}");
+        assert_eq!(sh("sleep 30", b"", 200).message(), "timed out");
+    }
+
+    #[test]
+    fn the_notice_fires_only_for_a_child_that_outstays_its_warm_up() {
+        fn noticed(script: &str, after: Duration) -> Outcome {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(script);
+            run_noticed(
+                &mut cmd,
+                b"",
+                Duration::from_secs(5),
+                Some((after, "waiting")),
+            )
+            .expect("ran")
+        }
+        // Fires: still running well past the warm-up. Does not fire: gone
+        // before it. Both must succeed; the test process's own stderr is not
+        // assertable here, so the output is what is checked.
+        assert_eq!(
+            noticed("sleep 0.3; echo done", Duration::from_millis(50)).text(),
+            "done"
+        );
+        assert_eq!(
+            noticed("echo quick", Duration::from_secs(30)).text(),
+            "quick"
+        );
     }
 }

@@ -40,6 +40,12 @@ pub enum Command {
         dir: Option<String>,
         #[arg(long, value_name = "NAME")]
         workflow: Option<String>,
+        /// `repo:<name>` label for the beads epic (default: the cwd's git root)
+        #[arg(long, value_name = "NAME")]
+        repo: Option<String>,
+        /// Do not create a beads epic for this Quest
+        #[arg(long)]
+        no_beads: bool,
         /// First prompt for the master
         #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
         prompt: Option<String>,
@@ -77,6 +83,9 @@ pub enum Command {
         /// Do not ask for confirmation
         #[arg(short, long)]
         force: bool,
+        /// Also close the Quest's beads epic
+        #[arg(long)]
+        close_epic: bool,
     },
 
     /// Reopen a closed Quest with a fresh master
@@ -390,6 +399,7 @@ pub enum SetKey {
     Cwd,
     Workflow,
     CtxResetPct,
+    BeadsEpic,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]

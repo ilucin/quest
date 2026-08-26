@@ -32,6 +32,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use serde::Serialize;
 
 use crate::Ctx;
+use crate::beads::Progress;
 use crate::error::QError;
 use crate::model::{DisplayState, Quest, Session, SessionStatus, display_state, needs_you};
 use crate::tmux;
@@ -45,6 +46,9 @@ pub struct QuestView {
     pub display_state: DisplayState,
     pub needs_you: bool,
     pub live_sessions: usize,
+    /// Beads counts (SPEC §13); `null` without an epic, or when `bd` has never
+    /// answered for this Quest.
+    pub progress: Option<Progress>,
 }
 
 impl QuestView {
@@ -53,8 +57,21 @@ impl QuestView {
             display_state: display_state(&quest, sessions),
             needs_you: needs_you(sessions),
             live_sessions: live(sessions).count(),
+            progress: None,
             quest,
         }
+    }
+
+    pub fn with_progress(mut self, progress: Option<Progress>) -> QuestView {
+        self.progress = progress;
+        self
+    }
+
+    /// `3/7`, or `-` when there is nothing to report.
+    pub fn progress_cell(&self) -> String {
+        self.progress
+            .map(|p| p.cell())
+            .unwrap_or_else(|| "-".to_string())
     }
 
     /// `active` / `idle · needs you` — the state column of a listing.

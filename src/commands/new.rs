@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::Ctx;
+use crate::beads;
 use crate::commands::{AttachMode, attach_mode, sweep_quiet};
+use crate::db::quest::QuestPatch;
 use crate::db::{Db, ID_ATTEMPTS};
 use crate::error::QError;
 use crate::model::{NameSource, Quest, Session, SessionRole, SessionStatus, new_id};
@@ -28,6 +30,8 @@ pub struct Args<'a> {
     pub goal: Option<&'a str>,
     pub dir: Option<&'a str>,
     pub workflow: Option<&'a str>,
+    pub repo: Option<&'a str>,
+    pub no_beads: bool,
     pub prompt: Option<&'a str>,
     pub prompt_file: Option<&'a str>,
     pub detach: bool,
@@ -41,7 +45,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     let (base, name_source) = resolve_slug(args.name, &cwd)?;
     let (slug, tmux_session) = claim_slug(ctx, db, &base, name_source)?;
 
-    // TODO(M2): beads epic and brain session (`--repo`, `--brain`, `--no-beads`).
+    // TODO(M2): brain session (`--brain`).
     let mut row = Quest::new(&slug, &cwd.to_string_lossy(), ctx.machine());
     row.name_source = name_source;
     row.goal = args.goal.map(str::to_string);
@@ -61,6 +65,11 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
             "name_source": quest.name_source,
         }),
     )?;
+
+    // The epic goes in before the master starts, so the brief its SessionStart
+    // hook injects already names it. A failing `bd` is a warning, never a
+    // failed `q new` (SPEC §13).
+    let quest = create_epic(ctx, quest, args);
 
     let master = match spawn_master(ctx, &quest, prompt) {
         Ok(master) => master,
@@ -96,6 +105,64 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         ctx.tmux().attach(&tmux_session, Some(&session.tmux_pane))?;
     }
     Ok(())
+}
+
+/// Creates the Quest's beads epic and stores it on the row. Returns the Quest
+/// unchanged when `--no-beads` was given or `bd` could not be reached — the
+/// warning goes to stderr so `--json` stdout stays a single payload.
+fn create_epic(ctx: &Ctx, quest: Quest, args: &Args) -> Quest {
+    if args.no_beads {
+        return quest;
+    }
+    let repo = beads::repo_label(&ctx.config, args.repo, Path::new(&quest.cwd));
+    let labels = format!("repo:{repo},quest:{}", quest.id);
+    let title = match quest
+        .goal
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+    {
+        Some(goal) => format!("{}: {goal}", quest.slug),
+        None => quest.slug.clone(),
+    };
+    match beads::client().create_epic(&title, &labels) {
+        Ok(epic) => store_epic(ctx, quest, &epic, &repo),
+        Err(e) => {
+            eprintln!(
+                "warning: no beads epic for {} ({e}); link one later with \
+                 `q set {} beads_epic <id>`, or pass --no-beads to skip this",
+                quest.slug, quest.slug
+            );
+            quest
+        }
+    }
+}
+
+/// A stored epic the database then refuses is still a real epic, so the
+/// database error is reported and the Quest carries on without the column.
+fn store_epic(ctx: &Ctx, quest: Quest, epic: &str, repo: &str) -> Quest {
+    let patch = QuestPatch {
+        beads_epic: Some(Some(epic.to_string())),
+        beads_repo: Some(Some(repo.to_string())),
+        ..QuestPatch::default()
+    };
+    let stored = ctx.db().and_then(|db| {
+        let stored = db.update_quest(&quest.id, &patch)?;
+        db.append_event(
+            &quest.id,
+            None,
+            "beads.epic",
+            &serde_json::json!({ "epic": epic, "repo": repo }),
+        )?;
+        Ok(stored)
+    });
+    match stored {
+        Ok(stored) => stored,
+        Err(e) => {
+            eprintln!("warning: beads epic {epic} could not be stored: {e:#}");
+            quest
+        }
+    }
 }
 
 /// The first free slug and the tmux session that goes with it. An auto slug

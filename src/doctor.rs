@@ -669,6 +669,33 @@ fn describe(db: &Db, session: &Session) -> String {
     format!("{quest}/{}", session.label)
 }
 
+/// `bd` and `BEADS_DIR` (SPEC §13, §19). A warning, not a failure: a Quest is
+/// perfectly usable without beads.
+fn check_beads() -> Check {
+    const NAME: &str = "bd";
+    let Some(path) = which("bd") else {
+        return with_hint(
+            check(NAME, Status::Warn, "not found on PATH"),
+            "quests are created without an epic; install bd or pass --no-beads",
+        );
+    };
+    match std::env::var_os("BEADS_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => check(
+            NAME,
+            Status::Ok,
+            format!("{} · BEADS_DIR={}", path.display(), dir.to_string_lossy()),
+        ),
+        None => with_hint(
+            check(
+                NAME,
+                Status::Warn,
+                format!("{} · BEADS_DIR is not set", path.display()),
+            ),
+            "bd will look for a .beads directory below the cwd",
+        ),
+    }
+}
+
 // ----------------------------------------------------------------- entry point
 
 fn report(ctx: &Ctx, fix: bool) -> Report {
@@ -690,6 +717,7 @@ fn report(ctx: &Ctx, fix: bool) -> Report {
             std::env::current_exe().ok().as_deref(),
             which("q").as_deref(),
         ),
+        check_beads(),
     ];
     checks.extend(check_hooks(chain));
     checks.push(check_statusline(chain));

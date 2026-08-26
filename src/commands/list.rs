@@ -1,6 +1,7 @@
 //! `q list` — every Quest with its derived state (SPEC §4, §16).
 
 use crate::Ctx;
+use crate::beads;
 use crate::cli::QuestState as StateFilter;
 use crate::commands::{QuestView, fmt, sweep_quiet};
 use crate::model::DisplayState;
@@ -26,6 +27,13 @@ pub fn run(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> anyhow::Result<(
         views.push(view);
     }
     sort(&mut views);
+    // One `bd` call for the whole listing, capped and cache-backed, so a slow
+    // or missing `bd` can never hold up `q list` (SPEC §13).
+    let quests: Vec<&crate::model::Quest> = views.iter().map(|v| &v.quest).collect();
+    let progress = beads::progress_all(&quests);
+    for view in &mut views {
+        view.progress = progress.get(&view.quest.id).copied();
+    }
 
     if ctx.json || !ctx.quiet {
         output::emit(ctx.json, &views, || human(&views))?;
@@ -75,13 +83,16 @@ fn human(views: &[QuestView]) -> String {
                 v.state_cell(),
                 v.quest.machine.clone(),
                 v.live_sessions.to_string(),
+                v.progress_cell(),
                 fmt::tilde(&v.quest.cwd),
                 fmt::age(v.quest.updated_at),
             ]
         })
         .collect();
     fmt::table(
-        &["ID", "SLUG", "STATE", "MACHINE", "SESS", "CWD", "AGE"],
+        &[
+            "ID", "SLUG", "STATE", "MACHINE", "SESS", "BEADS", "CWD", "AGE",
+        ],
         &rows,
     )
 }
@@ -123,6 +134,13 @@ mod tests {
             view("waiting", Q::Active, 1, &[S::Waiting]),
         ];
         sort(&mut views);
+        // One `bd` call for the whole listing, capped and cache-backed, so a slow
+        // or missing `bd` can never hold up `q list` (SPEC §13).
+        let quests: Vec<&crate::model::Quest> = views.iter().map(|v| &v.quest).collect();
+        let progress = beads::progress_all(&quests);
+        for view in &mut views {
+            view.progress = progress.get(&view.quest.id).copied();
+        }
         let order: Vec<&str> = views.iter().map(|v| v.quest.slug.as_str()).collect();
         assert_eq!(
             order,
