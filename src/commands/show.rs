@@ -3,6 +3,7 @@
 use serde::Serialize;
 
 use crate::Ctx;
+use crate::beads;
 use crate::commands::{QuestView, fmt, sweep_quiet};
 use crate::model::{Event, Session};
 use crate::output;
@@ -29,14 +30,15 @@ pub fn run(ctx: &Ctx, target: &str) -> anyhow::Result<()> {
     let sessions = db.list_sessions_by_quest(&quest.id)?;
     let events = db.list_events_by_quest(&quest.id, EVENTS)?;
     let tmux_session = session_name(&ctx.config, &quest.slug);
+    let progress = beads::progress(&quest);
     let payload = ShowView {
-        view: QuestView::new(quest, &sessions),
+        view: QuestView::new(quest, &sessions).with_progress(progress),
         sessions,
         events,
     };
 
     if ctx.json || !ctx.quiet {
-        // TODO(M1/M2): links and beads progress belong in both renderings.
+        // TODO(M1): links belong in both renderings.
         output::emit(ctx.json, &payload, || {
             human(
                 &payload.view,
@@ -57,6 +59,7 @@ fn human(view: &QuestView, tmux_session: &str, sessions: &[Session], events: &[E
         ("cwd", fmt::tilde(&quest.cwd)),
         ("machine", quest.machine.clone()),
         ("workflow", fmt::or_dash(quest.workflow.as_deref())),
+        ("beads", beads_cell(view)),
         ("tmux", tmux_session.to_string()),
         (
             "created",
@@ -121,6 +124,23 @@ fn human(view: &QuestView, tmux_session: &str, sessions: &[Session], events: &[E
             })
             .collect();
         out.push_str(&indent(&fmt::table(&["WHEN", "KIND", "PAYLOAD"], &rows)));
+    }
+    out
+}
+
+/// `bd-42 (repo quest) · 3/7 closed · 1 open`
+fn beads_cell(view: &QuestView) -> String {
+    let quest = &view.quest;
+    let Some(epic) = quest.beads_epic.as_deref() else {
+        return "-".to_string();
+    };
+    let mut out = epic.to_string();
+    if let Some(repo) = quest.beads_repo.as_deref() {
+        out.push_str(&format!(" (repo {repo})"));
+    }
+    match view.progress {
+        Some(p) => out.push_str(&format!(" · {}", p.summary())),
+        None => out.push_str(" · progress unavailable"),
     }
     out
 }

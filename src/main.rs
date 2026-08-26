@@ -1,3 +1,4 @@
+mod beads;
 mod brief;
 mod cli;
 mod commands;
@@ -169,6 +170,8 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             goal,
             dir,
             workflow,
+            repo,
+            no_beads,
             prompt,
             prompt_file,
             detach,
@@ -181,6 +184,8 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
                     goal: goal.as_deref(),
                     dir: dir.as_deref(),
                     workflow: workflow.as_deref(),
+                    repo: repo.as_deref(),
+                    no_beads: *no_beads,
                     prompt: prompt.as_deref(),
                     prompt_file: prompt_file.as_deref(),
                     detach: *detach,
@@ -206,9 +211,13 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             let ctx = Ctx::with_db(args)?;
             commands::enter::run(&ctx, quest, session.as_deref()).map(|()| 0)
         }
-        Command::Close { quest, force } => {
+        Command::Close {
+            quest,
+            force,
+            close_epic,
+        } => {
             let ctx = Ctx::with_db(args)?;
-            commands::close::run(&ctx, quest, *force).map(|()| 0)
+            commands::close::run(&ctx, quest, *force, *close_epic).map(|()| 0)
         }
         Command::Resume {
             quest,

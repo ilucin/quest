@@ -5,17 +5,16 @@
 //! trimmed, which is why `MAX_CHARS` leaves headroom under the 32k budget.
 
 use std::collections::BTreeMap;
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::beads;
 use crate::commands::fmt;
 use crate::db::Db;
 use crate::error::QError;
 use crate::model::{Event, Link, Quest, Session, SessionRole, SessionStatus, display_state};
+use crate::proc;
 
 /// Default for section 9.
 pub const DEFAULT_EVENTS: usize = 30;
@@ -87,9 +86,15 @@ pub fn default_target(arg: Option<&str>) -> anyhow::Result<String> {
 /// What sections 4 and 8 shell out to. Stubbed in tests and under `Q_FIXTURE`.
 pub trait External {
     /// `bd list -l quest:<id> --json`; `None` when `bd` is missing or failed.
-    fn bd_list(&self, quest_id: &str) -> Option<String>;
     /// `brain show <slug>`; `None` when `brain` is missing or failed.
     fn brain_show(&self, slug: &str) -> Option<String>;
+
+    /// The Quest's issues, always through `beads.rs` — the very call `q show`
+    /// makes, so the brief cannot show a shorter or differently filtered list.
+    /// `$Q_FIXTURE` is honoured in there, not here.
+    fn bd_list(&self, quest_id: &str) -> Option<String> {
+        beads::client().list_quest(quest_id)
+    }
 }
 
 /// The real tools, or — under `$Q_FIXTURE` — canned output from the files
@@ -106,23 +111,14 @@ pub fn external() -> Box<dyn External> {
 struct RealExternal;
 
 impl External for RealExternal {
-    fn bd_list(&self, quest_id: &str) -> Option<String> {
-        run_capped(
-            "bd",
-            &["list", "-l", &format!("quest:{quest_id}"), "--json"],
-        )
-    }
     fn brain_show(&self, slug: &str) -> Option<String> {
-        run_capped("brain", &["show", slug])
+        proc::run_capped("brain", &["show", slug], EXTERNAL_TIMEOUT)
     }
 }
 
 struct FixtureExternal;
 
 impl External for FixtureExternal {
-    fn bd_list(&self, _quest_id: &str) -> Option<String> {
-        fixture_file("Q_FIXTURE_BD")
-    }
     fn brain_show(&self, _slug: &str) -> Option<String> {
         fixture_file("Q_FIXTURE_BRAIN")
     }
@@ -138,52 +134,13 @@ pub struct NoExternal;
 
 #[cfg(test)]
 impl External for NoExternal {
-    fn bd_list(&self, _quest_id: &str) -> Option<String> {
-        None
-    }
     fn brain_show(&self, _slug: &str) -> Option<String> {
         None
     }
-}
-
-/// Runs `program` with a wall-clock cap; `None` on any failure, non-zero exit
-/// or timeout. Output is drained on a thread and handed back over a channel,
-/// so neither a chatty child nor a grandchild holding the pipe open (a `bd`
-/// dolt server) can block past the cap; a late reader thread is simply
-/// abandoned.
-fn run_capped(program: &str, args: &[&str]) -> Option<String> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = tx.send(stdout.read_to_string(&mut buf).ok().map(|_| buf));
-    });
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() < EXTERNAL_TIMEOUT => {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-        }
-    };
-    if !status.is_some_and(|s| s.success()) {
-        return None;
+    /// Never the real `bd`: a unit test runs without `$Q_FIXTURE`.
+    fn bd_list(&self, _quest_id: &str) -> Option<String> {
+        None
     }
-    let remaining = EXTERNAL_TIMEOUT.saturating_sub(started.elapsed());
-    rx.recv_timeout(remaining).ok().flatten()
 }
 
 /// Brief timestamps are UTC so a brief reads the same on every machine it is
@@ -244,7 +201,7 @@ pub fn render_with(
         .as_deref()
         .and_then(|s| resolve_session(quest, &sessions, s).cloned());
 
-    let beads = quest.beads_epic.as_deref().map(|_| ext.bd_list(&quest.id));
+    let beads = beads::epic_of(quest).map(|_| ext.bd_list(&quest.id));
     let brain = quest
         .brain_session
         .as_deref()
@@ -410,7 +367,7 @@ fn section_how(
             ));
         }
     }
-    if let Some(epic) = quest.beads_epic.as_deref() {
+    if let Some(epic) = beads::epic_of(quest) {
         let repo = quest.beads_repo.as_deref().unwrap_or("<repo>");
         out.push_str(&format!(
             "- Beads: every issue you open carries `-l repo:{repo},quest:{}` and the \
@@ -435,7 +392,7 @@ fn section_workflow(out: &mut String, quest: &Quest) {
 
 fn section_beads(out: &mut String, quest: &Quest, beads: Option<&Option<String>>) {
     out.push_str("## 4. Beads\n\n");
-    let Some(epic) = quest.beads_epic.as_deref() else {
+    let Some(epic) = beads::epic_of(quest) else {
         out.push_str("No beads epic linked.\n\n");
         return;
     };
@@ -445,10 +402,7 @@ fn section_beads(out: &mut String, quest: &Quest, beads: Option<&Option<String>>
     }
     out.push('\n');
     match beads.and_then(|b| b.as_deref()) {
-        Some(raw) => match parse_bd(raw) {
-            Some(issues) => render_issues(out, &issues),
-            None => out.push_str("- `bd list` output could not be parsed.\n"),
-        },
+        Some(raw) => render_issues(out, raw, quest, epic),
         None => out.push_str("- `bd list -l quest:<id>` unavailable (bd missing or failed).\n"),
     }
     out.push_str(&format!(
@@ -457,61 +411,39 @@ fn section_beads(out: &mut String, quest: &Quest, beads: Option<&Option<String>>
     ));
 }
 
-struct Issue {
-    id: String,
-    title: String,
-    status: String,
-}
-
-/// `bd list --json` is an array of issues; tolerate an object wrapping one.
-fn parse_bd(raw: &str) -> Option<Vec<Issue>> {
-    let value: Value = serde_json::from_str(raw).ok()?;
-    let items = match &value {
-        Value::Array(a) => a.clone(),
-        Value::Object(o) => o.get("issues")?.as_array()?.clone(),
-        _ => return None,
+/// The counts and the rows both come out of `beads.rs`, off the one payload:
+/// the brief used to tally the same JSON its own way and drifted from
+/// `q show` — it counted the epic as open work and read `blocked` off a status
+/// `bd` never stores. There is one definition of a Quest's progress, and this
+/// renders it.
+fn render_issues(out: &mut String, raw: &str, quest: &Quest, epic: &str) {
+    let Some(rows) = beads::rows(raw, &quest.id, Some(epic)) else {
+        out.push_str("- `bd list` output could not be parsed.\n");
+        return;
     };
-    Some(
-        items
-            .iter()
-            .map(|i| Issue {
-                id: str_of(i, "id"),
-                title: str_of(i, "title"),
-                status: str_of(i, "status"),
-            })
-            .collect(),
-    )
-}
-
-fn str_of(v: &Value, key: &str) -> String {
-    v.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or("-")
-        .to_string()
-}
-
-fn render_issues(out: &mut String, issues: &[Issue]) {
-    let mut by_status: BTreeMap<&str, Vec<&Issue>> = BTreeMap::new();
-    for i in issues {
-        by_status.entry(i.status.as_str()).or_default().push(i);
+    let progress = beads::count(raw, &quest.id, Some(epic)).unwrap_or_default();
+    out.push_str(&format!("- **progress**: {}\n", progress.summary()));
+    // Closed work is already in the count; what an agent needs listed is what
+    // is left. Grouped by status so the list reads in one order every time.
+    let mut by_status: BTreeMap<&str, Vec<&beads::Row>> = BTreeMap::new();
+    for row in rows.iter().filter(|r| r.status != "closed") {
+        by_status.entry(row.status.as_str()).or_default().push(row);
     }
-    let count = |s: &str| by_status.get(s).map_or(0, Vec::len);
-    out.push_str(&format!(
-        "- **progress**: {}/{} closed · {} open · {} in progress · {} blocked\n",
-        count("closed"),
-        issues.len(),
-        count("open"),
-        count("in_progress"),
-        count("blocked")
-    ));
     for (status, list) in &by_status {
-        if *status == "closed" {
-            continue;
-        }
-        for i in list {
-            out.push_str(&format!("  - [{status}] `{}` {}\n", i.id, i.title));
+        for row in list {
+            let blocked = if row.blocked { " (blocked)" } else { "" };
+            out.push_str(&format!(
+                "  - [{}] `{}` {}{blocked}\n",
+                or_dash(status),
+                or_dash(&row.id),
+                or_dash(&row.title)
+            ));
         }
     }
+}
+
+fn or_dash(value: &str) -> &str {
+    if value.is_empty() { "-" } else { value }
 }
 
 fn section_sessions(out: &mut String, sessions: &[Session]) {
@@ -931,10 +863,17 @@ mod tests {
     #[test]
     fn beads_output_is_summarised() {
         let (db, quest) = seeded();
+        let label = format!("quest:{}", quest.id);
         let bd = serde_json::json!([
-            { "id": "bd-1", "title": "done", "status": "closed" },
-            { "id": "bd-2", "title": "doing", "status": "in_progress" },
-            { "id": "bd-3", "title": "stuck", "status": "blocked" },
+            // The epic itself, and another Quest's issue: neither is this
+            // Quest's work, so neither may reach the count or the list.
+            { "id": "bd-42", "title": "the epic", "status": "open",
+              "issue_type": "epic", "labels": [&label] },
+            { "id": "bd-9", "title": "not ours", "status": "open",
+              "labels": ["quest:q-somebody-else"] },
+            { "id": "bd-1", "title": "done", "status": "closed", "labels": [&label] },
+            { "id": "bd-2", "title": "doing", "status": "in_progress", "labels": [&label] },
+            { "id": "bd-3", "title": "stuck", "status": "blocked", "labels": [&label] },
         ])
         .to_string();
         let md = render_with(
@@ -947,9 +886,17 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(md.contains("**progress**: 1/3 closed · 0 open · 1 in progress · 1 blocked"));
+        // Exactly `Progress::summary()` — the string `q show` prints.
+        assert!(
+            md.contains("**progress**: 1/3 closed · 1 in progress · 1 blocked"),
+            "{md}"
+        );
         assert!(md.contains("[blocked] `bd-3` stuck"));
-        assert!(!md.contains("`bd-1`"));
+        // Closed work is counted, not listed; the epic and the stranger are
+        // neither.
+        assert!(!md.contains("[closed] `bd-1`"));
+        assert!(!md.contains("`bd-42` the epic"), "{md}");
+        assert!(!md.contains("bd-9"), "{md}");
         assert!(md.contains("repo:repo-x,quest:"));
         assert!(md.contains("_(brain note unavailable)_"));
         let worker = Opts {
@@ -1154,9 +1101,18 @@ mod tests {
     }
 
     #[test]
-    fn bd_json_wrapped_in_an_object_is_accepted() {
-        let issues = parse_bd(r#"{"issues":[{"id":"bd-1","title":"t","status":"open"}]}"#).unwrap();
-        assert_eq!(issues.len(), 1);
-        assert!(parse_bd("nope").is_none());
+    fn unparseable_bd_output_is_said_to_be_unparseable() {
+        let (db, quest) = seeded();
+        let md = render_with(
+            &db,
+            &quest,
+            &Opts::default(),
+            &Canned {
+                bd: Some("nope".to_string()),
+                brain: None,
+            },
+        )
+        .unwrap();
+        assert!(md.contains("could not be parsed"), "{md}");
     }
 }

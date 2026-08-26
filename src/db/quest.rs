@@ -20,6 +20,8 @@ pub struct QuestPatch {
     pub cwd: Option<String>,
     pub workflow: Option<Option<String>>,
     pub ctx_reset_pct: Option<Option<u8>>,
+    pub beads_epic: Option<Option<String>>,
+    pub beads_repo: Option<Option<String>>,
 }
 
 impl QuestPatch {
@@ -30,6 +32,8 @@ impl QuestPatch {
             && self.cwd.is_none()
             && self.workflow.is_none()
             && self.ctx_reset_pct.is_none()
+            && self.beads_epic.is_none()
+            && self.beads_repo.is_none()
     }
 }
 
@@ -165,6 +169,14 @@ impl Db {
         if let Some(v) = &patch.ctx_reset_pct {
             sets.push("ctx_reset_pct = :pct");
             binds.push((":pct", v));
+        }
+        if let Some(v) = &patch.beads_epic {
+            sets.push("beads_epic = :beads_epic");
+            binds.push((":beads_epic", v));
+        }
+        if let Some(v) = &patch.beads_repo {
+            sets.push("beads_repo = :beads_repo");
+            binds.push((":beads_repo", v));
         }
         sets.push("updated_at = :ts");
         binds.push((":ts", &ts));
