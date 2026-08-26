@@ -220,6 +220,13 @@ pub(crate) fn u8_col(row: &Row, name: &str) -> rusqlite::Result<Option<u8>> {
         .transpose()
 }
 
+/// Reads a nullable INTEGER column holding a boolean — anything non-zero is
+/// true, so a hand-edited `2` still reads as "on".
+pub(crate) fn bool_col(row: &Row, name: &str) -> rusqlite::Result<Option<bool>> {
+    let raw: Option<i64> = row.get(name)?;
+    Ok(raw.map(|v| v != 0))
+}
+
 /// Reads a nullable TEXT column holding JSON.
 pub(crate) fn json_col<T: DeserializeOwned>(row: &Row, name: &str) -> rusqlite::Result<Option<T>> {
     let raw: Option<String> = row.get(name)?;

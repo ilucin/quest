@@ -46,6 +46,15 @@ pub fn run(ctx: &Ctx, target: &str, key: SetKey, value: &str) -> anyhow::Result<
             stored = beads::validate_repo_label(value)?;
             patch.beads_repo = Some(blank_to_null(&stored));
         }
+        SetKey::AutoReset => {
+            let on = parse_toggle(value)?;
+            stored = match on {
+                Some(true) => "on".to_string(),
+                Some(false) => "off".to_string(),
+                None => "default".to_string(),
+            };
+            patch.auto_reset = Some(on);
+        }
         SetKey::CtxResetPct => {
             let pct = parse_pct(value)?;
             stored = match pct {
@@ -164,11 +173,29 @@ fn parse_pct(value: &str) -> anyhow::Result<Option<u8>> {
     Ok(Some(pct))
 }
 
+/// `on`/`off` (and the usual synonyms), or one of `CLEAR` to fall back to
+/// `[context] auto_reset`.
+fn parse_toggle(value: &str) -> anyhow::Result<Option<bool>> {
+    let trimmed = value.trim().to_ascii_lowercase();
+    if CLEAR.contains(&trimmed.as_str()) {
+        return Ok(None);
+    }
+    match trimmed.as_str() {
+        "on" | "true" | "yes" | "1" => Ok(Some(true)),
+        "off" | "false" | "no" | "0" => Ok(Some(false)),
+        _ => Err(QError::Other(format!(
+            "invalid auto_reset `{value}`: expected on, off, or `default` to clear it"
+        ))
+        .into()),
+    }
+}
+
 fn key_name(key: SetKey) -> &'static str {
     match key {
         SetKey::Goal => "goal",
         SetKey::Cwd => "cwd",
         SetKey::Workflow => "workflow",
+        SetKey::AutoReset => "auto_reset",
         SetKey::CtxResetPct => "ctx_reset_pct",
         SetKey::BeadsEpic => "beads_epic",
         SetKey::BeadsRepo => "beads_repo",
@@ -188,6 +215,22 @@ mod tests {
         assert_eq!(parse_pct("").unwrap(), None);
         for bad in ["0", "101", "-1", "half"] {
             assert!(parse_pct(bad).is_err(), "accepted `{bad}`");
+        }
+    }
+
+    #[test]
+    fn auto_reset_takes_a_toggle_or_clears() {
+        for on in ["on", "ON", " true ", "yes", "1"] {
+            assert_eq!(parse_toggle(on).unwrap(), Some(true), "`{on}`");
+        }
+        for off in ["off", "false", "no", "0"] {
+            assert_eq!(parse_toggle(off).unwrap(), Some(false), "`{off}`");
+        }
+        for clear in ["default", "NONE", ""] {
+            assert_eq!(parse_toggle(clear).unwrap(), None, "`{clear}`");
+        }
+        for bad in ["maybe", "2", "-1"] {
+            assert!(parse_toggle(bad).is_err(), "accepted `{bad}`");
         }
     }
 }

@@ -34,6 +34,7 @@ pub struct Args<'a> {
     pub no_beads: bool,
     pub prompt: Option<&'a str>,
     pub prompt_file: Option<&'a str>,
+    pub no_auto_reset: bool,
     pub detach: bool,
 }
 
@@ -54,6 +55,8 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     row.goal = args.goal.map(str::to_string);
     // TODO(M5): validate `--workflow` against the workflow registry.
     row.workflow = args.workflow.map(str::to_string);
+    // Only the opt-out is stored; NULL keeps following `[context] auto_reset`.
+    row.auto_reset = args.no_auto_reset.then_some(false);
     let quest = db.insert_quest(&row)?;
     db.append_event(
         &quest.id,
@@ -66,6 +69,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
             "machine": quest.machine,
             "workflow": quest.workflow,
             "name_source": quest.name_source,
+            "auto_reset": quest.auto_reset,
         }),
     )?;
 

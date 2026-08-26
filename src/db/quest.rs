@@ -2,13 +2,13 @@
 
 use rusqlite::{Row, ToSql, params};
 
-use super::{Db, ID_ATTEMPTS, db_err, enum_col, is_id_collision, u8_col};
+use super::{Db, ID_ATTEMPTS, bool_col, db_err, enum_col, is_id_collision, u8_col};
 use crate::error::QError;
 use crate::model::{NameSource, Quest, QuestState, new_id, now};
 
 const COLUMNS: &str = "id, slug, name_source, name_input_hash, goal, cwd, machine, state, \
      workflow, template_id, beads_epic, beads_repo, brain_session, ctx_reset_pct, \
-     created_at, updated_at, finished_at";
+     auto_reset, created_at, updated_at, finished_at";
 
 /// Fields `q set` / `q rename` can change. `None` leaves a column alone; the
 /// nullable columns nest, so `Some(None)` clears them.
@@ -22,6 +22,8 @@ pub struct QuestPatch {
     pub ctx_reset_pct: Option<Option<u8>>,
     pub beads_epic: Option<Option<String>>,
     pub beads_repo: Option<Option<String>>,
+
+    pub auto_reset: Option<Option<bool>>,
 }
 
 impl QuestPatch {
@@ -34,6 +36,7 @@ impl QuestPatch {
             && self.ctx_reset_pct.is_none()
             && self.beads_epic.is_none()
             && self.beads_repo.is_none()
+            && self.auto_reset.is_none()
     }
 }
 
@@ -58,7 +61,8 @@ impl Db {
         self.conn.execute(
             &format!(
                 "INSERT INTO quest ({COLUMNS}) VALUES \
-                 (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+                 (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+                  ?18)"
             ),
             params![
                 q.id,
@@ -75,6 +79,7 @@ impl Db {
                 q.beads_repo,
                 q.brain_session,
                 q.ctx_reset_pct,
+                q.auto_reset,
                 q.created_at,
                 q.updated_at,
                 q.finished_at,
@@ -177,6 +182,10 @@ impl Db {
         if let Some(v) = &patch.beads_repo {
             sets.push("beads_repo = :beads_repo");
             binds.push((":beads_repo", v));
+        }
+        if let Some(v) = &patch.auto_reset {
+            sets.push("auto_reset = :auto_reset");
+            binds.push((":auto_reset", v));
         }
         sets.push("updated_at = :ts");
         binds.push((":ts", &ts));
@@ -293,6 +302,7 @@ fn row_to_quest(row: &Row) -> rusqlite::Result<Quest> {
         beads_repo: row.get("beads_repo")?,
         brain_session: row.get("brain_session")?,
         ctx_reset_pct: u8_col(row, "ctx_reset_pct")?,
+        auto_reset: bool_col(row, "auto_reset")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         finished_at: row.get("finished_at")?,

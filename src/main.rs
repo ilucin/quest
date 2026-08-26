@@ -174,6 +174,7 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             no_beads,
             prompt,
             prompt_file,
+            no_auto_reset,
             detach,
         } => {
             let ctx = Ctx::with_db(args)?;
@@ -188,6 +189,7 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
                     no_beads: *no_beads,
                     prompt: prompt.as_deref(),
                     prompt_file: prompt_file.as_deref(),
+                    no_auto_reset: *no_auto_reset,
                     detach: *detach,
                 },
             )
@@ -279,6 +281,21 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
                 },
             )
             .map(|()| 0)
+        }
+        Command::Reset {
+            session,
+            delay,
+            strategy,
+        } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::reset::run(
+                &ctx,
+                &commands::reset::Args {
+                    session,
+                    delay: *delay,
+                    strategy: strategy.map(Into::into),
+                },
+            )
         }
         Command::Kill { session, force } => {
             let ctx = Ctx::with_db(args)?;
