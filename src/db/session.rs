@@ -182,18 +182,22 @@ impl Db {
             .map_err(db_err)
     }
 
-    /// The live session Claude last reported this session id for.
+    /// The live session Claude last reported this session id for, narrowed to
+    /// `tmux_pane` when given — `claude --resume` can replay the same id from
+    /// another pane, and the pane is the session's identity.
     pub fn find_session_by_claude_id(
         &self,
         claude_session_id: &str,
+        tmux_pane: Option<&str>,
     ) -> anyhow::Result<Option<Session>> {
         self.conn
             .query_row(
                 &format!(
                     "SELECT {COLUMNS} FROM session WHERE claude_session_id = ?1 \
-                     AND status != 'ended' ORDER BY updated_at DESC, id DESC LIMIT 1"
+                     AND status != 'ended' AND (?2 IS NULL OR tmux_pane = ?2) \
+                     ORDER BY started_at DESC, id DESC LIMIT 1"
                 ),
-                [claude_session_id],
+                params![claude_session_id, tmux_pane],
                 row_to_session,
             )
             .map(Some)

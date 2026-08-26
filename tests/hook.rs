@@ -487,6 +487,10 @@ fn statusline_passes_through_to_the_chain() {
 
 /// A quest with one live session, mirroring what `q new` writes.
 fn seed_session(env: &Env, claude_session_id: Option<&str>) {
+    seed_session_with(env, claude_session_id, "idle");
+}
+
+fn seed_session_with(env: &Env, claude_session_id: Option<&str>, status: &str) {
     // Let `q` create and migrate the database first.
     env.q().args(["list", "--json"]).assert().success();
     let conn = rusqlite::Connection::open(env.dir.path().join("q.db")).unwrap();
@@ -499,8 +503,8 @@ fn seed_session(env: &Env, claude_session_id: Option<&str>) {
     conn.execute(
         "INSERT INTO session (id, quest_id, role, label, tmux_session, tmux_pane, status,
                               claude_session_id, started_at, updated_at)
-         VALUES ('s-0001', 'q-0001', 'master', 'master', 'q-alpha', '%1', 'idle', ?1, 1, 1)",
-        [claude_session_id],
+         VALUES ('s-0001', 'q-0001', 'master', 'master', 'q-alpha', '%1', ?2, ?1, 1, 1)",
+        rusqlite::params![claude_session_id, status],
     )
     .unwrap();
 }
@@ -563,13 +567,31 @@ fn statusline_resolves_by_claude_session_id_without_env() {
 }
 
 #[test]
-fn statusline_outside_a_quest_leaves_db_alone_and_still_chains() {
+fn statusline_outside_a_quest_never_creates_the_db_and_still_chains() {
     let env = Env::new();
-    seed_session(&env, None);
     env.q()
         .args(["config", "set", "statusline.chain", "echo chained"])
         .assert()
         .success();
+    for q_session in [None, Some("s-0001")] {
+        let mut cmd = env.q();
+        cmd.args(["hook", "statusline"]).env_remove("Q_QUEST");
+        match q_session {
+            Some(id) => cmd.env("Q_SESSION", id),
+            None => cmd.env_remove("Q_SESSION"),
+        };
+        cmd.write_stdin(payload(42.6))
+            .assert()
+            .success()
+            .stdout("chained\n");
+        assert!(!env.dir.path().join("q.db").exists(), "db created");
+    }
+}
+
+#[test]
+fn statusline_ignores_an_unrelated_claude_session() {
+    let env = Env::new();
+    seed_session(&env, None);
     env.q()
         .args(["hook", "statusline"])
         .env_remove("Q_QUEST")
@@ -577,8 +599,61 @@ fn statusline_outside_a_quest_leaves_db_alone_and_still_chains() {
         .write_stdin(payload(42.6))
         .assert()
         .success()
-        .stdout("chained\n");
+        .stdout("");
     assert_eq!(session_ctx(&env), (None, None, None));
+}
+
+#[test]
+fn statusline_by_claude_id_requires_the_same_pane_when_tmux_pane_is_set() {
+    let env = Env::new();
+    seed_session(&env, Some("claude-abc"));
+    let run = |pane: &str| {
+        env.q()
+            .args(["hook", "statusline"])
+            .env_remove("Q_SESSION")
+            .env("TMUX_PANE", pane)
+            .write_stdin(payload(30.0))
+            .assert()
+            .success();
+    };
+    run("%7");
+    assert_eq!(session_ctx(&env).0, None);
+    run("%1");
+    assert_eq!(session_ctx(&env).0, Some(30));
+}
+
+#[test]
+fn statusline_replaces_a_stale_claude_session_id() {
+    let env = Env::new();
+    seed_session(&env, Some("claude-old"));
+    env.q()
+        .args(["hook", "statusline"])
+        .env("Q_SESSION", "s-0001")
+        .write_stdin(payload(5.0))
+        .assert()
+        .success();
+    let (pct, _, claude) = session_ctx(&env);
+    assert_eq!(pct, Some(5));
+    assert_eq!(claude.as_deref(), Some("claude-abc"));
+}
+
+#[test]
+fn statusline_leaves_an_ended_session_alone() {
+    let env = Env::new();
+    seed_session_with(&env, Some("claude-abc"), "ended");
+    for q_session in [Some("s-0001"), None] {
+        let mut cmd = env.q();
+        cmd.args(["hook", "statusline"]);
+        match q_session {
+            Some(id) => cmd.env("Q_SESSION", id),
+            None => cmd.env_remove("Q_SESSION"),
+        };
+        cmd.env_remove("TMUX_PANE")
+            .write_stdin(payload(60.0))
+            .assert()
+            .success();
+    }
+    assert_eq!(session_ctx(&env).0, None);
 }
 
 #[test]
