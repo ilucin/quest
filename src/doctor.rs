@@ -210,9 +210,11 @@ fn check_tmux(tmux: &dyn Tmux) -> Check {
 /// Budget for the two `claude` calls; both read local state, so a slow answer
 /// means something is wrong rather than merely busy.
 const CLAUDE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Budget for the statusline probe. Claude calls the statusline after every
-/// message, so anything slower than this is already a problem.
-const STATUSLINE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Budget for the statusline probe: the chain's own budget plus room for the
+/// two spawns around it. Anything less would fail a chain the handler itself
+/// would have accepted.
+const PROBE_MARGIN: Duration = Duration::from_secs(2);
+const STATUSLINE_TIMEOUT: Duration = hook::CHAIN_TIMEOUT.saturating_add(PROBE_MARGIN);
 
 fn check_claude(claude: Option<&Path>) -> Check {
     let Some(path) = claude else {
@@ -221,16 +223,22 @@ fn check_claude(claude: Option<&Path>) -> Check {
             "install Claude Code (https://claude.com/claude-code)",
         );
     };
-    let version = claude_version(path);
-    let detail = match &version {
-        Some(v) => format!("{v} · {}", path.display()),
-        None => path.display().to_string(),
-    };
-    check("claude", Status::Ok, detail)
+    match claude_version(path) {
+        Some(v) => check("claude", Status::Ok, format!("{v} · {}", path.display())),
+        // On PATH but not answering: a broken install, a wrapper script that
+        // swallows `--version`, something. Not proof it cannot run, so a warning.
+        None => with_hint(
+            check(
+                "claude",
+                Status::Warn,
+                format!("{} did not answer `--version`", path.display()),
+            ),
+            "reinstall Claude Code (https://claude.com/claude-code)",
+        ),
+    }
 }
 
-/// An unreadable version is not a problem of its own — the check reports the
-/// path either way — so this returns `None` rather than a status.
+/// `None` when the call failed or printed something unrecognisable.
 fn claude_version(claude: &Path) -> Option<String> {
     let mut cmd = Command::new(claude);
     cmd.arg("--version");
@@ -258,7 +266,8 @@ fn parse_auth_status(out: &str) -> Option<Login> {
     if !payload.get("loggedIn")?.as_bool()? {
         return Some(Login::Out);
     }
-    let who: Vec<&str> = ["authMethod", "email", "subscriptionType"]
+    // Deliberately not `email`: `q doctor` output ends up pasted into issues.
+    let who: Vec<&str> = ["authMethod", "subscriptionType"]
         .iter()
         .filter_map(|k| payload.get(*k).and_then(Value::as_str))
         .filter(|s| !s.is_empty())
@@ -275,8 +284,9 @@ fn check_claude_login(claude: Option<&Path>) -> Check {
     let mut cmd = Command::new(claude);
     cmd.args(["auth", "status", "--json"]);
     let out = proc::run(&mut cmd, b"", CLAUDE_TIMEOUT).ok();
-    let answered = out.as_ref().filter(|o| o.success());
-    match answered.and_then(|o| parse_auth_status(&o.text())) {
+    // `claude auth status --json` exits 1 when logged out but still prints the
+    // payload (verified on 2.1.246), so the JSON decides, not the exit status.
+    match out.as_ref().and_then(|o| parse_auth_status(&o.text())) {
         Some(Login::In(who)) if who.is_empty() => check(LOGIN, Status::Ok, "logged in"),
         Some(Login::In(who)) => check(LOGIN, Status::Ok, format!("logged in · {who}")),
         Some(Login::Out) => with_hint(
@@ -287,14 +297,25 @@ fn check_claude_login(claude: Option<&Path>) -> Check {
     }
 }
 
+/// `~/.claude/.credentials.json` — where Claude Code keeps a token, when it
+/// keeps one in a file at all. Not derived from `$Q_CLAUDE_SETTINGS`: that
+/// override says which settings file q edits, not where Claude stores its
+/// credentials.
+fn credentials_path() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".claude").join(".credentials.json"))
+}
+
 /// No usable `claude auth status` (an older Claude Code has no `auth`
 /// subcommand): fall back to the credentials file. It is absent when the
 /// token lives in the macOS keychain, so its absence is only a warning —
 /// nothing here proves the user is logged *out*.
 fn credentials_fallback(timed_out: bool) -> Check {
-    let creds = hook::claude_dir().map(|d| d.join(".credentials.json"));
+    credentials_status(credentials_path().as_deref(), timed_out)
+}
+
+fn credentials_status(creds: Option<&Path>, timed_out: bool) -> Check {
     match creds {
-        Ok(path) if path.exists() => check(
+        Some(path) if path.exists() => check(
             LOGIN,
             Status::Ok,
             format!("credentials at {}", path.display()),
@@ -319,12 +340,12 @@ fn credentials_fallback(timed_out: bool) -> Check {
 /// is a failure like `missing` is: it means the entry points at another binary
 /// or carries a stale timeout, which is exactly what `q hook install` fixes.
 fn check_hooks(chain: &str) -> Vec<Check> {
-    let status = match hook::installed_status(chain) {
+    let status = match hook::installed_status(None, chain) {
         Ok(status) => status,
         Err(e) => {
             return vec![with_hint(
                 check("hooks", Status::Fail, detail("hooks", &e)),
-                "q hook install",
+                hooks_hint(&e),
             )];
         }
     };
@@ -339,6 +360,20 @@ fn check_hooks(chain: &str) -> Vec<Check> {
         status.statusline.command.as_deref(),
     ));
     checks
+}
+
+/// `q hook install` cannot help with a settings file that does not parse — it
+/// reads the same file and fails the same way — so say what actually unblocks.
+fn hooks_hint(e: &anyhow::Error) -> String {
+    match (
+        e.downcast_ref::<crate::error::QError>(),
+        hook::settings_path(),
+    ) {
+        (Some(crate::error::QError::Settings(_)), Ok(path)) => {
+            format!("fix the JSON at {}", path.display())
+        }
+        _ => "q hook install".to_string(),
+    }
 }
 
 fn hook_check(name: String, state: hook::State, command: Option<&str>) -> Check {
@@ -390,24 +425,53 @@ fn check_statusline(chain: &str) -> Check {
     let mut cmd = Command::new(exe);
     cmd.args(["hook", "statusline"])
         .env("Q_DB", probe_db())
+        .env(hook::PROBE_ENV, "1")
         .env_remove("Q_SESSION")
         .env_remove("Q_QUEST")
         .env_remove("TMUX_PANE");
     match proc::run(&mut cmd, probe_payload().as_bytes(), STATUSLINE_TIMEOUT) {
-        Ok(out) => evaluate_statusline(out.timed_out(), out.code(), &out.text(), chain),
+        Ok(out) => evaluate_statusline(
+            Probe {
+                timed_out: out.timed_out(),
+                code: out.code(),
+                out: out.text(),
+                // `Q_PROBE` makes the handler report the chain's fate here.
+                diag: out.stderr_text(),
+            },
+            chain,
+        ),
         Err(e) => check(STATUSLINE, Status::Fail, format!("cannot probe: {e}")),
     }
 }
 
-/// A database path nothing ever creates, so the probe stays side-effect free.
+/// A database path nothing ever creates: the parent directory does not exist,
+/// so even a handler that tried to open it could not — and a leftover file
+/// from an earlier run cannot be picked up by mistake.
 fn probe_db() -> PathBuf {
-    std::env::temp_dir().join(format!("q-doctor-probe-{}.db", std::process::id()))
+    std::env::temp_dir()
+        .join(format!("q-doctor-probe-{}", std::process::id()))
+        .join("q.db")
 }
 
 /// A configured chain that prints nothing only warns: it may legitimately
 /// have nothing to say about a synthetic payload, and a red doctor over a
 /// cosmetic status bar would be worse than a quiet one.
-fn evaluate_statusline(timed_out: bool, code: Option<i32>, out: &str, chain: &str) -> Check {
+/// What the probe run produced: the handler's own outcome plus, on stderr,
+/// how the chain inside it fared (see `hook::PROBE_ENV`).
+struct Probe {
+    timed_out: bool,
+    code: Option<i32>,
+    out: String,
+    diag: String,
+}
+
+fn evaluate_statusline(probe: Probe, chain: &str) -> Check {
+    let Probe {
+        timed_out,
+        code,
+        out,
+        diag,
+    } = probe;
     let secs = STATUSLINE_TIMEOUT.as_secs();
     if timed_out {
         return with_hint(
@@ -430,6 +494,14 @@ fn evaluate_statusline(timed_out: bool, code: Option<i32>, out: &str, chain: &st
     if chain.is_empty() {
         return check(STATUSLINE, Status::Ok, "no chain configured");
     }
+    // The handler never fails over a bad chain — a status bar is cosmetic — so
+    // a chain that timed out or exited non-zero is reported, not hidden.
+    if !diag.is_empty() {
+        return with_hint(
+            check(STATUSLINE, Status::Warn, format!("`{chain}` {diag}")),
+            "check the [statusline] chain command",
+        );
+    }
     if out.is_empty() {
         return with_hint(
             check(
@@ -443,19 +515,56 @@ fn evaluate_statusline(timed_out: bool, code: Option<i32>, out: &str, chain: &st
     check(
         STATUSLINE,
         Status::Ok,
-        format!("`{chain}` → {}", first_line(out, 60)),
+        format!("`{chain}` → {}", first_line(&out, 60)),
     )
 }
 
-/// First line, at most `max` chars, ellipsised — a statusline is wide and
-/// often coloured, and one report line has room for neither.
+/// First line, escapes stripped, at most `max` chars, ellipsised — a
+/// statusline is wide and coloured, and one report line has room for neither.
+/// Colour has to go before the cut, or the cut can land inside an escape and
+/// leave the terminal wearing it.
 fn first_line(s: &str, max: usize) -> String {
-    let line = s.lines().next().unwrap_or("").trim();
+    let line = strip_ansi(s.lines().next().unwrap_or(""));
+    let line = line.trim();
     if line.chars().count() <= max {
         return line.to_string();
     }
     let mut out: String = line.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
+    out
+}
+
+/// Drops ANSI escape sequences: CSI (`ESC [ … final`), OSC (`ESC ] … BEL`, or
+/// `ESC \\`), and any other two-character escape.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                // Parameter and intermediate bytes, then one final byte @..~.
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                let mut esc = false;
+                for c in chars.by_ref() {
+                    if c == '\u{7}' || (esc && c == '\\') {
+                        break;
+                    }
+                    esc = c == '\u{1b}';
+                }
+            }
+            _ => {}
+        }
+    }
     out
 }
 
@@ -763,7 +872,7 @@ mod tests {
         ) else {
             panic!("expected a logged-in answer");
         };
-        assert_eq!(who, "claude.ai · a@b.c · team");
+        assert_eq!(who, "claude.ai · team", "the email must not be reported");
 
         let Some(Login::In(who)) = parse_auth_status(r#"{"loggedIn":true}"#) else {
             panic!("expected a logged-in answer");
@@ -782,6 +891,40 @@ mod tests {
     }
 
     #[test]
+    fn the_credentials_fallback_only_warns_when_there_is_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds = dir.path().join(".credentials.json");
+
+        let unknown = credentials_status(Some(&creds), false);
+        assert_eq!(unknown.status, Status::Warn);
+        assert!(unknown.detail.starts_with("unknown: "), "{unknown:?}");
+        assert!(unknown.detail.contains("no answer"), "{unknown:?}");
+        assert!(
+            credentials_status(Some(&creds), true)
+                .detail
+                .contains("timed out")
+        );
+        assert_eq!(credentials_status(None, false).status, Status::Warn);
+
+        fs::write(&creds, "{}").unwrap();
+        let found = credentials_status(Some(&creds), false);
+        assert_eq!(found.status, Status::Ok);
+        assert!(found.detail.starts_with("credentials at "), "{found:?}");
+    }
+
+    #[test]
+    fn the_credentials_path_is_anchored_at_the_home_directory() {
+        // Never derived from `$Q_CLAUDE_SETTINGS`: that is q's override for
+        // the file it edits, not Claude's token store.
+        let path = credentials_path().expect("a home directory");
+        assert!(path.ends_with(".claude/.credentials.json"), "{path:?}");
+        assert_eq!(
+            Some(path),
+            dirs::home_dir().map(|h| h.join(".claude/.credentials.json"))
+        );
+    }
+
+    #[test]
     fn a_login_check_without_claude_is_skipped_not_failed() {
         let skipped = check_claude_login(None);
         assert_eq!(skipped.status, Status::Warn);
@@ -796,34 +939,86 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_that_does_not_answer_its_version_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("claude");
+        executable(&broken); // an empty script: exits 0, prints nothing
+        let check = check_claude(Some(&broken));
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("did not answer"), "{check:?}");
+        assert!(check.fix_hint.is_some());
+    }
+
+    /// A probe outcome: the handler exited `code`, printed `out`, and said
+    /// `diag` about the chain.
+    fn probe(code: Option<i32>, out: &str, diag: &str) -> Probe {
+        Probe {
+            timed_out: false,
+            code,
+            out: out.to_string(),
+            diag: diag.to_string(),
+        }
+    }
+
+    #[test]
     fn statusline_probe_grades_the_handler_then_the_chain() {
         // The handler itself must exit 0.
-        let timeout = evaluate_statusline(true, None, "", "ccusage");
+        let timeout = evaluate_statusline(
+            Probe {
+                timed_out: true,
+                code: None,
+                out: String::new(),
+                diag: String::new(),
+            },
+            "ccusage",
+        );
         assert_eq!(timeout.status, Status::Fail);
         assert!(timeout.detail.contains("did not finish"), "{timeout:?}");
         assert!(timeout.fix_hint.is_some());
 
-        let failed = evaluate_statusline(false, Some(2), "", "");
+        let failed = evaluate_statusline(probe(Some(2), "", ""), "");
         assert_eq!(failed.status, Status::Fail);
         assert!(failed.detail.contains("exited 2"), "{failed:?}");
         assert_eq!(
-            evaluate_statusline(false, None, "", "").detail,
+            evaluate_statusline(probe(None, "", ""), "").detail,
             "`q hook statusline` exited a signal"
         );
 
         // No chain: nothing to echo, and that is fine.
-        let none = evaluate_statusline(false, Some(0), "", "");
+        let none = evaluate_statusline(probe(Some(0), "", ""), "");
         assert_eq!(none.status, Status::Ok);
         assert_eq!(none.detail, "no chain configured");
 
         // A configured chain that says nothing is suspicious, not fatal.
-        let silent = evaluate_statusline(false, Some(0), "", "ccusage");
+        let silent = evaluate_statusline(probe(Some(0), "", ""), "ccusage");
         assert_eq!(silent.status, Status::Warn);
         assert!(silent.detail.contains("printed nothing"), "{silent:?}");
 
-        let echoed = evaluate_statusline(false, Some(0), "ctx 42%\nsecond", "ccusage");
+        let echoed = evaluate_statusline(probe(Some(0), "ctx 42%\nsecond", ""), "ccusage");
         assert_eq!(echoed.status, Status::Ok);
         assert_eq!(echoed.detail, "`ccusage` → ctx 42%");
+    }
+
+    #[test]
+    fn a_chain_that_failed_inside_the_handler_is_reported() {
+        // The handler still exits 0, so only the diagnostic tells us.
+        let failed = evaluate_statusline(probe(Some(0), "", "exited 3"), "exit 3");
+        assert_eq!(failed.status, Status::Warn);
+        assert_eq!(failed.detail, "`exit 3` exited 3");
+        assert!(failed.fix_hint.is_some());
+
+        // A chain that both printed and failed is still reported as failing.
+        let noisy = evaluate_statusline(probe(Some(0), "ctx", "exited 1: boom"), "ccusage");
+        assert_eq!(noisy.status, Status::Warn);
+        assert_eq!(noisy.detail, "`ccusage` exited 1: boom");
+    }
+
+    #[test]
+    fn the_probe_budget_covers_the_handlers_own_chain_budget() {
+        assert!(
+            STATUSLINE_TIMEOUT > hook::CHAIN_TIMEOUT,
+            "a chain the handler would accept must not be reported as a hang"
+        );
     }
 
     #[test]
@@ -832,6 +1027,24 @@ mod tests {
         assert_eq!(first_line("", 10), "");
         assert_eq!(first_line("čćžšđ", 3), "čć…");
         assert_eq!(first_line("čćžšđ", 5), "čćžšđ");
+    }
+
+    #[test]
+    fn colour_is_stripped_before_the_line_is_cut() {
+        // A coloured statusline: the escapes go, the text stays.
+        assert_eq!(first_line("\u{1b}[1;32mctx 42%\u{1b}[0m", 60), "ctx 42%");
+        // Cutting a coloured line can no longer land inside an escape.
+        let cut = first_line("\u{1b}[31mabcdefghij\u{1b}[0m", 5);
+        assert_eq!(cut, "abcd…");
+        assert!(!cut.contains('\u{1b}'));
+
+        assert_eq!(strip_ansi("plain"), "plain");
+        // OSC 8 hyperlink, BEL-terminated, and the ESC \ form.
+        assert_eq!(strip_ansi("\u{1b}]8;;http://x\u{7}link"), "link");
+        assert_eq!(strip_ansi("\u{1b}]0;title\u{1b}\\rest"), "rest");
+        // A lone escape at the end must not panic or leak.
+        assert_eq!(strip_ansi("a\u{1b}"), "a");
+        assert_eq!(strip_ansi("a\u{1b}[38;5;196m"), "a");
     }
 
     #[test]

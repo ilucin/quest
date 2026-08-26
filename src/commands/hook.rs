@@ -76,7 +76,14 @@ const EVENTS: [Event; 7] = [
 
 const STATUSLINE_SUB: &str = "statusline";
 const CHAIN_KEY: &str = "statusline.chain";
-const CHAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the statusline chain gets before it is killed. `q doctor` sizes
+/// its probe from this, so the two never disagree about what "too slow" means.
+pub const CHAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Set by `q doctor`'s statusline probe: makes this handler report on stderr
+/// how the chain fared, which the probe captures. Claude Code never sets it —
+/// in a real refresh a failing chain must stay silent.
+pub const PROBE_ENV: &str = "Q_PROBE";
 
 fn known_sub(sub: &str) -> bool {
     sub == STATUSLINE_SUB || EVENTS.iter().any(|e| e.sub == sub)
@@ -227,9 +234,9 @@ fn read_settings(path: &Path) -> anyhow::Result<Value> {
         Ok(text) if text.trim().is_empty() => Ok(json!({})),
         Ok(text) => {
             let v: Value = serde_json::from_str(&text)
-                .map_err(|e| QError::Config(format!("{}: {e}", path.display())))?;
+                .map_err(|e| QError::Settings(format!("{}: {e}", path.display())))?;
             if !v.is_object() {
-                return Err(QError::Config(format!(
+                return Err(QError::Settings(format!(
                     "{}: expected a JSON object at the top level",
                     path.display()
                 ))
@@ -238,7 +245,7 @@ fn read_settings(path: &Path) -> anyhow::Result<Value> {
             Ok(v)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
-        Err(e) => Err(QError::Config(format!("{}: {e}", path.display())).into()),
+        Err(e) => Err(QError::Settings(format!("{}: {e}", path.display())).into()),
     }
 }
 
@@ -435,7 +442,7 @@ pub fn install(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
     // `null` counts as absent; anything else of the wrong shape is an error.
     if !matches!(before["statusLine"], Value::Null | Value::Object(_)) {
         return Err(
-            QError::Config(format!("{}: `statusLine` is not an object", path.display())).into(),
+            QError::Settings(format!("{}: `statusLine` is not an object", path.display())).into(),
         );
     }
 
@@ -452,7 +459,7 @@ pub fn install(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
         }
         if !hooks.is_object() {
             return Err(
-                QError::Config(format!("{}: `hooks` is not an object", path.display())).into(),
+                QError::Settings(format!("{}: `hooks` is not an object", path.display())).into(),
             );
         }
         let groups = hooks
@@ -464,7 +471,7 @@ pub fn install(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
             *groups = json!([]);
         }
         let Some(groups) = groups.as_array_mut() else {
-            return Err(QError::Config(format!(
+            return Err(QError::Settings(format!(
                 "{}: `hooks.{}` is not an array",
                 path.display(),
                 ev.name
@@ -586,10 +593,7 @@ pub fn uninstall(ctx: &Ctx) -> anyhow::Result<u8> {
 
 /// Exit 1 when anything is missing or drifted, so `q doctor` can lean on it.
 pub fn status(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
-    let path = settings_path()?;
-    let cmd = q_command(command)?;
-    let settings = read_settings(&path)?;
-    let status = compute_status(&settings, path, &cmd, &ctx.config.statusline.chain);
+    let status = installed_status(command, &ctx.config.statusline.chain)?;
     output::emit(ctx.json, &status, || status.human())?;
     Ok(u8::from(!status.ok))
 }
@@ -602,12 +606,18 @@ pub fn statusline(ctx: &Ctx) -> anyhow::Result<u8> {
     let mut input = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut input);
     let chain = ctx.config.statusline.chain.trim();
-    if !chain.is_empty()
-        && let Some(out) = run_chain(chain, &input, CHAIN_TIMEOUT)
-    {
-        let mut stdout = std::io::stdout().lock();
-        let _ = stdout.write_all(&out);
-        let _ = stdout.flush();
+    if !chain.is_empty() {
+        let out = run_chain(chain, &input, CHAIN_TIMEOUT);
+        if let Some(out) = &out {
+            let mut stdout = std::io::stdout().lock();
+            let _ = stdout.write_all(&out.stdout);
+            let _ = stdout.flush();
+        }
+        if env_var(PROBE_ENV).is_some()
+            && let Some(diag) = chain_diagnostic(out.as_ref())
+        {
+            eprintln!("{diag}");
+        }
     }
     record_ctx(&input);
     Ok(0)
@@ -669,30 +679,44 @@ fn ctx_pct(payload: &Value) -> Option<u8> {
 }
 
 /// Runs the chain with the payload on stdin. A chain that outlives `timeout`
-/// is killed and whatever it printed so far is kept.
-fn run_chain(chain: &str, input: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+/// is killed — process group and all — and whatever it printed so far is kept.
+/// `None` only when `sh` itself could not be started.
+fn run_chain(chain: &str, input: &[u8], timeout: Duration) -> Option<proc::Outcome> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(chain);
-    proc::run(&mut cmd, input, timeout).ok().map(|o| o.stdout)
+    proc::run(&mut cmd, input, timeout).ok()
 }
 
-/// The install state `q hook status` reports, for callers that only want to
-/// read it — `q doctor`. `chain` is the configured statusline chain.
-pub fn installed_status(chain: &str) -> anyhow::Result<Status> {
+/// What went wrong with the chain, in one line, for `q doctor`'s probe.
+/// `None` when it exited cleanly — the only case the user needs no report of.
+fn chain_diagnostic(out: Option<&proc::Outcome>) -> Option<String> {
+    let Some(out) = out else {
+        return Some("could not be started".to_string());
+    };
+    let what = if out.timed_out() {
+        format!("did not finish in {}s", CHAIN_TIMEOUT.as_secs())
+    } else {
+        match out.code() {
+            Some(0) => return None,
+            Some(code) => format!("exited {code}"),
+            None => "was killed by a signal".to_string(),
+        }
+    };
+    let stderr = out.stderr_text();
+    match stderr.lines().find(|l| !l.trim().is_empty()) {
+        Some(line) => Some(format!("{what}: {}", line.trim())),
+        None => Some(what),
+    }
+}
+
+/// The install state `q hook status` reports. `command` overrides the q
+/// invocation entries are compared against, `chain` is the configured
+/// statusline chain.
+pub fn installed_status(command: Option<&str>, chain: &str) -> anyhow::Result<Status> {
     let path = settings_path()?;
-    let cmd = q_command(None)?;
+    let cmd = q_command(command)?;
     let settings = read_settings(&path)?;
     Ok(compute_status(&settings, path, &cmd, chain))
-}
-
-/// Directory holding Claude Code's user files, i.e. where `settings.json`
-/// lives. `q doctor` looks for credentials next to it.
-pub fn claude_dir() -> anyhow::Result<PathBuf> {
-    let path = settings_path()?;
-    Ok(path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(".")))
 }
 
 #[cfg(test)]
@@ -701,8 +725,42 @@ mod tests {
 
     #[test]
     fn a_timed_out_chain_keeps_its_partial_output() {
-        let out = run_chain("echo partial; sleep 30", b"", Duration::from_millis(200));
-        assert_eq!(out.as_deref(), Some(&b"partial\n"[..]));
+        let started = std::time::Instant::now();
+        let out = run_chain(
+            "echo partial; sleep 30 & wait",
+            b"",
+            Duration::from_millis(200),
+        )
+        .expect("sh ran");
+        assert_eq!(out.stdout, b"partial\n");
+        assert!(out.timed_out());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_chain_diagnostic_names_only_a_bad_outcome() {
+        let ran = |script: &str| run_chain(script, b"", Duration::from_millis(500));
+        assert_eq!(chain_diagnostic(ran("true").as_ref()), None);
+        assert_eq!(
+            chain_diagnostic(ran("exit 3").as_ref()),
+            Some("exited 3".to_string())
+        );
+        assert_eq!(
+            chain_diagnostic(ran("echo why >&2; exit 3").as_ref()),
+            Some("exited 3: why".to_string())
+        );
+        assert_eq!(
+            chain_diagnostic(ran("sleep 30 & wait").as_ref()),
+            Some(format!("did not finish in {}s", CHAIN_TIMEOUT.as_secs()))
+        );
+        assert_eq!(
+            chain_diagnostic(None),
+            Some("could not be started".to_string())
+        );
     }
 
     #[test]

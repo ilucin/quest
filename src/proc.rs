@@ -1,21 +1,27 @@
 //! Running a short-lived child process with a deadline. Everything q shells
 //! out to on a hot path (the statusline chain, `q doctor`'s probes) has to
-//! come back promptly or not at all, so the wait is always bounded and stderr
-//! is always dropped.
+//! come back promptly or not at all, so both the wait *and* the reading of the
+//! child's pipes are bounded, and the child runs in its own process group so
+//! a forking chain dies whole.
 
 use std::io::{Read, Write};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// How often the wait loop polls the child.
 const POLL: Duration = Duration::from_millis(20);
+/// Reading the pipes still gets this long after the deadline, so a child that
+/// used up its whole budget does not also lose its output.
+const DRAIN_FLOOR: Duration = Duration::from_millis(250);
 
 pub struct Outcome {
     /// `None` when the child was killed for outliving the timeout.
     pub status: Option<ExitStatus>,
     /// Whatever the child printed before it exited or was killed.
     pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 impl Outcome {
@@ -34,18 +40,33 @@ impl Outcome {
 
     /// Trimmed stdout, lossily decoded.
     pub fn text(&self) -> String {
-        String::from_utf8_lossy(&self.stdout).trim().to_string()
+        text(&self.stdout)
+    }
+
+    /// Trimmed stderr, lossily decoded.
+    pub fn stderr_text(&self) -> String {
+        text(&self.stderr)
     }
 }
 
-/// Runs `cmd` with `input` on stdin and at most `timeout` to finish. stdout is
-/// captured, stderr discarded; a child that overruns is killed and its partial
-/// output kept. Only a failure to spawn is an error.
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim().to_string()
+}
+
+/// Runs `cmd` with `input` on stdin and at most `timeout` to finish. Both
+/// pipes are captured; a child that overruns is killed — process group and
+/// all — and its partial output kept. Only a failure to spawn is an error.
 pub fn run(cmd: &mut Command, input: &[u8], timeout: Duration) -> std::io::Result<Outcome> {
+    use std::os::unix::process::CommandExt;
+
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
+        // Its own process group, so a timeout can kill the whole tree: a
+        // chain like `sh -c 'foo & wait'` leaves a grandchild holding the
+        // stdout pipe, and killing only the shell would not free it.
+        .process_group(0)
         .spawn()?;
 
     // Both pipes are drained off-thread: a child that fills stdout while we
@@ -56,15 +77,10 @@ pub fn run(cmd: &mut Command, input: &[u8], timeout: Duration) -> std::io::Resul
             let _ = stdin.write_all(&input);
         });
     }
-    let reader = child.stdout.take().map(|mut stdout| {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf);
-            buf
-        })
-    });
+    let out_rx = child.stdout.take().map(drain);
+    let err_rx = child.stderr.take().map(drain);
 
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
     let mut status = None;
     loop {
         match child.try_wait() {
@@ -72,17 +88,79 @@ pub fn run(cmd: &mut Command, input: &[u8], timeout: Duration) -> std::io::Resul
                 status = Some(s);
                 break;
             }
-            Ok(None) if Instant::now() < deadline => thread::sleep(POLL),
+            Ok(None) if started.elapsed() < timeout => thread::sleep(POLL),
             // Timed out, or the child became unwaitable: either way, stop it.
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_group(&mut child);
                 break;
             }
         }
     }
-    let stdout = reader.and_then(|r| r.join().ok()).unwrap_or_default();
-    Ok(Outcome { status, stdout })
+    // Never join the readers: a survivor we failed to kill could hold a pipe
+    // open forever, and a hot path may not wait for it.
+    let until = Instant::now() + timeout.saturating_sub(started.elapsed()).max(DRAIN_FLOOR);
+    Ok(Outcome {
+        status,
+        stdout: collect(out_rx, until),
+        stderr: collect(err_rx, until),
+    })
+}
+
+/// SIGKILL to the child's whole process group, then reap it. `process_group(0)`
+/// made the child its own group leader, so its pid is the group id.
+fn kill_group(child: &mut Child) {
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: killpg on the group q just created for this child; the worst a
+    // race can do is fail with ESRCH, which is ignored.
+    unsafe {
+        libc::killpg(pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A pipe being read off-thread: what has arrived so far, plus the signal that
+/// nothing more will. The buffer is shared rather than sent at the end so a
+/// reader that never reaches EOF — a grandchild still holding the write end —
+/// still yields its partial output.
+struct Draining {
+    buf: Arc<Mutex<Vec<u8>>>,
+    eof: mpsc::Receiver<()>,
+}
+
+fn drain(mut pipe: impl Read + Send + 'static) -> Draining {
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let (tx, eof) = mpsc::channel();
+    let sink = Arc::clone(&buf);
+    thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = pipe.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            lock(&sink).extend_from_slice(&chunk[..n]);
+        }
+        let _ = tx.send(());
+    });
+    Draining { buf, eof }
+}
+
+/// Everything read by EOF, or by `until` — whichever comes first. An abandoned
+/// reader thread costs its buffer, not the caller's deadline.
+fn collect(pipe: Option<Draining>, until: Instant) -> Vec<u8> {
+    let Some(pipe) = pipe else {
+        return Vec::new();
+    };
+    let _ = pipe
+        .eof
+        .recv_timeout(until.saturating_duration_since(Instant::now()));
+    lock(&pipe.buf).clone()
+}
+
+/// A panicking reader thread must not poison the output: the bytes it already
+/// collected are still good.
+fn lock(buf: &Mutex<Vec<u8>>) -> std::sync::MutexGuard<'_, Vec<u8>> {
+    buf.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
@@ -109,18 +187,43 @@ mod tests {
     }
 
     #[test]
-    fn stdin_reaches_the_child_and_stderr_is_dropped() {
+    fn stdin_reaches_the_child_and_stderr_is_captured_separately() {
         let out = sh("cat; echo noise >&2", b"payload", 5000);
         assert_eq!(out.text(), "payload");
+        assert_eq!(out.stderr_text(), "noise");
     }
 
     #[test]
     fn an_overrunning_child_is_killed_but_keeps_its_partial_output() {
-        let out = sh("echo partial; sleep 30", b"", 200);
+        // `sleep` in the background makes `sh` fork: the grandchild inherits
+        // the stdout pipe, so only killing the group ends the read.
+        let started = Instant::now();
+        let out = sh("echo partial; sleep 30 & wait", b"", 200);
         assert!(out.timed_out());
         assert!(!out.success());
         assert_eq!(out.code(), None);
         assert_eq!(out.text(), "partial");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_forking_child_leaves_no_survivor() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        // The grandchild outlives the timeout by design; if the group kill
+        // missed it, it wakes up and writes the marker.
+        let out = sh(
+            &format!("(sleep 0.3; : > {}) & echo partial; wait", marker.display()),
+            b"",
+            100,
+        );
+        assert_eq!(out.text(), "partial");
+        thread::sleep(Duration::from_millis(700));
+        assert!(!marker.exists(), "the grandchild survived the group kill");
     }
 
     #[test]
