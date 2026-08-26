@@ -603,6 +603,7 @@ dependencies = [
  "clap",
  "dirs",
  "predicates",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

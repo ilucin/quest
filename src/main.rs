@@ -280,8 +280,8 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             HookAction::Notification => hooks::run(hooks::Event::Notification),
             HookAction::PreCompact => hooks::run(hooks::Event::PreCompact),
             HookAction::SessionEnd => hooks::run(hooks::Event::SessionEnd),
-            // TODO(M2, SPEC §12): link auto-capture; until then drain stdin, exit 0.
-            HookAction::PostToolUse => commands::hook::noop(),
+            // No Ctx: reads `$Q_DB` itself and never creates the database.
+            HookAction::PostToolUse => commands::hook_capture::run(),
         },
 
         // Agent self-report (bd-8lz.2.5).

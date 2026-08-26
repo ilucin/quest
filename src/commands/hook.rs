@@ -593,13 +593,6 @@ pub fn status(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
     Ok(u8::from(!status.ok))
 }
 
-/// `PostToolUse` until link capture lands (M2): drain stdin, exit 0.
-pub fn noop() -> anyhow::Result<u8> {
-    let mut sink = Vec::new();
-    let _ = std::io::stdin().read_to_end(&mut sink);
-    Ok(0)
-}
-
 /// Statusline refresh (SPEC §7): forwards the raw payload to the chained
 /// command and prints whatever it prints, then records the context-window %
 /// Claude reports for the session this pane belongs to. Runs after every
