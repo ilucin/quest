@@ -1000,8 +1000,10 @@ fn a_held_write_lock_makes_the_hook_give_up_quickly_and_atomically() {
     holder
         .execute_batch("BEGIN IMMEDIATE; UPDATE quest SET updated_at = 2;")
         .unwrap();
+    // Held well past the upper bound below so the hook is guaranteed to give
+    // up (via busy_timeout) and return before the lock is ever released.
     let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(4));
+        std::thread::sleep(Duration::from_secs(10));
         holder.execute_batch("COMMIT").unwrap();
     });
 
@@ -1011,7 +1013,11 @@ fn a_held_write_lock_makes_the_hook_give_up_quickly_and_atomically() {
         .stdout("");
     let took = started.elapsed();
     assert!(took >= Duration::from_millis(2500), "{took:?}");
-    assert!(took <= Duration::from_millis(3600), "{took:?}");
+    // Upper bound is intentionally loose (busy_timeout is ~3s) to absorb
+    // wall-clock jitter on slower/loaded CI runners (observed up to ~4.3s on
+    // macOS); it still proves the hook returned well before the 10s lock
+    // release above, so nothing partially written is ever observed.
+    assert!(took <= Duration::from_millis(8000), "{took:?}");
     release.join().unwrap();
 
     let s = env.session();
