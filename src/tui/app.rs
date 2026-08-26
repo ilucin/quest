@@ -106,8 +106,13 @@ pub fn tab_layout() -> Vec<(Tab, String, u16, u16)> {
     out
 }
 
-/// The tab whose label covers column `col` of the header row.
-pub fn tab_at_column(col: u16) -> Option<Tab> {
+/// The tab whose label covers column `col` of a tab bar `bar_width` columns
+/// wide. Columns past the bar belong to the machine label, not to the tab
+/// whose label the renderer clipped there.
+pub fn tab_at_column(col: u16, bar_width: u16) -> Option<Tab> {
+    if col >= bar_width {
+        return None;
+    }
     tab_layout()
         .into_iter()
         .find(|(_, _, x, w)| col >= *x && col < x + w)
@@ -129,6 +134,9 @@ pub struct App {
     /// Last known terminal size; the renderer keeps it current.
     pub width: u16,
     pub height: u16,
+    /// Columns the tab bar was last drawn into. The renderer owns it, and
+    /// mouse hit-testing reads it so a click can only select a visible tab.
+    pub tab_bar_width: u16,
     /// Ticks elapsed, and refreshes asked for — the tabs hang their reload
     /// bookkeeping off these.
     pub ticks: u64,
@@ -153,6 +161,7 @@ impl App {
             tick_secs: config.ui.tick_local.max(1),
             width: 0,
             height: 0,
+            tab_bar_width: 0,
             ticks: 0,
             refreshes: 0,
             status: String::new(),
@@ -225,23 +234,20 @@ impl App {
             }
             Input::Char('x') => {
                 self.refreshes += 1;
-                self.status = "refreshing…".to_string();
                 Some(Action::Refresh)
             }
             // Digits jump between tabs — the SPEC §17 affordance for phone ssh
             // clients, where the modified keys are the ones that never arrive.
-            Input::Char(c) if c.is_ascii_digit() => {
-                match c.to_digit(10).and_then(Tab::from_digit) {
-                    Some(tab) => {
-                        self.select(tab);
-                        Some(Action::None)
-                    }
-                    // An out-of-range digit is the shell's to swallow, not the
-                    // tab's — otherwise `5` would mean something on one tab only.
-                    None => Some(Action::None),
+            _ => {
+                let digit = input.digit()?;
+                // An out-of-range digit is still the shell's to swallow, not
+                // the tab's — otherwise `5` would mean something on one tab
+                // only.
+                if let Some(tab) = Tab::from_digit(digit) {
+                    self.select(tab);
                 }
+                Some(Action::None)
             }
-            _ => None,
         }
     }
 
@@ -262,12 +268,16 @@ impl App {
     /// vertical movement.
     pub fn handle_mouse(&mut self, ev: MouseInput) -> Action {
         if self.help {
-            self.help = false;
+            // A click dismisses the overlay; a wheel scroll over it must not,
+            // or a nudge of the mouse loses the help the user just opened.
+            if matches!(ev, MouseInput::Click { .. }) {
+                self.help = false;
+            }
             return Action::None;
         }
         match ev {
             MouseInput::Click { col, row: 0 } => {
-                if let Some(tab) = tab_at_column(col) {
+                if let Some(tab) = tab_at_column(col, self.tab_bar_width) {
                     self.select(tab);
                 }
                 Action::None
@@ -288,6 +298,9 @@ mod tests {
     fn app() -> App {
         let mut app = App::new(&Config::default(), "laptop");
         app.set_size(120, 40);
+        // What `render_header` would have published at that width; hit-testing
+        // reads it, and these tests never render.
+        app.tab_bar_width = 120 - 8;
         app
     }
 
@@ -390,6 +403,9 @@ mod tests {
         assert_eq!(press(&mut a, ch('x')), Action::Refresh);
         assert_eq!(a.refreshes, 1);
         assert!(!a.should_quit);
+        // The refresh is synchronous and the redraw happens after it, so a
+        // "refreshing…" message could never be seen — and used to stick.
+        assert!(a.status.is_empty(), "{:?}", a.status);
     }
 
     #[test]
@@ -409,15 +425,31 @@ mod tests {
     fn tab_hit_testing_matches_the_rendered_labels() {
         let slots = tab_layout();
         assert_eq!(slots.len(), 4);
+        let wide = 200;
         for (tab, label, x, w) in &slots {
             assert!(label.starts_with(char::from_digit(tab.digit(), 10).unwrap()));
-            assert_eq!(tab_at_column(*x), Some(*tab));
-            assert_eq!(tab_at_column(x + w - 1), Some(*tab));
+            assert_eq!(tab_at_column(*x, wide), Some(*tab));
+            assert_eq!(tab_at_column(x + w - 1, wide), Some(*tab));
         }
         // The lead space and the separators belong to no tab.
-        assert_eq!(tab_at_column(0), None);
+        assert_eq!(tab_at_column(0, wide), None);
         let (_, _, x, w) = slots[0];
-        assert_eq!(tab_at_column(x + w), None);
+        assert_eq!(tab_at_column(x + w, wide), None);
+    }
+
+    #[test]
+    fn hit_testing_stops_at_the_edge_of_the_drawn_bar() {
+        let (last, _, x, w) = tab_layout().into_iter().last().unwrap();
+        // Whole label visible: the last column of it still hits.
+        assert_eq!(tab_at_column(x + w - 1, x + w), Some(last));
+        // Bar clipped mid-label: the columns past the clip belong to whatever
+        // the header drew there (the machine name), not to the clipped tab.
+        assert_eq!(tab_at_column(x, x + 1), Some(last));
+        assert_eq!(tab_at_column(x + 1, x + 1), None);
+        // A bar with no room at all can never select anything.
+        for col in 0..x + w + 4 {
+            assert_eq!(tab_at_column(col, 0), None, "col {col}");
+        }
     }
 
     #[test]
@@ -429,8 +461,20 @@ mod tests {
         // Clicks below the bar do not change tabs.
         a.handle_mouse(MouseInput::Click { col: x, row: 5 });
         assert_eq!(a.tab, Tab::Templates);
-        // Any click dismisses the overlay.
+        // A click dismisses the overlay.
         a.help = true;
+        a.handle_mouse(MouseInput::Click { col: 0, row: 9 });
+        assert!(!a.help);
+    }
+
+    #[test]
+    fn scrolling_over_the_help_overlay_leaves_it_open() {
+        let mut a = app();
+        a.help = true;
+        assert_eq!(a.handle_mouse(MouseInput::ScrollDown), Action::None);
+        assert!(a.help, "a wheel scroll must not dismiss the overlay");
+        assert_eq!(a.handle_mouse(MouseInput::ScrollUp), Action::None);
+        assert!(a.help);
         a.handle_mouse(MouseInput::Click { col: 0, row: 9 });
         assert!(!a.help);
     }

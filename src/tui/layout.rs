@@ -80,6 +80,14 @@ pub fn chrome(area: Rect) -> Chrome {
     }
 }
 
+/// How wide a right-hand chrome segment (the machine label, the key hint) may
+/// be on a row `total` columns wide. A fixed `Constraint::Length` starves the
+/// left band on a narrow terminal — at 60 columns a 302-column machine name
+/// leaves the tab bar zero columns — so the left band always keeps a third.
+pub fn right_segment(total: u16, want: u16) -> u16 {
+    want.min(total.saturating_sub(total.div_ceil(3)))
+}
+
 /// A `w`×`h` box centred in `area`, clamped to it — the help overlay.
 pub fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width);
@@ -164,6 +172,22 @@ mod tests {
         assert_eq!(c.header.height, 1);
         assert_eq!(c.body.height, 0);
         assert_eq!(c.status.height, 0);
+    }
+
+    #[test]
+    fn right_segment_never_starves_the_left_band() {
+        // Room for everything: the segment gets exactly what it asked for.
+        assert_eq!(right_segment(100, 8), 8);
+        assert_eq!(right_segment(80, 29), 29);
+        // Cramped: the left band keeps at least a third of the row.
+        assert_eq!(right_segment(30, 29), 20);
+        assert_eq!(right_segment(20, 29), 13);
+        // A machine name longer than the terminal cannot wipe the tab bar.
+        assert_eq!(right_segment(60, 302), 40);
+        for total in 0..=200u16 {
+            let left = total - right_segment(total, u16::MAX);
+            assert!(left >= total / 3, "total {total} left {left}");
+        }
     }
 
     #[test]

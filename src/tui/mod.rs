@@ -23,6 +23,7 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crossterm::cursor::Show;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, poll, read as read_event,
 };
@@ -49,32 +50,146 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     let tick = Duration::from_secs(app.tick_secs);
     let mouse = app.mouse;
 
-    let mut terminal = enter(mouse)?;
-    // Restores on the way out whichever way the loop ends — `?`, break, unwind.
-    let _guard = Guard;
+    let (guard, mut terminal) = enter(mouse)?;
     let result = event_loop(ctx, &mut terminal, &mut app, tick);
-    let _ = terminal.show_cursor();
+    // Explicit so the terminal is back to normal before `main` prints an error
+    // into it; a panic or a `?` above drops the guard just the same.
+    drop(guard);
     result
 }
 
 // ------------------------------------------------------------ terminal state
 
-/// Whether mouse capture is currently on, so the panic hook and the guard
-/// undo exactly what `enter` did.
+/// What has actually been switched on, so the guard and the panic hook undo
+/// exactly that much — from either, in either order.
+static RAW_ON: AtomicBool = AtomicBool::new(false);
+static ALT_ON: AtomicBool = AtomicBool::new(false);
 static MOUSE_ON: AtomicBool = AtomicBool::new(false);
 static HOOK: Once = Once::new();
 
-struct Guard;
+/// The terminal-level effects the lifecycle performs, behind a trait so
+/// `arm`'s failure paths, the guard and `restore`'s undo order are testable
+/// without a tty — the half of this module a `TestBackend` cannot reach.
+trait TermIo {
+    fn raw(&mut self, on: bool) -> io::Result<()>;
+    fn alt(&mut self, on: bool) -> io::Result<()>;
+    fn mouse(&mut self, on: bool) -> io::Result<()>;
+    fn show_cursor(&mut self) -> io::Result<()>;
+    fn flush(&mut self) -> io::Result<()>;
+}
 
-impl Drop for Guard {
-    fn drop(&mut self) {
-        restore();
+impl<T: TermIo + ?Sized> TermIo for &mut T {
+    fn raw(&mut self, on: bool) -> io::Result<()> {
+        (**self).raw(on)
+    }
+    fn alt(&mut self, on: bool) -> io::Result<()> {
+        (**self).alt(on)
+    }
+    fn mouse(&mut self, on: bool) -> io::Result<()> {
+        (**self).mouse(on)
+    }
+    fn show_cursor(&mut self) -> io::Result<()> {
+        (**self).show_cursor()
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        (**self).flush()
     }
 }
 
-fn enter(mouse: bool) -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
-    // A terminal left in raw mode is the worst way for this to fail, so the
-    // hook goes in before raw mode does.
+/// The real terminal. Stateless, so the panic hook can build one.
+#[derive(Debug)]
+struct Stdio;
+
+impl TermIo for Stdio {
+    fn raw(&mut self, on: bool) -> io::Result<()> {
+        if on {
+            enable_raw_mode()
+        } else {
+            disable_raw_mode()
+        }
+    }
+
+    fn alt(&mut self, on: bool) -> io::Result<()> {
+        let mut out = io::stdout();
+        if on {
+            execute!(out, EnterAlternateScreen)
+        } else {
+            execute!(out, LeaveAlternateScreen)
+        }
+    }
+
+    fn mouse(&mut self, on: bool) -> io::Result<()> {
+        let mut out = io::stdout();
+        if on {
+            execute!(out, EnableMouseCapture)
+        } else {
+            execute!(out, DisableMouseCapture)
+        }
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), Show)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
+}
+
+/// Switches the terminal back however the TUI ends — `?`, break, or unwind.
+#[derive(Debug)]
+struct Guard<T: TermIo> {
+    io: T,
+}
+
+impl<T: TermIo> Drop for Guard<T> {
+    fn drop(&mut self) {
+        restore_with(&mut self.io);
+    }
+}
+
+fn enter(mouse: bool) -> anyhow::Result<(Guard<Stdio>, Terminal<CrosstermBackend<Stdout>>)> {
+    install_hook();
+    let guard = arm(Stdio, mouse)?;
+    // `Terminal::new` asks the backend for its size — a fallible ioctl. The
+    // guard is armed by now, so failing here still restores.
+    let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    Ok((guard, terminal))
+}
+
+/// Switch the terminal into TUI mode, handing back the guard that switches it
+/// off again.
+///
+/// Every step after the first is an exit path of its own — raw mode is already
+/// on and the caller has nothing to drop yet — so a failure undoes the whole
+/// sequence here rather than leaving the shell in the alternate screen.
+fn arm<T: TermIo>(mut io: T, mouse: bool) -> anyhow::Result<Guard<T>> {
+    match arm_steps(&mut io, mouse) {
+        Ok(()) => Ok(Guard { io }),
+        Err(e) => {
+            restore_with(&mut io);
+            Err(e.into())
+        }
+    }
+}
+
+/// Each flag is set *before* the call that applies it, so a step that failed
+/// half-written is still undone.
+fn arm_steps<T: TermIo>(io: &mut T, mouse: bool) -> io::Result<()> {
+    RAW_ON.store(true, Ordering::SeqCst);
+    io.raw(true)?;
+    ALT_ON.store(true, Ordering::SeqCst);
+    io.alt(true)?;
+    if mouse {
+        MOUSE_ON.store(true, Ordering::SeqCst);
+        io.mouse(true)?;
+    }
+    Ok(())
+}
+
+/// A terminal left in raw mode is the worst way for this to fail, so the hook
+/// goes in before raw mode does.
+fn install_hook() {
     HOOK.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -82,32 +197,74 @@ fn enter(mouse: bool) -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
             previous(info);
         }));
     });
-
-    enable_raw_mode()?;
-    let mut out = io::stdout();
-    if let Err(e) = execute!(out, EnterAlternateScreen) {
-        let _ = disable_raw_mode();
-        return Err(e.into());
-    }
-    if mouse {
-        MOUSE_ON.store(true, Ordering::SeqCst);
-        execute!(out, EnableMouseCapture)?;
-    }
-    Ok(Terminal::new(CrosstermBackend::new(out))?)
 }
 
-/// Idempotent: safe from the panic hook and the guard, in either order.
 fn restore() {
-    let mut out = io::stdout();
-    if MOUSE_ON.swap(false, Ordering::SeqCst) {
-        let _ = execute!(out, DisableMouseCapture);
+    restore_with(&mut Stdio);
+}
+
+/// Undoes exactly what is on, and nothing when nothing is: safe from the panic
+/// hook and the guard, in either order.
+fn restore_with<T: TermIo>(io: &mut T) {
+    let mouse = MOUSE_ON.swap(false, Ordering::SeqCst);
+    let alt = ALT_ON.swap(false, Ordering::SeqCst);
+    let raw = RAW_ON.swap(false, Ordering::SeqCst);
+    if !(mouse || alt || raw) {
+        return;
     }
-    let _ = execute!(out, LeaveAlternateScreen);
-    let _ = disable_raw_mode();
-    let _ = out.flush();
+    // First, and whatever else is on: ratatui hides the cursor on every draw,
+    // and `LeaveAlternateScreen` restores the screen buffer, not DECTCEM
+    // visibility — that is a global attribute. Without this a panic leaves an
+    // invisible cursor behind, which reads as a hung shell.
+    let _ = io.show_cursor();
+    if mouse {
+        let _ = io.mouse(false);
+    }
+    if alt {
+        let _ = io.alt(false);
+    }
+    if raw {
+        let _ = io.raw(false);
+    }
+    let _ = io.flush();
 }
 
 // ------------------------------------------------------------------ the loop
+
+/// Next tick deadline. A fixed period from the last one so the tick does not
+/// drift by however long the refresh took, resynced to now when we fell more
+/// than a whole period behind (a slow refresh, a suspended process) so a
+/// backlog never fires as a burst of catch-up ticks.
+fn advance_tick(last: Instant, now: Instant, tick: Duration) -> Instant {
+    let next = last + tick;
+    if now.saturating_duration_since(next) >= tick {
+        now
+    } else {
+        next
+    }
+}
+
+/// Reduce a crossterm event to a state transition, plus whether anything the
+/// renderer can see changed. The second half is not `action != Action::None`:
+/// switching tabs returns `Action::None` and very much needs a redraw, while a
+/// mouse report the alphabet drops needs none.
+fn apply_event(app: &mut App, ev: Event) -> (Action, bool) {
+    match ev {
+        Event::Key(key) if key.kind != KeyEventKind::Release => match keys::normalize(key) {
+            Some(input) => (app.handle(input), true),
+            None => (Action::None, false),
+        },
+        Event::Mouse(m) if app.mouse => match keys::normalize_mouse(m) {
+            Some(input) => (app.handle_mouse(input), true),
+            None => (Action::None, false),
+        },
+        Event::Resize(w, h) => {
+            app.set_size(w, h);
+            (Action::None, true)
+        }
+        _ => (Action::None, false),
+    }
+}
 
 fn event_loop(
     ctx: &Ctx,
@@ -115,46 +272,66 @@ fn event_loop(
     app: &mut App,
     tick: Duration,
 ) -> anyhow::Result<()> {
-    refresh(ctx, app)?;
+    refresh_now(ctx, app);
     let mut last_tick = Instant::now();
+    let mut dirty = true;
 
     loop {
-        terminal.draw(|frame| render(frame, app))?;
+        // Mouse capture is ANY-MOTION tracking (CSI ?1003h), so without this
+        // an idle mouse crossing the window costs a full render pass per
+        // report.
+        if dirty {
+            terminal.draw(|frame| render(frame, app))?;
+            dirty = false;
+        }
 
         // Block until the next tick is due rather than spinning on a zero
         // timeout; a TUI that burns a core while idle is a bug.
         let timeout = tick.saturating_sub(last_tick.elapsed());
+        let mut refresh_due = false;
         if poll(timeout)? {
-            let action = match read_event()? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => keys::normalize(key)
-                    .map(|input| app.handle(input))
-                    .unwrap_or(Action::None),
-                Event::Mouse(m) if app.mouse => keys::normalize_mouse(m)
-                    .map(|input| app.handle_mouse(input))
-                    .unwrap_or(Action::None),
-                Event::Resize(w, h) => {
-                    app.set_size(w, h);
-                    Action::None
-                }
-                _ => Action::None,
-            };
+            let (action, changed) = apply_event(app, read_event()?);
+            dirty |= changed;
             match action {
                 Action::Quit => break,
-                Action::Refresh => refresh(ctx, app)?,
+                Action::Refresh => refresh_due = true,
                 Action::None => {}
             }
         }
 
-        if last_tick.elapsed() >= tick {
+        let now = Instant::now();
+        if now.saturating_duration_since(last_tick) >= tick {
+            last_tick = advance_tick(last_tick, now, tick);
             app.tick();
-            refresh(ctx, app)?;
-            last_tick = Instant::now();
+            refresh_due = true;
+        }
+
+        // One call site, so `x` on a due tick cannot refresh twice.
+        if refresh_due {
+            refresh_now(ctx, app);
+            dirty = true;
         }
         if app.should_quit {
             break;
         }
     }
     Ok(())
+}
+
+fn refresh_now(ctx: &Ctx, app: &mut App) {
+    let result = refresh(ctx, app);
+    report_refresh(app, result);
+}
+
+/// A failed reload belongs in the status bar, not in `main`'s error path: a
+/// transient `SQLITE_BUSY` from another `q` process or from a hook handler
+/// holding the write lock must not drop the user out of the TUI. Returning
+/// `()` is the point — there is no `?` for the loop to take.
+fn report_refresh(app: &mut App, result: anyhow::Result<()>) {
+    match result {
+        Ok(()) => app.status.clear(),
+        Err(e) => app.status = format!("refresh failed: {e}"),
+    }
 }
 
 /// Reload the active tab. The tabs own their loading; the shell only decides
@@ -191,16 +368,23 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
     if area.height == 0 {
+        app.tab_bar_width = 0;
         return;
     }
     let machine = format!(" {} ", app.machine);
     let [bar, right] = Layout::horizontal([
         Constraint::Min(0),
-        Constraint::Length(layout::width(&machine) as u16),
+        Constraint::Length(layout::right_segment(
+            area.width,
+            layout::width(&machine) as u16,
+        )),
     ])
     .areas(area);
+    // Hit-testing must agree with what was drawn, not with what would have
+    // been drawn on an unbounded row.
+    app.tab_bar_width = bar.width;
 
     let mut spans = vec![Span::raw(" ")];
     for (i, (tab, label, _, _)) in app::tab_layout().into_iter().enumerate() {
@@ -215,7 +399,12 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(label, style));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), bar);
-    frame.render_widget(Paragraph::new(Line::from(Span::raw(machine).bold())), right);
+    frame.render_widget(
+        Paragraph::new(Line::from(
+            Span::raw(layout::truncate(&machine, right.width as usize)).bold(),
+        )),
+        right,
+    );
 }
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -237,7 +426,10 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 
     let [l, r] = Layout::horizontal([
         Constraint::Min(0),
-        Constraint::Length(layout::width(hint) as u16),
+        Constraint::Length(layout::right_segment(
+            area.width,
+            layout::width(hint) as u16,
+        )),
     ])
     .areas(area);
     frame.render_widget(
@@ -247,7 +439,12 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         )))),
         l,
     );
-    frame.render_widget(Paragraph::new(Line::from(Span::raw(hint).dim())), r);
+    frame.render_widget(
+        Paragraph::new(Line::from(
+            Span::raw(layout::truncate(hint, r.width as usize)).dim(),
+        )),
+        r,
+    );
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
@@ -311,8 +508,12 @@ pub(crate) fn placeholder(frame: &mut Frame, area: Rect, title: &str, bead: &str
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::tui::keys::Input;
+    use crate::tui::keys::{Input, MouseInput};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::backend::TestBackend;
+    use std::sync::{Mutex, MutexGuard};
 
     fn draw(app: &mut App, w: u16, h: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -331,6 +532,415 @@ mod tests {
 
     fn app() -> App {
         App::new(&Config::default(), "laptop")
+    }
+
+    // ------------------------------------------------------ terminal lifecycle
+    //
+    // The statics `arm`/`restore` drive are process-global, so these tests take
+    // a lock and always leave them clear.
+
+    static LIFECYCLE: Mutex<()> = Mutex::new(());
+
+    fn lifecycle_lock() -> MutexGuard<'static, ()> {
+        let guard = LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+        clear_flags();
+        guard
+    }
+
+    fn clear_flags() {
+        RAW_ON.store(false, Ordering::SeqCst);
+        ALT_ON.store(false, Ordering::SeqCst);
+        MOUSE_ON.store(false, Ordering::SeqCst);
+    }
+
+    fn flags() -> (bool, bool, bool) {
+        (
+            RAW_ON.load(Ordering::SeqCst),
+            ALT_ON.load(Ordering::SeqCst),
+            MOUSE_ON.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Records the escape/termios steps instead of performing them, and can be
+    /// told to fail at one of them.
+    #[derive(Debug, Default)]
+    struct FakeTerm {
+        calls: Vec<&'static str>,
+        fail_on: Option<&'static str>,
+    }
+
+    impl FakeTerm {
+        fn failing_at(step: &'static str) -> FakeTerm {
+            FakeTerm {
+                calls: Vec::new(),
+                fail_on: Some(step),
+            }
+        }
+
+        fn step(&mut self, name: &'static str) -> io::Result<()> {
+            self.calls.push(name);
+            if self.fail_on == Some(name) {
+                return Err(io::Error::other(name));
+            }
+            Ok(())
+        }
+    }
+
+    impl TermIo for FakeTerm {
+        fn raw(&mut self, on: bool) -> io::Result<()> {
+            self.step(if on { "raw on" } else { "raw off" })
+        }
+        fn alt(&mut self, on: bool) -> io::Result<()> {
+            self.step(if on { "alt on" } else { "alt off" })
+        }
+        fn mouse(&mut self, on: bool) -> io::Result<()> {
+            self.step(if on { "mouse on" } else { "mouse off" })
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.step("cursor show")
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.step("flush")
+        }
+    }
+
+    /// Everything `run` does to the terminal, end to end, with the guard
+    /// dropped the way the loop returning drops it.
+    #[test]
+    fn the_guard_switches_back_exactly_what_arm_switched_on() {
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        {
+            let _guard = arm(&mut term, true).expect("arm");
+            assert_eq!(flags(), (true, true, true));
+        }
+        assert_eq!(
+            term.calls,
+            [
+                "raw on",
+                "alt on",
+                "mouse on",
+                "cursor show",
+                "mouse off",
+                "alt off",
+                "raw off",
+                "flush",
+            ]
+        );
+        assert_eq!(flags(), (false, false, false));
+    }
+
+    #[test]
+    fn mouse_capture_is_left_alone_when_the_config_says_so() {
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        {
+            let _guard = arm(&mut term, false).expect("arm");
+            assert_eq!(flags(), (true, true, false));
+        }
+        // Nothing is undone that was never switched on.
+        assert_eq!(
+            term.calls,
+            [
+                "raw on",
+                "alt on",
+                "cursor show",
+                "alt off",
+                "raw off",
+                "flush"
+            ]
+        );
+    }
+
+    /// B1: raw mode and the alternate screen are on before the last two steps,
+    /// and the caller has no guard to drop yet. A failure there used to return
+    /// `Err` straight past `main`, leaving the shell in the alternate screen,
+    /// in raw mode.
+    #[test]
+    fn a_failure_part_way_through_arm_leaves_the_terminal_clean() {
+        let _lock = lifecycle_lock();
+        for (mouse, step, want) in [
+            (
+                true,
+                "raw on",
+                vec!["raw on", "cursor show", "raw off", "flush"],
+            ),
+            (
+                true,
+                "alt on",
+                vec![
+                    "raw on",
+                    "alt on",
+                    "cursor show",
+                    "alt off",
+                    "raw off",
+                    "flush",
+                ],
+            ),
+            (
+                true,
+                "mouse on",
+                vec![
+                    "raw on",
+                    "alt on",
+                    "mouse on",
+                    "cursor show",
+                    "mouse off",
+                    "alt off",
+                    "raw off",
+                    "flush",
+                ],
+            ),
+            (
+                false,
+                "alt on",
+                vec![
+                    "raw on",
+                    "alt on",
+                    "cursor show",
+                    "alt off",
+                    "raw off",
+                    "flush",
+                ],
+            ),
+        ] {
+            clear_flags();
+            let mut term = FakeTerm::failing_at(step);
+            let err = match arm(&mut term, mouse) {
+                Ok(_) => panic!("arm must fail at {step}"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains(step), "{err} at {step}");
+            assert_eq!(term.calls, want, "failing at {step}");
+            assert_eq!(flags(), (false, false, false), "failing at {step}");
+        }
+    }
+
+    /// B2: ratatui hides the cursor on every draw and `LeaveAlternateScreen`
+    /// does not bring it back, so `restore` must — otherwise the panic hook
+    /// hands back a shell that looks hung.
+    #[test]
+    fn restore_shows_the_cursor_before_anything_else() {
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        term.calls.clear();
+
+        restore_with(&mut term);
+        assert_eq!(term.calls[0], "cursor show");
+        assert!(term.calls.contains(&"alt off"));
+    }
+
+    /// The panic hook and the guard both restore, in whichever order they run.
+    #[test]
+    fn restoring_twice_is_a_no_op_the_second_time() {
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+
+        restore_with(&mut term);
+        assert_eq!(flags(), (false, false, false));
+        term.calls.clear();
+        restore_with(&mut term);
+        assert!(term.calls.is_empty(), "{:?}", term.calls);
+        // And with nothing ever armed.
+        restore_with(&mut term);
+        assert!(term.calls.is_empty(), "{:?}", term.calls);
+    }
+
+    // ------------------------------------------------------------- the loop
+
+    /// N2: a reload that fails is a status line, not the end of the session.
+    #[test]
+    fn a_failed_refresh_lands_in_the_status_bar() {
+        let mut app = app();
+        report_refresh(&mut app, Err(anyhow::anyhow!("database is locked")));
+        assert_eq!(app.status, "refresh failed: database is locked");
+        let lines = draw(&mut app, 100, 10);
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .contains("refresh failed: database is locked"),
+            "{lines:?}"
+        );
+
+        // And the next reload that works takes the message away again — the
+        // old "refreshing…" had nothing to clear it at all.
+        report_refresh(&mut app, Ok(()));
+        assert!(app.status.is_empty());
+        let lines = draw(&mut app, 100, 10);
+        assert!(lines.last().unwrap().contains("rows 2"), "{lines:?}");
+    }
+
+    #[test]
+    fn the_tick_deadline_holds_its_period_and_resyncs_after_a_stall() {
+        let tick = Duration::from_secs(2);
+        let t0 = Instant::now();
+        // On the grid, and a little late: the next deadline does not slide by
+        // however long the refresh took.
+        assert_eq!(advance_tick(t0, t0 + tick, tick), t0 + tick);
+        assert_eq!(
+            advance_tick(t0, t0 + tick + Duration::from_millis(300), tick),
+            t0 + tick
+        );
+        // More than a whole period behind: resync instead of firing a burst of
+        // catch-up ticks.
+        let late = t0 + Duration::from_secs(30);
+        assert_eq!(advance_tick(t0, late, tick), late);
+    }
+
+    #[test]
+    fn only_events_that_change_something_ask_for_a_redraw() {
+        let mut app = app();
+        let mouse = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 3,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        // Mouse capture is ANY-MOTION tracking: motion reports arrive
+        // constantly and must not cost a render pass.
+        assert_eq!(
+            apply_event(&mut app, mouse(MouseEventKind::Moved)),
+            (Action::None, false)
+        );
+        // A key with no letter in the alphabet is just as free.
+        let f1 = Event::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        assert_eq!(apply_event(&mut app, f1), (Action::None, false));
+
+        // A tab switch returns `Action::None` too, and absolutely needs a redraw.
+        let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(apply_event(&mut app, tab), (Action::None, true));
+        assert_eq!(app.tab, Tab::Sessions);
+        assert_eq!(
+            apply_event(&mut app, Event::Resize(80, 24)),
+            (Action::None, true)
+        );
+        assert_eq!((app.width, app.height), (80, 24));
+
+        // `x` is the one that also reloads.
+        let x = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(apply_event(&mut app, x), (Action::Refresh, true));
+
+        // With `[ui] mouse = false` the loop never even captures these.
+        app.mouse = false;
+        assert_eq!(
+            apply_event(&mut app, mouse(MouseEventKind::Down(MouseButton::Left))),
+            (Action::None, false)
+        );
+    }
+
+    #[test]
+    fn a_key_release_is_dropped_rather_than_firing_the_binding_twice() {
+        let mut app = app();
+        let mut release = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        release.kind = crossterm::event::KeyEventKind::Release;
+        assert_eq!(
+            apply_event(&mut app, Event::Key(release)),
+            (Action::None, false)
+        );
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn tab_clicks_land_on_the_labels_actually_drawn() {
+        let mut app = app();
+        let lines = draw(&mut app, 100, 20);
+        let header = &lines[0];
+        for (tab, label, x, w) in app::tab_layout() {
+            let drawn: String = header
+                .chars()
+                .skip(x as usize)
+                .take(w as usize)
+                .collect::<String>();
+            assert_eq!(
+                drawn, label,
+                "{tab:?} is not drawn where hit-testing puts it"
+            );
+            assert_eq!(app::tab_at_column(x, app.tab_bar_width), Some(tab));
+            assert_eq!(app::tab_at_column(x + w - 1, app.tab_bar_width), Some(tab));
+        }
+    }
+
+    /// N5: the header splits the row, so the bar can be narrower than the
+    /// labels `tab_layout` lays out. A click past the clip is on the machine
+    /// name, not on the tab whose label was cut off there.
+    #[test]
+    fn a_click_past_the_clipped_tab_bar_selects_nothing() {
+        let mut app = app();
+        draw(&mut app, 50, 10);
+        // `" laptop "` takes 8 of the 50 columns.
+        assert_eq!(app.tab_bar_width, 42);
+        let (events, _, x, w) = app::tab_layout().into_iter().last().unwrap();
+        assert!(x < app.tab_bar_width, "Events starts inside the bar");
+        assert!(x + w > app.tab_bar_width, "and is drawn clipped");
+
+        // On the visible part of the clipped label: still Events.
+        app.handle_mouse(MouseInput::Click {
+            col: app.tab_bar_width - 1,
+            row: 0,
+        });
+        assert_eq!(app.tab, events);
+
+        // On the machine label — visually the clipped `4 Events` — nothing moves.
+        app.tab = Tab::Quests;
+        for col in [app.tab_bar_width, app.tab_bar_width + 1, x + w - 1] {
+            app.handle_mouse(MouseInput::Click { col, row: 0 });
+            assert_eq!(app.tab, Tab::Quests, "col {col}");
+        }
+    }
+
+    /// N6: `[machine] name` has no length cap, and a fixed `Length` for the
+    /// right-hand segment used to hand the tab bar zero columns.
+    #[test]
+    fn a_machine_name_longer_than_the_terminal_cannot_wipe_the_tab_bar() {
+        let mut app = App::new(&Config::default(), &"m".repeat(300));
+        let lines = draw(&mut app, 60, 10);
+        assert_eq!(app.tab_bar_width, 20);
+        assert!(lines[0].starts_with(" 1 Quests"), "{:?}", lines[0]);
+        assert!(lines[0].contains('m'), "{:?}", lines[0]);
+        // Clicks still land on the tabs that survived the clip.
+        assert_eq!(
+            app::tab_at_column(1, app.tab_bar_width),
+            Some(Tab::Quests),
+            "{:?}",
+            lines[0]
+        );
+        assert_eq!(app::tab_at_column(39, app.tab_bar_width), None);
+    }
+
+    #[test]
+    fn a_narrow_status_bar_still_shows_the_machine_readout() {
+        let mut app = app();
+        let lines = draw(&mut app, 24, 5);
+        let status = lines.last().unwrap();
+        assert!(status.contains("lap"), "{status:?}");
+        assert!(status.contains("help"), "{status:?}");
+    }
+
+    /// N8: the chrome arithmetic and both `Layout` splits, swept over the
+    /// sizes that actually break constraint solvers.
+    #[test]
+    fn every_terminal_size_renders_without_panicking() {
+        for w in [1u16, 2, 20, 70, 100, 200] {
+            for h in [1u16, 2, 3, 24] {
+                for help in [false, true] {
+                    let mut app = app();
+                    app.help = help;
+                    let lines = draw(&mut app, w, h);
+                    assert_eq!(lines.len(), h as usize, "{w}x{h} help={help}");
+                    assert!(
+                        lines.iter().all(|l| layout::width(l) <= w as usize),
+                        "{w}x{h} help={help}: {lines:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

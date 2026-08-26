@@ -84,7 +84,16 @@ fn bare_invocation_succeeds() {
 /// so under every test and every script) it must fall back to the banner
 /// rather than reaching for the alternate screen.
 #[test]
-fn bare_invocation_off_a_terminal_does_not_launch_the_tui() {
+fn bare_invocation_off_a_terminal_prints_the_banner() {
+    q().assert()
+        .success()
+        .stdout(predicate::str::contains("q --help"));
+}
+
+/// `--json` short-circuits before the `is_terminal` check, so this pins the
+/// reported flag rather than the fallback above.
+#[test]
+fn bare_json_reports_that_the_tui_was_not_launched() {
     let assert = q().arg("--json").assert().success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
