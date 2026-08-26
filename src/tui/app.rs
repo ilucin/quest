@@ -55,15 +55,22 @@ impl Tab {
 }
 
 /// What the event loop must do after a transition. Everything the state
-/// machine cannot do by itself lives here; later beads add variants (attaching
-/// to a pane, opening a pager) rather than reaching for the terminal from
-/// inside `handle`.
+/// machine cannot do by itself lives here, so no tab ever reaches for the
+/// terminal or a subprocess from inside `handle`.
+///
+/// The two hand-over variants carry no target: the loop asks the active tab
+/// which row it is on, exactly as the renderer does, so a selection can never
+/// be recorded here and then go stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     /// State updated (or nothing happened); just redraw.
     None,
     /// Reload the active tab's data before redrawing.
     Refresh,
+    /// Leave TUI mode and attach to the selection's master (SPEC §17 `o`).
+    Attach,
+    /// Leave TUI mode and page the selection's brief (SPEC §17 `b`).
+    Brief,
     Quit,
 }
 
@@ -77,7 +84,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("↑ ↓ / k j", "move the selection"),
     (
         "Enter / Ctrl-J",
-        "open the selection (Ctrl-J is the Enter alias)",
+        "the active tab's Enter (Ctrl-J is its alias)",
     ),
     ("x", "refresh now"),
     ("?", "toggle this help"),
