@@ -1,6 +1,6 @@
 //! `q hook install | uninstall | status` — merges q's hooks and statusline
 //! into Claude Code's `settings.json` (SPEC §7), touching only q-owned
-//! entries — plus `q hook statusline`. The event handlers live in later beads.
+//! entries — plus `q hook statusline`. The event handlers live in `crate::hooks`.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -593,7 +593,7 @@ pub fn status(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
     Ok(u8::from(!status.ok))
 }
 
-// TODO(bd-8lz.2.2): the event handlers. Until then: drain stdin, exit 0.
+/// `PostToolUse` until link capture lands (M2): drain stdin, exit 0.
 pub fn noop() -> anyhow::Result<u8> {
     let mut sink = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut sink);
