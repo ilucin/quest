@@ -1,5 +1,6 @@
 //! One module per CLI command; the dispatcher in `main.rs` calls into them.
 
+pub mod brief;
 pub mod close;
 pub mod enter;
 pub mod fmt;
