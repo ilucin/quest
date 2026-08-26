@@ -13,6 +13,9 @@ mod output;
 mod proc;
 mod registry;
 mod tmux;
+mod tui;
+
+use std::io::IsTerminal;
 
 use clap::Parser;
 
@@ -144,7 +147,14 @@ fn parse_cli() -> Cli {
 /// The process exit code, or an error `main` renders and exits 1 on.
 fn run(args: &Cli) -> anyhow::Result<u8> {
     let Some(command) = &args.command else {
-        // TODO(M3): launch the TUI.
+        // SPEC §16: bare `q` is the TUI — but only when there is a terminal to
+        // draw on. `--json` and a redirected stdout keep the one-line banner,
+        // which is what a script reads.
+        if !args.json && std::io::stdout().is_terminal() {
+            let ctx = Ctx::with_db(args)?;
+            tui::run(&ctx)?;
+            return Ok(0);
+        }
         let version = env!("CARGO_PKG_VERSION");
         if args.json || !args.quiet {
             output::emit(
