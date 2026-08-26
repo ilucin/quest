@@ -8,7 +8,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -429,6 +429,7 @@ fn check_statusline(chain: &str) -> Check {
         .env_remove("Q_SESSION")
         .env_remove("Q_QUEST")
         .env_remove("TMUX_PANE");
+    let started = Instant::now();
     match proc::run(&mut cmd, probe_payload().as_bytes(), STATUSLINE_TIMEOUT) {
         Ok(out) => evaluate_statusline(
             Probe {
@@ -437,6 +438,7 @@ fn check_statusline(chain: &str) -> Check {
                 out: out.text(),
                 // `Q_PROBE` makes the handler report the chain's fate here.
                 diag: out.stderr_text(),
+                elapsed: started.elapsed(),
             },
             chain,
         ),
@@ -463,6 +465,10 @@ struct Probe {
     code: Option<i32>,
     out: String,
     diag: String,
+    /// How long the handler actually took. A handler that outlives the budget
+    /// its own chain gets is holding something open (a backgrounded process
+    /// on the chain's stdout, say) and would do the same in the status bar.
+    elapsed: Duration,
 }
 
 fn evaluate_statusline(probe: Probe, chain: &str) -> Check {
@@ -471,7 +477,11 @@ fn evaluate_statusline(probe: Probe, chain: &str) -> Check {
         code,
         out,
         diag,
+        elapsed,
     } = probe;
+    // The handler's stderr is another program's output arriving in a report
+    // line: one line, escapes stripped, bounded — same as the chain's stdout.
+    let diag = output::first_line(&diag, 100);
     let secs = STATUSLINE_TIMEOUT.as_secs();
     if timed_out {
         return with_hint(
@@ -502,6 +512,24 @@ fn evaluate_statusline(probe: Probe, chain: &str) -> Check {
             "check the [statusline] chain command",
         );
     }
+    // Succeeded, but not in time to be a status bar: the chain came back
+    // inside its own budget yet the handler did not, so something it spawned
+    // is still holding a pipe.
+    let budget = hook::CHAIN_TIMEOUT;
+    if elapsed > budget {
+        return with_hint(
+            check(
+                STATUSLINE,
+                Status::Warn,
+                format!(
+                    "`{chain}` took {:.1}s — longer than the {}s budget",
+                    elapsed.as_secs_f32(),
+                    budget.as_secs()
+                ),
+            ),
+            "check the [statusline] chain for a background process holding stdout",
+        );
+    }
     if out.is_empty() {
         return with_hint(
             check(
@@ -515,57 +543,8 @@ fn evaluate_statusline(probe: Probe, chain: &str) -> Check {
     check(
         STATUSLINE,
         Status::Ok,
-        format!("`{chain}` → {}", first_line(&out, 60)),
+        format!("`{chain}` → {}", output::first_line(&out, 60)),
     )
-}
-
-/// First line, escapes stripped, at most `max` chars, ellipsised — a
-/// statusline is wide and coloured, and one report line has room for neither.
-/// Colour has to go before the cut, or the cut can land inside an escape and
-/// leave the terminal wearing it.
-fn first_line(s: &str, max: usize) -> String {
-    let line = strip_ansi(s.lines().next().unwrap_or(""));
-    let line = line.trim();
-    if line.chars().count() <= max {
-        return line.to_string();
-    }
-    let mut out: String = line.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
-/// Drops ANSI escape sequences: CSI (`ESC [ … final`), OSC (`ESC ] … BEL`, or
-/// `ESC \\`), and any other two-character escape.
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('[') => {
-                // Parameter and intermediate bytes, then one final byte @..~.
-                for c in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                let mut esc = false;
-                for c in chars.by_ref() {
-                    if c == '\u{7}' || (esc && c == '\\') {
-                        break;
-                    }
-                    esc = c == '\u{1b}';
-                }
-            }
-            _ => {}
-        }
-    }
-    out
 }
 
 /// The database check doubles as the handle the orphan check needs.
@@ -957,6 +936,7 @@ mod tests {
             code,
             out: out.to_string(),
             diag: diag.to_string(),
+            elapsed: Duration::ZERO,
         }
     }
 
@@ -969,6 +949,7 @@ mod tests {
                 code: None,
                 out: String::new(),
                 diag: String::new(),
+                elapsed: STATUSLINE_TIMEOUT,
             },
             "ccusage",
         );
@@ -1014,37 +995,51 @@ mod tests {
     }
 
     #[test]
+    fn a_handler_slower_than_the_chain_budget_warns_even_when_it_succeeded() {
+        let slow = evaluate_statusline(
+            Probe {
+                elapsed: hook::CHAIN_TIMEOUT + Duration::from_millis(500),
+                ..probe(Some(0), "ctx 42%", "")
+            },
+            "ccusage",
+        );
+        assert_eq!(slow.status, Status::Warn);
+        assert!(slow.detail.contains("longer than"), "{slow:?}");
+        assert!(slow.fix_hint.is_some());
+
+        // Inside the budget it is just a working statusline.
+        let quick = evaluate_statusline(
+            Probe {
+                elapsed: Duration::from_millis(30),
+                ..probe(Some(0), "ctx 42%", "")
+            },
+            "ccusage",
+        );
+        assert_eq!(quick.status, Status::Ok);
+    }
+
+    #[test]
+    fn a_diagnostic_reaches_the_report_as_one_plain_line() {
+        let dirty = evaluate_statusline(
+            probe(
+                Some(0),
+                "",
+                &("exited 1: \u{1b}[31m".to_string() + &"x".repeat(200) + "\u{1b}[0m\nand more"),
+            ),
+            "ccusage",
+        );
+        assert_eq!(dirty.status, Status::Warn);
+        assert!(!dirty.detail.contains('\u{1b}'), "{dirty:?}");
+        assert!(!dirty.detail.contains('\n'), "{dirty:?}");
+        assert!(dirty.detail.chars().count() < 130, "{dirty:?}");
+    }
+
+    #[test]
     fn the_probe_budget_covers_the_handlers_own_chain_budget() {
         assert!(
             STATUSLINE_TIMEOUT > hook::CHAIN_TIMEOUT,
             "a chain the handler would accept must not be reported as a hang"
         );
-    }
-
-    #[test]
-    fn first_line_is_one_line_and_bounded() {
-        assert_eq!(first_line("  a  \nb", 10), "a");
-        assert_eq!(first_line("", 10), "");
-        assert_eq!(first_line("čćžšđ", 3), "čć…");
-        assert_eq!(first_line("čćžšđ", 5), "čćžšđ");
-    }
-
-    #[test]
-    fn colour_is_stripped_before_the_line_is_cut() {
-        // A coloured statusline: the escapes go, the text stays.
-        assert_eq!(first_line("\u{1b}[1;32mctx 42%\u{1b}[0m", 60), "ctx 42%");
-        // Cutting a coloured line can no longer land inside an escape.
-        let cut = first_line("\u{1b}[31mabcdefghij\u{1b}[0m", 5);
-        assert_eq!(cut, "abcd…");
-        assert!(!cut.contains('\u{1b}'));
-
-        assert_eq!(strip_ansi("plain"), "plain");
-        // OSC 8 hyperlink, BEL-terminated, and the ESC \ form.
-        assert_eq!(strip_ansi("\u{1b}]8;;http://x\u{7}link"), "link");
-        assert_eq!(strip_ansi("\u{1b}]0;title\u{1b}\\rest"), "rest");
-        // A lone escape at the end must not panic or leak.
-        assert_eq!(strip_ansi("a\u{1b}"), "a");
-        assert_eq!(strip_ansi("a\u{1b}[38;5;196m"), "a");
     }
 
     #[test]

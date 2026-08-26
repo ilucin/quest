@@ -702,9 +702,12 @@ fn chain_diagnostic(out: Option<&proc::Outcome>) -> Option<String> {
             None => "was killed by a signal".to_string(),
         }
     };
+    // The chain's stderr is arbitrary output — colour, control bytes, any
+    // length — and this line has to survive being written to stderr and read
+    // back by `q doctor` as one line.
     let stderr = out.stderr_text();
     match stderr.lines().find(|l| !l.trim().is_empty()) {
-        Some(line) => Some(format!("{what}: {}", line.trim())),
+        Some(line) => Some(format!("{what}: {}", output::first_line(line, 120))),
         None => Some(what),
     }
 }
