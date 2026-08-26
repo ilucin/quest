@@ -13,7 +13,8 @@ pub struct Args<'a> {
 }
 
 pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
-    sweep_quiet(ctx)?;
+    // The brief must render even when tmux is unreachable.
+    let _ = sweep_quiet(ctx);
     let db = ctx.db()?;
     let quest = db.resolve_quest(&brief::default_target(args.quest)?)?;
     let opts = Opts {
@@ -22,9 +23,16 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         ..Opts::default()
     };
     let markdown = brief::render(db, &quest, &opts)?;
+    // Mirrors section 2: a resolved session's role wins over `--for`.
+    let sessions = db.list_sessions_by_quest(&quest.id)?;
+    let role = opts
+        .session
+        .as_deref()
+        .and_then(|s| brief::resolve_session(&quest, &sessions, s))
+        .map_or(opts.role, |s| s.role);
     let payload = serde_json::json!({
         "quest_id": quest.id,
-        "for": opts.role,
+        "for": role,
         "markdown": markdown,
     });
     if ctx.json || !ctx.quiet {

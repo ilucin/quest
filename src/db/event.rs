@@ -98,7 +98,13 @@ fn row_to_event(row: &Row) -> rusqlite::Result<Event> {
         session_id: row.get("session_id")?,
         ts: row.get("ts")?,
         kind: row.get("kind")?,
-        payload: json_col(row, "payload")?,
+        // A hand-edited or foreign payload that is not JSON still reads.
+        payload: match json_col(row, "payload") {
+            Ok(payload) => payload,
+            Err(_) => row
+                .get::<_, Option<String>>("payload")?
+                .map(serde_json::Value::String),
+        },
     })
 }
 
@@ -176,6 +182,20 @@ mod tests {
         assert_eq!(db.list_events_by_quest(&a.id, 2).unwrap().len(), 2);
         assert_eq!(db.list_events_by_quest(&b.id, 10).unwrap().len(), 1);
         assert!(db.list_events_by_quest("q-nope", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn non_json_payload_reads_as_a_raw_string() {
+        let db = db();
+        let q = quest(&db, "alpha");
+        db.conn
+            .execute(
+                "INSERT INTO event (quest_id, ts, kind, payload) VALUES (?1, 1, 'note', 'not json')",
+                [&q.id],
+            )
+            .unwrap();
+        let events = db.list_events_by_quest(&q.id, 10).unwrap();
+        assert_eq!(events[0].payload, Some(serde_json::json!("not json")));
     }
 
     #[test]

@@ -1,18 +1,24 @@
+use std::io::{ErrorKind, Write};
+
 use serde::Serialize;
 
 /// Single print path for every command: JSON when `--json`, otherwise the
-/// human rendering (only built when actually needed).
+/// human rendering (only built when actually needed). A closed pipe
+/// (`q brief | head`) is not an error.
 pub fn emit<T, F>(json: bool, value: &T, human: F) -> anyhow::Result<()>
 where
     T: Serialize,
     F: FnOnce() -> String,
 {
-    if json {
-        println!("{}", serde_json::to_string(value)?);
+    let text = if json {
+        serde_json::to_string(value)?
     } else {
-        println!("{}", human());
+        human()
+    };
+    match writeln!(std::io::stdout().lock(), "{text}") {
+        Err(e) if e.kind() == ErrorKind::BrokenPipe => Ok(()),
+        other => Ok(other?),
     }
-    Ok(())
 }
 
 /// Centralized error rendering, mirroring `emit`'s two modes. `code` is a

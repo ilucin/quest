@@ -2080,9 +2080,58 @@ fn brief_resolves_quest_and_role_from_env() {
         .assert()
         .success();
     let json = json_of(&assert);
-    assert_eq!(json["for"], "worker");
+    // The resolved session's role beats $Q_ROLE, and the payload agrees.
+    assert_eq!(json["for"], "master");
     let md = json["markdown"].as_str().unwrap();
     assert!(md.contains("You are session `master`"), "{md}");
+    assert!(
+        md.contains("role `worker` was requested, the session's wins"),
+        "{md}"
+    );
+
+    let json = env.json(&["brief", "from-env", "--session", "from-env/master"]);
+    assert!(
+        json["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("You are session `master`")
+    );
+    let json = env.json(&["brief", "from-env", "--session", "ghost", "--for", "worker"]);
+    assert_eq!(json["for"], "worker");
+    assert!(
+        json["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("_(session not found: ghost)_")
+    );
+}
+
+#[test]
+fn brief_survives_a_closed_pipe() {
+    let env = Env::new();
+    env.new_quest("piped");
+    // The read end is closed before `q` writes, so the write hits EPIPE.
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("q"))
+        .env("Q_DB", env.dir.path().join("q.db"))
+        .env("Q_CONFIG", env.dir.path().join("config.toml"))
+        .env("Q_FIXTURE", env.dir.path().join("tmux.json"))
+        .args(["brief", "piped"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

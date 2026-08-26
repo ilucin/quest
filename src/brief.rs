@@ -1,11 +1,13 @@
 //! The Quest brief (SPEC §9): deterministic markdown built from the database,
 //! shared by `q brief`, SessionStart hook injection, `q reset`, `q resume`
-//! and handoff. Sections 1–10 in spec order; the size cap trims brain body,
-//! then events, then links.
+//! and handoff. Sections 1–10 in spec order; the size cap first caps links,
+//! then halves the brain body, then the events. Beads and sessions are never
+//! trimmed, which is why `MAX_CHARS` leaves headroom under the 32k budget.
 
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -17,11 +19,14 @@ use crate::model::{Event, Link, Quest, Session, SessionRole, SessionStatus, disp
 
 /// Default for section 9.
 pub const DEFAULT_EVENTS: usize = 30;
-/// ~6k tokens (SPEC §23 #4).
+/// ~6k tokens (SPEC §23 #4). Beads and sessions are never trimmed, so this
+/// stays well under the 32k budget the hook injection has to fit.
 pub const MAX_CHARS: usize = 24_000;
 /// Cap on the brain body before the global cap even applies.
 const BRAIN_MAX_CHARS: usize = 8_000;
 const RECENT_ENDED: usize = 5;
+const LINKS_CAP: usize = 10;
+const NOTE_WIDTH: usize = 300;
 const PROMPT_WIDTH: usize = 60;
 const EXTERNAL_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -89,6 +94,8 @@ pub trait External {
 
 /// The real tools, or — under `$Q_FIXTURE` — canned output from the files
 /// `$Q_FIXTURE_BD` / `$Q_FIXTURE_BRAIN` (absent file = tool unavailable).
+/// `Q_FIXTURE` itself is the tmux stub's fixture (see `tmux.rs`); here it is
+/// only read as a "we are in a test" switch, its value is not used.
 pub fn external() -> Box<dyn External> {
     match std::env::var_os("Q_FIXTURE") {
         Some(p) if !p.is_empty() => Box::new(FixtureExternal),
@@ -125,10 +132,11 @@ fn fixture_file(var: &str) -> Option<String> {
     std::fs::read_to_string(std::env::var_os(var)?).ok()
 }
 
-/// No-op tools for unit tests and callers that want a DB-only brief.
-#[allow(dead_code)]
+/// No-op tools for unit tests.
+#[cfg(test)]
 pub struct NoExternal;
 
+#[cfg(test)]
 impl External for NoExternal {
     fn bd_list(&self, _quest_id: &str) -> Option<String> {
         None
@@ -139,7 +147,10 @@ impl External for NoExternal {
 }
 
 /// Runs `program` with a wall-clock cap; `None` on any failure, non-zero exit
-/// or timeout. Output is drained on a thread so a chatty child cannot block.
+/// or timeout. Output is drained on a thread and handed back over a channel,
+/// so neither a chatty child nor a grandchild holding the pipe open (a `bd`
+/// dolt server) can block past the cap; a late reader thread is simply
+/// abandoned.
 fn run_capped(program: &str, args: &[&str]) -> Option<String> {
     let mut child = Command::new(program)
         .args(args)
@@ -149,9 +160,10 @@ fn run_capped(program: &str, args: &[&str]) -> Option<String> {
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = String::new();
-        stdout.read_to_string(&mut buf).ok().map(|_| buf)
+        let _ = tx.send(stdout.read_to_string(&mut buf).ok().map(|_| buf));
     });
     let started = Instant::now();
     let status = loop {
@@ -167,11 +179,37 @@ fn run_capped(program: &str, args: &[&str]) -> Option<String> {
             }
         }
     };
-    let out = reader.join().ok().flatten();
-    match status {
-        Some(s) if s.success() => out,
-        _ => None,
+    if !status.is_some_and(|s| s.success()) {
+        return None;
     }
+    let remaining = EXTERNAL_TIMEOUT.saturating_sub(started.elapsed());
+    rx.recv_timeout(remaining).ok().flatten()
+}
+
+/// Brief timestamps are UTC so a brief reads the same on every machine it is
+/// handed to; `fmt::stamp` (local) stays for the interactive commands.
+fn stamp(ts: i64) -> String {
+    use chrono::{TimeZone, Utc};
+    Utc.timestamp_opt(ts, 0)
+        .single()
+        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
+/// `--session` resolution: a session id, a bare `<label>`, or `<quest>/<label>`
+/// where `<quest>` must be this Quest's id or slug (another Quest's session is
+/// never "me").
+pub fn resolve_session<'a>(
+    quest: &Quest,
+    sessions: &'a [Session],
+    target: &str,
+) -> Option<&'a Session> {
+    let label = match target.split_once('/') {
+        Some((q, label)) if q == quest.id || q == quest.slug => label,
+        Some(_) => return None,
+        None => target,
+    };
+    sessions.iter().find(|s| s.id == target || s.label == label)
 }
 
 // ------------------------------------------------------------------ rendering
@@ -194,7 +232,7 @@ pub fn render_with(
     let me = opts
         .session
         .as_deref()
-        .and_then(|s| sessions.iter().find(|x| x.id == s || x.label == s).cloned());
+        .and_then(|s| resolve_session(quest, &sessions, s).cloned());
 
     let beads = quest.beads_epic.as_deref().map(|_| ext.bd_list(&quest.id));
     let brain = quest
@@ -202,8 +240,8 @@ pub fn render_with(
         .as_deref()
         .and_then(|slug| ext.brain_show(slug));
 
-    // Each trim step tightens one input; the loop stops as soon as the
-    // rendering fits.
+    // Each trim step tightens one input, cheapest loss first; the loop stops
+    // as soon as the rendering fits.
     let mut brain_cap = BRAIN_MAX_CHARS;
     let mut event_cap = opts.events;
     let mut link_cap = usize::MAX;
@@ -227,12 +265,12 @@ pub fn render_with(
         if out.chars().count() <= opts.max_chars {
             return Ok(out);
         }
-        if brain.is_some() && brain_cap > 0 {
+        if link_cap > LINKS_CAP {
+            link_cap = LINKS_CAP;
+        } else if brain.is_some() && brain_cap > 0 {
             brain_cap = if brain_cap > 1_000 { brain_cap / 2 } else { 0 };
         } else if event_cap > 0 {
             event_cap = if event_cap > 5 { event_cap / 2 } else { 0 };
-        } else if link_cap > 10 {
-            link_cap = 10;
         } else {
             return Ok(out);
         }
@@ -261,14 +299,14 @@ fn assemble(
 ) -> String {
     let mut out = String::new();
     section_quest(&mut out, quest, sessions);
-    section_how(&mut out, quest, sessions, me, opts.role);
+    section_how(&mut out, quest, sessions, me, opts);
     section_workflow(&mut out, quest);
     section_beads(&mut out, quest, beads);
     section_sessions(&mut out, sessions);
     section_links(&mut out, links, caps.links);
     section_artifacts(&mut out, links);
     section_brain(&mut out, quest, brain, caps.brain);
-    section_events(&mut out, events, caps.events, opts.events);
+    section_events(&mut out, events, caps.events);
     section_blockers(&mut out, notes, sessions);
     out
 }
@@ -287,14 +325,14 @@ fn section_quest(out: &mut String, quest: &Quest, sessions: &[Session]) {
         ("machine", quest.machine.clone()),
         ("cwd", quest.cwd.clone()),
         ("workflow", fmt::or_dash(quest.workflow.as_deref())),
-        ("created", fmt::stamp(quest.created_at)),
+        ("created", stamp(quest.created_at)),
         ("template", fmt::or_dash(quest.template_id.as_deref())),
     ];
     for (k, v) in rows {
         out.push_str(&format!("- **{k}**: {v}\n"));
     }
     if let Some(ts) = quest.finished_at {
-        out.push_str(&format!("- **finished**: {}\n", fmt::stamp(ts)));
+        out.push_str(&format!("- **finished**: {}\n", stamp(ts)));
     }
     out.push('\n');
 }
@@ -304,15 +342,31 @@ fn section_how(
     quest: &Quest,
     sessions: &[Session],
     me: Option<&Session>,
-    role: SessionRole,
+    opts: &Opts,
 ) {
+    let role = opts.role;
     out.push_str("## 2. How you work here\n\n");
-    if let Some(s) = me {
-        out.push_str(&format!(
-            "You are session `{}` ({}, id `{}`).\n\n",
-            s.label, s.role, s.id
-        ));
-    }
+    // A resolved session knows its role better than `--for` / `$Q_ROLE`.
+    let role = match me {
+        Some(s) => {
+            let note = if s.role == role {
+                String::new()
+            } else {
+                format!("; role `{}` was requested, the session's wins", role)
+            };
+            out.push_str(&format!(
+                "You are session `{}` ({}, id `{}`{note}).\n\n",
+                s.label, s.role, s.id
+            ));
+            s.role
+        }
+        None => {
+            if let Some(target) = opts.session.as_deref() {
+                out.push_str(&format!("_(session not found: {target})_\n\n"));
+            }
+            role
+        }
+    };
     match role {
         SessionRole::Master => {
             out.push_str(
@@ -325,17 +379,9 @@ fn section_how(
                  - Report where you are: `q phase \"<text>\"`.\n\
                  - Link everything you produce: `q link add <ref>` / `q artifact add <path>`.\n\
                  - Record decisions and open questions: `q note \"<text>\"` \
-                 (`--blocker` when stuck). When you are done, leave a closing `q note`.\n",
+                 (`--blocker` when stuck). When you are done, leave a closing `q note`.\n\
+                 - Lost the picture? `q brief` re-renders this document from the database.\n",
             );
-            if quest.beads_epic.is_some() {
-                let repo = quest.beads_repo.as_deref().unwrap_or("<repo>");
-                out.push_str(&format!(
-                    "- Beads: every issue you open carries `-l repo:{repo},quest:{}` and the \
-                     epic `{}` as parent.\n",
-                    quest.id,
-                    quest.beads_epic.as_deref().unwrap_or("-")
-                ));
-            }
         }
         SessionRole::Worker => {
             let master = sessions
@@ -353,6 +399,14 @@ fn section_how(
                  - Stuck? `q note --blocker \"<text>\"` and tell the master.\n",
             ));
         }
+    }
+    if let Some(epic) = quest.beads_epic.as_deref() {
+        let repo = quest.beads_repo.as_deref().unwrap_or("<repo>");
+        out.push_str(&format!(
+            "- Beads: every issue you open carries `-l repo:{repo},quest:{}` and the \
+             epic `{epic}` as parent.\n",
+            quest.id
+        ));
     }
     out.push('\n');
 }
@@ -566,6 +620,7 @@ fn section_artifacts(out: &mut String, links: &[Link]) {
 
 fn section_brain(out: &mut String, quest: &Quest, brain: Option<&str>, cap: usize) {
     let Some(slug) = quest.brain_session.as_deref() else {
+        out.push_str("## 8. Brain session\n\n_(no brain session linked)_\n\n");
         return;
     };
     out.push_str(&format!("## 8. Brain session `{slug}`\n\n"));
@@ -587,7 +642,7 @@ fn section_brain(out: &mut String, quest: &Quest, brain: Option<&str>, cap: usiz
     out.push('\n');
 }
 
-fn section_events(out: &mut String, events: &[Event], cap: usize, requested: usize) {
+fn section_events(out: &mut String, events: &[Event], cap: usize) {
     out.push_str("## 9. Recent events\n\n");
     if events.is_empty() {
         out.push_str("No events yet.\n\n");
@@ -600,7 +655,8 @@ fn section_events(out: &mut String, events: &[Event], cap: usize, requested: usi
     }
     if shown < events.len() {
         out.push_str(&format!(
-            "\n_(truncated: showing {shown} of the last {requested} events; run `q events`)_\n"
+            "\n_(truncated: showing {shown} of the last {} events; run `q events`)_\n",
+            events.len()
         ));
     }
     out.push('\n');
@@ -612,11 +668,12 @@ fn event_line(e: &Event) -> String {
         .as_deref()
         .map(|s| format!(" [{s}]"))
         .unwrap_or_default();
-    let text = event_text(e);
-    format!("{} `{}`{who} {text}", fmt::stamp(e.ts), e.kind)
+    let text = fmt::oneline(&event_text(e), NOTE_WIDTH);
+    format!("{} `{}`{who} {text}", stamp(e.ts), e.kind)
 }
 
-/// The human part of a payload: `text` when present, else `k=v` pairs.
+/// The human part of a payload: `text` when present, else `k=v` pairs. Kept
+/// to one line so a multi-line note cannot break the bullet list.
 fn event_text(e: &Event) -> String {
     match e.payload.as_ref() {
         Some(Value::Object(map)) => {
@@ -639,15 +696,16 @@ fn event_text(e: &Event) -> String {
     }
 }
 
+/// The blocker contract for `note` events (what `q note --blocker` writes):
+/// the payload is `{"text": "<text>", "blocker": true}`. Nothing else marks a
+/// blocker — no `tag`/`tags` fields, no kind of its own. Blockers are not
+/// resolvable yet; that is a follow-up.
 fn is_blocker(e: &Event) -> bool {
-    let Some(p) = e.payload.as_ref() else {
-        return false;
-    };
-    p.get("blocker").and_then(Value::as_bool) == Some(true)
-        || p.get("tag").and_then(Value::as_str) == Some("blocker")
-        || p.get("tags")
-            .and_then(Value::as_array)
-            .is_some_and(|t| t.iter().any(|v| v.as_str() == Some("blocker")))
+    e.payload
+        .as_ref()
+        .and_then(|p| p.get("blocker"))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 fn section_blockers(out: &mut String, notes: &[Event], sessions: &[Session]) {
@@ -757,7 +815,7 @@ mod tests {
             &quest.id,
             Some(&master.id),
             "note",
-            &serde_json::json!({ "text": "DB is locked", "tag": "blocker" }),
+            &serde_json::json!({ "text": "DB is locked", "blocker": true }),
         )
         .unwrap();
         db.append_event(
@@ -859,6 +917,15 @@ mod tests {
         assert!(!md.contains("`bd-1`"));
         assert!(md.contains("repo:repo-x,quest:"));
         assert!(md.contains("_(brain note unavailable)_"));
+        let worker = Opts {
+            role: SessionRole::Worker,
+            ..Opts::default()
+        };
+        let md = render_with(&db, &quest, &worker, &NoExternal).unwrap();
+        assert!(
+            md.contains("repo:repo-x,quest:"),
+            "workers get the rule too"
+        );
     }
 
     #[test]
@@ -885,10 +952,8 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    #[test]
-    fn size_cap_trims_brain_then_events_then_links() {
-        let (db, quest) = seeded();
-        for i in 0..40 {
+    fn bulk(db: &Db, quest: &Quest, notes: usize, links: usize) {
+        for i in 0..notes {
             db.append_event(
                 &quest.id,
                 None,
@@ -897,10 +962,16 @@ mod tests {
             )
             .unwrap();
         }
-        for i in 0..30 {
+        for i in 0..links {
             db.insert_link(&Link::new(&quest.id, "url", &format!("https://x/{i}")))
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn size_cap_trims_links_then_brain_then_events() {
+        let (db, quest) = seeded();
+        bulk(&db, &quest, 40, 30);
         let brain = Canned {
             bd: None,
             brain: Some("b".repeat(5_000)),
@@ -908,33 +979,143 @@ mod tests {
         let full = render_with(&db, &quest, &Opts::default(), &brain).unwrap();
         assert!(!full.contains("truncated"), "{full}");
 
-        // Brain goes first.
+        // Links go first.
+        let opts = Opts {
+            max_chars: full.chars().count() - 200,
+            ..Opts::default()
+        };
+        let md = render_with(&db, &quest, &opts, &brain).unwrap();
+        assert!(md.contains("more links"), "{md}");
+        assert!(!md.contains("brain body cut"));
+        assert!(!md.contains("truncated: showing"));
+
+        // Then the brain body.
         let opts = Opts {
             max_chars: full.chars().count() - 3_000,
             ..Opts::default()
         };
         let md = render_with(&db, &quest, &opts, &brain).unwrap();
-        assert!(md.contains("_(truncated: brain body cut for size)_"));
+        assert!(
+            md.contains("_(truncated: brain body cut for size)_"),
+            "{md}"
+        );
         assert!(!md.contains("truncated: showing"));
 
-        // Then events.
+        // Finally events.
         let opts = Opts {
-            max_chars: 8_000,
+            max_chars: 4_000,
             ..Opts::default()
         };
         let md = render_with(&db, &quest, &opts, &brain).unwrap();
         assert!(md.contains("brain body dropped"));
         assert!(md.contains("truncated: showing"), "{md}");
-        assert!(!md.contains("more links"));
+        assert!(md.contains("of the last 30 events"), "{md}");
+        assert!(md.contains("## 10. Open questions / blockers"));
+    }
 
-        // Finally links.
-        let opts = Opts {
-            max_chars: 2_000,
+    #[test]
+    fn huge_links_do_not_starve_brain_and_events() {
+        let (db, quest) = seeded();
+        bulk(&db, &quest, 40, 450);
+        let brain = Canned {
+            bd: None,
+            brain: Some("b".repeat(BRAIN_MAX_CHARS)),
+        };
+        let md = render_with(&db, &quest, &Opts::default(), &brain).unwrap();
+        assert!(md.chars().count() <= MAX_CHARS, "{}", md.chars().count());
+        assert!(md.contains("more links"), "{md}");
+        assert!(md.contains(&"b".repeat(BRAIN_MAX_CHARS)));
+        assert!(!md.contains("truncated: brain"));
+        assert!(!md.contains("truncated: showing"));
+        let events = md
+            .split("## 9.")
+            .nth(1)
+            .unwrap()
+            .split("## 10.")
+            .next()
+            .unwrap();
+        assert_eq!(events.lines().filter(|l| l.starts_with("- ")).count(), 30);
+    }
+
+    #[test]
+    fn events_truncation_counts_what_exists() {
+        let (db, quest) = seeded();
+        // Two events qualify; ask to show fewer than that.
+        let mut out = String::new();
+        let events = db.list_events_by_kinds(&quest.id, EVENT_KINDS, 30).unwrap();
+        section_events(&mut out, &events, 1);
+        assert!(out.contains("showing 1 of the last 3 events"), "{out}");
+    }
+
+    #[test]
+    fn note_text_is_one_line_and_bounded() {
+        let (db, quest) = seeded();
+        db.append_event(
+            &quest.id,
+            None,
+            "note",
+            &serde_json::json!({ "text": format!("first\nsecond {}", "y".repeat(3_000)) }),
+        )
+        .unwrap();
+        let md = render_with(&db, &quest, &Opts::default(), &NoExternal).unwrap();
+        let line = md.lines().find(|l| l.contains("first second")).unwrap();
+        assert!(line.starts_with("- "), "{line}");
+        assert!(line.chars().count() < NOTE_WIDTH + 60, "{line}");
+        assert!(line.ends_with('…'));
+    }
+
+    #[test]
+    fn brain_header_is_present_without_a_brain_session() {
+        let db = Db::open_in_memory().unwrap();
+        let quest = db
+            .insert_quest(&Quest::new("bare", "/tmp/repo", "laptop"))
+            .unwrap();
+        let md = render_with(&db, &quest, &Opts::default(), &NoExternal).unwrap();
+        assert!(headers(&md).contains(&"## 8. Brain session"), "{md}");
+        assert!(md.contains("_(no brain session linked)_"));
+    }
+
+    #[test]
+    fn session_forms_and_role_precedence() {
+        let (db, quest) = seeded();
+        let worker = Opts {
+            role: SessionRole::Master,
+            session: Some(format!("{}/w1-tests", quest.slug)),
             ..Opts::default()
         };
-        let md = render_with(&db, &quest, &opts, &brain).unwrap();
-        assert!(md.contains("more links"), "{md}");
-        assert!(md.contains("## 10. Open questions / blockers"));
+        let md = render_with(&db, &quest, &worker, &NoExternal).unwrap();
+        assert!(md.contains("You are session `w1-tests` (worker"), "{md}");
+        assert!(md.contains("role `master` was requested, the session's wins"));
+        assert!(md.contains("You are a **worker**"));
+        assert!(!md.contains("You are the **master**"));
+
+        let by_id = Opts {
+            session: Some(format!("{}/w1-tests", quest.id)),
+            ..Opts::default()
+        };
+        let md = render_with(&db, &quest, &by_id, &NoExternal).unwrap();
+        assert!(md.contains("You are session `w1-tests`"), "{md}");
+
+        for bogus in ["nope", "other-quest/w1-tests"] {
+            let opts = Opts {
+                session: Some(bogus.to_string()),
+                ..Opts::default()
+            };
+            let md = render_with(&db, &quest, &opts, &NoExternal).unwrap();
+            assert!(
+                md.contains(&format!("_(session not found: {bogus})_")),
+                "{md}"
+            );
+            assert!(md.contains("You are the **master**"));
+        }
+    }
+
+    #[test]
+    fn timestamps_are_utc() {
+        assert_eq!(stamp(0), "1970-01-01 00:00 UTC");
+        let (db, quest) = seeded();
+        let md = render_with(&db, &quest, &Opts::default(), &NoExternal).unwrap();
+        assert!(md.contains(" UTC `note`"), "{md}");
     }
 
     #[test]
