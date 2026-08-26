@@ -48,16 +48,7 @@ impl Target {
         // Identity, so a recycled pid cannot make another session's entry speak
         // for this one: `<slug>/<label>` is the name q launched Claude with, and
         // the session id is the exact match when a hook recorded one.
-        let name = self.name();
-        let verdict = registry::verdict(Ask {
-            pid: session.claude_pid,
-            pane_pid: pane,
-            name: Some(&name),
-            session_id: session.claude_session_id.as_deref(),
-            now_ms: registry::now_ms(),
-        });
-        let refusal = gate(session.status, &verdict);
-        (verdict, refusal)
+        consult(session, pane, Some(&self.name()))
     }
 
     /// For the commands that can only act on a live pane (`q peek`, `q send`).
@@ -72,6 +63,38 @@ impl Target {
         }
         Ok(())
     }
+}
+
+/// The one place the two sources are consulted: build the registry `Ask` from a
+/// session row and turn the pair into a refusal. Every send-keys path in q goes
+/// through here — `q send` and `q reset` via [`Target::idle_gate`], the
+/// `/rename` after a Quest rename via [`refusal`].
+///
+/// `name` is the `<slug>/<label>` Claude answers to *now*; `None` skips the
+/// name check (the `sessionId` a `SessionStart` hook recorded is the stronger
+/// identity anyway).
+fn consult(session: &Session, pane: Option<i64>, name: Option<&str>) -> (Verdict, Option<String>) {
+    let verdict = registry::verdict(Ask {
+        pid: session.claude_pid,
+        pane_pid: pane,
+        name,
+        session_id: session.claude_session_id.as_deref(),
+        now_ms: registry::now_ms(),
+    });
+    let refusal = gate(session.status, &verdict);
+    (verdict, refusal)
+}
+
+/// The gate for a session row on its own, without a resolved `Target`: the
+/// `/rename` that follows a Quest rename (SPEC §10) asks about a session it is
+/// in the middle of renaming, so it cannot use [`Target::idle_gate`] — the row
+/// already carries the new slug while Claude still answers to the old one, and
+/// only the caller knows which name to ask about.
+///
+/// `pane` is the pane's own pid, which only matters when no hook ever recorded
+/// Claude's; callers without a cheap way to get one pass `None`.
+pub fn refusal(session: &Session, pane: Option<i64>, name: Option<&str>) -> Option<String> {
+    consult(session, pane, name).1
 }
 
 /// Resolves `target` against the database.

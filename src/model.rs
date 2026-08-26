@@ -72,6 +72,11 @@ text_enum!(NameSource, "name source", {
     Auto => "auto",
     Template => "template",
 });
+// `name_cache.source`: where an auto-naming proposal came from (SPEC §10).
+text_enum!(NameOrigin, "name origin", {
+    Claude => "claude",
+    Heuristic => "heuristic",
+});
 text_enum!(SessionRole, "session role", { Master => "master", Worker => "worker" });
 text_enum!(SessionStatus, "session status", {
     Starting => "starting",
@@ -177,6 +182,9 @@ pub struct Session {
     pub ctx_updated_at: Option<i64>,
     pub first_prompt: Option<String>,
     pub last_prompt: Option<String>,
+    /// The `<slug>/<label>` a `/rename` still owes this Claude session, held
+    /// because it was not idle when its Quest was renamed (SPEC §10).
+    pub pending_rename: Option<String>,
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub updated_at: i64,
@@ -209,6 +217,7 @@ impl Session {
             ctx_updated_at: None,
             first_prompt: None,
             last_prompt: None,
+            pending_rename: None,
             started_at: ts,
             ended_at: None,
             updated_at: ts,

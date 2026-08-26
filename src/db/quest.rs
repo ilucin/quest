@@ -4,7 +4,7 @@ use rusqlite::{Row, ToSql, params};
 
 use super::{Db, ID_ATTEMPTS, bool_col, db_err, enum_col, is_id_collision, u8_col};
 use crate::error::QError;
-use crate::model::{NameSource, Quest, QuestState, new_id, now};
+use crate::model::{NameOrigin, NameSource, Quest, QuestState, new_id, now};
 
 const COLUMNS: &str = "id, slug, name_source, name_input_hash, goal, cwd, machine, state, \
      workflow, template_id, beads_epic, beads_repo, brain_session, ctx_reset_pct, \
@@ -16,6 +16,7 @@ const COLUMNS: &str = "id, slug, name_source, name_input_hash, goal, cwd, machin
 pub struct QuestPatch {
     pub slug: Option<String>,
     pub name_source: Option<NameSource>,
+    pub name_input_hash: Option<Option<String>>,
     pub goal: Option<Option<String>>,
     pub cwd: Option<String>,
     pub workflow: Option<Option<String>>,
@@ -26,10 +27,18 @@ pub struct QuestPatch {
     pub auto_reset: Option<Option<bool>>,
 }
 
+/// One `name_cache` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedName {
+    pub slug: String,
+    pub source: NameOrigin,
+}
+
 impl QuestPatch {
     fn is_empty(&self) -> bool {
         self.slug.is_none()
             && self.name_source.is_none()
+            && self.name_input_hash.is_none()
             && self.goal.is_none()
             && self.cwd.is_none()
             && self.workflow.is_none()
@@ -159,6 +168,10 @@ impl Db {
             sets.push("name_source = :name_source");
             binds.push((":name_source", v));
         }
+        if let Some(v) = &patch.name_input_hash {
+            sets.push("name_input_hash = :name_input_hash");
+            binds.push((":name_input_hash", v));
+        }
         if let Some(v) = &patch.goal {
             sets.push("goal = :goal");
             binds.push((":goal", v));
@@ -256,12 +269,21 @@ impl Db {
             .ok_or_else(|| QError::NotFound(format!("quest `{id}`")).into())
     }
 
-    pub fn name_cache_get(&self, input_hash: &str) -> anyhow::Result<Option<String>> {
+    /// A cached proposal for this input, if one was ever accepted. Only
+    /// validated model answers land here — a heuristic fallback is never
+    /// cached (SPEC §10), so `source` is in practice always `claude`; it is
+    /// stored anyway so the provenance survives a future second namer.
+    pub fn name_cache_get(&self, input_hash: &str) -> anyhow::Result<Option<CachedName>> {
         self.conn
             .query_row(
-                "SELECT slug FROM name_cache WHERE input_hash = ?1",
+                "SELECT slug, source FROM name_cache WHERE input_hash = ?1",
                 [input_hash],
-                |row| row.get(0),
+                |row| {
+                    Ok(CachedName {
+                        slug: row.get(0)?,
+                        source: enum_col::<NameOrigin>(row, "source")?,
+                    })
+                },
             )
             .map(Some)
             .or_else(|e| match e {
@@ -270,12 +292,19 @@ impl Db {
             })
     }
 
-    pub fn name_cache_put(&self, input_hash: &str, slug: &str) -> anyhow::Result<()> {
+    pub fn name_cache_put(
+        &self,
+        input_hash: &str,
+        slug: &str,
+        source: NameOrigin,
+    ) -> anyhow::Result<()> {
         self.conn
             .execute(
-                "INSERT INTO name_cache (input_hash, slug, created_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(input_hash) DO UPDATE SET slug = excluded.slug",
-                params![input_hash, slug, now()],
+                "INSERT INTO name_cache (input_hash, slug, source, created_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(input_hash) DO UPDATE SET slug = excluded.slug, \
+                 source = excluded.source",
+                params![input_hash, slug, source, now()],
             )
             .map_err(db_err)?;
         Ok(())
@@ -595,15 +624,50 @@ mod tests {
     fn name_cache_reads_back_and_overwrites() {
         let db = db();
         assert!(db.name_cache_get("hash").unwrap().is_none());
-        db.name_cache_put("hash", "cdc-backfill").unwrap();
+        db.name_cache_put("hash", "cdc-backfill", NameOrigin::Claude)
+            .unwrap();
         assert_eq!(
-            db.name_cache_get("hash").unwrap().as_deref(),
-            Some("cdc-backfill")
+            db.name_cache_get("hash").unwrap(),
+            Some(CachedName {
+                slug: "cdc-backfill".to_string(),
+                source: NameOrigin::Claude,
+            })
         );
-        db.name_cache_put("hash", "cdc-restore").unwrap();
+        db.name_cache_put("hash", "cdc-restore", NameOrigin::Heuristic)
+            .unwrap();
         assert_eq!(
-            db.name_cache_get("hash").unwrap().as_deref(),
-            Some("cdc-restore")
+            db.name_cache_get("hash").unwrap(),
+            Some(CachedName {
+                slug: "cdc-restore".to_string(),
+                source: NameOrigin::Heuristic,
+            })
         );
+    }
+
+    #[test]
+    fn the_name_input_hash_is_patchable_and_clearable() {
+        let db = db();
+        let q = insert(&db, "alpha");
+        assert_eq!(q.name_input_hash, None);
+        let q = db
+            .update_quest(
+                &q.id,
+                &QuestPatch {
+                    name_input_hash: Some(Some("abc".to_string())),
+                    ..QuestPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(q.name_input_hash.as_deref(), Some("abc"));
+        let q = db
+            .update_quest(
+                &q.id,
+                &QuestPatch {
+                    name_input_hash: Some(None),
+                    ..QuestPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(q.name_input_hash, None);
     }
 }

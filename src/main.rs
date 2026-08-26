@@ -8,6 +8,7 @@ mod doctor;
 mod error;
 mod hooks;
 mod model;
+mod naming;
 mod output;
 mod proc;
 mod registry;
@@ -304,6 +305,26 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
         Command::Rename { quest, slug } => {
             let ctx = Ctx::with_db(args)?;
             commands::rename::run(&ctx, quest, slug).map(|()| 0)
+        }
+        Command::Name {
+            quest,
+            auto,
+            apply,
+            refresh,
+            detach,
+        } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::name::run(
+                &ctx,
+                &commands::name::Args {
+                    quest,
+                    auto: *auto,
+                    apply: *apply,
+                    refresh: *refresh,
+                    detach: *detach,
+                },
+            )
+            .map(|()| 0)
         }
         Command::Set { quest, key, value } => {
             let ctx = Ctx::with_db(args)?;

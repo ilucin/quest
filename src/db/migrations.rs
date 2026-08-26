@@ -8,9 +8,9 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::error::QError;
 
 /// The version this binary expects. Must equal the last entry in `MIGRATIONS`.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
-const MIGRATIONS: &[(u32, &str)] = &[(1, V1), (2, V2)];
+const MIGRATIONS: &[(u32, &str)] = &[(1, V1), (2, V2), (3, V3)];
 
 const V1: &str = r#"
 CREATE TABLE quest (
@@ -103,6 +103,14 @@ CREATE TABLE name_cache (          -- auto-naming: input_hash -> slug
 /// column. Nullable like `ctx_reset_pct`: NULL follows `[context] auto_reset`.
 const V2: &str = r#"
 ALTER TABLE quest ADD COLUMN auto_reset INTEGER;   -- 1 | 0 | NULL = config
+"#;
+
+/// Auto-naming (SPEC §10): where a cached proposal came from, and the
+/// `/rename` a live Claude session still owes because it was busy when its
+/// Quest was renamed.
+const V3: &str = r#"
+ALTER TABLE name_cache ADD COLUMN source TEXT NOT NULL DEFAULT 'claude';
+ALTER TABLE session ADD COLUMN pending_rename TEXT;
 "#;
 
 pub fn user_version(conn: &Connection) -> anyhow::Result<u32> {

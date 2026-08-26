@@ -15,14 +15,14 @@ use crate::model::{NameSource, Quest, Session, SessionRole, SessionStatus, new_i
 use crate::output;
 use crate::tmux::{NewSession, config_override, db_override, quest_env, session_name};
 
-const SLUG_MAX: usize = 40;
+pub const SLUG_MAX: usize = 40;
 /// `foo`, `foo-2` … `foo-99` — how far an auto slug will step aside.
 const SLUG_ATTEMPTS: u32 = 99;
 const SLUG_RULE: &str = "must match ^[a-z0-9]+(-[a-z0-9]+)*$ and be at most 40 characters";
 pub const MASTER: &str = "master";
 
 /// Branch names that say nothing about the work, so they never become a slug.
-const GENERIC_BRANCHES: [&str; 4] = ["main", "master", "develop", "HEAD"];
+pub const GENERIC_BRANCHES: [&str; 4] = ["main", "master", "develop", "HEAD"];
 
 #[derive(Debug, Default)]
 pub struct Args<'a> {
@@ -250,7 +250,7 @@ fn claim_slug(
 }
 
 /// `base-<n>`, kept within `SLUG_MAX` by trimming the base.
-fn numbered(base: &str, n: u32) -> String {
+pub fn numbered(base: &str, n: u32) -> String {
     let suffix = format!("-{n}");
     let mut head = base.to_string();
     if head.len() + suffix.len() > SLUG_MAX {
@@ -360,8 +360,10 @@ fn resolve_slug(name: Option<&str>, cwd: &Path) -> anyhow::Result<(String, NameS
             validate_slug(name)?;
             Ok((name.to_string(), NameSource::Manual))
         }
-        // TODO(M2): auto-naming via `claude -p --model haiku`, with this as the
-        // fallback.
+        // A new Quest gets the heuristic slug right away — `q new` must not
+        // wait on a model. `name_source = auto` and a NULL `name_input_hash`
+        // then make the master's first `Stop` hook schedule the real
+        // auto-name (SPEC §10, `naming.rs`).
         None => Ok((
             heuristic_slug(git_branch(cwd).as_deref(), cwd),
             NameSource::Auto,
@@ -386,7 +388,7 @@ fn validate_kebab(what: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn is_slug(s: &str) -> bool {
+pub fn is_slug(s: &str) -> bool {
     !s.is_empty()
         && s.split('-').all(|part| {
             !part.is_empty()
@@ -413,7 +415,7 @@ fn heuristic_slug(branch: Option<&str>, cwd: &Path) -> String {
 }
 
 /// Lowercased, every other run of characters collapsed to one `-`.
-fn slugify(raw: &str) -> String {
+pub fn slugify(raw: &str) -> String {
     let mut out = String::new();
     for c in raw.chars() {
         if c.is_ascii_alphanumeric() {
@@ -426,7 +428,7 @@ fn slugify(raw: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-fn git_branch(cwd: &Path) -> Option<String> {
+pub fn git_branch(cwd: &Path) -> Option<String> {
     let out = Command::new("git")
         .args([
             "-C",
