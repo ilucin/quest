@@ -1499,9 +1499,11 @@ fn the_masters_stop_hook_schedules_a_rename_when_the_naming_input_changed() {
 
     let spawns = env.spawns();
     assert_eq!(spawns.len(), 1, "{spawns:?}");
+    // No `--detach`: the spawn already is the detach, and the flag would make
+    // the child fork a grandchild and exit (round-2 review, low #4).
     assert_eq!(
         spawns[0]["args"],
-        json!(["name", "q-0001", "--auto", "--apply", "--detach"])
+        json!(["name", "q-0001", "--auto", "--apply"])
     );
     assert!(
         spawns[0]["exe"].as_str().unwrap().ends_with("q"),

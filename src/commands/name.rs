@@ -10,7 +10,7 @@ use crate::Ctx;
 use crate::commands::new::Claim;
 use crate::commands::{new, rename, sweep_quiet};
 use crate::error::QError;
-use crate::model::NameSource;
+use crate::model::{NameOrigin, NameSource};
 use crate::naming::{self, Input};
 use crate::output;
 
@@ -115,12 +115,17 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         Some(&proposal.input_hash),
     ) {
         Ok(renamed) => renamed,
-        // Terminal: the input has been paid for and would hash the same next
-        // time, so stamping it is what stops every following `Stop` hook from
-        // buying the identical model answer again. The failure is logged
-        // because the caller is usually a detached child nobody watches.
+        // The model answer is already cached under this input hash, so a retry
+        // costs nothing — stamping only turns a transient failure (a tmux
+        // hiccup, a locked database) into a permanent one. It is stamped when
+        // retrying cannot help: a name the grammar or another Quest rejects, and
+        // a heuristic proposal, which has no cache entry to retry from. The
+        // failure is logged because the caller is usually a detached child
+        // nobody watches (round-2 review, low #3).
         Err(e) => {
-            let _ = stamp(ctx, &quest.id, &proposal.input_hash);
+            if terminal(&e) || proposal.source == NameOrigin::Heuristic {
+                let _ = stamp(ctx, &quest.id, &proposal.input_hash);
+            }
             let _ = db.append_event(
                 &quest.id,
                 None,
@@ -163,6 +168,15 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Whether a failed rename would fail the same way next time: the name itself
+/// is the problem, not the machine underneath.
+fn terminal(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<QError>(),
+        Some(QError::Conflict(_) | QError::Invalid(_))
+    )
 }
 
 /// Writes `name_input_hash` on a rename that changed nothing else.

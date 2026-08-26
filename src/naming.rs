@@ -20,7 +20,7 @@
 //! never pays for a second model call; a rejected answer is *not* cached. The
 //! same hash drives regeneration: the master's `Stop` hook compares it against
 //! `quest.name_input_hash` and, when they differ, spawns
-//! `q name <quest> --auto --apply --detach` in the background. No periodic job.
+//! `q name <quest> --auto --apply` in the background. No periodic job.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -46,6 +46,16 @@ const HEURISTIC_WORDS: usize = 4;
 /// wrapped the token in a code fence put it on line 2; one that wrote an essay
 /// did not answer the question.
 const ANSWER_LINES: usize = 10;
+/// Shortest lone token (no hyphen) taken as an answer. Below it a slug-shaped
+/// line is far more likely to be a stray word than a name.
+const LONE_TOKEN_MIN: usize = 4;
+/// Lone tokens that are valid slugs but never an answer to "name this work" —
+/// a chatty model opens with one of these on its own line. Only consulted for a
+/// token with no hyphen in it.
+const FILLER: [&str; 14] = [
+    "sure", "okay", "yes", "yeah", "done", "text", "slug", "name", "here", "hmm", "thanks",
+    "answer", "output", "none",
+];
 
 /// The environment that marks a Quest pane (SPEC §7). Every process q starts
 /// for its own bookkeeping drops all of it: inherited, the child's own hooks —
@@ -299,22 +309,38 @@ pub fn propose(
 /// The first line is usually the whole answer, but a model that fenced its
 /// token put `` ```text `` there instead — and `text` is a perfectly valid
 /// slug, so taking the first line alone would name the Quest after the fence.
-/// Fence lines are dropped and the first *remaining* line that is a slug on its
-/// own — once the punctuation a chatty model wraps a token in is stripped —
-/// wins. A prose line is never a slug (it has spaces), so an explanation still
-/// falls through to the heuristic.
+/// Fence lines are dropped and every *remaining* line that is a slug on its
+/// own — once the punctuation a chatty model wraps a token in is stripped — is a
+/// candidate. A prose line is never a slug (it has spaces), so an explanation
+/// still falls through to the heuristic.
+///
+/// A hyphen is what an answer to *this* question looks like, so a hyphenated
+/// candidate always beats a lone token above it (`"Sure\ncdc-backfill"`). A lone
+/// token is only taken when it could not be an acknowledgement: long enough, and
+/// not one of [`FILLER`].
 fn sanitize(raw: &str) -> Option<String> {
-    raw.lines()
+    let candidates: Vec<&str> = raw
+        .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with("```") && !l.starts_with("~~~"))
         .take(ANSWER_LINES)
-        .find_map(|line| {
+        .filter_map(|line| {
             let slug = line.trim_matches(|c: char| {
                 c.is_whitespace()
                     || matches!(c, '`' | '"' | '\'' | '.' | ',' | ':' | ';' | '*' | '#')
             });
-            (slug.len() <= SLUG_MAX && is_slug(slug)).then(|| slug.to_string())
+            (slug.len() <= SLUG_MAX && is_slug(slug)).then_some(slug)
         })
+        .collect();
+    candidates
+        .iter()
+        .find(|s| s.contains('-'))
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|s| s.len() >= LONE_TOKEN_MIN && !FILLER.contains(*s))
+        })
+        .map(|s| s.to_string())
 }
 
 /// The fallback when the model is unavailable or unusable: the git branch if it
@@ -448,26 +474,21 @@ pub fn maybe_rename(db: &Db, session: &Session) {
 /// The session just went idle, so a held `/rename` can go out now — unless
 /// Claude's own registry still disagrees.
 fn flush_pending(db: &Db, quest: &Quest, session: &Session) {
-    if session.pending_rename.is_none() {
+    let Some((session, desired)) = owed(db, quest, session) else {
         return;
-    }
-    // The Quest may have been renamed again while the send was held, so the
-    // name that goes out is the current one, not the parked text.
-    let desired = claude_name(&quest.slug, &session.label);
+    };
     // The `list-panes` and the `send-keys` below are unbounded tmux calls on a
     // hook's critical path. Both are local socket round trips against a server
     // this pane is already living in — a tmux that cannot answer them has the
     // user's terminal wedged too — and every other hook path already makes
     // them (the liveness sweep, `q peek`), so they are taken as they are.
     let tmux = crate::tmux::tmux();
-    // `Stop` means the turn is over, so the row is idle whatever it still says;
-    // the registry is the second opinion.
     let pane_pid = pane_pid(&tmux.list_panes().unwrap_or_default(), &session.tmux_pane);
-    let mut idle = session.clone();
-    idle.status = SessionStatus::Idle;
     // Claude still answers to whatever it was last told, which is never the
     // parked name — that is precisely the send that did not happen.
-    if crate::commands::target::refusal(&idle, pane_pid, session.claude_name.as_deref()).is_some() {
+    if crate::commands::target::refusal(&session, pane_pid, session.claude_name.as_deref())
+        .is_some()
+    {
         return;
     }
     if send_rename(tmux.as_ref(), &session.tmux_pane, &desired).is_err() {
@@ -483,6 +504,24 @@ fn flush_pending(db: &Db, quest: &Quest, session: &Session) {
         )?;
         Ok(())
     });
+}
+
+/// The row `stop` just wrote — not the one it was handed — and the `/rename` it
+/// owes. `None` when nothing is owed, or when the session is not idle after
+/// all: `stop`'s write may have been dropped on a lock timeout, and a
+/// `Notification` racing this turn may have moved the session to `waiting`,
+/// where a `/rename` would answer a permission prompt (SPEC §8 — the hazard
+/// `reset::schedule` guards the same way).
+fn owed(db: &Db, quest: &Quest, session: &Session) -> Option<(Session, String)> {
+    let row = db.get_session(&session.id).ok().flatten()?;
+    row.pending_rename.as_deref()?;
+    if row.status != SessionStatus::Idle {
+        return None;
+    }
+    // The Quest may have been renamed again while the send was held, so the
+    // name that goes out is the current one, not the parked text.
+    let desired = claude_name(&quest.slug, &row.label);
+    Some((row, desired))
 }
 
 /// Regenerate in the background when this is the master of an auto-named Quest
@@ -504,12 +543,13 @@ fn schedule(db: &Db, quest: &Quest, session: &Session) -> anyhow::Result<()> {
         "name.scheduled",
         &serde_json::json!({ "input_hash": hash }),
     )?;
+    // No `--detach`: `spawn_detached` already is the detach, and the flag would
+    // make the child fork a grandchild and exit.
     spawn_detached(&[
         "name".to_string(),
         quest.id.clone(),
         "--auto".to_string(),
         "--apply".to_string(),
-        "--detach".to_string(),
     ])
 }
 
@@ -761,7 +801,35 @@ mod tests {
             sanitize("cdc-backfill.\n\nthoughts"),
             Some("cdc-backfill".to_string())
         );
-        assert_eq!(sanitize("\n\nq1"), Some("q1".to_string()));
+        // A lone token with no hyphen is still an answer when it is long
+        // enough not to be an acknowledgement.
+        assert_eq!(sanitize("\n\nbackfill"), Some("backfill".to_string()));
+    }
+
+    /// Round-2 review, low #2: any lone lowercase token used to be taken as the
+    /// answer, so a model that opened with "Sure" named the Quest `sure`. A
+    /// hyphenated candidate now wins over anything above it, and a lone token
+    /// has to be long enough and not a filler word.
+    #[test]
+    fn a_filler_word_never_wins_over_the_real_token() {
+        assert_eq!(
+            sanitize("Sure\ncdc-backfill"),
+            Some("cdc-backfill".to_string())
+        );
+        assert_eq!(
+            sanitize("okay\n\nhere\ncdc-backfill\nhope that helps"),
+            Some("cdc-backfill".to_string())
+        );
+        // Nothing but filler is no answer at all.
+        assert_eq!(sanitize("sure\nokay"), None);
+        for filler in FILLER {
+            assert_eq!(sanitize(filler), None, "accepted `{filler}`");
+        }
+        // Short lone tokens are rejected whatever they say.
+        assert_eq!(sanitize("q1"), None);
+        assert_eq!(sanitize("cdc"), None);
+        // …but a hyphen makes even a short one an answer.
+        assert_eq!(sanitize("a-b"), Some("a-b".to_string()));
     }
 
     /// Round-1 review, blocking #2: the first line of a fenced answer is the
@@ -948,6 +1016,46 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let quest = db.insert_quest(&quest("old-name")).unwrap();
         (db, quest)
+    }
+
+    /// Round-2 review, blocking #1: the `Stop` hook used to force the row it was
+    /// handed to `idle` before the gate, so a session the database says is
+    /// `waiting` (a `Notification` won the race, or `stop`'s write was dropped)
+    /// had `/rename` typed into its permission prompt.
+    #[test]
+    fn a_held_rename_waits_for_the_stored_row_to_say_idle() {
+        let (db, quest) = seeded();
+        let mut session = Session::new(&quest.id, SessionRole::Master, "master", "q-old", "%7");
+        session.status = SessionStatus::Busy;
+        let session = db.insert_session(&session).unwrap();
+        db.set_pending_rename(&session.id, Some("old-name/master"))
+            .unwrap();
+
+        // Nothing owed until the row itself is idle — the handed row says so.
+        let mut stale = session.clone();
+        stale.status = SessionStatus::Idle;
+        assert!(owed(&db, &quest, &stale).is_none());
+        db.update_session_status(
+            &session.id,
+            SessionStatus::Waiting,
+            Some("permission_prompt"),
+        )
+        .unwrap();
+        assert!(owed(&db, &quest, &stale).is_none());
+
+        // Idle in the database, and the name that goes out is the Quest's
+        // current one rather than the parked text.
+        db.update_session_status(&session.id, SessionStatus::Idle, None)
+            .unwrap();
+        let mut renamed = quest.clone();
+        renamed.slug = "new-name".to_string();
+        let (row, desired) = owed(&db, &renamed, &stale).unwrap();
+        assert_eq!(desired, "new-name/master");
+        assert_eq!(row.pending_rename.as_deref(), Some("old-name/master"));
+
+        // And nothing is owed once the send has happened.
+        db.set_pending_rename(&session.id, None).unwrap();
+        assert!(owed(&db, &renamed, &stale).is_none());
     }
 
     #[test]

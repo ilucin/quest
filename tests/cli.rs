@@ -6706,12 +6706,13 @@ fn name_apply_steps_aside_when_a_tmux_session_already_holds_the_proposal() {
     assert_eq!(out["current"], "cdc-backfill-2");
 }
 
-/// A rename that fails is terminal for this input: the model answer has been
-/// paid for and would hash the same on the next `Stop`, so the hash is stamped
-/// anyway and the failure is logged — the caller is normally a detached child
-/// whose stderr goes to `/dev/null` (round-1 review, medium #6).
+/// A rename that failed on the machine (tmux went away) is logged — the caller
+/// is normally a detached child whose stderr goes to `/dev/null` (round-1
+/// review, medium #6) — but the hash is *not* stamped: the answer is already in
+/// the cache, so the retry is free, and stamping would make a transient failure
+/// permanent (round-2 review, low #3).
 #[test]
-fn a_failed_apply_stamps_the_hash_and_logs_it_rather_than_paying_again() {
+fn a_failed_apply_logs_it_and_leaves_the_hash_unstamped_for_a_retry() {
     let env = Env::new();
     let quest = quest_with_prompt(&env, "foo");
     let id = quest["quest"]["id"].as_str().unwrap().to_string();
@@ -6735,7 +6736,7 @@ fn a_failed_apply_stamps_the_hash_and_logs_it_rather_than_paying_again() {
 
     let stored = env.quest_row("foo");
     assert_eq!(stored["slug"], "foo");
-    assert!(stored["name_input_hash"].is_string(), "{stored}");
+    assert!(stored["name_input_hash"].is_null(), "{stored}");
     assert!(event_kinds(&env, &id).contains(&"name.failed".to_string()));
     // The answer stays in the cache, so a later retry does not pay for it.
     assert_eq!(
@@ -6744,20 +6745,44 @@ fn a_failed_apply_stamps_the_hash_and_logs_it_rather_than_paying_again() {
     );
 }
 
+/// The other half of round-2 review low #3: a heuristic proposal has nothing in
+/// the cache to retry from, so a failed apply stamps the hash rather than
+/// letting every following `Stop` hook call the model again.
+#[test]
+fn a_failed_apply_of_a_heuristic_name_stamps_the_hash() {
+    let env = Env::new();
+    quest_with_prompt(&env, "foo");
+    let mut fixture = env.fixture();
+    fixture["fail_rename_session"] = serde_json::json!("tmux server went away");
+    env.write_fixture(fixture);
+
+    // No canned answer at all = `claude` unavailable, so the proposal is the
+    // heuristic one.
+    env.cmd()
+        .args(["name", "foo", "--auto", "--apply", "--force", "--json"])
+        .assert()
+        .failure();
+
+    let stored = env.quest_row("foo");
+    assert_eq!(stored["slug"], "foo");
+    assert!(stored["name_input_hash"].is_string(), "{stored}");
+    assert!(env.cached_names().is_empty());
+}
+
 #[test]
 fn name_apply_records_the_input_hash_even_when_the_slug_does_not_change() {
     let env = Env::new();
-    quest_with_prompt(&env, "foo");
-    let canned = env.canned_name("foo");
+    quest_with_prompt(&env, "cdc-backfill");
+    let canned = env.canned_name("cdc-backfill");
 
     let out = env.name_json(
         Some(&canned),
-        &["name", "foo", "--auto", "--apply", "--force"],
+        &["name", "cdc-backfill", "--auto", "--apply", "--force"],
     );
     assert_eq!(out["applied"], true);
     assert_eq!(out["renamed"]["changed"], false);
-    assert_eq!(out["current"], "foo");
-    let stored = env.quest_row("foo");
+    assert_eq!(out["current"], "cdc-backfill");
+    let stored = env.quest_row("cdc-backfill");
     assert_eq!(stored["name_input_hash"], out["proposal"]["input_hash"]);
     // No rename happened, so nothing was logged and nobody was told.
     assert!(
