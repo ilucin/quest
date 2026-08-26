@@ -117,6 +117,17 @@ impl Db {
         self.require_session(id)
     }
 
+    /// Self-reported phase (`q phase`).
+    pub fn update_session_phase(&self, id: &str, phase: &str) -> anyhow::Result<Session> {
+        self.conn
+            .execute(
+                "UPDATE session SET phase = ?1, updated_at = ?2 WHERE id = ?3",
+                params![phase, now(), id],
+            )
+            .map_err(db_err)?;
+        self.require_session(id)
+    }
+
     pub fn mark_session_ended(&self, id: &str, ended_at: i64) -> anyhow::Result<Session> {
         self.conn
             .execute(

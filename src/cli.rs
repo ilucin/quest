@@ -139,6 +139,106 @@ pub enum Command {
         #[command(subcommand)]
         action: HookAction,
     },
+
+    // Agent self-report (SPEC §7, §12): quest from $Q_QUEST, session from
+    // $Q_SESSION unless overridden.
+    /// Report what this session is doing now (requires $Q_SESSION)
+    Phase {
+        text: String,
+        #[arg(long, value_name = "QUEST")]
+        quest: Option<String>,
+    },
+
+    /// Leave a note on the Quest's timeline
+    Note {
+        text: String,
+        /// Mark the note as a blocker the master must resolve
+        #[arg(long)]
+        blocker: bool,
+        #[arg(long, value_name = "QUEST")]
+        quest: Option<String>,
+    },
+
+    /// Attach a reference (PR, task, worktree, URL, ...) to the Quest
+    Link {
+        #[command(subcommand)]
+        action: LinkAction,
+    },
+
+    /// List a Quest's links grouped by kind
+    Links {
+        quest: Option<String>,
+        /// Re-fetch enrichment (reserved: enrichment lands in a later milestone)
+        #[arg(long, hide = true)]
+        refresh: bool,
+    },
+
+    /// Attach a produced file to the Quest
+    Artifact {
+        #[command(subcommand)]
+        action: ArtifactAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LinkAction {
+    /// Add a link; the kind is detected from the reference unless given
+    Add {
+        r#ref: String,
+        #[arg(long, value_enum)]
+        kind: Option<LinkKind>,
+        #[arg(long, value_name = "TEXT")]
+        title: Option<String>,
+        #[arg(long, value_name = "QUEST")]
+        quest: Option<String>,
+    },
+    /// Remove a link by id
+    Rm {
+        id: i64,
+        #[arg(long, value_name = "QUEST")]
+        quest: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ArtifactAction {
+    /// Add a file (stored by absolute path)
+    Add {
+        path: String,
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+        #[arg(long, value_name = "QUEST")]
+        quest: Option<String>,
+    },
+}
+
+/// `link.kind` (SPEC §4).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "lowercase")]
+pub enum LinkKind {
+    Pr,
+    Task,
+    Worktree,
+    Url,
+    Branch,
+    Beads,
+    Brain,
+    Artifact,
+}
+
+impl LinkKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkKind::Pr => "pr",
+            LinkKind::Task => "task",
+            LinkKind::Worktree => "worktree",
+            LinkKind::Url => "url",
+            LinkKind::Branch => "branch",
+            LinkKind::Beads => "beads",
+            LinkKind::Brain => "brain",
+            LinkKind::Artifact => "artifact",
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]

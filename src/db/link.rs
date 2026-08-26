@@ -1,6 +1,6 @@
 //! `link` table — external references attached to a Quest (SPEC §12).
 
-use rusqlite::{Row, params};
+use rusqlite::{OptionalExtension, Row, params};
 
 use super::{Db, db_err, json_col, json_val};
 use crate::model::Link;
@@ -34,6 +34,41 @@ impl Db {
             id: self.conn.last_insert_rowid(),
             ..link.clone()
         })
+    }
+
+    pub fn get_link(&self, id: i64) -> anyhow::Result<Option<Link>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {COLUMNS} FROM link WHERE id = ?1"))
+            .map_err(db_err)?;
+        stmt.query_row([id], row_to_link).optional().map_err(db_err)
+    }
+
+    /// The row behind `UNIQUE(quest_id, kind, ref)`, if any.
+    pub fn find_link(
+        &self,
+        quest_id: &str,
+        kind: &str,
+        r#ref: &str,
+    ) -> anyhow::Result<Option<Link>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {COLUMNS} FROM link WHERE quest_id = ?1 AND kind = ?2 AND ref = ?3"
+            ))
+            .map_err(db_err)?;
+        stmt.query_row(params![quest_id, kind, r#ref], row_to_link)
+            .optional()
+            .map_err(db_err)
+    }
+
+    /// True when a row was deleted.
+    pub fn delete_link(&self, id: i64) -> anyhow::Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM link WHERE id = ?1", [id])
+            .map_err(db_err)?;
+        Ok(n > 0)
     }
 
     pub fn list_links_by_quest(&self, quest_id: &str) -> anyhow::Result<Vec<Link>> {
@@ -117,6 +152,24 @@ mod tests {
         assert_eq!(listed[0].meta.as_ref().unwrap()["ci"], "passing");
         assert_eq!(listed[1].kind, "branch");
         assert!(db.list_links_by_quest("q-nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_find_and_delete() {
+        let db = Db::open_in_memory().unwrap();
+        let q = db
+            .insert_quest(&Quest::new("alpha", "/tmp/repo", "laptop"))
+            .unwrap();
+        let stored = db.insert_link(&link(&q.id, "url", "https://x")).unwrap();
+        assert_eq!(db.get_link(stored.id).unwrap(), Some(stored.clone()));
+        assert_eq!(
+            db.find_link(&q.id, "url", "https://x").unwrap(),
+            Some(stored.clone())
+        );
+        assert_eq!(db.find_link(&q.id, "pr", "https://x").unwrap(), None);
+        assert!(db.delete_link(stored.id).unwrap());
+        assert!(!db.delete_link(stored.id).unwrap());
+        assert_eq!(db.get_link(stored.id).unwrap(), None);
     }
 
     #[test]
