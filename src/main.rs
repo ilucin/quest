@@ -8,6 +8,7 @@ mod error;
 mod hooks;
 mod model;
 mod output;
+mod registry;
 mod tmux;
 
 use clap::Parser;
@@ -237,6 +238,41 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
                 },
             )
             .map(|()| 0)
+        }
+        Command::Sessions { quest, all } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::sessions::run(
+                &ctx,
+                &commands::sessions::Args {
+                    quest: quest.as_deref(),
+                    all: *all,
+                },
+            )
+            .map(|()| 0)
+        }
+        Command::Peek { session, lines } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::peek::run(&ctx, session, *lines).map(|()| 0)
+        }
+        Command::Send {
+            session,
+            text,
+            force,
+        } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::send::run(
+                &ctx,
+                &commands::send::Args {
+                    session,
+                    text,
+                    force: *force,
+                },
+            )
+            .map(|()| 0)
+        }
+        Command::Kill { session, force } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::kill::run(&ctx, session, *force).map(|()| 0)
         }
         Command::Rename { quest, slug } => {
             let ctx = Ctx::with_db(args)?;

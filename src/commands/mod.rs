@@ -7,14 +7,19 @@ pub mod events;
 pub mod fmt;
 pub mod hook;
 pub mod hook_capture;
+pub mod kill;
 pub mod list;
 pub mod new;
+pub mod peek;
 pub mod rename;
 pub mod resume;
 pub mod rm;
+pub mod send;
+pub mod sessions;
 pub mod set;
 pub mod show;
 pub mod spawn;
+pub mod target;
 
 // Agent self-report (bd-8lz.2.5).
 pub mod link;
@@ -64,6 +69,17 @@ impl QuestView {
 
 pub fn live(sessions: &[Session]) -> impl Iterator<Item = &Session> {
     sessions.iter().filter(|s| s.status != SessionStatus::Ended)
+}
+
+/// The pane's own process id, when tmux still has that pane. `None` is an
+/// ordinary answer: the pane may be gone, or tmux may not be running.
+pub fn pane_pid(ctx: &Ctx, pane_id: &str) -> Option<i64> {
+    ctx.tmux()
+        .list_panes()
+        .ok()?
+        .into_iter()
+        .find(|p| p.pane_id == pane_id)
+        .map(|p| i64::from(p.pane_pid))
 }
 
 /// The liveness sweep every command that reads Quests runs first (SPEC §6).

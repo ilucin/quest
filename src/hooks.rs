@@ -15,13 +15,12 @@ use std::process::Command;
 use serde_json::{Value, json};
 
 use crate::brief::{self, Opts};
+use crate::commands::fmt::{EVENT_PROMPT_CHARS, truncate};
 use crate::db::Db;
 use crate::model::{Session, SessionStatus, now};
 
 /// Stored on the session row.
 const LAST_PROMPT_CHARS: usize = 500;
-/// Stored in the `session.prompt` event payload.
-const EVENT_PROMPT_CHARS: usize = 200;
 
 /// Lock budgets, well inside the 10s/15s timeouts `q hook install` sets for
 /// these hooks in Claude's settings (Claude's own default is 60s): a hook
@@ -284,17 +283,6 @@ fn session_end(db: &Db, session: &Session, payload: &Value) {
     });
 }
 
-/// At most `max` chars, on a char boundary, with an ellipsis when cut.
-fn truncate(s: &str, max: usize) -> String {
-    let s = s.trim();
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,12 +306,5 @@ mod tests {
         );
         assert_eq!(waiting_for(Some(""), Some("Task done")), None);
         assert_eq!(waiting_for(None, None), None);
-    }
-
-    #[test]
-    fn truncate_is_char_safe() {
-        assert_eq!(truncate("  abc ", 10), "abc");
-        assert_eq!(truncate("čćžšđ", 3), "čć…");
-        assert_eq!(truncate("čćžšđ", 5), "čćžšđ");
     }
 }
