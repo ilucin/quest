@@ -87,6 +87,9 @@ pub trait Tmux {
     /// selects its window first.
     fn attach(&self, session: &str, pane: Option<&str>) -> anyhow::Result<()>;
     fn send_keys(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()>;
+    /// One bracketed paste, then Enter when asked — for text a TUI has to read
+    /// as a single input even though it spans lines.
+    fn paste(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()>;
     fn capture_pane(&self, pane_id: &str, lines: usize) -> anyhow::Result<String>;
     fn rename_session(&self, old: &str, new: &str) -> anyhow::Result<()>;
     fn rename_window(&self, pane_id: &str, new: &str) -> anyhow::Result<()>;
@@ -189,9 +192,38 @@ fn env_args(env: &[(String, String)]) -> Vec<String> {
 fn args_send_keys(pane_id: &str, text: &str, enter: bool) -> Vec<Vec<String>> {
     let mut out = vec![args(&["send-keys", "-t", pane_id, "-l", "--", text])];
     if enter {
-        out.push(args(&["send-keys", "-t", pane_id, "Enter"]));
+        out.push(args_send_enter(pane_id));
     }
     out
+}
+
+fn args_send_enter(pane_id: &str) -> Vec<String> {
+    args(&["send-keys", "-t", pane_id, "Enter"])
+}
+
+/// A paste buffer of our own, per process: two concurrent `q send`s must not
+/// consume each other's text.
+fn send_buffer() -> String {
+    format!("q-send-{}", std::process::id())
+}
+
+/// The text goes in as an argument rather than through stdin, exactly like
+/// `send-keys -l`, so both paths share the same size ceiling and quoting.
+fn args_set_buffer(buffer: &str, text: &str) -> Vec<String> {
+    args(&["set-buffer", "-b", buffer, "--", text])
+}
+
+/// `-p` brackets the paste with `ESC[200~` / `ESC[201~` when the application in
+/// the pane asked for bracketed paste — which is how a TUI tells a pasted
+/// newline from a pressed Enter (verified against tmux 3.6b). Without the
+/// request tmux sends the bytes bare, so this is never worse than `send-keys`.
+/// `-d` drops the buffer once it is pasted.
+fn args_paste_buffer(pane_id: &str, buffer: &str) -> Vec<String> {
+    args(&["paste-buffer", "-p", "-d", "-b", buffer, "-t", pane_id])
+}
+
+fn args_delete_buffer(buffer: &str) -> Vec<String> {
+    args(&["delete-buffer", "-b", buffer])
 }
 
 fn args_capture_pane(pane_id: &str, lines: usize) -> Vec<String> {
@@ -415,6 +447,20 @@ impl Tmux for RealTmux {
         Ok(())
     }
 
+    fn paste(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()> {
+        let buffer = send_buffer();
+        run(&args_set_buffer(&buffer, text))?;
+        if let Err(e) = run(&args_paste_buffer(pane_id, &buffer)) {
+            // `-d` never ran, so the buffer would outlive the failure.
+            let _ = run(&args_delete_buffer(&buffer));
+            return Err(e);
+        }
+        if enter {
+            run(&args_send_enter(pane_id))?;
+        }
+        Ok(())
+    }
+
     fn capture_pane(&self, pane_id: &str, lines: usize) -> anyhow::Result<String> {
         Ok(tail(&run(&args_capture_pane(pane_id, lines))?, lines))
     }
@@ -497,6 +543,10 @@ pub struct FixturePane {
     /// What `send_keys` wrote and `capture_pane` reads back.
     #[serde(default)]
     pub buffer: String,
+    /// Every `paste` in order, so a test can tell a bracketed paste from typed
+    /// keys — the wire difference is invisible in `buffer`.
+    #[serde(default)]
+    pub pastes: Vec<String>,
 }
 
 impl FixturePane {
@@ -532,6 +582,7 @@ impl FixtureState {
             env: spec_env.iter().cloned().collect(),
             command: command.map(str::to_string),
             buffer: String::new(),
+            pastes: Vec::new(),
         };
         let out = pane.as_pane();
         self.panes.push(pane);
@@ -744,6 +795,18 @@ impl Tmux for FixtureTmux {
     fn send_keys(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()> {
         self.edit(|state| {
             let pane = state.pane_mut(pane_id)?;
+            pane.buffer.push_str(text);
+            if enter {
+                pane.buffer.push('\n');
+            }
+            Ok(())
+        })
+    }
+
+    fn paste(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()> {
+        self.edit(|state| {
+            let pane = state.pane_mut(pane_id)?;
+            pane.pastes.push(text.to_string());
             pane.buffer.push_str(text);
             if enter {
                 pane.buffer.push('\n');
@@ -1836,6 +1899,9 @@ mod tests {
             unreachable!()
         }
         fn send_keys(&self, _: &str, _: &str, _: bool) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn paste(&self, _: &str, _: &str, _: bool) -> anyhow::Result<()> {
             unreachable!()
         }
         fn capture_pane(&self, _: &str, _: usize) -> anyhow::Result<String> {

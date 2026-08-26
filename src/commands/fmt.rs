@@ -72,6 +72,22 @@ pub fn oneline(text: &str, max: usize) -> String {
     flat.chars().take(keep).collect::<String>() + "…"
 }
 
+/// How much of a prompt an event payload keeps: enough to recognise it in
+/// `q events`, not enough to turn the log into a transcript.
+pub const EVENT_PROMPT_CHARS: usize = 200;
+
+/// At most `max` characters, ellipsised, with the ends trimmed. Newlines are
+/// kept — unlike `oneline`, this is for stored text, not a table cell.
+pub fn truncate(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
+}
+
 /// `-` for anything absent, so a column never collapses.
 pub fn or_dash(value: Option<&str>) -> String {
     match value {
@@ -182,6 +198,14 @@ mod tests {
         assert_eq!(oneline("abcdef", 6), "abcdef");
         assert_eq!(oneline("abcdef", 5), "abcd…");
         assert_eq!(oneline("", 5), "");
+    }
+
+    #[test]
+    fn truncate_is_char_safe_and_keeps_newlines() {
+        assert_eq!(truncate("  abc ", 10), "abc");
+        assert_eq!(truncate("čćžšđ", 3), "čć…");
+        assert_eq!(truncate("čćžšđ", 5), "čćžšđ");
+        assert_eq!(truncate("a\nb", 10), "a\nb");
     }
 
     #[test]

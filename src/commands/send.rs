@@ -8,11 +8,12 @@
 //! way past it.
 
 use crate::Ctx;
-use crate::commands::{sweep_quiet, target};
+use crate::commands::fmt::{EVENT_PROMPT_CHARS, truncate};
+use crate::commands::{pane_pid, sweep_quiet, target};
 use crate::error::QError;
 use crate::model::SessionStatus;
 use crate::output;
-use crate::registry::{self, Verdict};
+use crate::registry::{self, Ask, Verdict};
 
 pub struct Args<'a> {
     pub session: &'a str,
@@ -30,24 +31,52 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     found.require_live()?;
 
     let session = &found.session;
-    let verdict = registry::verdict(session.claude_pid);
+    // The pane's pid is only needed when no hook ever recorded Claude's, so it
+    // costs a `list-panes` exactly in the case the registry would otherwise
+    // have nothing to say.
+    let pane = session
+        .claude_pid
+        .is_none()
+        .then(|| pane_pid(ctx, &session.tmux_pane))
+        .flatten();
+    let verdict = registry::verdict(Ask::new(
+        session.claude_pid,
+        pane,
+        session.claude_name.as_deref(),
+    ));
     let refusal = gate(session.status, &verdict);
     if let Some(reason) = &refusal
         && !args.force
     {
+        let hint = verdict
+            .hint()
+            .map(|h| format!(" ({h})"))
+            .unwrap_or_default();
         return Err(QError::Conflict(format!(
-            "{} is not idle: {reason}. Pass --force to send anyway",
+            "{} is not idle: {reason}{hint}. Pass --force to send anyway",
             found.name()
         ))
         .into());
     }
 
-    ctx.tmux().send_keys(&session.tmux_pane, text, true)?;
+    // A newline typed into a TUI is Enter, so a multi-line prompt would submit
+    // once per line. Bracketed paste is how a terminal says "these newlines
+    // are text"; a single line keeps the plain, verified send-keys path.
+    let pasted = text.contains('\n');
+    if pasted {
+        ctx.tmux().paste(&session.tmux_pane, text, true)?;
+    } else {
+        ctx.tmux().send_keys(&session.tmux_pane, text, true)?;
+    }
     ctx.db()?.append_event(
         &found.quest.id,
         Some(&session.id),
         "session.send",
-        &serde_json::json!({ "text": text, "forced": args.force }),
+        &serde_json::json!({
+            "text": truncate(text, EVENT_PROMPT_CHARS),
+            "forced": args.force,
+            "pasted": pasted,
+        }),
     )?;
 
     if ctx.json || !ctx.quiet {
@@ -60,6 +89,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
                 "pane": session.tmux_pane,
                 "text": text,
                 "forced": args.force,
+                "pasted": pasted,
                 "status": session.status,
                 "registry": verdict,
             }),
@@ -75,17 +105,21 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Why the send should not happen, or `None` when both sources agree the
+/// Why the send should not happen, or `None` when the two sources agree the
 /// session is between turns.
 ///
-/// The database decides first: `starting` has no prompt yet, `busy` is
-/// mid-turn, `waiting` is sitting on a prompt. Only for a database that says
-/// `idle` does the registry get a say — and a registry that knows nothing
-/// (no pid yet, no file, an unreadable one) never blocks on its own.
+/// The database decides first: `busy` is mid-turn, `waiting` is sitting on a
+/// prompt. For a database that says `idle` the registry can object — and one
+/// that knows nothing (no pid, no file, a stale or unreadable one) never
+/// objects on its own.
+///
+/// `starting` is the one row the registry can overrule. Without hooks the row
+/// never leaves `starting`, so Claude's own "idle" is the only evidence there
+/// is that it is up and between turns.
 fn gate(status: SessionStatus, verdict: &Verdict) -> Option<String> {
     match status {
         SessionStatus::Idle => verdict.refuses().then(|| verdict.describe()),
-        SessionStatus::Ended => Some("session has ended".to_string()),
+        SessionStatus::Starting if verdict.agrees_idle() => None,
         other => Some(format!("q has it as {other} ({})", verdict.describe())),
     }
 }
@@ -129,19 +163,25 @@ mod tests {
 
     #[test]
     fn a_database_that_says_not_idle_refuses_whatever_the_registry_says() {
-        for status in [
-            SessionStatus::Busy,
-            SessionStatus::Waiting,
-            SessionStatus::Starting,
-        ] {
+        for status in [SessionStatus::Busy, SessionStatus::Waiting] {
             for verdict in [Verdict::Idle { name: None }, unknown(), busy()] {
                 let reason = gate(status, &verdict).unwrap_or_else(|| panic!("{status} passed"));
                 assert!(reason.contains(status.as_str()), "{reason}");
             }
         }
+    }
+
+    /// The hooks-not-installed case: the row is stuck on `starting`, and only
+    /// Claude's own registry can say the session is actually up and waiting.
+    #[test]
+    fn a_starting_row_the_registry_calls_idle_passes() {
         assert_eq!(
-            gate(SessionStatus::Ended, &Verdict::Idle { name: None }),
-            Some("session has ended".to_string())
+            gate(SessionStatus::Starting, &Verdict::Idle { name: None }),
+            None
         );
+        for verdict in [unknown(), busy()] {
+            let reason = gate(SessionStatus::Starting, &verdict).unwrap();
+            assert!(reason.contains("starting"), "{reason}");
+        }
     }
 }
