@@ -331,6 +331,18 @@ pub fn needs_you(sessions: &[Session]) -> bool {
     sessions.iter().any(|s| s.status == SessionStatus::Waiting)
 }
 
+/// The context reading the Quest is judged by: its live master's (SPEC §8).
+/// A Quest resumed after a reset has more than one master row, so the freshest
+/// reading wins; an ended master is not the one the human is talking to.
+pub fn master_ctx_pct(sessions: &[Session]) -> Option<u8> {
+    sessions
+        .iter()
+        .filter(|s| s.role == SessionRole::Master && s.status != SessionStatus::Ended)
+        .filter(|s| s.ctx_pct.is_some())
+        .max_by_key(|s| (s.ctx_updated_at.unwrap_or(s.updated_at), s.started_at))
+        .and_then(|s| s.ctx_pct)
+}
+
 /// `q-7f3a` / `s-3b9c` / `t-1a2b`. 16 bits of entropy, so callers must retry on
 /// a UNIQUE collision — `Db::insert_quest` and friends do.
 ///
@@ -423,6 +435,36 @@ mod tests {
             let got = display_state(&quest(*state), &sessions);
             assert_eq!(got, *want, "{state:?} + {statuses:?}");
         }
+    }
+
+    #[test]
+    fn derived_master_ctx_pct() {
+        let master = |ctx: Option<u8>, at: i64, status: SessionStatus| {
+            let mut s = Session::new("q-0001", SessionRole::Master, "master", "q-x", "%1");
+            s.ctx_pct = ctx;
+            s.ctx_updated_at = Some(at);
+            s.status = status;
+            s
+        };
+        assert_eq!(master_ctx_pct(&[]), None);
+        // A worker's reading is not the Quest's.
+        let mut worker = session(SessionStatus::Busy);
+        worker.ctx_pct = Some(90);
+        assert_eq!(master_ctx_pct(&[worker]), None);
+        // No reading yet is not a reading of zero.
+        assert_eq!(
+            master_ctx_pct(&[master(None, 5, SessionStatus::Idle)]),
+            None
+        );
+        // The freshest live master wins; an ended one is ignored.
+        assert_eq!(
+            master_ctx_pct(&[
+                master(Some(41), 10, SessionStatus::Idle),
+                master(Some(12), 20, SessionStatus::Busy),
+                master(Some(99), 30, SessionStatus::Ended),
+            ]),
+            Some(12)
+        );
     }
 
     #[test]

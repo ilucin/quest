@@ -4,7 +4,8 @@
 #![allow(dead_code)]
 
 use ratatui::layout::Rect;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// At or above this width a Quest row fits on two lines (SPEC §17).
 pub const WIDE_COLS: u16 = 100;
@@ -101,12 +102,24 @@ pub fn centered(area: Rect, w: u16, h: u16) -> Rect {
 }
 
 /// Display width of a string in terminal cells.
+///
+/// `UnicodeWidthStr` rather than a per-`char` sum: the two disagree on
+/// sequences the terminal paints as one glyph (an emoji followed by a
+/// variation selector, a base letter followed by combining marks), and only
+/// the string form measures what is actually drawn.
 pub fn width(s: &str) -> usize {
-    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+    UnicodeWidthStr::width(s)
 }
 
 /// Truncate to `max` display columns, ellipsising when anything was cut.
-/// Column-aware rather than char-aware, so CJK and emoji do not overflow.
+///
+/// Measured the same way [`width`] measures — whole grapheme clusters, each
+/// costed with `UnicodeWidthStr` — because a per-`char` sum disagrees with the
+/// string width on exactly the sequences a name is likely to carry: `❤\u{FE0F}`
+/// sums to one column and paints two, so a per-`char` budget overflows the row.
+/// Cutting between clusters is also the only cut that leaves whole glyphs: a
+/// flag is a pair of regional indicators and half of one is a stray letter, and
+/// a ZWJ sequence cut mid-join leaves the joiner dangling on the ellipsis.
 pub fn truncate(s: &str, max: usize) -> String {
     if width(s) <= max {
         return s.to_string();
@@ -114,14 +127,15 @@ pub fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
+    let budget = max - 1;
     let mut out = String::new();
     let mut used = 0;
-    for c in s.chars() {
-        let cw = c.width().unwrap_or(0);
-        if used + cw > max.saturating_sub(1) {
+    for cluster in s.graphemes(true) {
+        let cw = width(cluster);
+        if used + cw > budget {
             break;
         }
-        out.push(c);
+        out.push_str(cluster);
         used += cw;
     }
     out.push('…');
@@ -200,6 +214,68 @@ mod tests {
             centered(Rect::new(0, 0, 10, 4), 40, 10),
             Rect::new(0, 0, 10, 4)
         );
+    }
+
+    #[test]
+    fn width_measures_clusters_not_chars() {
+        // A base letter plus a combining acute paints one cell.
+        assert_eq!(width("e\u{301}"), 1);
+        assert_eq!(width("nai\u{308}ve"), 5);
+        // The SPEC §17 row glyphs are one column each.
+        assert_eq!(width("▸ ⏸ ▓░"), 6);
+    }
+
+    #[test]
+    fn truncate_never_splits_a_combining_sequence() {
+        // The cut lands between clusters, and the marks travel with their base.
+        let s = "e\u{301}e\u{301}e\u{301}e\u{301}";
+        assert_eq!(truncate(s, 3), "e\u{301}e\u{301}…");
+        assert_eq!(width(&truncate(s, 3)), 3);
+        // A string that is only marks has no cluster to join.
+        assert_eq!(truncate("\u{301}\u{301}", 5), "\u{301}\u{301}");
+    }
+
+    /// The cases a per-`char` budget gets wrong: they measure one way and
+    /// paint another, and they are the ones real Quest names and PR titles
+    /// actually carry.
+    #[test]
+    fn truncate_keeps_emoji_sequences_whole() {
+        // An emoji-presentation selector: one column by char sum, two painted.
+        assert_eq!(width("❤\u{FE0F}"), 2);
+        let heart = "ship it ❤\u{FE0F} now, and it has to be cut somewhere";
+        for max in 0..=width(heart) + 2 {
+            let cut = truncate(heart, max);
+            assert!(
+                width(&cut) <= max,
+                "{max}: {cut:?} measures {}",
+                width(&cut)
+            );
+        }
+
+        // A flag is a pair of regional indicators; half of one is a letter in
+        // a box, not a flag.
+        let flag = "a🇭🇷b🇭🇷c";
+        for max in 0..=width(flag) + 2 {
+            let cut = truncate(flag, max);
+            assert!(width(&cut) <= max, "{max}: {cut:?}");
+            let halves = cut
+                .chars()
+                .filter(|c| ('\u{1F1E6}'..='\u{1F1FF}').contains(c))
+                .count();
+            assert_eq!(halves % 2, 0, "{max}: {cut:?} split a flag");
+        }
+        assert_eq!(truncate(flag, 3), "a…");
+
+        // A ZWJ sequence cut mid-join leaves the joiner on the ellipsis.
+        let family = "x👨\u{200D}👩\u{200D}👧y and a tail to cut into";
+        for max in 0..=width(family) + 2 {
+            let cut = truncate(family, max);
+            assert!(width(&cut) <= max, "{max}: {cut:?}");
+            assert!(
+                !cut.contains('\u{200D}') || cut.contains("👧"),
+                "{max}: {cut:?} carries a dangling joiner"
+            );
+        }
     }
 
     #[test]

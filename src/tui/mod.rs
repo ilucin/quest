@@ -281,6 +281,7 @@ fn event_loop(
         // an idle mouse crossing the window costs a full render pass per
         // report.
         if dirty {
+            sync_now(ctx, app);
             terminal.draw(|frame| render(frame, app))?;
             dirty = false;
         }
@@ -323,15 +324,36 @@ fn refresh_now(ctx: &Ctx, app: &mut App) {
     report_refresh(app, result);
 }
 
+/// The redraw preamble: bring the active tab's per-selection data in line with
+/// the selection before it is drawn. Cheap by design — a no-op unless a key
+/// moved the selection since the last frame — so moving down a list costs one
+/// indexed query rather than the whole reload a tick does.
+///
+/// A failure only *sets* the error: it must not clear a reload failure that is
+/// the actual reason the screen is stale.
+fn sync_now(ctx: &Ctx, app: &mut App) {
+    let result = match app.tab {
+        Tab::Quests => quests::sync(ctx, app),
+        _ => Ok(()),
+    };
+    if let Err(e) = result {
+        app.refresh_error = Some(format!("refresh failed: {e:#}"));
+    }
+}
+
 /// A failed reload belongs in the status bar, not in `main`'s error path: a
 /// transient `SQLITE_BUSY` from another `q` process or from a hook handler
 /// holding the write lock must not drop the user out of the TUI. Returning
 /// `()` is the point — there is no `?` for the loop to take.
+///
+/// It lands in `refresh_error`, not in `status`: `refresh_now` runs on every
+/// tick, so clearing `status` here would wipe whatever a keypress had just
+/// put there, within a tick and without the user having touched anything.
 fn report_refresh(app: &mut App, result: anyhow::Result<()>) {
-    match result {
-        Ok(()) => app.status.clear(),
-        Err(e) => app.status = format!("refresh failed: {e}"),
-    }
+    app.refresh_error = match result {
+        Ok(()) => None,
+        Err(e) => Some(format!("refresh failed: {e:#}")),
+    };
 }
 
 /// Reload the active tab. The tabs own their loading; the shell only decides
@@ -364,7 +386,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_status(frame, chrome.status, app);
 
     if app.help {
-        render_help(frame, area);
+        render_help(frame, area, app.tab);
     }
 }
 
@@ -412,16 +434,35 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let hint = " ? help · x refresh · q quit ";
-    let left = if app.status.is_empty() {
-        format!(
+    // A reload that failed outranks a keypress's feedback: it is the reason
+    // what is on screen may be stale.
+    let left = match (app.refresh_error.as_deref(), app.current_status()) {
+        // A capture owns the head of the bar: the bar *is* the box, with its
+        // cursor and match count, and `filters` deliberately keeps the
+        // in-flight query out of the chips. Swapping the box for the error
+        // would leave the keyboard armed and the list filtered with nothing on
+        // screen saying either, so the error is appended instead.
+        (error, Some(status)) if app.capturing() => match error {
+            Some(e) => format!(" {status} · {e}"),
+            None => format!(" {status}"),
+        },
+        (Some(e), _) => format!(" {e}"),
+        (None, Some(status)) => format!(" {status}"),
+        (None, None) => format!(
             " {} · rows {} · tick {}s · mouse {}",
             app.machine,
             app.row_mode().lines(),
             app.tick_secs,
             if app.mouse { "on" } else { "off" },
-        )
+        ),
+    };
+    // The filters are a mode, not a message: they lead the line and stay there
+    // until they are turned off, whatever else has something to say.
+    let filters = app.filters();
+    let left = if filters.is_empty() {
+        left
     } else {
-        format!(" {}", app.status)
+        format!(" [{filters}]{left}")
     };
 
     let [l, r] = Layout::horizontal([
@@ -447,20 +488,21 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
-    let key_width = app::HELP
+fn render_help(frame: &mut Frame, area: Rect, tab: Tab) {
+    let rows = app::help_rows(tab);
+    let key_width = rows
         .iter()
         .map(|(k, _)| layout::width(k))
         .max()
         .unwrap_or(0);
-    let inner_width = app::HELP
+    let inner_width = rows
         .iter()
         .map(|(_, d)| key_width + 2 + layout::width(d))
         .max()
         .unwrap_or(0);
-    let box_area = layout::centered(area, (inner_width + 4) as u16, (app::HELP.len() + 2) as u16);
+    let box_area = layout::centered(area, (inner_width + 4) as u16, (rows.len() + 2) as u16);
 
-    let lines: Vec<Line> = app::HELP
+    let lines: Vec<Line> = rows
         .iter()
         .map(|(k, d)| {
             Line::from(vec![
@@ -757,7 +799,10 @@ mod tests {
     fn a_failed_refresh_lands_in_the_status_bar() {
         let mut app = app();
         report_refresh(&mut app, Err(anyhow::anyhow!("database is locked")));
-        assert_eq!(app.status, "refresh failed: database is locked");
+        assert_eq!(
+            app.refresh_error.as_deref(),
+            Some("refresh failed: database is locked")
+        );
         let lines = draw(&mut app, 100, 10);
         assert!(
             lines
@@ -770,9 +815,66 @@ mod tests {
         // And the next reload that works takes the message away again — the
         // old "refreshing…" had nothing to clear it at all.
         report_refresh(&mut app, Ok(()));
-        assert!(app.status.is_empty());
+        assert!(app.refresh_error.is_none());
         let lines = draw(&mut app, 100, 10);
         assert!(lines.last().unwrap().contains("rows 2"), "{lines:?}");
+    }
+
+    /// N13: while `/` is open the status bar *is* the box — it is the only
+    /// thing on screen saying the keyboard is armed and the list is filtered
+    /// (`filters` keeps an in-flight query out of the chips on purpose). A
+    /// tick that fails mid-word must report itself without evicting it.
+    #[test]
+    fn a_failed_refresh_does_not_evict_the_search_box() {
+        let mut app = app();
+        app.handle(Input::Char('/'));
+        for c in "run".chars() {
+            app.handle(Input::Char(c));
+        }
+        assert!(app.capturing());
+
+        report_refresh(&mut app, Err(anyhow::anyhow!("database is locked")));
+        let lines = draw(&mut app, 100, 10);
+        let bar = lines.last().unwrap();
+        assert!(bar.contains("/run"), "the box was evicted: {bar}");
+        assert!(
+            bar.contains("refresh failed: database is locked"),
+            "the failure went unsaid: {bar}"
+        );
+        assert!(app.capturing(), "the keyboard was handed back");
+
+        // Once the box is closed the failure has the bar to itself again.
+        app.handle(Input::Esc);
+        assert!(!app.capturing());
+        let lines = draw(&mut app, 100, 10);
+        assert!(
+            lines.last().unwrap().contains("refresh failed"),
+            "{lines:?}"
+        );
+    }
+
+    /// The seam bd-8lz.4.1 left for the tabs that load data: a tick's success
+    /// must not wipe what a keypress put in the status bar.
+    #[test]
+    fn a_successful_reload_leaves_a_keypress_message_alone() {
+        let mut app = app();
+        app.say("close cdc-backfill: lands in bd-8lz.4.4");
+        for _ in 0..3 {
+            report_refresh(&mut app, Ok(()));
+        }
+        assert_eq!(app.status, "close cdc-backfill: lands in bd-8lz.4.4");
+        let lines = draw(&mut app, 100, 10);
+        assert!(lines.last().unwrap().contains("bd-8lz.4.4"), "{lines:?}");
+        // A failure outranks it while it lasts, and does not destroy it.
+        report_refresh(&mut app, Err(anyhow::anyhow!("locked")));
+        let lines = draw(&mut app, 100, 10);
+        assert!(
+            lines.last().unwrap().contains("refresh failed"),
+            "{lines:?}"
+        );
+        report_refresh(&mut app, Ok(()));
+        let lines = draw(&mut app, 100, 10);
+        assert!(lines.last().unwrap().contains("bd-8lz.4.4"), "{lines:?}");
     }
 
     #[test]
@@ -930,14 +1032,24 @@ mod tests {
         for w in [1u16, 2, 20, 70, 100, 200] {
             for h in [1u16, 2, 3, 24] {
                 for help in [false, true] {
-                    let mut app = app();
-                    app.help = help;
-                    let lines = draw(&mut app, w, h);
-                    assert_eq!(lines.len(), h as usize, "{w}x{h} help={help}");
-                    assert!(
-                        lines.iter().all(|l| layout::width(l) <= w as usize),
-                        "{w}x{h} help={help}: {lines:?}"
-                    );
+                    for tab in Tab::ALL {
+                        let mut app = app();
+                        app.tab = tab;
+                        app.help = help;
+                        // The sweep itself is the assertion: `draw` panics on
+                        // a widget written outside its area, and every band of
+                        // the chrome is exercised at every breakpoint.
+                        let lines = draw(&mut app, w, h);
+                        // The chrome always wins the last line it was given:
+                        // a body that overran would have taken it.
+                        if h >= 2 && w >= 40 {
+                            let status = lines.last().unwrap();
+                            assert!(
+                                status.contains("q quit") || help,
+                                "{w}x{h} {tab:?} help={help}: {status:?}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -957,14 +1069,20 @@ mod tests {
     #[test]
     fn the_body_follows_the_selected_tab() {
         let mut app = app();
+        // The Quests tab is built (bd-8lz.4.2); with an empty database it
+        // draws its own empty state rather than the stub.
         let body = draw(&mut app, 100, 20).join("\n");
-        assert!(body.contains("Quests tab"), "{body}");
-        assert!(body.contains("bd-8lz.4.2"), "{body}");
+        assert!(body.contains("no open quests"), "{body}");
 
         app.handle(Input::Char('4'));
         let body = draw(&mut app, 100, 20).join("\n");
         assert!(body.contains("Events tab"), "{body}");
-        assert!(!body.contains("Quests tab"), "{body}");
+        assert!(!body.contains("no open quests"), "{body}");
+
+        app.handle(Input::Char('1'));
+        let body = draw(&mut app, 100, 20).join("\n");
+        assert!(body.contains("no open quests"), "{body}");
+        assert!(!body.contains("Events tab"), "{body}");
     }
 
     #[test]
@@ -991,21 +1109,36 @@ mod tests {
     fn the_help_overlay_covers_the_body_and_lists_the_bindings() {
         let mut app = app();
         app.handle(Input::Char('?'));
-        // Sized so the centred overlay covers the body text underneath it.
-        let rendered = draw(&mut app, 70, 12).join("\n");
+        // Wide enough for the widest row, so the overlay spans the body.
+        let rendered = draw(&mut app, 68, 26).join("\n");
         assert!(rendered.contains("Keys"), "{rendered}");
-        for (key, desc) in app::HELP {
+        for (key, desc) in app::help_rows(app.tab) {
             assert!(rendered.contains(key), "missing key {key}: {rendered}");
             assert!(rendered.contains(desc), "missing desc {desc}: {rendered}");
         }
         // `Clear` really wiped what was underneath.
-        assert!(!rendered.contains("Quests tab"), "{rendered}");
+        assert!(!rendered.contains("n starts one"), "{rendered}");
 
         // Dismissing it brings the body back.
         app.handle(Input::Esc);
-        let rendered = draw(&mut app, 70, 12).join("\n");
-        assert!(rendered.contains("Quests tab"), "{rendered}");
+        let rendered = draw(&mut app, 68, 26).join("\n");
+        assert!(rendered.contains("n starts one"), "{rendered}");
         assert!(!rendered.contains("Keys"), "{rendered}");
+    }
+
+    /// The overlay is the shell's keys plus the active tab's own.
+    #[test]
+    fn the_help_overlay_follows_the_tab() {
+        let mut app = app();
+        app.help = true;
+        let quests = draw(&mut app, 90, 30).join("\n");
+        assert!(quests.contains("cycle the machine filter"), "{quests}");
+        app.help = false;
+        app.handle(Input::Char('4'));
+        app.help = true;
+        let events = draw(&mut app, 90, 30).join("\n");
+        assert!(!events.contains("cycle the machine filter"), "{events}");
+        assert!(events.contains("next / previous tab"), "{events}");
     }
 
     #[test]

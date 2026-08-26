@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,15 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const SLOW_WRITE: Duration = Duration::from_secs(2);
 /// How long a cached progress reading counts as fresh.
 pub const CACHE_TTL: i64 = 30;
+/// How long a *failed* read is remembered before `bd` is tried again.
+///
+/// A failure writes no cache, so without this the "nothing fresh" test is true
+/// again immediately and the next caller re-spawns `bd`. On the TUI's 2 s tick
+/// that means a `bd` present but slow costs up to [`READ_TIMEOUT`] on the UI
+/// thread every tick — longer than the tick itself — and the keyboard goes
+/// dead. Matching [`CACHE_TTL`] keeps the two paths on the same cadence: at
+/// most one `bd` call per Quest listing per half-minute, succeed or fail.
+pub const FAILURE_TTL: i64 = CACHE_TTL;
 /// `bd list` defaults to 50 rows; counts have to see all of them.
 const NO_LIMIT: &[&str] = &["--all", "-n", "0", "--no-pager", "--json"];
 /// A listing's stdout is a *document*, so [`proc`]'s default 64 KiB capture
@@ -82,6 +92,20 @@ impl Progress {
     /// `3/7` — the listing cell (SPEC §13).
     pub fn cell(&self) -> String {
         format!("{}/{}", self.closed, self.total)
+    }
+
+    /// The mini bar beside the cell (SPEC §17): `width` cells of `▓` for the
+    /// closed share, `░` for the rest. A Quest with no issues yet is all
+    /// empty rather than all full — nothing done is not everything done.
+    pub fn bar(&self, width: usize) -> String {
+        // Round down, but never claim "done" until it is: a single open issue
+        // keeps at least one empty cell.
+        let filled = match (self.closed * width).checked_div(self.total) {
+            None => 0,
+            Some(_) if self.closed >= self.total => width,
+            Some(exact) => exact.min(width.saturating_sub(1)),
+        };
+        "▓".repeat(filled) + &"░".repeat(width - filled)
     }
 
     /// `3/7 closed · 2 open · 1 in progress · 1 blocked`. Empty buckets are
@@ -772,6 +796,47 @@ pub fn progress_all(quests: &[&Quest]) -> HashMap<String, Progress> {
     progress_all_with(client().as_ref(), quests)
 }
 
+/// When the last whole-listing read failed, as a unix timestamp; 0 is never.
+/// Process-local on purpose: it exists to protect a long-lived TUI from its own
+/// tick, and a one-shot `q list` should not inherit an older process's bad luck.
+static LAST_FAILURE: AtomicI64 = AtomicI64::new(0);
+
+/// Test-only exclusive access to [`LAST_FAILURE`]. `cargo test` runs the whole
+/// crate's unit tests in one process, so the static is shared by every test
+/// that reaches `progress_all_with` with a Quest carrying an epic — directly,
+/// or through `refresh`/`fill_progress`. The guard clears the window on the way
+/// in and gives it back clear, so no test can inherit or leak one.
+#[cfg(test)]
+pub(crate) mod backoff {
+    use super::{LAST_FAILURE, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) struct Guard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            LAST_FAILURE.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn acquire() -> Guard {
+        // A test that panicked while holding it poisons the lock; the window
+        // was cleared on the way out regardless, so the poison is not news.
+        let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        LAST_FAILURE.store(0, Ordering::Relaxed);
+        Guard { _lock: lock }
+    }
+}
+
+fn backing_off(now: i64) -> bool {
+    let last = LAST_FAILURE.load(Ordering::Relaxed);
+    last != 0 && (now - last).abs() < FAILURE_TTL
+}
+
 pub fn progress_all_with(bd: &dyn Bd, quests: &[&Quest]) -> HashMap<String, Progress> {
     let epics: HashMap<String, Option<String>> = quests
         .iter()
@@ -784,8 +849,15 @@ pub fn progress_all_with(bd: &dyn Bd, quests: &[&Quest]) -> HashMap<String, Prog
         .keys()
         .filter_map(|id| read_cache(id).map(|c| (id.clone(), c)))
         .collect();
-    if epics.keys().all(|id| cached.get(id).is_some_and(fresh)) {
-        return cached.into_iter().map(|(k, c)| (k, c.progress)).collect();
+    let stale = || -> HashMap<String, Progress> {
+        // Stale beats blank: a listing shows the last reading it had.
+        cached
+            .iter()
+            .map(|(k, c)| (k.clone(), c.progress))
+            .collect()
+    };
+    if epics.keys().all(|id| cached.get(id).is_some_and(fresh)) || backing_off(now()) {
+        return stale();
     }
     let ids: Vec<&str> = epics.keys().map(String::as_str).collect();
     match bd
@@ -793,13 +865,16 @@ pub fn progress_all_with(bd: &dyn Bd, quests: &[&Quest]) -> HashMap<String, Prog
         .and_then(|raw| count_by_quest(&raw, &epics))
     {
         Some(counted) => {
+            LAST_FAILURE.store(0, Ordering::Relaxed);
             for (id, progress) in &counted {
                 write_cache(id, progress);
             }
             counted.into_iter().collect()
         }
-        // Stale beats blank: a listing shows the last reading it had.
-        None => cached.into_iter().map(|(k, c)| (k, c.progress)).collect(),
+        None => {
+            LAST_FAILURE.store(now(), Ordering::Relaxed);
+            stale()
+        }
     }
 }
 
@@ -855,6 +930,25 @@ mod tests {
             p.summary(),
             "1/5 closed · 1 open · 1 in progress · 1 blocked"
         );
+    }
+
+    #[test]
+    fn the_progress_bar_fills_with_the_closed_share() {
+        let p = |closed, total| Progress {
+            closed,
+            total,
+            ..Progress::default()
+        };
+        assert_eq!(p(0, 0).bar(7), "░░░░░░░");
+        assert_eq!(p(0, 7).bar(7), "░░░░░░░");
+        assert_eq!(p(3, 7).bar(7), "▓▓▓░░░░");
+        assert_eq!(p(7, 7).bar(7), "▓▓▓▓▓▓▓");
+        // One issue short of done never paints a full bar.
+        assert_eq!(p(99, 100).bar(7), "▓▓▓▓▓▓░");
+        assert_eq!(p(3, 7).bar(0), "");
+        for (closed, total) in [(0, 0), (0, 3), (1, 3), (3, 3), (99, 100)] {
+            assert_eq!(p(closed, total).bar(7).chars().count(), 7);
+        }
     }
 
     #[test]
@@ -1163,6 +1257,76 @@ mod tests {
         fn relabel_repo(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), String> {
             unreachable!()
         }
+    }
+
+    /// A `bd` that never answers, and counts how often it was asked.
+    #[derive(Default)]
+    struct FailingBd(std::cell::Cell<usize>);
+
+    impl Bd for FailingBd {
+        fn create_epic(&self, _: &str, _: &str, _: &str) -> Result<String, String> {
+            unreachable!()
+        }
+        fn list_quest(&self, _: &str) -> Option<String> {
+            self.0.set(self.0.get() + 1);
+            None
+        }
+        fn list_quests(&self, _: &[&str]) -> Option<String> {
+            self.0.set(self.0.get() + 1);
+            None
+        }
+        fn close(&self, _: &str, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+        fn relabel_repo(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+    }
+
+    /// A failed read writes no cache, so nothing stops the next caller asking
+    /// again — and on the TUI's 2 s tick a `bd` that is present but slow then
+    /// costs `READ_TIMEOUT` on the UI thread every tick, which is longer than
+    /// the tick. The keyboard goes dead while the process looks idle.
+    #[test]
+    fn a_failing_bd_is_not_respawned_on_every_tick() {
+        let _guard = backoff::acquire();
+        let mut quest = Quest::new("slow", "/tmp/work", "laptop");
+        quest.beads_epic = Some("bd-42".to_string());
+        let bd = FailingBd::default();
+
+        assert!(progress_all_with(&bd, &[&quest]).is_empty());
+        assert_eq!(bd.0.get(), 1);
+        for _ in 0..10 {
+            assert!(progress_all_with(&bd, &[&quest]).is_empty());
+        }
+        assert_eq!(bd.0.get(), 1, "bd was respawned inside the backoff window");
+
+        // The window is not a lockout: once it has passed, bd is asked again.
+        LAST_FAILURE.store(now() - FAILURE_TTL, Ordering::Relaxed);
+        assert!(progress_all_with(&bd, &[&quest]).is_empty());
+        assert_eq!(bd.0.get(), 2);
+    }
+
+    /// The window is process-wide and the unit tests share one process, so the
+    /// guard — not the caller's discipline — is what keeps it from crossing
+    /// test boundaries in either direction.
+    #[test]
+    fn the_backoff_window_does_not_leak_between_tests() {
+        let mut quest = Quest::new("slow", "/tmp/work", "laptop");
+        quest.beads_epic = Some("bd-42".to_string());
+        let bd = FailingBd::default();
+
+        let guard = backoff::acquire();
+        assert!(progress_all_with(&bd, &[&quest]).is_empty());
+        assert!(backing_off(now()), "a failure should arm the window");
+        drop(guard);
+
+        let guard = backoff::acquire();
+        assert!(
+            !backing_off(now()),
+            "the window outlived its guard: the next test inherits a bd q will not call"
+        );
+        drop(guard);
     }
 
     #[test]

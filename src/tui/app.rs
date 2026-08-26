@@ -67,7 +67,7 @@ pub enum Action {
     Quit,
 }
 
-/// One row of the `?` overlay.
+/// One row of the `?` overlay: the keys every tab answers to.
 pub const HELP: &[(&str, &str)] = &[
     ("Tab / S-Tab", "next / previous tab"),
     (
@@ -84,6 +84,26 @@ pub const HELP: &[(&str, &str)] = &[
     ("q / Esc", "close the help, or quit"),
     ("Ctrl-C", "quit"),
 ];
+
+/// The overlay for one tab: the shell's keys, then that tab's own. A tab with
+/// no keys of its own shows only the first half.
+pub fn help_rows(tab: Tab) -> Vec<(&'static str, &'static str)> {
+    let mut rows: Vec<(&str, &str)> = HELP.to_vec();
+    let own: &[(&str, &str)] = match tab {
+        Tab::Quests => quests::HELP,
+        _ => &[],
+    };
+    if !own.is_empty() {
+        rows.push(("", ""));
+        rows.extend_from_slice(own);
+    }
+    rows
+}
+
+/// How long a status message holds the bar before the chrome line returns.
+/// In seconds rather than ticks so a 10 s remote tick does not leave it up for
+/// most of a minute.
+const STATUS_SECS: u64 = 8;
 
 /// One space before the first tab label, so the bar is not flush to the edge.
 const TAB_LEAD: u16 = 1;
@@ -141,8 +161,22 @@ pub struct App {
     /// bookkeeping off these.
     pub ticks: u64,
     pub refreshes: u64,
-    /// Transient one-line feedback in the status bar.
+    /// Transient one-line feedback in the status bar, set by a key handler,
+    /// with the tick it was set on: it is *transient*, so the chrome line
+    /// comes back rather than a stale "search cleared" owning the bar for the
+    /// rest of the session.
     pub status: String,
+    status_at: u64,
+    /// The last reload that failed, kept apart from `status` so a tick's
+    /// success cannot wipe a message a keypress just wrote (and so a failure
+    /// survives until the next reload rather than until the next keypress).
+    pub refresh_error: Option<String>,
+    /// The Quest a tab handed to another tab — `s` on the Quests tab means
+    /// "the Sessions tab, filtered to this one" (SPEC §17).
+    pub focus_quest: Option<String>,
+    /// Whether the right-hand detail panel is up. Shell-level rather than
+    /// per-tab: it is one panel, and `Enter` means the same thing everywhere.
+    pub detail: bool,
     pub quests: quests::State,
     pub sessions: sessions::State,
     pub templates: templates::State,
@@ -165,6 +199,10 @@ impl App {
             ticks: 0,
             refreshes: 0,
             status: String::new(),
+            status_at: 0,
+            refresh_error: None,
+            focus_quest: None,
+            detail: false,
             quests: quests::State::default(),
             sessions: sessions::State::default(),
             templates: templates::State::default(),
@@ -192,7 +230,14 @@ impl App {
         if self.help {
             return self.handle_help(input);
         }
-        if let Some(action) = self.handle_global(input) {
+        // While a tab is capturing text (the `/` search box, and the forms of
+        // bd-8lz.4.4) the shell's bare-letter keys would eat the typing, so
+        // only the unconditional escape hatch is claimed above the tab.
+        if self.capturing() {
+            if input == Input::Ctrl('c') {
+                return self.quit();
+            }
+        } else if let Some(action) = self.handle_global(input) {
             return action;
         }
         match self.tab {
@@ -251,10 +296,59 @@ impl App {
         }
     }
 
-    fn select(&mut self, tab: Tab) {
+    /// Whether the active tab is reading raw text rather than commands.
+    pub(super) fn capturing(&self) -> bool {
+        match self.tab {
+            Tab::Quests => self.quests.capturing(),
+            _ => false,
+        }
+    }
+
+    /// One-line feedback for the next redraw.
+    pub fn say(&mut self, message: impl Into<String>) {
+        self.status = message.into();
+        self.status_at = self.ticks;
+    }
+
+    /// The message to show, or `None` once it has had its time. Text being
+    /// typed never expires: while a tab is capturing, the status bar *is* the
+    /// input box.
+    pub fn current_status(&self) -> Option<&str> {
+        if self.status.is_empty() {
+            return None;
+        }
+        if self.capturing() {
+            return Some(&self.status);
+        }
+        let ttl = (STATUS_SECS / self.tick_secs.max(1)).max(1);
+        (self.ticks.saturating_sub(self.status_at) < ttl).then_some(self.status.as_str())
+    }
+
+    /// The active tab's filter indicator, empty when nothing is filtered.
+    pub fn filters(&self) -> String {
+        match self.tab {
+            Tab::Quests => self.quests.filters(),
+            _ => String::new(),
+        }
+    }
+
+    /// The one way to change tabs: every tab switch has to go through the
+    /// capture teardown, not only the ones the tab bar drives.
+    pub(super) fn select(&mut self, tab: Tab) {
         if self.tab != tab {
+            // Whatever was being typed is abandoned with the tab: a capture
+            // left armed behind an inactive tab is invisible, and the mouse
+            // can switch tabs from inside the box (the keyboard cannot).
+            self.cancel_capture();
             self.tab = tab;
             self.status.clear();
+        }
+    }
+
+    /// Give the keyboard back on whichever tab was holding it.
+    fn cancel_capture(&mut self) {
+        if self.tab == Tab::Quests {
+            self.quests.cancel_capture();
         }
     }
 
@@ -404,7 +498,8 @@ mod tests {
         assert_eq!(a.refreshes, 1);
         assert!(!a.should_quit);
         // The refresh is synchronous and the redraw happens after it, so a
-        // "refreshing…" message could never be seen — and used to stick.
+        // "refreshing…" message would be painted only once the refresh it
+        // announced was already over — and then stick until the next keypress.
         assert!(a.status.is_empty(), "{:?}", a.status);
     }
 
@@ -465,6 +560,71 @@ mod tests {
         a.help = true;
         a.handle_mouse(MouseInput::Click { col: 0, row: 9 });
         assert!(!a.help);
+    }
+
+    /// The keyboard cannot leave the `/` box except through Esc or Enter, but
+    /// the mouse can — and a capture left armed behind another tab is
+    /// invisible: no box on screen, and every bare letter swallowed as text
+    /// the moment the tab comes back.
+    #[test]
+    fn a_click_on_another_tab_cannot_leave_the_search_box_armed() {
+        let mut a = app();
+        a.handle(Input::Char('/'));
+        a.handle(Input::Char('r'));
+        assert!(a.capturing());
+        // The box is the status bar while it is open.
+        assert!(a.status.contains("/r"), "{}", a.status);
+
+        let (_, _, x, _) = tab_layout()[1];
+        a.handle_mouse(MouseInput::Click { col: x, row: 0 });
+        assert_eq!(a.tab, Tab::Sessions);
+        assert!(!a.capturing(), "the box is still holding the keyboard");
+        // A query left behind would filter the list on return with nothing on
+        // screen to say so; `filters` reports it once the box is closed.
+        a.tab = Tab::Quests;
+        assert!(
+            a.filters().is_empty(),
+            "an uncommitted query is still filtering: {:?}",
+            a.filters()
+        );
+        a.tab = Tab::Sessions;
+
+        // Back on Quests, the shell's keys are the shell's again.
+        let (_, _, x, _) = tab_layout()[0];
+        a.handle_mouse(MouseInput::Click { col: x, row: 0 });
+        assert_eq!(a.tab, Tab::Quests);
+        assert!(!a.capturing());
+        assert_eq!(a.handle(Input::Char('q')), Action::Quit);
+        assert!(a.should_quit);
+    }
+
+    /// A message is transient by contract: `status` is the only thing between
+    /// the user and the chrome line, so it has to give the bar back.
+    #[test]
+    fn a_status_message_gives_the_bar_back_after_a_few_ticks() {
+        let mut a = app();
+        a.say("search cleared");
+        assert_eq!(a.current_status(), Some("search cleared"));
+        for _ in 0..(STATUS_SECS / a.tick_secs) {
+            a.tick();
+        }
+        assert_eq!(a.current_status(), None, "the message never expires");
+
+        // A newer message starts its own clock.
+        a.say("filter /run");
+        assert_eq!(a.current_status(), Some("filter /run"));
+
+        // Text being typed is not a message: the box would vanish mid-word.
+        a.handle(Input::Char('/'));
+        a.handle(Input::Char('r'));
+        for _ in 0..100 {
+            a.tick();
+        }
+        assert!(a.capturing());
+        assert_eq!(
+            a.current_status().map(str::to_string),
+            Some(a.status.clone())
+        );
     }
 
     #[test]
