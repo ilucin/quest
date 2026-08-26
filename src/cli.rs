@@ -156,22 +156,3 @@ pub enum SetKey {
     Workflow,
     CtxResetPct,
 }
-
-impl Command {
-    /// Name used in "not implemented" errors and, later, in dispatch logging.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Command::New { .. } => "new",
-            Command::List { .. } => "list",
-            Command::Show { .. } => "show",
-            Command::Enter { .. } => "enter",
-            Command::Close { .. } => "close",
-            Command::Resume { .. } => "resume",
-            Command::Rename { .. } => "rename",
-            Command::Set { .. } => "set",
-            Command::Rm { .. } => "rm",
-            Command::Doctor { .. } => "doctor",
-            Command::Config { .. } => "config",
-        }
-    }
-}

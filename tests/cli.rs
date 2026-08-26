@@ -79,30 +79,6 @@ fn quiet_does_not_suppress_json_output() {
 }
 
 #[test]
-fn stub_command_fails_with_not_implemented() {
-    q().arg("doctor")
-        .assert()
-        .code(1)
-        .stderr(predicate::str::starts_with("error: "))
-        .stderr(predicate::str::contains("not implemented"));
-}
-
-#[test]
-fn stub_command_json_error_goes_to_stderr() {
-    let assert = q().args(["doctor", "--json"]).assert().code(1).stdout("");
-    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
-    assert!(
-        parsed["error"]
-            .as_str()
-            .unwrap()
-            .contains("not implemented"),
-        "unexpected payload: {parsed}"
-    );
-    assert_eq!(parsed["code"], "not_implemented");
-}
-
-#[test]
 fn unknown_command_is_a_usage_error() {
     q().arg("definitely-not-a-command").assert().code(2);
 }

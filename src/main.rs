@@ -226,12 +226,6 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             let ctx = Ctx::with_db(args)?;
             commands::rm::run(&ctx, quest, *force).map(|()| 0)
         }
-        other => {
-            // Every real command starts here: config, then an open database.
-            let ctx = Ctx::with_db(args)?;
-            ctx.db()?;
-            Err(QError::not_implemented(other.name()).into())
-        }
     }
 }
 
