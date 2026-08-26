@@ -216,6 +216,28 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             let ctx = Ctx::with_db(args)?;
             commands::resume::run(&ctx, quest, prompt.as_deref(), *detach).map(|()| 0)
         }
+        Command::Spawn {
+            quest,
+            prompt,
+            label,
+            workflow,
+            dir,
+            no_attach,
+        } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::spawn::run(
+                &ctx,
+                &commands::spawn::Args {
+                    quest,
+                    label,
+                    prompt,
+                    workflow: workflow.as_deref(),
+                    dir: dir.as_deref(),
+                    no_attach: *no_attach,
+                },
+            )
+            .map(|()| 0)
+        }
         Command::Rename { quest, slug } => {
             let ctx = Ctx::with_db(args)?;
             commands::rename::run(&ctx, quest, slug).map(|()| 0)

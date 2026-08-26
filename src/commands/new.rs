@@ -262,8 +262,18 @@ fn resolve_slug(name: Option<&str>, cwd: &Path) -> anyhow::Result<(String, NameS
 }
 
 pub fn validate_slug(slug: &str) -> anyhow::Result<()> {
-    if slug.len() > SLUG_MAX || !is_slug(slug) {
-        return Err(QError::Invalid(format!("invalid slug `{slug}`: it {SLUG_RULE}")).into());
+    validate_kebab("slug", slug)
+}
+
+/// A session label follows the slug grammar — it becomes part of a tmux window
+/// name and of `claude -n <slug>/<label>` (SPEC §6).
+pub fn validate_label(label: &str) -> anyhow::Result<()> {
+    validate_kebab("label", label)
+}
+
+fn validate_kebab(what: &str, value: &str) -> anyhow::Result<()> {
+    if value.len() > SLUG_MAX || !is_slug(value) {
+        return Err(QError::Invalid(format!("invalid {what} `{value}`: it {SLUG_RULE}")).into());
     }
     Ok(())
 }
@@ -325,7 +335,7 @@ fn git_branch(cwd: &Path) -> Option<String> {
 }
 
 /// `claude -n <slug>/<label> [-- <prompt>]`, run by tmux through a shell.
-fn claude_command(slug: &str, label: &str, prompt: Option<&str>) -> String {
+pub fn claude_command(slug: &str, label: &str, prompt: Option<&str>) -> String {
     let mut cmd = format!("claude -n {}", shell_quote(&format!("{slug}/{label}")));
     if let Some(prompt) = prompt {
         cmd.push_str(" -- ");
@@ -344,7 +354,7 @@ fn shell_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', r"'\''"))
 }
 
-fn fresh_session_id(db: &Db) -> anyhow::Result<String> {
+pub fn fresh_session_id(db: &Db) -> anyhow::Result<String> {
     for _ in 0..ID_ATTEMPTS {
         let id = new_id("s");
         if db.get_session(&id)?.is_none() {

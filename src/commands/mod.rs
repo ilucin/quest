@@ -14,6 +14,7 @@ pub mod resume;
 pub mod rm;
 pub mod set;
 pub mod show;
+pub mod spawn;
 
 // Agent self-report (bd-8lz.2.5).
 pub mod link;

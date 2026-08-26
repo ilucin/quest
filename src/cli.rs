@@ -90,6 +90,25 @@ pub enum Command {
         detach: bool,
     },
 
+    /// Spawn a worker agent in a new window of the Quest's tmux session
+    Spawn {
+        quest: String,
+        /// First prompt for the worker
+        prompt: String,
+        /// Session label: lowercase kebab-case, unique among live sessions
+        #[arg(long, value_name = "LABEL")]
+        label: String,
+        /// Workflow for this worker (default: the Quest's)
+        #[arg(long, value_name = "NAME")]
+        workflow: Option<String>,
+        /// Working directory (default: the Quest's)
+        #[arg(long, value_name = "PATH")]
+        dir: Option<String>,
+        /// Do not move the tmux client to the new window
+        #[arg(long)]
+        no_attach: bool,
+    },
+
     /// Rename a Quest's slug
     Rename { quest: String, slug: String },
 

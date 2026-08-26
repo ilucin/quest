@@ -400,6 +400,10 @@ pub struct FixturePane {
     pub window_name: String,
     #[serde(default)]
     pub window_index: i32,
+    /// What `-c` asked for; real tmux keeps no such field, but a test has no
+    /// other way to see the directory a window was opened in.
+    #[serde(default)]
+    pub cwd: String,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -427,6 +431,7 @@ impl FixtureState {
         session: &str,
         window: &str,
         index: i32,
+        cwd: &str,
         spec_env: &[(String, String)],
         command: Option<&str>,
     ) -> Pane {
@@ -437,6 +442,7 @@ impl FixtureState {
             session_name: session.to_string(),
             window_name: window.to_string(),
             window_index: index,
+            cwd: cwd.to_string(),
             env: spec_env.iter().cloned().collect(),
             command: command.map(str::to_string),
             buffer: String::new(),
@@ -590,6 +596,7 @@ impl Tmux for FixtureTmux {
                 &spec.name,
                 &spec.window_name,
                 0,
+                &spec.cwd,
                 &spec.env,
                 spec.command.as_deref(),
             ))
@@ -609,6 +616,7 @@ impl Tmux for FixtureTmux {
                 &spec.session,
                 &spec.window_name,
                 index + 1,
+                &spec.cwd,
                 &spec.env,
                 spec.command.as_deref(),
             ))
