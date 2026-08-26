@@ -109,6 +109,18 @@ pub enum Command {
         force: bool,
     },
 
+    /// The Quest brief: deterministic markdown from the database (SPEC §9)
+    Brief {
+        /// Defaults to $Q_QUEST
+        quest: Option<String>,
+        /// Whose instructions to include; defaults to $Q_ROLE, else master
+        #[arg(long, value_enum, value_name = "ROLE")]
+        r#for: Option<Role>,
+        /// The session (id or label) the brief is for; defaults to $Q_SESSION
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+    },
+
     /// Check the local environment
     Doctor {
         /// Repair what can be repaired
@@ -196,4 +208,19 @@ pub enum SetKey {
     Cwd,
     Workflow,
     CtxResetPct,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum Role {
+    Master,
+    Worker,
+}
+
+impl From<Role> for crate::model::SessionRole {
+    fn from(role: Role) -> Self {
+        match role {
+            Role::Master => Self::Master,
+            Role::Worker => Self::Worker,
+        }
+    }
 }

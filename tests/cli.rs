@@ -46,8 +46,8 @@ fn help_lists_subcommands() {
     let assert = q().arg("--help").assert().success();
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     for sub in [
-        "new", "list", "show", "enter", "close", "resume", "rename", "set", "rm", "doctor",
-        "config",
+        "new", "list", "show", "enter", "close", "resume", "rename", "set", "rm", "brief",
+        "doctor", "config",
     ] {
         assert!(out.contains(sub), "`{sub}` missing from --help:\n{out}");
     }
@@ -2025,4 +2025,145 @@ fn new_sweeps_before_it_creates() {
         1
     );
     assert!(event_kinds(&env, &quest_id).contains(&"session.end".to_string()));
+}
+
+// ----------------------------------------------------------------- q brief
+
+#[test]
+fn brief_renders_markdown_and_json() {
+    let env = Env::new();
+    let quest = env.new_quest("briefed");
+    let id = quest["quest"]["id"].as_str().unwrap();
+
+    let assert = env.cmd().args(["brief", "briefed"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.starts_with(&format!("# Quest {id} `briefed`")), "{out}");
+    for header in [
+        "## 1. Quest",
+        "## 5. Sessions",
+        "## 10. Open questions / blockers",
+    ] {
+        assert!(out.contains(header), "{header} missing:\n{out}");
+    }
+    assert!(out.contains("| master | master |"), "{out}");
+    assert!(out.contains("You are the **master**"));
+
+    let json = env.json(&["brief", "brief", "--for", "worker"]);
+    assert_eq!(json["quest_id"], id);
+    assert_eq!(json["for"], "worker");
+    assert!(
+        json["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("You are a **worker**")
+    );
+}
+
+#[test]
+fn brief_resolves_quest_and_role_from_env() {
+    let env = Env::new();
+    let quest = env.new_quest("from-env");
+    let id = quest["quest"]["id"].as_str().unwrap();
+
+    env.cmd()
+        .arg("brief")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Q_QUEST"));
+
+    let mut cmd = env.cmd();
+    let assert = cmd
+        .env("Q_QUEST", id)
+        .env("Q_ROLE", "worker")
+        .env("Q_SESSION", "master")
+        .args(["brief", "--json"])
+        .assert()
+        .success();
+    let json = json_of(&assert);
+    // The resolved session's role beats $Q_ROLE, and the payload agrees.
+    assert_eq!(json["for"], "master");
+    let md = json["markdown"].as_str().unwrap();
+    assert!(md.contains("You are session `master`"), "{md}");
+    assert!(
+        md.contains("role `worker` was requested, the session's wins"),
+        "{md}"
+    );
+
+    let json = env.json(&["brief", "from-env", "--session", "from-env/master"]);
+    assert!(
+        json["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("You are session `master`")
+    );
+    let json = env.json(&["brief", "from-env", "--session", "ghost", "--for", "worker"]);
+    assert_eq!(json["for"], "worker");
+    assert!(
+        json["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("_(session not found: ghost)_")
+    );
+}
+
+#[test]
+fn brief_survives_a_closed_pipe() {
+    let env = Env::new();
+    env.new_quest("piped");
+    // The read end is closed before `q` writes, so the write hits EPIPE.
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("q"))
+        .env("Q_DB", env.dir.path().join("q.db"))
+        .env("Q_CONFIG", env.dir.path().join("config.toml"))
+        .env("Q_FIXTURE", env.dir.path().join("tmux.json"))
+        .args(["brief", "piped"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn brief_reads_bd_and_brain_from_fixtures() {
+    let env = Env::new();
+    let quest = env.new_quest("fixtured");
+    let id = quest["quest"]["id"].as_str().unwrap().to_string();
+    env.conn()
+        .execute(
+            "UPDATE quest SET beads_epic = 'bd-9', brain_session = 'fixtured' WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+    let bd = env.dir.path().join("bd.json");
+    std::fs::write(&bd, r#"[{"id":"bd-9.1","title":"first","status":"open"}]"#).unwrap();
+    let brain = env.dir.path().join("brain.md");
+    std::fs::write(&brain, "quest: q\n\nnotes from the brain").unwrap();
+
+    let mut cmd = env.cmd();
+    let assert = cmd
+        .env("Q_FIXTURE_BD", &bd)
+        .env("Q_FIXTURE_BRAIN", &brain)
+        .args(["brief", "fixtured"])
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.contains("[open] `bd-9.1` first"), "{out}");
+    assert!(out.contains("notes from the brain"), "{out}");
+
+    // Without the fixture files the tools count as unavailable.
+    let assert = env.cmd().args(["brief", "fixtured"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.contains("unavailable (bd missing or failed)"), "{out}");
+    assert!(out.contains("_(brain note unavailable)_"), "{out}");
 }

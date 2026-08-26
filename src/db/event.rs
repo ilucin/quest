@@ -52,6 +52,43 @@ impl Db {
             .map_err(db_err)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
     }
+
+    /// Only events whose kind is in `kinds`, most recent first, capped at
+    /// `limit`. An empty `kinds` matches nothing.
+    pub fn list_events_by_kinds(
+        &self,
+        quest_id: &str,
+        kinds: &[&str],
+        limit: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..kinds.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {COLUMNS} FROM event WHERE quest_id = ?1 AND kind IN ({placeholders}) \
+                 ORDER BY ts DESC, id DESC LIMIT ?2"
+            ))
+            .map_err(db_err)?;
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(quest_id.to_string()),
+            Box::new(i64::try_from(limit).unwrap_or(i64::MAX)),
+        ];
+        params.extend(
+            kinds
+                .iter()
+                .map(|k| Box::new(k.to_string()) as Box<dyn rusqlite::ToSql>),
+        );
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), row_to_event)
+            .map_err(db_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+    }
 }
 
 fn row_to_event(row: &Row) -> rusqlite::Result<Event> {
@@ -61,7 +98,13 @@ fn row_to_event(row: &Row) -> rusqlite::Result<Event> {
         session_id: row.get("session_id")?,
         ts: row.get("ts")?,
         kind: row.get("kind")?,
-        payload: json_col(row, "payload")?,
+        // A hand-edited or foreign payload that is not JSON still reads.
+        payload: match json_col(row, "payload") {
+            Ok(payload) => payload,
+            Err(_) => row
+                .get::<_, Option<String>>("payload")?
+                .map(serde_json::Value::String),
+        },
     })
 }
 
@@ -139,5 +182,43 @@ mod tests {
         assert_eq!(db.list_events_by_quest(&a.id, 2).unwrap().len(), 2);
         assert_eq!(db.list_events_by_quest(&b.id, 10).unwrap().len(), 1);
         assert!(db.list_events_by_quest("q-nope", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn non_json_payload_reads_as_a_raw_string() {
+        let db = db();
+        let q = quest(&db, "alpha");
+        db.conn
+            .execute(
+                "INSERT INTO event (quest_id, ts, kind, payload) VALUES (?1, 1, 'note', 'not json')",
+                [&q.id],
+            )
+            .unwrap();
+        let events = db.list_events_by_quest(&q.id, 10).unwrap();
+        assert_eq!(events[0].payload, Some(serde_json::json!("not json")));
+    }
+
+    #[test]
+    fn listing_by_kinds_filters_and_caps() {
+        let db = db();
+        let q = quest(&db, "alpha");
+        for kind in ["note", "session.prompt", "phase", "note", "session.stop"] {
+            db.append_event(&q.id, None, kind, &serde_json::Value::Null)
+                .unwrap();
+        }
+        let kinds: Vec<String> = db
+            .list_events_by_kinds(&q.id, &["note", "phase"], 10)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, ["note", "phase", "note"]);
+        assert_eq!(
+            db.list_events_by_kinds(&q.id, &["note", "phase"], 2)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(db.list_events_by_kinds(&q.id, &[], 10).unwrap().is_empty());
     }
 }

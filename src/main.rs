@@ -1,3 +1,4 @@
+mod brief;
 mod cli;
 mod commands;
 mod config;
@@ -221,6 +222,22 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
         Command::Set { quest, key, value } => {
             let ctx = Ctx::with_db(args)?;
             commands::set::run(&ctx, quest, *key, value).map(|()| 0)
+        }
+        Command::Brief {
+            quest,
+            r#for,
+            session,
+        } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::brief::run(
+                &ctx,
+                &commands::brief::Args {
+                    quest: quest.as_deref(),
+                    role: r#for.map(Into::into),
+                    session: session.as_deref(),
+                },
+            )
+            .map(|()| 0)
         }
         Command::Rm { quest, force } => {
             let ctx = Ctx::with_db(args)?;
