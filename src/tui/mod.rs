@@ -3,6 +3,7 @@
 //! Split so the interesting parts need no terminal:
 //! * [`keys`] turns crossterm events into an `Input` alphabet,
 //! * [`app`] is the pure key → state machine,
+//! * [`form`] is the reusable modal input layer every prompt is built from,
 //! * [`layout`] holds the responsive arithmetic,
 //! * `render` draws an `App` into any ratatui backend (`TestBackend` included),
 //! * only `run` below talks to a real terminal, and [`handoff`] is the one
@@ -13,6 +14,7 @@
 
 pub mod app;
 pub mod events;
+pub mod form;
 pub mod keys;
 pub mod layout;
 pub mod pager;
@@ -454,6 +456,12 @@ fn event_loop(
                     brief_in_pager(ctx, &mut Stdio, terminal, app)?;
                     dirty = true;
                 }
+                // Creating, renaming, closing or resuming all change the
+                // listing, so the reload is part of the action.
+                Action::Submit => {
+                    submit(ctx, app);
+                    refresh_due = true;
+                }
                 Action::None => {}
             }
         }
@@ -475,6 +483,25 @@ fn event_loop(
         }
     }
     Ok(())
+}
+
+/// Run the open form (SPEC §17 `n` / `r` / `c` / `R`).
+///
+/// The modal is taken first and only put back on failure, so a form that
+/// succeeded can never be submitted twice, and one that failed keeps every
+/// field the user typed with the reason next to it. A failure is never fatal:
+/// a Quest that would not close leaves the TUI exactly where it was.
+///
+/// Dispatch lives here rather than in the tab so bd-8lz.4.5's Sessions prompts
+/// have somewhere to hang; today every [`app::Prompt`] is a Quest prompt.
+fn submit(ctx: &Ctx, app: &mut App) {
+    let Some(mut modal) = app.modal.take() else {
+        return;
+    };
+    if let Err(e) = quests::submit(ctx, app, &modal.prompt, &modal.form) {
+        modal.form.set_error(format!("{e:#}"));
+        app.modal = Some(modal);
+    }
 }
 
 fn refresh_now(ctx: &Ctx, app: &mut App) {
@@ -543,6 +570,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     render_status(frame, chrome.status, app);
 
+    // Over the whole frame, whatever tab is behind it: this is what makes
+    // "the keyboard is captured" and "there is a box on screen" the same
+    // condition (`App::capturing`).
+    if let Some(modal) = &app.modal {
+        form::render(frame, area, &modal.form);
+    }
     if app.help {
         render_help(frame, area, app.tab);
     }
@@ -596,8 +629,13 @@ fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
 /// thirds of the row (`layout::right_segment`), and a hint that outgrows that
 /// is silently truncated from the right — losing `q quit`, the one key a stuck
 /// user needs. `the_status_hint_fits_the_segment_it_is_given` pins that.
-fn hint(tab: Tab) -> &'static str {
-    match tab {
+fn hint(app: &App) -> &'static str {
+    // With a form up, `q` is a letter and `x` is a letter: advertising them
+    // would be advertising keys that do not work.
+    if app.modal.is_some() {
+        return " Tab field · ⏎ ok · Esc cancel ";
+    }
+    match app.tab {
         Tab::Quests => " ? help · o attach · b brief · q quit ",
         _ => " ? help · x refresh · q quit ",
     }
@@ -607,7 +645,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     if area.height == 0 {
         return;
     }
-    let hint = hint(app.tab);
+    let hint = hint(app);
     // A reload that failed outranks a keypress's feedback: it is the reason
     // what is on screen may be stale.
     let left = match (app.refresh_error.as_deref(), app.current_status()) {
@@ -1349,12 +1387,17 @@ mod tests {
     #[test]
     fn the_status_hint_names_the_keys_the_tab_actually_has() {
         // Quests' headline actions are the two that take over the terminal.
-        let quests = hint(Tab::Quests);
+        let on = |tab: Tab| {
+            let mut a = app();
+            a.tab = tab;
+            hint(&a)
+        };
+        let quests = on(Tab::Quests);
         assert!(quests.contains("o attach"), "{quests:?}");
         assert!(quests.contains("b brief"), "{quests:?}");
         // The stub tabs have neither, and advertise the reload instead.
         for tab in [Tab::Sessions, Tab::Templates, Tab::Events] {
-            let other = hint(tab);
+            let other = on(tab);
             assert!(!other.contains("attach"), "{tab:?}: {other:?}");
             assert!(!other.contains("brief"), "{tab:?}: {other:?}");
             assert!(other.contains("x refresh"), "{tab:?}: {other:?}");
@@ -1362,10 +1405,17 @@ mod tests {
         // `?` and `q` are on every tab: one opens the list of everything the
         // hint had no room for, the other is the way out.
         for tab in Tab::ALL {
-            let h = hint(tab);
+            let h = on(tab);
             assert!(h.contains("? help"), "{tab:?}: {h:?}");
             assert!(h.contains("q quit"), "{tab:?}: {h:?}");
         }
+        // With a form up neither is true — `q` is a letter in a field — so the
+        // bar advertises the form's own keys instead.
+        let mut with_form = app();
+        with_form.handle(Input::Char('n'));
+        let h = hint(&with_form);
+        assert!(!h.contains("q quit"), "{h:?}");
+        assert!(h.contains("Esc cancel"), "{h:?}");
         // And `x` is still reachable on Quests, just from the overlay.
         assert!(
             app::help_rows(Tab::Quests)
@@ -1381,8 +1431,10 @@ mod tests {
     /// the chrome at.
     #[test]
     fn the_status_hint_fits_the_segment_it_is_given() {
+        let mut a = app();
         for tab in Tab::ALL {
-            let h = hint(tab);
+            a.tab = tab;
+            let h = hint(&a);
             let want = layout::width(h) as u16;
             assert_eq!(
                 layout::right_segment(70, want),
@@ -1390,6 +1442,11 @@ mod tests {
                 "{tab:?}: {h:?} is {want} columns and does not fit at 70"
             );
         }
+        a.tab = Tab::Quests;
+        a.handle(Input::Char('n'));
+        let h = hint(&a);
+        let want = layout::width(h) as u16;
+        assert_eq!(layout::right_segment(70, want), want, "form hint {h:?}");
     }
 
     /// Rendered, not just returned: the arms have to reach the actual bar.

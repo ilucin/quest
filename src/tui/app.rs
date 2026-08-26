@@ -7,6 +7,7 @@
 
 use crate::config::Config;
 
+use super::form::{Form, Outcome};
 use super::keys::{Input, MouseInput};
 use super::layout::{self, RowMode};
 use super::{events, quests, sessions, templates};
@@ -71,7 +72,45 @@ pub enum Action {
     Attach,
     /// Leave TUI mode and page the selection's brief (SPEC §17 `b`).
     Brief,
+    /// Run the open modal's [`Prompt`] (SPEC §17 `n` / `r` / `c` / `R`).
+    /// Carries nothing: the loop reads the form — and the Quest id the prompt
+    /// was opened against — out of `App::modal`.
+    Submit,
     Quit,
+}
+
+/// What an open form will do when it is submitted.
+///
+/// The Quest is carried by **id**, not by "whatever is selected when Enter
+/// lands": a tick can reload and reorder the listing while a prompt is up, and
+/// closing the wrong Quest because the rows moved under a confirmation is the
+/// one failure this shape makes impossible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prompt {
+    NewQuest,
+    Rename { quest: String, slug: String },
+    Close { quest: String, slug: String },
+    Resume { quest: String, slug: String },
+}
+
+impl Prompt {
+    /// The Quest the prompt was opened against, if any.
+    pub fn quest(&self) -> Option<&str> {
+        match self {
+            Prompt::NewQuest => None,
+            Prompt::Rename { quest, .. }
+            | Prompt::Close { quest, .. }
+            | Prompt::Resume { quest, .. } => Some(quest),
+        }
+    }
+}
+
+/// A form on screen, holding the keyboard, together with what submitting it
+/// means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Modal {
+    pub prompt: Prompt,
+    pub form: Form,
 }
 
 /// One row of the `?` overlay: the keys every tab answers to.
@@ -184,6 +223,16 @@ pub struct App {
     /// Whether the right-hand detail panel is up. Shell-level rather than
     /// per-tab: it is one panel, and `Enter` means the same thing everywhere.
     pub detail: bool,
+    /// The open form, if any. Shell-level like `help`: it is drawn over the
+    /// whole frame whatever tab is behind it, which is what makes
+    /// "`capturing()` implies something on screen" true by construction.
+    pub modal: Option<Modal>,
+    /// Every machine this `q` knows of — the local one first, then the
+    /// configured remotes. The new-Quest form's machine field cycles it.
+    pub machines: Vec<String>,
+    /// `[tmux] session_prefix`, so a prompt can name the tmux session it is
+    /// about to kill exactly as `q close` does.
+    pub tmux_prefix: String,
     pub quests: quests::State,
     pub sessions: sessions::State,
     pub templates: templates::State,
@@ -210,6 +259,9 @@ impl App {
             refresh_error: None,
             focus_quest: None,
             detail: false,
+            modal: None,
+            machines: machines(config, machine),
+            tmux_prefix: config.tmux.session_prefix.clone(),
             quests: quests::State::default(),
             sessions: sessions::State::default(),
             templates: templates::State::default(),
@@ -237,9 +289,16 @@ impl App {
         if self.help {
             return self.handle_help(input);
         }
-        // While a tab is capturing text (the `/` search box, and the forms of
-        // bd-8lz.4.4) the shell's bare-letter keys would eat the typing, so
-        // only the unconditional escape hatch is claimed above the tab.
+        // A form owns every key but the unconditional escape hatch: `q`, `x`
+        // and the digits are text in a field, not quit/refresh/switch-tab.
+        if self.modal.is_some() {
+            if input == Input::Ctrl('c') {
+                return self.quit();
+            }
+            return self.handle_modal(input);
+        }
+        // Same rule for a tab capturing text (the `/` search box): the shell's
+        // bare-letter keys would eat the typing.
         if self.capturing() {
             if input == Input::Ctrl('c') {
                 return self.quit();
@@ -265,6 +324,37 @@ impl App {
                 Action::None
             }
             _ => Action::None,
+        }
+    }
+
+    /// The open form's key. Everything it does is state; submitting leaves
+    /// through an `Action` so the process spawning stays in the event loop.
+    fn handle_modal(&mut self, input: Input) -> Action {
+        let Some(modal) = self.modal.as_mut() else {
+            return Action::None;
+        };
+        match modal.form.handle(input) {
+            Outcome::Editing => Action::None,
+            Outcome::Cancel => {
+                self.dismiss();
+                Action::None
+            }
+            Outcome::Submit => Action::Submit,
+        }
+    }
+
+    /// Put a form up. The hint goes in the status bar as well as in the box:
+    /// on a terminal too short for the box the bar is what says the keyboard
+    /// is captured, and while a form is up `current_status` does not expire.
+    pub(super) fn open(&mut self, prompt: Prompt, form: Form) {
+        self.say(format!("{} · {}", form.title, form.hint));
+        self.modal = Some(Modal { prompt, form });
+    }
+
+    /// Take the form down and give the bar back.
+    pub(super) fn dismiss(&mut self) {
+        if self.modal.take().is_some() {
+            self.status.clear();
         }
     }
 
@@ -303,8 +393,13 @@ impl App {
         }
     }
 
-    /// Whether the active tab is reading raw text rather than commands.
+    /// Whether something is reading raw text rather than commands. True only
+    /// while that something is on screen: a form is drawn over every tab, and
+    /// the `/` box *is* the status bar.
     pub(super) fn capturing(&self) -> bool {
+        if self.modal.is_some() {
+            return true;
+        }
         match self.tab {
             Tab::Quests => self.quests.capturing(),
             _ => false,
@@ -352,8 +447,11 @@ impl App {
         }
     }
 
-    /// Give the keyboard back on whichever tab was holding it.
+    /// Give the keyboard back, whatever was holding it. A form is a Quests-tab
+    /// affordance drawn over the whole frame, so leaving the tab abandons it
+    /// exactly as it abandons a half-typed `/` query.
     fn cancel_capture(&mut self) {
+        self.modal = None;
         if self.tab == Tab::Quests {
             self.quests.cancel_capture();
         }
@@ -388,6 +486,18 @@ impl App {
             MouseInput::ScrollDown => self.handle(Input::Down),
         }
     }
+}
+
+/// The local machine, then every configured remote, de-duplicated and in a
+/// stable order.
+fn machines(config: &Config, machine: &str) -> Vec<String> {
+    let mut out = vec![machine.to_string()];
+    for remote in &config.remotes {
+        if !out.contains(&remote.name) {
+            out.push(remote.name.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -656,6 +766,64 @@ mod tests {
             assert_eq!(Tab::from_digit(tab.digit()), Some(tab));
             assert_eq!(tab.next().prev(), tab);
         }
+    }
+
+    /// The mode gate at its purest: with a form up, `handle_global` never
+    /// runs. Every key it claims — `q`, `x`, `?`, Tab and the digits — is the
+    /// form's, and only Ctrl-C still gets through.
+    #[test]
+    fn a_form_takes_every_key_the_shell_would_have_claimed() {
+        let mut a = app();
+        a.handle(Input::Char('n'));
+        assert!(a.modal.is_some());
+        assert!(a.capturing());
+
+        for c in ['q', 'x', '?', '1', '4', '0'] {
+            assert_eq!(a.handle(Input::Char(c)), Action::None, "{c}");
+        }
+        assert!(!a.should_quit);
+        assert!(!a.help);
+        assert_eq!(a.tab, Tab::Quests);
+        assert_eq!(a.refreshes, 0);
+        // Tab moves between fields, not between tabs.
+        a.handle(Input::Tab);
+        a.handle(Input::BackTab);
+        assert_eq!(a.tab, Tab::Quests);
+        assert!(a.modal.is_some());
+
+        // Enter is the submission; the loop does the work.
+        assert_eq!(a.handle(Input::Enter), Action::Submit);
+        assert!(a.modal.is_some(), "Enter must not take the form down");
+        // Esc does.
+        assert_eq!(a.handle(Input::Esc), Action::None);
+        assert!(a.modal.is_none());
+        assert!(a.status.is_empty());
+        assert!(!a.capturing());
+        assert_eq!(a.handle(Input::Char('q')), Action::Quit);
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_inside_a_form() {
+        let mut a = app();
+        a.handle(Input::Char('n'));
+        assert_eq!(a.handle(Input::Ctrl('c')), Action::Quit);
+        assert!(a.should_quit);
+    }
+
+    #[test]
+    fn the_machine_list_is_the_local_machine_then_the_remotes() {
+        let mut config = Config::default();
+        config.remotes.push(crate::config::Remote {
+            name: "ws".to_string(),
+            ssh: "ws.local".to_string(),
+        });
+        // A remote that repeats the local name is not offered twice.
+        config.remotes.push(crate::config::Remote {
+            name: "laptop".to_string(),
+            ssh: "self".to_string(),
+        });
+        let a = App::new(&config, "laptop");
+        assert_eq!(a.machines, ["laptop", "ws"]);
     }
 
     #[test]

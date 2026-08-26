@@ -217,6 +217,9 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
                     prompt_file: prompt_file.as_deref(),
                     no_auto_reset: *no_auto_reset,
                     detach: *detach,
+                    // The global `--machine` already decides this; only the
+                    // TUI's form sets it per Quest.
+                    machine: None,
                 },
             )
             .map(|()| 0)

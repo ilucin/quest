@@ -8,50 +8,107 @@ use crate::model::{Quest, QuestState, now};
 use crate::output;
 use crate::tmux::session_name;
 
+/// What a close did, for the payload of whatever asked for it.
+pub struct Closed {
+    pub quest: Quest,
+    /// The Quest was already finished, so only the epic could still be done.
+    pub already_finished: bool,
+    pub sessions_ended: usize,
+    pub epic_closed: bool,
+}
+
+impl Closed {
+    /// The one-line human rendering, shared by `q close` and the TUI's prompt.
+    pub fn describe(&self) -> String {
+        if self.already_finished {
+            return format!(
+                "quest {} ({}) is already finished{}",
+                self.quest.id,
+                self.quest.slug,
+                epic_note(&self.quest, self.epic_closed)
+            );
+        }
+        format!(
+            "closed {} ({}) · {} session(s) ended{}",
+            self.quest.id,
+            self.quest.slug,
+            self.sessions_ended,
+            epic_note(&self.quest, self.epic_closed)
+        )
+    }
+}
+
 pub fn run(ctx: &Ctx, target: &str, force: bool, close_epic: bool) -> anyhow::Result<()> {
     sweep_quiet(ctx)?;
+    let quest = ctx.db()?.resolve_quest(target)?;
+
+    if !force && let Some(question) = confirmation(ctx, &quest, close_epic)? {
+        confirm(ctx, &question)?;
+    }
+    let out = apply(ctx, &quest, close_epic)?;
+
+    if ctx.json || !ctx.quiet {
+        output::emit(
+            ctx.json,
+            &serde_json::json!({
+                "quest": out.quest,
+                "already_finished": out.already_finished,
+                "sessions_ended": out.sessions_ended,
+                "epic_closed": out.epic_closed,
+            }),
+            || out.describe(),
+        )?;
+    }
+    Ok(())
+}
+
+/// The question to put before closing, or `None` when there is nothing left to
+/// ask about — an already-finished Quest whose epic is done, or was never
+/// asked for, has no side effect to confirm.
+///
+/// Split out of [`apply`] so the TUI's prompt asks the same thing the terminal
+/// does, in a place where `confirm`'s read of stdin would be fatal.
+pub fn confirmation(ctx: &Ctx, quest: &Quest, close_epic: bool) -> anyhow::Result<Option<String>> {
+    if quest.state == QuestState::Finished {
+        if !close_epic {
+            return Ok(None);
+        }
+        let Some(epic) = beads::epic_of(quest) else {
+            return Ok(None);
+        };
+        if epic_already_closed(ctx, quest)? {
+            return Ok(None);
+        }
+        return Ok(Some(format!("close beads epic {epic}?")));
+    }
+    let epic = match beads::epic_of(quest).filter(|_| close_epic) {
+        Some(epic) => format!(" and its beads epic {epic}"),
+        None => String::new(),
+    };
+    Ok(Some(format!(
+        "close quest {}{epic} (kills tmux session {})?",
+        quest.slug,
+        session_name(&ctx.config, &quest.slug)
+    )))
+}
+
+/// The close itself: kill the tmux session, end every live session row, close
+/// the epic if asked, mark the Quest finished (SPEC §5). Confirmation is the
+/// caller's — [`confirmation`] above builds the question.
+pub fn apply(ctx: &Ctx, quest: &Quest, close_epic: bool) -> anyhow::Result<Closed> {
     let db = ctx.db()?;
-    let quest = db.resolve_quest(target)?;
     let tmux_session = session_name(&ctx.config, &quest.slug);
 
     // Closing twice is not an error; there is nothing left to do but the epic,
     // which is worth a second run when the first one did not ask for it.
     if quest.state == QuestState::Finished {
-        let epic_closed = close_epic && close_epic_again(ctx, &quest, force)?;
-        if ctx.json || !ctx.quiet {
-            output::emit(
-                ctx.json,
-                &serde_json::json!({
-                    "quest": quest,
-                    "already_finished": true,
-                    "sessions_ended": 0,
-                    "epic_closed": epic_closed,
-                }),
-                || {
-                    format!(
-                        "quest {} ({}) is already finished{}",
-                        quest.id,
-                        quest.slug,
-                        epic_note(&quest, epic_closed)
-                    )
-                },
-            )?;
-        }
-        return Ok(());
-    }
-
-    if !force {
-        let epic = match beads::epic_of(&quest).filter(|_| close_epic) {
-            Some(epic) => format!(" and its beads epic {epic}"),
-            None => String::new(),
-        };
-        confirm(
-            ctx,
-            &format!(
-                "close quest {}{epic} (kills tmux session {tmux_session})?",
-                quest.slug
-            ),
-        )?;
+        let epic_closed = close_epic && close_epic_again(ctx, quest)?;
+        return Ok(Closed {
+            quest: quest.clone(),
+            already_finished: true,
+            sessions_ended: 0,
+            epic_closed,
+        });
     }
 
     if ctx.tmux().has_session(&tmux_session)? {
@@ -71,7 +128,7 @@ pub fn run(ctx: &Ctx, target: &str, force: bool, close_epic: bool) -> anyhow::Re
         )?;
     }
     // TODO(M2): `--summarize` (brain).
-    let epic_closed = close_epic && close_the_epic(ctx, &quest);
+    let epic_closed = close_epic && close_the_epic(ctx, quest);
     let quest = db.update_quest_state(&quest.id, QuestState::Finished, Some(ts))?;
     db.append_event(
         &quest.id,
@@ -80,27 +137,12 @@ pub fn run(ctx: &Ctx, target: &str, force: bool, close_epic: bool) -> anyhow::Re
         &serde_json::json!({ "sessions_ended": ending.len() }),
     )?;
 
-    if ctx.json || !ctx.quiet {
-        output::emit(
-            ctx.json,
-            &serde_json::json!({
-                "quest": quest,
-                "already_finished": false,
-                "sessions_ended": ending.len(),
-                "epic_closed": epic_closed,
-            }),
-            || {
-                format!(
-                    "closed {} ({}) · {} session(s) ended{}",
-                    quest.id,
-                    quest.slug,
-                    ending.len(),
-                    epic_note(&quest, epic_closed)
-                )
-            },
-        )?;
-    }
-    Ok(())
+    Ok(Closed {
+        quest,
+        already_finished: false,
+        sessions_ended: ending.len(),
+        epic_closed,
+    })
 }
 
 /// ` · epic bd-e closed`, for the one-liner — the epic is the half of what
@@ -115,9 +157,8 @@ fn epic_note(quest: &Quest, epic_closed: bool) -> String {
 /// `--close-epic` on a Quest that is already finished. The epic is a row in a
 /// shared tracker, so a repeat run must neither write to it twice nor append a
 /// second `beads.epic_closed` event: the recorded event is the proof it was
-/// already done. Anything that does reach `bd` is confirmed first, since the
-/// Quest itself needs no closing and the tracker write is the whole action.
-fn close_epic_again(ctx: &Ctx, quest: &Quest, force: bool) -> anyhow::Result<bool> {
+/// already done.
+fn close_epic_again(ctx: &Ctx, quest: &Quest) -> anyhow::Result<bool> {
     let Some(epic) = beads::epic_of(quest) else {
         eprintln!(
             "warning: --close-epic: quest {} has no beads epic",
@@ -128,9 +169,6 @@ fn close_epic_again(ctx: &Ctx, quest: &Quest, force: bool) -> anyhow::Result<boo
     if epic_already_closed(ctx, quest)? {
         eprintln!("note: beads epic {epic} was already closed by an earlier `q close`");
         return Ok(false);
-    }
-    if !force {
-        confirm(ctx, &format!("close beads epic {epic}?"))?;
     }
     Ok(close_the_epic(ctx, quest))
 }

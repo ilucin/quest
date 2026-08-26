@@ -39,9 +39,61 @@ pub struct Args<'a> {
     pub prompt_file: Option<&'a str>,
     pub no_auto_reset: bool,
     pub detach: bool,
+    /// The machine the Quest is recorded against. `None` is `ctx.machine()`,
+    /// which is what the global `--machine` already decides for the CLI; the
+    /// TUI's new-Quest form picks it per Quest instead (SPEC §17).
+    pub machine: Option<&'a str>,
+}
+
+/// Everything `q new` creates, before anything is printed or attached to.
+///
+/// [`create`] is the whole of quest creation as a library call, so the TUI's
+/// new-Quest form runs exactly the path `q new` runs — the slug claim, the
+/// beads epic, the tmux session, the master, and the rollback when the master
+/// will not start — rather than a second copy of it.
+pub struct Created {
+    pub quest: Quest,
+    pub session: Session,
+    pub tmux_session: String,
 }
 
 pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
+    let Created {
+        quest,
+        session,
+        tmux_session,
+    } = create(ctx, args)?;
+
+    let attach = attach_mode(ctx, !args.detach);
+    if ctx.json || !ctx.quiet {
+        output::emit(
+            ctx.json,
+            &serde_json::json!({
+                "quest": quest,
+                "session": session,
+                "tmux_session": tmux_session,
+                "attach": attach,
+            }),
+            || {
+                format!(
+                    "created quest {} ({}) · tmux {tmux_session} · run: q enter {}",
+                    quest.id, quest.slug, quest.slug
+                )
+            },
+        )?;
+    }
+    if attach != AttachMode::None {
+        // An exec attach replaces this process, so nothing buffered survives it.
+        std::io::stdout().flush()?;
+        ctx.tmux().attach(&tmux_session, Some(&session.tmux_pane))?;
+    }
+    Ok(())
+}
+
+/// The Quest row, its beads epic, its tmux session and its master — SPEC §5
+/// steps 1, 2, 4 and 5. Steps 3 (brain) and 6 (attach) are the caller's:
+/// `q new` attaches unless `-d`, the TUI leaves that to `o`.
+pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
     sweep_quiet(ctx)?;
     let db = ctx.db()?;
     // Both before anything is written: a bad label or a contradictory pair of
@@ -52,8 +104,16 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     let (base, name_source) = resolve_slug(args.name, &cwd)?;
     let (slug, tmux_session) = claim_slug(ctx, db, &base, name_source)?;
 
+    let machine = match args.machine {
+        Some(machine) => {
+            crate::config::validate_machine_name(machine)?;
+            machine
+        }
+        None => ctx.machine(),
+    };
+
     // TODO(M2): brain session (`--brain`).
-    let mut row = Quest::new(&slug, &cwd.to_string_lossy(), ctx.machine());
+    let mut row = Quest::new(&slug, &cwd.to_string_lossy(), machine);
     row.name_source = name_source;
     row.goal = args.goal.map(str::to_string);
     // TODO(M5): validate `--workflow` against the workflow registry.
@@ -92,32 +152,11 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    let session = master.session;
-
-    let attach = attach_mode(ctx, !args.detach);
-    if ctx.json || !ctx.quiet {
-        output::emit(
-            ctx.json,
-            &serde_json::json!({
-                "quest": quest,
-                "session": session,
-                "tmux_session": tmux_session,
-                "attach": attach,
-            }),
-            || {
-                format!(
-                    "created quest {} ({}) · tmux {tmux_session} · run: q enter {}",
-                    quest.id, quest.slug, quest.slug
-                )
-            },
-        )?;
-    }
-    if attach != AttachMode::None {
-        // An exec attach replaces this process, so nothing buffered survives it.
-        std::io::stdout().flush()?;
-        ctx.tmux().attach(&tmux_session, Some(&session.tmux_pane))?;
-    }
-    Ok(())
+    Ok(Created {
+        quest,
+        session: master.session,
+        tmux_session,
+    })
 }
 
 /// The Quest row is about to be deleted, so its epic loses its only pointer:
