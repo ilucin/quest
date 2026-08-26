@@ -13,8 +13,11 @@
 //! to an error.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -155,13 +158,50 @@ fn pids_in(dir: &Path) -> Vec<i64> {
         .collect()
 }
 
+/// How long `ps` may take before its answer is worth less than the wait. The
+/// registry is advisory, and `q send` is interactive.
+const PS_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// `pid -> ppid` for every process, from one `ps`. Empty when `ps` is not
-/// there or says nothing usable — the callers all degrade to `Unknown`.
+/// there, hangs, or says nothing usable — the callers all degrade to `Unknown`.
 fn process_parents() -> HashMap<i64, i64> {
-    let Ok(out) = Command::new("ps").args(["-Ao", "pid=,ppid="]).output() else {
-        return HashMap::new();
-    };
-    parse_parents(&String::from_utf8_lossy(&out.stdout))
+    parse_parents(&ps_output().unwrap_or_default())
+}
+
+/// `ps -Ao pid=,ppid=` under a wall-clock cap. A `ps` on a wedged filesystem
+/// can block indefinitely, so the pipe is drained on a thread and the child is
+/// killed once the cap passes; `None` on any failure or timeout.
+fn ps_output() -> Option<String> {
+    let mut child = Command::new("ps")
+        .args(["-Ao", "pid=,ppid="])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = tx.send(stdout.read_to_string(&mut buf).ok().map(|_| buf));
+    });
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(None) if started.elapsed() < PS_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    rx.recv_timeout(PS_TIMEOUT.saturating_sub(started.elapsed()))
+        .ok()
+        .flatten()
 }
 
 fn parse_parents(text: &str) -> HashMap<i64, i64> {

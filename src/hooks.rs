@@ -283,7 +283,6 @@ fn session_end(db: &Db, session: &Session, payload: &Value) {
     });
 }
 
-/// At most `max` chars, on a char boundary, with an ellipsis when cut.
 #[cfg(test)]
 mod tests {
     use super::*;

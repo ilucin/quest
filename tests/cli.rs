@@ -3955,6 +3955,16 @@ impl Env {
             .unwrap()
     }
 
+    /// A row the `Notification` hook parked on a prompt.
+    fn set_waiting(&self, session_id: &str, waiting_for: &str) {
+        self.conn()
+            .execute(
+                "UPDATE session SET status = 'waiting', waiting_for = ?1 WHERE id = ?2",
+                rusqlite::params![waiting_for, session_id],
+            )
+            .unwrap();
+    }
+
     /// One `<pid>.json` in the stubbed Claude session registry.
     fn registry(&self, pid: i64, json: &str) {
         let dir = self.dir.path().join("registry");
@@ -4542,6 +4552,36 @@ fn sessions_shows_the_registry_when_it_contradicts_the_row() {
             .unwrap()
             .iter()
             .all(|r| r["registry"].is_null())
+    );
+
+    // Agreeing in different words is still agreeing: the hooks fold Claude's
+    // `permission_prompt` into `permission`, the registry quotes it raw.
+    fleet.env.set_waiting(&fleet.worker_id, "permission");
+    fleet.env.registry(
+        1002,
+        r#"{"pid":1002,"status":"waiting","waitingFor":"permission_prompt"}"#,
+    );
+    let rows = fleet.env.json(&["sessions", "alpha"]);
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["registry"].is_null()),
+        "{rows}"
+    );
+
+    // An entry that belongs to another session is not a second opinion at all.
+    fleet.env.set_status(&fleet.worker_id, "idle", None);
+    fleet
+        .env
+        .registry(1002, r#"{"pid":1002,"name":"beta/other","status":"busy"}"#);
+    let rows = fleet.env.json(&["sessions", "alpha"]);
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["registry"].is_null()),
+        "{rows}"
     );
 }
 

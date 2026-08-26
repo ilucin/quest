@@ -95,7 +95,7 @@ fn annotate(views: &mut [SessionView]) {
             continue;
         };
         // The row already says this; a second column would only repeat it.
-        if said != status_cell(&view.session) {
+        if coarse(&said) != coarse(&status_cell(&view.session)) {
             view.registry = Some(said);
         }
     }
@@ -173,6 +173,13 @@ fn human(views: &[SessionView], across_quests: bool) -> String {
         ));
     }
     fmt::table(&header, &rows)
+}
+
+/// The status without what it waits for. The two sources spell the reason
+/// differently — the hooks fold Claude's `permission_prompt` into `permission`,
+/// the registry quotes it raw — and a spelling is not a contradiction.
+fn coarse(cell: &str) -> &str {
+    cell.split(':').next().unwrap_or(cell).trim()
 }
 
 /// `waiting` alone says nothing about what for; the hook records it, so show it.
@@ -292,6 +299,16 @@ mod tests {
         s.status = SessionStatus::Busy;
         s.waiting_for = Some("ignored".to_string());
         assert_eq!(status_cell(&s), "busy");
+    }
+
+    /// The two sources name the same prompt differently, so the comparison
+    /// that decides whether to show a REG column drops the reason.
+    #[test]
+    fn the_reason_a_session_waits_is_not_part_of_the_comparison() {
+        assert_eq!(coarse("waiting: permission"), "waiting");
+        assert_eq!(coarse("waiting: permission_prompt"), "waiting");
+        assert_eq!(coarse("idle"), "idle");
+        assert_ne!(coarse("busy"), coarse("waiting: permission"));
     }
 
     #[test]
