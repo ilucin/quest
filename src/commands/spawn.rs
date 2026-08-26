@@ -89,6 +89,9 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         .map(str::to_string)
         .or_else(|| quest.workflow.clone());
     row.first_prompt = Some(prompt.to_string());
+    // The name `claude -n` is given below (SPEC §6), recorded so the registry's
+    // identity check has something true to compare against.
+    row.claude_name = Some(crate::naming::claude_name(&quest.slug, args.label));
     // `session.start` is the hook's to append once Claude comes up.
     let pending = db.insert_session(&row)?;
     if pending.id != session_id {

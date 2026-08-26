@@ -304,6 +304,21 @@ impl Db {
         self.require_session(id)
     }
 
+    /// A `/rename` just went out: `name` is what Claude answers to from now on,
+    /// and nothing is owed any more. Recorded because the registry's identity
+    /// check is only as good as q's memory of the name it launched — and last
+    /// told — this session (SPEC §6, §10).
+    pub fn record_claude_name(&self, id: &str, name: &str) -> anyhow::Result<Session> {
+        self.conn
+            .execute(
+                "UPDATE session SET claude_name = ?1, pending_rename = NULL, \
+                 updated_at = ?2 WHERE id = ?3",
+                params![name, now(), id],
+            )
+            .map_err(db_err)?;
+        self.require_session(id)
+    }
+
     fn require_session(&self, id: &str) -> anyhow::Result<Session> {
         self.get_session(id)?
             .ok_or_else(|| QError::NotFound(format!("session `{id}`")).into())

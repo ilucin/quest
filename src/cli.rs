@@ -194,6 +194,9 @@ pub enum Command {
         /// Re-run this command in the background and return immediately
         #[arg(long, requires = "auto")]
         detach: bool,
+        /// Let auto-naming take over a Quest that was named by hand
+        #[arg(long, requires = "apply")]
+        force: bool,
     },
 
     /// Set a Quest property

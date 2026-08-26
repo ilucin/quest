@@ -1639,6 +1639,51 @@ fn a_stop_hook_holds_the_rename_while_claudes_registry_disagrees() {
     );
 }
 
+/// The last line of defence for round-1 review blocking #1: `$Q_NAMING` marks
+/// a process q started to name a Quest, and no hook fired inside one may write
+/// — even with a full Quest environment around it. Without this, q's own hooks
+/// running inside the naming `claude -p` would overwrite the master's row,
+/// inject its brief into the naming prompt and schedule naming all over again.
+#[test]
+fn every_hook_is_a_no_op_inside_a_naming_subprocess() {
+    for sub in [
+        "session-start",
+        "user-prompt-submit",
+        "stop",
+        "notification",
+        "pre-compact",
+        "session-end",
+        "post-tool-use",
+        "statusline",
+    ] {
+        let env = Env::new();
+        env.seed_master("auto", "busy");
+        env.seed_pane("q-alpha", "master", "%7");
+        env.q()
+            .env("Q_QUEST", "q-0001")
+            .env("Q_SESSION", "s-0001")
+            .env("Q_NAMING", "1")
+            .env("Q_NO_DETACH", env.spawns_path())
+            .args(["hook", sub])
+            .write_stdin(json!({ "session_id": "abc", "prompt": "hello" }).to_string())
+            .assert()
+            .success()
+            .stdout("");
+        assert!(env.events().is_empty(), "{sub} wrote an event");
+        assert!(env.spawns().is_empty(), "{sub} spawned a naming run");
+        assert_eq!(env.pane_buffer("%7"), "", "{sub} typed into the pane");
+        assert_eq!(
+            env.conn()
+                .query_row("SELECT status FROM session WHERE id = 's-0001'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+            "busy",
+            "{sub} moved the session"
+        );
+    }
+}
+
 #[test]
 fn a_stop_hook_without_a_pending_rename_sends_nothing() {
     let env = Env::new();

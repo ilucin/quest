@@ -3,7 +3,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
 
 use crate::Ctx;
 use crate::beads;
@@ -23,6 +23,9 @@ pub const MASTER: &str = "master";
 
 /// Branch names that say nothing about the work, so they never become a slug.
 pub const GENERIC_BRANCHES: [&str; 4] = ["main", "master", "develop", "HEAD"];
+
+/// All a `git rev-parse` gets. Naming runs it from a hook.
+const GIT_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default)]
 pub struct Args<'a> {
@@ -206,6 +209,66 @@ fn store_epic(ctx: &Ctx, quest: Quest, epic: &str, repo: &str) -> Quest {
     }
 }
 
+/// Why a slug cannot be used. A Quest row and a live tmux session are both
+/// blocking: `q rename` refuses to move onto either.
+enum Taken {
+    Quest(String),
+    Tmux(String),
+}
+
+/// What holds `slug`, or `None` when nothing does.
+fn taken(ctx: &Ctx, db: &Db, slug: &str) -> anyhow::Result<Option<Taken>> {
+    if let Some(existing) = db.get_quest_by_slug(slug)? {
+        return Ok(Some(Taken::Quest(existing.id)));
+    }
+    let tmux_session = session_name(&ctx.config, slug);
+    if ctx.tmux().has_session(&tmux_session)? {
+        return Ok(Some(Taken::Tmux(tmux_session)));
+    }
+    Ok(None)
+}
+
+/// `base` for `n == 1`, then `base-2`, `base-3`, …
+fn candidate(base: &str, n: u32) -> String {
+    if n == 1 {
+        base.to_string()
+    } else {
+        numbered(base, n)
+    }
+}
+
+/// What [`claim`] found for a proposed slug.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// Free — `base` itself, or the first numbered variant that was.
+    Free(String),
+    /// The caller already holds it; there is nothing to rename.
+    Own,
+    /// `base` and every variant of it is taken.
+    Exhausted,
+}
+
+/// The first of `base`, `base-2`, … that neither a Quest nor a tmux session
+/// holds. `own` is the slug the caller already carries.
+///
+/// Auto-naming steps aside by exactly the rule `q new` does (`claim_slug`
+/// below shares the check and the attempt count), so a proposal that collides
+/// lands on the same variant either way — and one that would collide with a
+/// tmux session is skipped here rather than failing inside `rename::apply`.
+pub fn claim(ctx: &Ctx, base: &str, own: &str) -> anyhow::Result<Claim> {
+    let db = ctx.db()?;
+    for n in 1..=SLUG_ATTEMPTS {
+        let slug = candidate(base, n);
+        if slug == own {
+            return Ok(Claim::Own);
+        }
+        if taken(ctx, db, &slug)?.is_none() {
+            return Ok(Claim::Free(slug));
+        }
+    }
+    Ok(Claim::Exhausted)
+}
+
 /// The first free slug and the tmux session that goes with it. An auto slug
 /// steps aside (`-2`, `-3`, …); an explicit `--name` is a hard error instead.
 fn claim_slug(
@@ -216,32 +279,26 @@ fn claim_slug(
 ) -> anyhow::Result<(String, String)> {
     let auto = source == NameSource::Auto;
     for n in 1..=SLUG_ATTEMPTS {
-        let slug = if n == 1 {
-            base.to_string()
-        } else {
-            numbered(base, n)
-        };
-        let tmux_session = session_name(&ctx.config, &slug);
-        if let Some(existing) = db.get_quest_by_slug(&slug)? {
-            if auto {
-                continue;
+        let slug = candidate(base, n);
+        match taken(ctx, db, &slug)? {
+            None => {
+                let tmux_session = session_name(&ctx.config, &slug);
+                return Ok((slug, tmux_session));
             }
-            return Err(QError::Conflict(format!(
-                "slug `{slug}` is already taken by quest {}; pick another with --name",
-                existing.id
-            ))
-            .into());
-        }
-        if ctx.tmux().has_session(&tmux_session)? {
-            if auto {
-                continue;
+            Some(_) if auto => continue,
+            Some(Taken::Quest(id)) => {
+                return Err(QError::Conflict(format!(
+                    "slug `{slug}` is already taken by quest {id}; pick another with --name"
+                ))
+                .into());
             }
-            return Err(QError::Conflict(format!(
-                "tmux session `{tmux_session}` already exists; kill it or pick another slug with --name"
-            ))
-            .into());
+            Some(Taken::Tmux(tmux_session)) => {
+                return Err(QError::Conflict(format!(
+                    "tmux session `{tmux_session}` already exists; kill it or pick another slug with --name"
+                ))
+                .into());
+            }
         }
-        return Ok((slug, tmux_session));
     }
     Err(QError::Conflict(format!(
         "`{base}` and its first {SLUG_ATTEMPTS} variants are all taken; pick a slug with --name"
@@ -301,6 +358,9 @@ pub fn spawn_master(ctx: &Ctx, quest: &Quest, prompt: Option<String>) -> anyhow:
     row.status = SessionStatus::Starting;
     row.workflow = quest.workflow.clone();
     row.first_prompt = prompt;
+    // The name `claude -n` was just given, so the registry's identity check has
+    // something true to compare against before any rename (SPEC §6).
+    row.claude_name = Some(crate::naming::claude_name(&quest.slug, MASTER));
     // `session.start` is the hook's to append once Claude comes up (M1).
     match db.insert_session(&row) {
         // A regenerated id would no longer match `Q_SESSION` in the window.
@@ -428,19 +488,22 @@ pub fn slugify(raw: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// The branch checked out in `cwd`, or `None`. Called from the master's `Stop`
+/// hook on every turn (`naming::Input::collect`), so it is bounded: a `git` on
+/// a stale network mount or waiting on `index.lock` must cost a hook the
+/// budget below and nothing more.
 pub fn git_branch(cwd: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .args([
+    let branch = crate::proc::run_capped(
+        "git",
+        &[
             "-C",
             &cwd.to_string_lossy(),
             "rev-parse",
             "--abbrev-ref",
             "HEAD",
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let branch = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        ],
+        GIT_TIMEOUT,
+    )?;
     (!branch.is_empty()).then_some(branch)
 }
 

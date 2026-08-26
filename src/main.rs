@@ -312,6 +312,7 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             apply,
             refresh,
             detach,
+            force,
         } => {
             let ctx = Ctx::with_db(args)?;
             commands::name::run(
@@ -322,6 +323,7 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
                     apply: *apply,
                     refresh: *refresh,
                     detach: *detach,
+                    force: *force,
                 },
             )
             .map(|()| 0)
@@ -378,6 +380,12 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             HookAction::Status { command } => {
                 commands::hook::status(&Ctx::config_only(args)?, command.as_deref())
             }
+            // Everything below is a hook firing inside a live Claude session.
+            // A Claude q started for its own bookkeeping — naming (SPEC §10) —
+            // must not be able to write to the Quest it is naming: its pane
+            // environment is scrubbed and its settings are not loaded, and this
+            // is the last line of that defence.
+            _ if naming::suppressed() => Ok(0),
             // Lenient: a broken config must never break the statusline.
             HookAction::Statusline => commands::hook::statusline(&Ctx::lenient(args)),
             HookAction::SessionStart => hooks::run(hooks::Event::SessionStart),

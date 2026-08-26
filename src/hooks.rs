@@ -7,6 +7,10 @@
 //! ever writes to stdout (the brief as `additionalContext`). Outside a Quest
 //! pane — no `$Q_QUEST` — or without an existing database, nothing is read or
 //! written; a hook never creates the database.
+//!
+//! Inside a process q started for its own bookkeeping (`$Q_NAMING`, SPEC §10)
+//! no handler here runs at all: the dispatcher in `main.rs` short-circuits
+//! every `q hook <event>` on `naming::suppressed`.
 
 use std::io::{Read, Write};
 use std::path::Path;

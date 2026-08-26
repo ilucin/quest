@@ -126,7 +126,7 @@ pub fn apply(
         &serde_json::json!({ "from": from, "to": quest.slug, "source": source }),
     )?;
     // Claude keeps its own session name; it only follows when the pane is idle.
-    let sync = naming::sync_claude_names(db, ctx.tmux(), &quest)?;
+    let sync = naming::sync_claude_names(db, ctx.tmux(), &quest, &from)?;
 
     Ok(Renamed {
         quest,

@@ -8,6 +8,14 @@
 //! the first prompt), marked `heuristic` so nobody mistakes it for a model
 //! answer.
 //!
+//! Everything q starts here is isolated from the Quest it is naming: the pane
+//! environment is scrubbed ([`PANE_ENV`]), `$Q_NAMING` makes any `q hook` it
+//! reaches a no-op ([`suppressed`]), and `claude -p` is given neither settings
+//! nor tools. Without that, the naming subprocess inherits `$Q_QUEST` and its
+//! own hooks write to the master's row — brief injected into the naming prompt,
+//! `Stop` flipping the master idle mid-turn, and that `Stop` scheduling naming
+//! again.
+//!
 //! The generated answer is cached by a hash of that input, so the same state
 //! never pays for a second model call; a rejected answer is *not* cached. The
 //! same hash drives regeneration: the master's `Stop` hook compares it against
@@ -34,8 +42,38 @@ const CLAUDE_TIMEOUT: Duration = Duration::from_secs(20);
 const PROMPT_CHARS: usize = 2_000;
 /// A heuristic slug from a prompt keeps at most this many words.
 const HEURISTIC_WORDS: usize = 4;
-/// `foo-2` … `foo-9` when the proposal is already another Quest's slug.
-const SLUG_ATTEMPTS: u32 = 9;
+/// How far down a chatty answer a slug is still looked for. A model that
+/// wrapped the token in a code fence put it on line 2; one that wrote an essay
+/// did not answer the question.
+const ANSWER_LINES: usize = 10;
+
+/// The environment that marks a Quest pane (SPEC §7). Every process q starts
+/// for its own bookkeeping drops all of it: inherited, the child's own hooks —
+/// and any `q hook` they run — would resolve to the very Quest being named and
+/// overwrite the master's row, inject its brief into the naming prompt, flip it
+/// idle mid-turn, and schedule another naming run from that `Stop`.
+pub const PANE_ENV: [&str; 4] = ["Q_QUEST", "Q_SESSION", "Q_ROLE", "TMUX_PANE"];
+
+/// Set on every process q starts for naming. `q hook <event>` does nothing at
+/// all when it is set — the belt to the scrubbed environment's braces, for a
+/// hook that finds a Quest some other way (a `$Q_QUEST` a user exported by
+/// hand, a settings file q did not write).
+pub const NAMING_ENV: &str = "Q_NAMING";
+
+/// Whether this process was started by q for naming, and so must not act as a
+/// hook.
+pub fn suppressed() -> bool {
+    std::env::var_os(NAMING_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// Strips the Quest identity from a child's environment and marks it as a
+/// naming process. Every `Command` naming spawns goes through here.
+fn scrub(cmd: &mut Command) -> &mut Command {
+    for key in PANE_ENV {
+        cmd.env_remove(key);
+    }
+    cmd.env(NAMING_ENV, "1")
+}
 
 /// What the model is asked about, and what the cache is keyed on (SPEC §10).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -139,21 +177,60 @@ pub trait Namer {
 pub fn namer() -> Box<dyn Namer> {
     match std::env::var_os("Q_FIXTURE") {
         Some(p) if !p.is_empty() => Box::new(FixtureNamer),
-        _ => Box::new(ClaudeNamer),
+        _ => Box::new(ClaudeNamer {
+            launcher: Box::new(ProcLauncher),
+        }),
     }
 }
 
-struct ClaudeNamer;
+/// How a built `Command` is finally run. The model's answer is all the namer
+/// wants back, so this is the whole surface — and it is the seam a test uses to
+/// inspect the `Command` without starting anything.
+pub trait Launcher {
+    /// The child's stdout, or `None` when it could not be started, exited
+    /// non-zero or outstayed [`CLAUDE_TIMEOUT`].
+    fn run(&self, cmd: &mut Command, input: &[u8]) -> Option<String>;
+}
+
+struct ProcLauncher;
+
+impl Launcher for ProcLauncher {
+    fn run(&self, cmd: &mut Command, input: &[u8]) -> Option<String> {
+        let out = crate::proc::run(cmd, input, CLAUDE_TIMEOUT).ok()?;
+        out.success().then(|| out.text())
+    }
+}
+
+/// The `claude -p` naming call, built where a test can read it back.
+///
+/// `--setting-sources ""` loads no settings file, so none of q's own hooks
+/// (nor MCP servers, nor `CLAUDE.md`) reach a subprocess whose whole job is to
+/// answer with one word; `--tools ""` leaves it nothing to run. Together with
+/// [`scrub`] that is three independent reasons this child cannot write to the
+/// Quest it is naming.
+fn claude_command(model: &str) -> Command {
+    let mut cmd = Command::new("claude");
+    cmd.args([
+        "-p",
+        "--model",
+        model,
+        "--setting-sources",
+        "",
+        "--tools",
+        "",
+    ]);
+    scrub(&mut cmd);
+    cmd
+}
+
+struct ClaudeNamer {
+    launcher: Box<dyn Launcher>,
+}
 
 impl Namer for ClaudeNamer {
     fn suggest(&self, model: &str, prompt: &str) -> Option<String> {
-        let out = crate::proc::run(
-            Command::new("claude").args(["-p", "--model", model]),
-            prompt.as_bytes(),
-            CLAUDE_TIMEOUT,
-        )
-        .ok()?;
-        out.success().then(|| out.text())
+        self.launcher
+            .run(&mut claude_command(model), prompt.as_bytes())
     }
 }
 
@@ -217,15 +294,27 @@ pub fn propose(
     })
 }
 
-/// A model answer reduced to a slug, or `None` when it is not one. Only the
-/// first non-empty line is considered, stripped of the punctuation a chatty
-/// model wraps a token in; whatever is left has to be a valid slug on its own.
+/// A model answer reduced to a slug, or `None` when it is not one.
+///
+/// The first line is usually the whole answer, but a model that fenced its
+/// token put `` ```text `` there instead — and `text` is a perfectly valid
+/// slug, so taking the first line alone would name the Quest after the fence.
+/// Fence lines are dropped and the first *remaining* line that is a slug on its
+/// own — once the punctuation a chatty model wraps a token in is stripped —
+/// wins. A prose line is never a slug (it has spaces), so an explanation still
+/// falls through to the heuristic.
 fn sanitize(raw: &str) -> Option<String> {
-    let line = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let slug = line.trim_matches(|c: char| {
-        c.is_whitespace() || matches!(c, '`' | '"' | '\'' | '.' | ',' | ':' | ';' | '*' | '#')
-    });
-    (slug.len() <= SLUG_MAX && is_slug(slug)).then(|| slug.to_string())
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("```") && !l.starts_with("~~~"))
+        .take(ANSWER_LINES)
+        .find_map(|line| {
+            let slug = line.trim_matches(|c: char| {
+                c.is_whitespace()
+                    || matches!(c, '`' | '"' | '\'' | '.' | ',' | ':' | ';' | '*' | '#')
+            });
+            (slug.len() <= SLUG_MAX && is_slug(slug)).then(|| slug.to_string())
+        })
 }
 
 /// The fallback when the model is unavailable or unusable: the git branch if it
@@ -265,27 +354,6 @@ fn first_words(slug: &str, n: usize) -> String {
         .join("-")
 }
 
-/// A slug no *other* Quest holds: the proposal itself, then `-2` … `-9`.
-/// `None` when the Quest already carries it — there is nothing to rename. If
-/// every variant is taken the base comes back anyway, so the rename fails
-/// loudly rather than picking something arbitrary.
-pub fn free_slug(db: &Db, quest: &Quest, base: &str) -> anyhow::Result<Option<String>> {
-    for n in 1..=SLUG_ATTEMPTS {
-        let candidate = if n == 1 {
-            base.to_string()
-        } else {
-            crate::commands::new::numbered(base, n)
-        };
-        if candidate == quest.slug {
-            return Ok(None);
-        }
-        if db.get_quest_by_slug(&candidate)?.is_none() {
-            return Ok(Some(candidate));
-        }
-    }
-    Ok(Some(base.to_string()))
-}
-
 // ------------------------------------------------------ Claude session names
 
 /// A Claude session carries its own name (`claude -n <slug>/<label>`), which a
@@ -302,10 +370,15 @@ pub struct Sync {
 }
 
 /// Tells every live session of `quest` its new `<slug>/<label>`.
+///
+/// `previous_slug` is what the Quest was called a moment ago, which is what
+/// Claude is still called: the registry's identity check needs the name Claude
+/// has, not the one it is about to be given (SPEC §23 #5).
 pub fn sync_claude_names(
     db: &Db,
     tmux: &dyn crate::tmux::Tmux,
     quest: &Quest,
+    previous_slug: &str,
 ) -> anyhow::Result<Sync> {
     // One `list-panes` for the whole fleet: the pane pid is how the registry
     // finds Claude when no hook ever recorded its own pid.
@@ -317,10 +390,11 @@ pub fn sync_claude_names(
         }
         let pane_pid = pane_pid(&panes, &session.tmux_pane);
         let desired = claude_name(&quest.slug, &session.label);
-        if crate::commands::target::refusal(&session, pane_pid, None).is_none()
+        let current = current_name(&session, previous_slug);
+        if crate::commands::target::refusal(&session, pane_pid, Some(&current)).is_none()
             && send_rename(tmux, &session.tmux_pane, &desired).is_ok()
         {
-            db.set_pending_rename(&session.id, None)?;
+            db.record_claude_name(&session.id, &desired)?;
             out.told.push(session.label.clone());
         } else {
             db.set_pending_rename(&session.id, Some(&desired))?;
@@ -328,6 +402,15 @@ pub fn sync_claude_names(
         }
     }
     Ok(out)
+}
+
+/// The name Claude currently answers to: the one q last told it, else the one
+/// it was launched with (`<previous slug>/<label>`, SPEC §6).
+fn current_name(session: &Session, previous_slug: &str) -> String {
+    session
+        .claude_name
+        .clone()
+        .unwrap_or_else(|| claude_name(previous_slug, &session.label))
 }
 
 pub fn claude_name(slug: &str, label: &str) -> String {
@@ -371,20 +454,27 @@ fn flush_pending(db: &Db, quest: &Quest, session: &Session) {
     // The Quest may have been renamed again while the send was held, so the
     // name that goes out is the current one, not the parked text.
     let desired = claude_name(&quest.slug, &session.label);
+    // The `list-panes` and the `send-keys` below are unbounded tmux calls on a
+    // hook's critical path. Both are local socket round trips against a server
+    // this pane is already living in — a tmux that cannot answer them has the
+    // user's terminal wedged too — and every other hook path already makes
+    // them (the liveness sweep, `q peek`), so they are taken as they are.
     let tmux = crate::tmux::tmux();
     // `Stop` means the turn is over, so the row is idle whatever it still says;
     // the registry is the second opinion.
     let pane_pid = pane_pid(&tmux.list_panes().unwrap_or_default(), &session.tmux_pane);
     let mut idle = session.clone();
     idle.status = SessionStatus::Idle;
-    if crate::commands::target::refusal(&idle, pane_pid, None).is_some() {
+    // Claude still answers to whatever it was last told, which is never the
+    // parked name — that is precisely the send that did not happen.
+    if crate::commands::target::refusal(&idle, pane_pid, session.claude_name.as_deref()).is_some() {
         return;
     }
     if send_rename(tmux.as_ref(), &session.tmux_pane, &desired).is_err() {
         return;
     }
     let _ = db.transaction(|db| {
-        db.set_pending_rename(&session.id, None)?;
+        db.record_claude_name(&session.id, &desired)?;
         db.append_event(
             &quest.id,
             Some(&session.id),
@@ -425,22 +515,45 @@ fn schedule(db: &Db, quest: &Quest, session: &Session) -> anyhow::Result<()> {
 
 /// Runs this binary again, fully detached: no stdio, no wait, so the caller
 /// (a hook, or `q name --detach`) returns immediately.
-///
-/// `$Q_NO_DETACH` replaces the spawn with a JSON line appended to the file it
-/// names, so tests can assert on the argv a hook *would* have run without ever
-/// starting a process.
 pub fn spawn_detached(args: &[String]) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
-    if let Some(path) = std::env::var_os("Q_NO_DETACH").filter(|v| !v.is_empty()) {
-        return record_argv(&PathBuf::from(path), &exe, args);
+    if let Some(path) = record_path() {
+        return record_argv(&path, &exe, args);
     }
-    Command::new(exe)
-        .args(args)
+    detached_command(&exe, args).spawn()?;
+    Ok(())
+}
+
+/// How the child is configured, kept separate from the spawn so a test can
+/// read the `Command` back.
+///
+/// No stdio: a hook's pipes must not be held open by a child that outlives it.
+/// Its own process group: Claude kills the hook's group when the hook times out
+/// or its pane goes away, and naming has to survive that (the same reason
+/// `proc::run` groups its children). No Quest identity, and `$Q_NAMING` set —
+/// see [`scrub`].
+fn detached_command(exe: &Path, args: &[String]) -> Command {
+    use std::os::unix::process::CommandExt;
+
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
-    Ok(())
+        .process_group(0);
+    scrub(&mut cmd);
+    cmd
+}
+
+/// Where a spawn records its argv instead of happening — `$Q_NO_DETACH`, so
+/// tests can assert on what a hook *would* have run without starting a
+/// process. Honoured only under `$Q_FIXTURE`: it is a test hook, and a stray
+/// export in a real shell must not be able to quietly turn naming off.
+fn record_path() -> Option<PathBuf> {
+    std::env::var_os("Q_FIXTURE").filter(|v| !v.is_empty())?;
+    std::env::var_os("Q_NO_DETACH")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn record_argv(path: &Path, exe: &Path, args: &[String]) -> anyhow::Result<()> {
@@ -497,6 +610,141 @@ mod tests {
         }
     }
 
+    /// Reads back what a `Command` was configured with, in the only two forms
+    /// `Command` exposes: the argv, and the environment deltas (a `None` value
+    /// is a removal).
+    fn argv(cmd: &Command) -> Vec<String> {
+        std::iter::once(cmd.get_program())
+            .chain(cmd.get_args())
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn removed(cmd: &Command) -> Vec<String> {
+        cmd.get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn set(cmd: &Command, key: &str) -> Option<String> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned())
+    }
+
+    /// What a launcher was handed, in the only forms `Command` exposes.
+    #[derive(Debug, Default)]
+    struct Seen {
+        argv: Vec<String>,
+        removed: Vec<String>,
+        naming: Option<String>,
+        input: String,
+    }
+
+    /// A launcher that records the `Command` and starts nothing.
+    struct Spy {
+        answer: Option<&'static str>,
+        seen: std::rc::Rc<std::cell::RefCell<Seen>>,
+    }
+
+    impl Launcher for Spy {
+        fn run(&self, cmd: &mut Command, input: &[u8]) -> Option<String> {
+            let mut removed = removed(cmd);
+            removed.sort();
+            *self.seen.borrow_mut() = Seen {
+                argv: argv(cmd),
+                removed,
+                naming: set(cmd, NAMING_ENV),
+                input: String::from_utf8_lossy(input).into_owned(),
+            };
+            self.answer.map(str::to_string)
+        }
+    }
+
+    /// The one that matters most (round-1 review, blocking #1): a `claude -p`
+    /// that inherited `$Q_QUEST` runs q's own hooks against the very Quest
+    /// being named — overwriting its master's row, injecting its brief into the
+    /// naming prompt and scheduling another naming run from the `Stop` that
+    /// follows.
+    #[test]
+    fn the_naming_subprocess_carries_no_quest_identity() {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Seen::default()));
+        let namer = ClaudeNamer {
+            launcher: Box::new(Spy {
+                answer: Some("cdc-backfill"),
+                seen: std::rc::Rc::clone(&seen),
+            }),
+        };
+        assert_eq!(
+            namer.suggest("haiku", "name this"),
+            Some("cdc-backfill".to_string())
+        );
+
+        let seen = seen.borrow();
+        let mut expected = PANE_ENV.to_vec();
+        expected.sort();
+        assert_eq!(seen.removed, expected);
+        assert_eq!(seen.naming.as_deref(), Some("1"));
+        assert_eq!(
+            seen.argv,
+            [
+                "claude",
+                "-p",
+                "--model",
+                "haiku",
+                // No settings file, so none of q's hooks load in the child.
+                "--setting-sources",
+                "",
+                // Naming reads nothing and writes nothing.
+                "--tools",
+                "",
+            ]
+        );
+        assert_eq!(seen.input, "name this");
+    }
+
+    #[test]
+    fn the_detached_child_is_scrubbed_and_leads_its_own_process_group() {
+        let args = vec!["name".to_string(), "q-0001".to_string()];
+        let cmd = detached_command(Path::new("/bin/echo"), &args);
+        let mut removals = removed(&cmd);
+        removals.sort();
+        let mut expected = PANE_ENV.to_vec();
+        expected.sort();
+        assert_eq!(removals, expected);
+        assert_eq!(set(&cmd, NAMING_ENV).as_deref(), Some("1"));
+        assert_eq!(argv(&cmd), ["/bin/echo", "name", "q-0001"]);
+
+        // `process_group` has no getter, so it is checked where it shows: the
+        // child is its own group leader, which is what lets naming outlive the
+        // hook whose group Claude kills.
+        let mut sleeper = detached_command(
+            Path::new("/bin/sh"),
+            &["-c".to_string(), "sleep 5".to_string()],
+        );
+        let mut child = sleeper.spawn().expect("spawned");
+        let pid = child.id();
+        let pgid = std::process::Command::new("ps")
+            .args(["-o", "pgid=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps ran");
+        let pgid = String::from_utf8_lossy(&pgid.stdout).trim().to_string();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(pgid, pid.to_string(), "the child joined its parent's group");
+    }
+
+    #[test]
+    fn scrub_marks_every_child_as_a_naming_process() {
+        // `suppressed` is what makes `q hook <event>` a no-op inside one, and
+        // the variable it reads is the one `scrub` sets.
+        let mut cmd = Command::new("true");
+        scrub(&mut cmd);
+        assert_eq!(set(&cmd, NAMING_ENV).as_deref(), Some("1"));
+    }
+
     #[test]
     fn a_bare_slug_is_accepted() {
         assert_eq!(sanitize("cdc-backfill"), Some("cdc-backfill".to_string()));
@@ -514,6 +762,42 @@ mod tests {
             Some("cdc-backfill".to_string())
         );
         assert_eq!(sanitize("\n\nq1"), Some("q1".to_string()));
+    }
+
+    /// Round-1 review, blocking #2: the first line of a fenced answer is the
+    /// fence, and `text` in ```` ```text ```` is itself a valid slug — so
+    /// reading only the first line named the Quest after the fence language.
+    #[test]
+    fn a_fenced_answer_yields_the_token_not_the_fence() {
+        for fenced in [
+            "```text\ncdc-backfill\n```",
+            "```\ncdc-backfill\n```",
+            "```bash\ncdc-backfill\n```",
+            "~~~\ncdc-backfill\n~~~",
+            "```text\ncdc-backfill\n```\nHope that helps!",
+        ] {
+            assert_eq!(
+                sanitize(fenced),
+                Some("cdc-backfill".to_string()),
+                "on `{fenced}`"
+            );
+        }
+        // A fence with nothing usable inside is still no answer.
+        assert_eq!(sanitize("```text\nnot a slug at all\n```"), None);
+    }
+
+    #[test]
+    fn a_slug_after_a_line_of_preamble_is_still_found() {
+        assert_eq!(
+            sanitize("Here you go:\ncdc-backfill"),
+            Some("cdc-backfill".to_string())
+        );
+        // Prose all the way down is not an answer, and the scan is bounded.
+        let essay = (0..50)
+            .map(|n| format!("line {n} of prose"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(sanitize(&format!("{essay}\ncdc-backfill")), None);
     }
 
     #[test]
@@ -741,22 +1025,15 @@ mod tests {
         );
     }
 
+    /// The registry can only vouch for a session it can identify, and during a
+    /// rename the row already carries the new slug while Claude still answers
+    /// to the old one (round-1 review, medium #4).
     #[test]
-    fn a_free_slug_steps_aside_for_another_quest() {
-        let (db, quest) = seeded();
-        assert_eq!(
-            free_slug(&db, &quest, "cdc-backfill").unwrap(),
-            Some("cdc-backfill".to_string())
-        );
-        // The Quest's own slug means there is nothing to do.
-        assert_eq!(free_slug(&db, &quest, "old-name").unwrap(), None);
-
-        db.insert_quest(&Quest::new("cdc-backfill", "/tmp", "laptop"))
-            .unwrap();
-        assert_eq!(
-            free_slug(&db, &quest, "cdc-backfill").unwrap(),
-            Some("cdc-backfill-2".to_string())
-        );
+    fn the_name_claude_answers_to_is_the_one_it_was_last_told() {
+        let mut session = Session::new("q-0001", SessionRole::Master, "master", "q-new", "%1");
+        assert_eq!(current_name(&session, "old-name"), "old-name/master");
+        session.claude_name = Some("older-still/master".to_string());
+        assert_eq!(current_name(&session, "old-name"), "older-still/master");
     }
 
     #[test]

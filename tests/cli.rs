@@ -6587,7 +6587,10 @@ fn name_apply_renames_the_quest_and_tells_every_idle_claude_session() {
         .unwrap();
     let canned = env.canned_name("cdc-backfill");
 
-    let out = env.name_json(Some(&canned), &["name", "alpha", "--auto", "--apply"]);
+    let out = env.name_json(
+        Some(&canned),
+        &["name", "alpha", "--auto", "--apply", "--force"],
+    );
     assert_eq!(out["applied"], true);
     assert_eq!(out["current"], "cdc-backfill");
     assert_eq!(out["renamed"]["changed"], true);
@@ -6640,7 +6643,10 @@ fn name_apply_holds_the_rename_of_a_session_that_is_not_idle() {
     env.set_status(&fleet.worker_id, "busy", None);
     let canned = env.canned_name("cdc-backfill");
 
-    let out = env.name_json(Some(&canned), &["name", "alpha", "--auto", "--apply"]);
+    let out = env.name_json(
+        Some(&canned),
+        &["name", "alpha", "--auto", "--apply", "--force"],
+    );
     assert_eq!(out["current"], "cdc-backfill");
     assert_eq!(out["renamed"]["told"], serde_json::json!(["master"]));
     assert_eq!(out["renamed"]["pending"], serde_json::json!(["tests"]));
@@ -6665,9 +6671,77 @@ fn name_apply_steps_aside_when_the_proposal_is_another_quests_slug() {
     env.new_quest("cdc-backfill");
     let canned = env.canned_name("cdc-backfill");
 
-    let out = env.name_json(Some(&canned), &["name", "foo", "--auto", "--apply"]);
+    let out = env.name_json(
+        Some(&canned),
+        &["name", "foo", "--auto", "--apply", "--force"],
+    );
     assert_eq!(out["current"], "cdc-backfill-2");
     assert_eq!(out["proposal"]["slug"], "cdc-backfill");
+}
+
+#[test]
+fn name_apply_steps_aside_when_a_tmux_session_already_holds_the_proposal() {
+    let env = Env::new();
+    quest_with_prompt(&env, "foo");
+    // A tmux session with no Quest row behind it — a leftover from a Quest that
+    // was removed. `rename::apply` refuses to move onto one, so the proposal
+    // has to step aside before it gets there.
+    let mut fixture = env.fixture();
+    fixture["panes"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "pane_id": "%99",
+            "session_name": "q-cdc-backfill",
+            "window_name": "master",
+        }));
+    env.write_fixture(fixture);
+    let canned = env.canned_name("cdc-backfill");
+
+    let out = env.name_json(
+        Some(&canned),
+        &["name", "foo", "--auto", "--apply", "--force"],
+    );
+    assert_eq!(out["proposal"]["slug"], "cdc-backfill");
+    assert_eq!(out["current"], "cdc-backfill-2");
+}
+
+/// A rename that fails is terminal for this input: the model answer has been
+/// paid for and would hash the same on the next `Stop`, so the hash is stamped
+/// anyway and the failure is logged — the caller is normally a detached child
+/// whose stderr goes to `/dev/null` (round-1 review, medium #6).
+#[test]
+fn a_failed_apply_stamps_the_hash_and_logs_it_rather_than_paying_again() {
+    let env = Env::new();
+    let quest = quest_with_prompt(&env, "foo");
+    let id = quest["quest"]["id"].as_str().unwrap().to_string();
+    let mut fixture = env.fixture();
+    fixture["fail_rename_session"] = serde_json::json!("tmux server went away");
+    env.write_fixture(fixture);
+    let canned = env.canned_name("cdc-backfill");
+
+    let assert = env
+        .cmd()
+        .env("Q_FIXTURE_CLAUDE_NAME", &canned)
+        .args(["name", "foo", "--auto", "--apply", "--force", "--json"])
+        .assert()
+        .failure();
+    assert!(
+        error_json(&assert)["error"]
+            .as_str()
+            .unwrap()
+            .contains("tmux server went away")
+    );
+
+    let stored = env.quest_row("foo");
+    assert_eq!(stored["slug"], "foo");
+    assert!(stored["name_input_hash"].is_string(), "{stored}");
+    assert!(event_kinds(&env, &id).contains(&"name.failed".to_string()));
+    // The answer stays in the cache, so a later retry does not pay for it.
+    assert_eq!(
+        env.cached_names(),
+        vec![("cdc-backfill".to_string(), "claude".to_string())]
+    );
 }
 
 #[test]
@@ -6676,7 +6750,10 @@ fn name_apply_records_the_input_hash_even_when_the_slug_does_not_change() {
     quest_with_prompt(&env, "foo");
     let canned = env.canned_name("foo");
 
-    let out = env.name_json(Some(&canned), &["name", "foo", "--auto", "--apply"]);
+    let out = env.name_json(
+        Some(&canned),
+        &["name", "foo", "--auto", "--apply", "--force"],
+    );
     assert_eq!(out["applied"], true);
     assert_eq!(out["renamed"]["changed"], false);
     assert_eq!(out["current"], "foo");
@@ -6704,31 +6781,72 @@ fn name_without_auto_reports_how_the_quest_got_its_name() {
 #[test]
 fn name_detach_records_the_argv_it_would_have_run_and_returns_at_once() {
     let env = Env::new();
-    quest_with_prompt(&env, "foo");
+    let quest = quest_with_prompt(&env, "foo");
+    let id = quest["quest"]["id"].as_str().unwrap().to_string();
     let spawns = env.dir.path().join("spawns.jsonl");
     let assert = env
         .cmd()
         .env("Q_NO_DETACH", &spawns)
-        .args(["name", "foo", "--auto", "--apply", "--detach", "--json"])
+        .args([
+            "name", "foo", "--auto", "--apply", "--detach", "--force", "--json",
+        ])
         .assert()
         .success();
     let out = json_of(&assert);
     assert_eq!(out["detached"], true);
-    assert_eq!(
-        out["args"],
-        serde_json::json!(["name", "foo", "--auto", "--apply"])
-    );
+    // The child is handed the id, not whatever the user typed: it resolves
+    // nothing itself and its stderr goes nowhere.
+    let expected = serde_json::json!(["name", id, "--auto", "--apply", "--force"]);
+    assert_eq!(out["args"], expected);
     let recorded: serde_json::Value =
         serde_json::from_str(std::fs::read_to_string(&spawns).unwrap().trim()).unwrap();
-    assert_eq!(
-        recorded["args"],
-        serde_json::json!(["name", "foo", "--auto", "--apply"])
-    );
+    assert_eq!(recorded["args"], expected);
     // Nothing was renamed: the child never ran.
     assert_eq!(
         env.quest_row("foo")["name_input_hash"],
         serde_json::Value::Null
     );
+}
+
+#[test]
+fn name_detach_refuses_a_quest_that_does_not_exist() {
+    let env = Env::new();
+    quest_with_prompt(&env, "foo");
+    let spawns = env.dir.path().join("spawns.jsonl");
+    let assert = env
+        .cmd()
+        .env("Q_NO_DETACH", &spawns)
+        .args(["name", "nope", "--auto", "--apply", "--detach", "--json"])
+        .assert()
+        .failure();
+    assert_eq!(error_json(&assert)["code"], "not_found");
+    assert!(!spawns.exists(), "a detached child was still spawned");
+}
+
+#[test]
+fn name_apply_leaves_a_hand_picked_name_alone_unless_forced() {
+    let env = Env::new();
+    quest_with_prompt(&env, "foo");
+    let canned = env.canned_name("cdc-backfill");
+    let assert = env
+        .cmd()
+        .env("Q_FIXTURE_CLAUDE_NAME", &canned)
+        .args(["name", "foo", "--auto", "--apply", "--json"])
+        .assert()
+        .failure();
+    assert_eq!(error_json(&assert)["code"], "conflict");
+    assert_eq!(env.quest_row("foo")["name_source"], "manual");
+    // Proposing without applying is always allowed.
+    let out = env.name_json(Some(&canned), &["name", "foo", "--auto"]);
+    assert_eq!(out["proposal"]["slug"], "cdc-backfill");
+    assert_eq!(out["applied"], false);
+    // And `--force` hands it over.
+    let out = env.name_json(
+        Some(&canned),
+        &["name", "foo", "--auto", "--apply", "--force"],
+    );
+    assert_eq!(out["current"], "cdc-backfill");
+    assert_eq!(out["quest"]["name_source"], "auto");
 }
 
 #[test]
