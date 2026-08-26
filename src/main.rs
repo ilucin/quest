@@ -2,6 +2,7 @@ mod cli;
 mod commands;
 mod config;
 mod db;
+mod doctor;
 mod error;
 mod model;
 mod output;
@@ -96,13 +97,18 @@ impl Ctx {
 
 fn main() {
     let args = parse_cli();
-    if let Err(e) = run(&args) {
-        let code = e
-            .downcast_ref::<QError>()
-            .map(QError::code)
-            .unwrap_or("other");
-        output::emit_error(args.json, &format!("{e:#}"), code);
-        std::process::exit(1);
+    match run(&args) {
+        Ok(0) => {}
+        // Commands report their own exit code; only `main` ends the process.
+        Ok(code) => std::process::exit(code.into()),
+        Err(e) => {
+            let code = e
+                .downcast_ref::<QError>()
+                .map(QError::code)
+                .unwrap_or("other");
+            output::emit_error(args.json, &format!("{e:#}"), code);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -123,7 +129,8 @@ fn parse_cli() -> Cli {
     }
 }
 
-fn run(args: &Cli) -> anyhow::Result<()> {
+/// The process exit code, or an error `main` renders and exits 1 on.
+fn run(args: &Cli) -> anyhow::Result<u8> {
     let Some(command) = &args.command else {
         // TODO(M3): launch the TUI.
         let version = env!("CARGO_PKG_VERSION");
@@ -134,7 +141,7 @@ fn run(args: &Cli) -> anyhow::Result<()> {
                 || format!("q {version} — run `q --help` for commands"),
             )?;
         }
-        return Ok(());
+        return Ok(0);
     };
 
     match command {
@@ -145,7 +152,7 @@ fn run(args: &Cli) -> anyhow::Result<()> {
             } else {
                 Ctx::lenient(args)
             };
-            config::run(&ctx, action.as_ref())
+            config::run(&ctx, action.as_ref()).map(|()| 0)
         }
         Command::New {
             name,
@@ -169,6 +176,13 @@ fn run(args: &Cli) -> anyhow::Result<()> {
                     detach: *detach,
                 },
             )
+            .map(|()| 0)
+        }
+        Command::Doctor { fix } => {
+            // Diagnosing a broken environment must not require a working one:
+            // doctor opens the config and the database itself, and reports
+            // whatever it finds.
+            doctor::run(&Ctx::lenient(args), *fix)
         }
         other => {
             // Every real command starts here: config, then an open database.

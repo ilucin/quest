@@ -22,6 +22,29 @@ const PANE_FORMAT: &str =
 
 const TMUX_MISSING: &str = "tmux not found on PATH";
 
+/// Per-session environment (`new-session -e`) arrived in tmux 3.2, and every
+/// session `q` opens depends on it.
+pub const MIN_TMUX: (u32, u32) = (3, 2);
+
+/// `major.minor` out of a `tmux -V` string: `tmux 3.6b` → `(3, 6)`,
+/// `tmux next-3.7` → `(3, 7)`. `None` when no number is in there at all.
+pub fn parse_version(raw: &str) -> Option<(u32, u32)> {
+    let text = raw.trim();
+    let digits = &text[text.find(|c: char| c.is_ascii_digit())?..];
+    let (major, rest) = leading_number(digits)?;
+    // A bare `3` is 3.0; the suffix in `3.2a` is not part of the number.
+    let minor = rest
+        .strip_prefix('.')
+        .and_then(leading_number)
+        .map_or(0, |(n, _)| n);
+    Some((major, minor))
+}
+
+fn leading_number(s: &str) -> Option<(u32, &str)> {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    Some((s[..end].parse().ok()?, &s[end..]))
+}
+
 /// One tmux pane. `pane_id` (`%42`) is a session's identity (SPEC §6) — it
 /// survives rename, `/clear` and a Claude restart in the same pane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,6 +381,9 @@ pub struct FixtureState {
     pub next_pane: u32,
     #[serde(default)]
     pub panes: Vec<FixturePane>,
+    /// Overrides what `version()` answers, so a test can pose as an old tmux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// The `(session, window)` of the last `attach`, so tests can assert on it.
     #[serde(default)]
     pub attached: Option<(String, Option<String>)>,
@@ -428,6 +454,9 @@ impl FixtureState {
             .ok_or_else(|| QError::Tmux(format!("can't find pane: {pane_id}")).into())
     }
 }
+
+/// Shaped like a real `tmux -V` so the version check parses it as any other.
+const FIXTURE_VERSION: &str = "tmux 3.6 (fixture)";
 
 pub struct FixtureTmux {
     path: PathBuf,
@@ -661,7 +690,10 @@ impl Tmux for FixtureTmux {
     }
 
     fn version(&self) -> anyhow::Result<String> {
-        Ok("tmux fixture".to_string())
+        Ok(self
+            .load()?
+            .version
+            .unwrap_or_else(|| FIXTURE_VERSION.to_string()))
     }
 }
 
@@ -736,6 +768,30 @@ fn absolutize(value: &str) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
+/// Every pane tmux knows about. No server means no panes; a missing binary is
+/// a real failure.
+pub fn live_panes(tmux: &dyn Tmux) -> anyhow::Result<Vec<Pane>> {
+    match tmux.list_panes() {
+        Ok(panes) => Ok(panes),
+        Err(e) if is_no_server(&e) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The sessions among `sessions` whose pane is gone. Keyed on the
+/// `(tmux_session, pane)` pair: tmux recycles pane ids, so `%1` in another
+/// tmux session is not this session's pane. Shared by `sweep` and `q doctor`.
+pub fn find_orphans(sessions: Vec<Session>, panes: &[Pane]) -> Vec<Session> {
+    let alive: HashSet<(&str, &str)> = panes
+        .iter()
+        .map(|p| (p.session_name.as_str(), p.pane_id.as_str()))
+        .collect();
+    sessions
+        .into_iter()
+        .filter(|s| !alive.contains(&(s.tmux_session.as_str(), s.tmux_pane.as_str())))
+        .collect()
+}
+
 /// Liveness (SPEC §6): a live session whose pane is gone has ended. Returns the
 /// sessions it marked, having appended a `session.end` event for each.
 pub fn sweep(db: &Db, tmux: &dyn Tmux) -> anyhow::Result<Vec<Session>> {
@@ -743,24 +799,10 @@ pub fn sweep(db: &Db, tmux: &dyn Tmux) -> anyhow::Result<Vec<Session>> {
     if live.is_empty() {
         return Ok(Vec::new());
     }
-    let panes = match tmux.list_panes() {
-        Ok(panes) => panes,
-        // No server means no panes; a missing binary is a real failure.
-        Err(e) if is_no_server(&e) => Vec::new(),
-        Err(e) => return Err(e),
-    };
-    // Keyed on the pair: tmux recycles pane ids, so `%1` in another tmux
-    // session is not this session's pane.
-    let alive: HashSet<(&str, &str)> = panes
-        .iter()
-        .map(|p| (p.session_name.as_str(), p.pane_id.as_str()))
-        .collect();
+    let panes = live_panes(tmux)?;
 
     let mut ended = Vec::new();
-    for session in live {
-        if alive.contains(&(session.tmux_session.as_str(), session.tmux_pane.as_str())) {
-            continue;
-        }
+    for session in find_orphans(live, &panes) {
         let row = db.mark_session_ended(&session.id, now())?;
         db.append_event(
             &row.quest_id,
@@ -784,6 +826,40 @@ mod tests {
             ("Q_QUEST".to_string(), "q-7f3a".to_string()),
             ("Q_ROLE".to_string(), "worker".to_string()),
         ]
+    }
+
+    #[test]
+    fn parse_version_reads_major_and_minor_from_every_tmux_spelling() {
+        assert_eq!(parse_version("tmux 3.6b"), Some((3, 6)));
+        assert_eq!(parse_version("tmux 3.2a\n"), Some((3, 2)));
+        assert_eq!(parse_version("tmux next-3.7"), Some((3, 7)));
+        assert_eq!(parse_version("tmux 3.6 (fixture)"), Some((3, 6)));
+        assert_eq!(parse_version("3.4"), Some((3, 4)));
+        // No minor at all, and a two-digit minor.
+        assert_eq!(parse_version("tmux 3"), Some((3, 0)));
+        assert_eq!(parse_version("tmux 3.10"), Some((3, 10)));
+    }
+
+    #[test]
+    fn parse_version_gives_up_on_a_version_without_a_number() {
+        assert_eq!(parse_version("tmux fixture"), None);
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("tmux master"), None);
+    }
+
+    #[test]
+    fn the_fixture_reports_a_parsable_version() {
+        let dir = TempDir::new().unwrap();
+        let tmux = FixtureTmux::new(dir.path().join("tmux.json"));
+        assert_eq!(tmux.version().unwrap(), FIXTURE_VERSION);
+        assert!(parse_version(&tmux.version().unwrap()).unwrap() >= MIN_TMUX);
+
+        tmux.save(&FixtureState {
+            version: Some("tmux 3.0".to_string()),
+            ..FixtureState::default()
+        })
+        .unwrap();
+        assert_eq!(tmux.version().unwrap(), "tmux 3.0");
     }
 
     #[test]
@@ -1188,7 +1264,7 @@ mod tests {
         let panes = t.list_panes().unwrap();
         assert_eq!(panes[0].pane_id, "%42");
         assert!(t.has_session("q-alpha").unwrap());
-        assert_eq!(t.version().unwrap(), "tmux fixture");
+        assert_eq!(t.version().unwrap(), FIXTURE_VERSION);
     }
 
     fn seeded_db() -> (Db, Quest) {
@@ -1197,6 +1273,47 @@ mod tests {
             .insert_quest(&Quest::new("alpha", "/tmp/repo", "laptop"))
             .unwrap();
         (db, quest)
+    }
+
+    fn pane(session: &str, id: &str) -> Pane {
+        Pane {
+            pane_id: id.to_string(),
+            pane_pid: 1,
+            session_name: session.to_string(),
+            window_name: "w".to_string(),
+            window_index: 0,
+        }
+    }
+
+    fn session_on(label: &str, tmux_session: &str, pane_id: &str) -> Session {
+        Session::new("q-0001", SessionRole::Worker, label, tmux_session, pane_id)
+    }
+
+    #[test]
+    fn find_orphans_keys_on_the_session_and_pane_pair() {
+        let sessions = vec![
+            session_on("alive", "q-alpha", "%1"),
+            session_on("gone", "q-alpha", "%2"),
+            // Same pane id, different tmux session: tmux recycles ids, so this
+            // one is an orphan too.
+            session_on("recycled", "q-beta", "%1"),
+        ];
+        let panes = [pane("q-alpha", "%1"), pane("q-other", "%9")];
+
+        let orphans: Vec<String> = find_orphans(sessions.clone(), &panes)
+            .into_iter()
+            .map(|s| s.label)
+            .collect();
+        assert_eq!(orphans, ["gone", "recycled"]);
+
+        // No panes at all (a dead tmux server) orphans everything; every pane
+        // present orphans nothing.
+        assert_eq!(find_orphans(sessions.clone(), &[]).len(), 3);
+        let all: Vec<Pane> = sessions
+            .iter()
+            .map(|s| pane(&s.tmux_session, &s.tmux_pane))
+            .collect();
+        assert!(find_orphans(sessions, &all).is_empty());
     }
 
     #[test]

@@ -25,9 +25,10 @@ impl std::ops::DerefMut for TestCmd {
 fn q() -> TestCmd {
     let dir = TempDir::new().unwrap();
     let mut cmd = Command::cargo_bin("q").unwrap();
+    // `Q_FIXTURE` keeps every tmux call in the fake backend; no test may reach
+    // a real tmux server.
     cmd.env("Q_DB", dir.path().join("q.db"))
         .env("Q_CONFIG", dir.path().join("config.toml"))
-        // Never a real tmux server, in any test.
         .env("Q_FIXTURE", dir.path().join("tmux.json"));
     TestCmd { dir, cmd }
 }
@@ -1143,4 +1144,346 @@ fn new_help_only_lists_the_implemented_flags() {
             "`{later}` is not implemented yet:\n{out}"
         );
     }
+}
+
+// ------------------------------------------------------------------- q doctor
+
+/// A no-op executable named `name`, so a check that only looks for a binary
+/// on `PATH` has a deterministic answer.
+fn stub_exe(dir: &std::path::Path, name: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// `q` with a `PATH` holding exactly `names` — `PATH`-dependent checks then
+/// report the same thing on every machine.
+fn doctor(names: &[&str]) -> TestCmd {
+    let mut cmd = q();
+    let bin = cmd.dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in names {
+        stub_exe(&bin, name);
+    }
+    cmd.env("PATH", &bin);
+    cmd
+}
+
+fn fixture_path(cmd: &TestCmd) -> std::path::PathBuf {
+    cmd.dir.path().join("tmux.json")
+}
+
+fn check<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap_or_else(|| panic!("no `{name}` check in {report}"))
+}
+
+/// A quest with one live session on `pane` of tmux session `tmux_session`.
+fn seed_session(db: &std::path::Path, tmux_session: &str, pane: &str) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute(
+        "INSERT INTO quest (id, slug, name_source, cwd, machine, state, created_at, updated_at)
+         VALUES ('q-0001', 'alpha', 'manual', '/tmp', 'laptop', 'active', 1, 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session (id, quest_id, role, label, tmux_session, tmux_pane, status,
+                              started_at, updated_at)
+         VALUES ('s-0001', 'q-0001', 'worker', 'w1', ?1, ?2, 'idle', 1, 1)",
+        [tmux_session, pane],
+    )
+    .unwrap();
+}
+
+#[test]
+fn doctor_json_reports_every_m0_check() {
+    let mut cmd = doctor(&["claude"]);
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+
+    let names: Vec<&str> = parsed["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "config",
+            "tmux",
+            "claude",
+            "db",
+            "q on PATH",
+            "orphan sessions"
+        ]
+    );
+    assert_eq!(parsed["ok"], true);
+    assert!(parsed["fixed"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn doctor_passes_with_a_fixture_tmux_and_an_empty_database() {
+    let mut cmd = doctor(&["claude"]);
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+
+    assert_eq!(check(&parsed, "tmux")["status"], "ok");
+    assert_eq!(check(&parsed, "tmux")["detail"], "3.6 (fixture)");
+    assert_eq!(check(&parsed, "claude")["status"], "ok");
+    assert_eq!(check(&parsed, "config")["status"], "ok");
+    assert_eq!(check(&parsed, "db")["status"], "ok");
+    assert!(
+        check(&parsed, "db")["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("schema v"),
+        "{parsed}"
+    );
+    assert_eq!(check(&parsed, "orphan sessions")["status"], "ok");
+    // Nothing but the stub `claude` is on PATH, so `q` itself is not.
+    assert_eq!(check(&parsed, "q on PATH")["status"], "warn");
+}
+
+#[test]
+fn doctor_human_output_marks_each_check() {
+    doctor(&["claude"])
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("✓ tmux 3.6 (fixture)"))
+        .stdout(predicate::str::contains("✓ orphan sessions none"));
+}
+
+#[test]
+fn doctor_warns_about_an_orphan_session_and_fixes_it() {
+    let mut cmd = doctor(&["claude"]);
+    let db = db_path(&cmd);
+    let fixture = fixture_path(&cmd);
+    // A live pane that is *not* the seeded session's: the check must key on
+    // the pair, not just on "some pane exists".
+    std::fs::write(
+        &fixture,
+        r#"{"next_pane":9,"panes":[{"pane_id":"%9","session_name":"q-other","window_name":"w","window_index":0}]}"#,
+    )
+    .unwrap();
+
+    // Creates and migrates the database, then seed a session behind its back.
+    cmd.args(["doctor", "--json"]).assert().success();
+    seed_session(&db, "q-alpha", "%1");
+
+    let mut cmd = doctor(&["claude"]);
+    cmd.env("Q_DB", &db).env("Q_FIXTURE", &fixture);
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    let orphans = check(&parsed, "orphan sessions");
+    assert_eq!(orphans["status"], "warn");
+    assert!(
+        orphans["detail"].as_str().unwrap().contains("alpha/w1"),
+        "{parsed}"
+    );
+    assert_eq!(orphans["fix_hint"], "q doctor --fix");
+    // A warning is not a failure.
+    assert_eq!(parsed["ok"], true);
+
+    let mut cmd = doctor(&["claude"]);
+    cmd.env("Q_DB", &db).env("Q_FIXTURE", &fixture);
+    let assert = cmd.args(["doctor", "--fix", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    assert_eq!(check(&parsed, "orphan sessions")["status"], "ok");
+    assert_eq!(
+        parsed["fixed"],
+        serde_json::json!(["ended orphan session alpha/w1"])
+    );
+
+    // The fix stuck: a rerun has nothing left to report.
+    let mut cmd = doctor(&["claude"]);
+    cmd.env("Q_DB", &db).env("Q_FIXTURE", &fixture);
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    assert_eq!(check(&parsed, "orphan sessions")["status"], "ok");
+    assert_eq!(check(&parsed, "orphan sessions")["detail"], "none");
+    assert!(parsed["fixed"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn doctor_keeps_a_session_whose_pane_is_alive() {
+    let mut cmd = doctor(&["claude"]);
+    let db = db_path(&cmd);
+    let fixture = fixture_path(&cmd);
+    std::fs::write(
+        &fixture,
+        r#"{"next_pane":1,"panes":[{"pane_id":"%1","session_name":"q-alpha","window_name":"w1","window_index":0}]}"#,
+    )
+    .unwrap();
+    cmd.args(["doctor", "--json"]).assert().success();
+    seed_session(&db, "q-alpha", "%1");
+
+    let mut cmd = doctor(&["claude"]);
+    cmd.env("Q_DB", &db).env("Q_FIXTURE", &fixture);
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    assert_eq!(check(&json_of(&assert), "orphan sessions")["status"], "ok");
+}
+
+#[test]
+fn doctor_fails_on_an_invalid_config() {
+    let mut cmd = doctor(&["claude"]);
+    let path = config_path(&cmd);
+    std::fs::write(&path, "[context]\nreset_strategy = \"nuke\"\n").unwrap();
+    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    let parsed = json_of(&assert);
+    assert_eq!(parsed["ok"], false);
+    let config = check(&parsed, "config");
+    assert_eq!(config["status"], "fail");
+    assert!(
+        config["detail"]
+            .as_str()
+            .unwrap()
+            .contains("reset_strategy"),
+        "{parsed}"
+    );
+    // Every other check still ran.
+    assert_eq!(parsed["checks"].as_array().unwrap().len(), 6);
+    assert_eq!(check(&parsed, "tmux")["status"], "ok");
+}
+
+#[test]
+fn doctor_fails_when_claude_is_not_on_path() {
+    // An empty PATH; the fixture keeps tmux passing, so only claude fails.
+    let assert = doctor(&[]).args(["doctor", "--json"]).assert().code(1);
+    let parsed = json_of(&assert);
+    assert_eq!(check(&parsed, "claude")["status"], "fail");
+    assert!(check(&parsed, "claude")["fix_hint"].is_string());
+    assert_eq!(check(&parsed, "tmux")["status"], "ok");
+    assert_eq!(parsed["ok"], false);
+}
+
+#[test]
+fn doctor_reports_a_database_from_a_newer_q() {
+    let mut cmd = doctor(&["claude"]);
+    let db = db_path(&cmd);
+    cmd.args(["doctor", "--json"]).assert().success();
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .pragma_update(None, "user_version", 99)
+        .unwrap();
+
+    let mut cmd = doctor(&["claude"]);
+    let fixture = fixture_path(&cmd);
+    cmd.env("Q_DB", &db).env("Q_FIXTURE", &fixture);
+    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    let parsed = json_of(&assert);
+    assert_eq!(check(&parsed, "db")["status"], "fail");
+    assert!(
+        check(&parsed, "db")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("upgrade q"),
+        "{parsed}"
+    );
+    // The orphan check depends on the database, so it stands down.
+    let orphans = check(&parsed, "orphan sessions");
+    assert_eq!(orphans["status"], "warn");
+    assert!(
+        orphans["detail"].as_str().unwrap().starts_with("skipped"),
+        "{parsed}"
+    );
+}
+
+#[test]
+fn doctor_fixes_orphans_even_when_another_check_fails() {
+    // An empty PATH: `claude` fails, so the run cannot end in success — the
+    // repair must happen anyway.
+    let mut cmd = doctor(&[]);
+    let db = db_path(&cmd);
+    let fixture = fixture_path(&cmd);
+    std::fs::write(&fixture, r#"{"next_pane":0,"panes":[]}"#).unwrap();
+    cmd.args(["doctor", "--json"]).assert().code(1);
+    seed_session(&db, "q-alpha", "%1");
+
+    let mut cmd = doctor(&[]);
+    cmd.env("Q_DB", &db).env("Q_FIXTURE", &fixture);
+    let assert = cmd.args(["doctor", "--fix", "--json"]).assert().code(1);
+    let parsed = json_of(&assert);
+    assert_eq!(parsed["ok"], false);
+    assert_eq!(check(&parsed, "claude")["status"], "fail");
+    assert_eq!(check(&parsed, "orphan sessions")["status"], "ok");
+    assert_eq!(
+        parsed["fixed"],
+        serde_json::json!(["ended orphan session alpha/w1"])
+    );
+
+    // Durable: the row itself is ended, not merely reported as such.
+    let status: String = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT status FROM session WHERE id = 's-0001'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "ended");
+}
+
+#[test]
+fn doctor_exits_non_zero_on_a_failure_in_human_mode() {
+    doctor(&[])
+        .arg("doctor")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("✗ claude not found on PATH"));
+}
+
+#[test]
+fn doctor_fails_on_a_tmux_older_than_the_minimum() {
+    let mut cmd = doctor(&["claude"]);
+    let fixture = fixture_path(&cmd);
+    std::fs::write(&fixture, r#"{"version":"tmux 3.0","panes":[]}"#).unwrap();
+    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    let parsed = json_of(&assert);
+    let tmux = check(&parsed, "tmux");
+    assert_eq!(tmux["status"], "fail");
+    assert!(tmux["detail"].as_str().unwrap().contains("3.2"), "{parsed}");
+    assert!(
+        tmux["fix_hint"].as_str().unwrap().contains("3.2"),
+        "{parsed}"
+    );
+}
+
+#[test]
+fn doctor_warns_about_an_unparsable_tmux_version() {
+    let mut cmd = doctor(&["claude"]);
+    let fixture = fixture_path(&cmd);
+    std::fs::write(&fixture, r#"{"version":"tmux master","panes":[]}"#).unwrap();
+    // A warning is not a failure, so the run still succeeds.
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    assert_eq!(check(&json_of(&assert), "tmux")["status"], "warn");
+}
+
+#[test]
+fn doctor_says_when_it_created_the_database() {
+    let mut cmd = doctor(&["claude"]);
+    let db = db_path(&cmd);
+    let fixture = fixture_path(&cmd);
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let detail = json_of(&assert);
+    let detail = check(&detail, "db")["detail"].as_str().unwrap().to_string();
+    assert!(detail.ends_with("(created)"), "{detail}");
+
+    let mut cmd = doctor(&["claude"]);
+    cmd.env("Q_DB", &db).env("Q_FIXTURE", &fixture);
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    assert!(
+        !check(&parsed, "db")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("created"),
+        "{parsed}"
+    );
 }
