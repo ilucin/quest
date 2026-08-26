@@ -12,7 +12,9 @@
 //! ignored: a registry `q` cannot understand must degrade to `Unknown`, never
 //! to an error.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -27,13 +29,20 @@ pub fn dir() -> Option<PathBuf> {
 
 /// What Claude reports a session is doing. Anything `q` does not know is
 /// `Other`, and treated as "not provably idle".
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     Idle,
     Busy,
     Waiting,
     Other(String),
+}
+
+/// Always a plain string, `Other` included — the derive would have written
+/// `{"other": "..."}` for that one arm alone.
+impl Serialize for Status {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
 }
 
 impl Status {
@@ -120,9 +129,79 @@ pub fn parse(text: &str) -> Option<Entry> {
 
 /// The entry for `pid` in `dir`, or `None` when the file is missing,
 /// unreadable or unparseable. Never an error: the registry is advisory.
+///
+/// A `pid` field that contradicts the file name means the file was copied or
+/// renamed, so it says nothing about the process `q` asked about.
 pub fn read_in(dir: &Path, pid: i64) -> Option<Entry> {
     let text = std::fs::read_to_string(dir.join(format!("{pid}.json"))).ok()?;
-    parse(&text)
+    let entry = parse(&text)?;
+    entry.pid.is_none_or(|p| p == pid).then_some(entry)
+}
+
+/// The pids `dir` holds entries for, from the `<pid>.json` file names.
+fn pids_in(dir: &Path) -> Vec<i64> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()?
+                .strip_suffix(".json")?
+                .parse::<i64>()
+                .ok()
+        })
+        .collect()
+}
+
+/// `pid -> ppid` for every process, from one `ps`. Empty when `ps` is not
+/// there or says nothing usable — the callers all degrade to `Unknown`.
+fn process_parents() -> HashMap<i64, i64> {
+    let Ok(out) = Command::new("ps").args(["-Ao", "pid=,ppid="]).output() else {
+        return HashMap::new();
+    };
+    parse_parents(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_parents(text: &str) -> HashMap<i64, i64> {
+    text.lines()
+        .filter_map(|line| {
+            let mut it = line.split_whitespace();
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Does `pid` sit under `ancestor`? The walk is capped because a `ps` snapshot
+/// taken while processes come and go can contain a cycle.
+fn descends_from(parents: &HashMap<i64, i64>, pid: i64, ancestor: i64) -> bool {
+    let mut at = pid;
+    for _ in 0..64 {
+        if at == ancestor {
+            return true;
+        }
+        match parents.get(&at) {
+            Some(&next) if next > 0 && next != at => at = next,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The registry pid whose process descends from `pane_pid`. `None` unless
+/// exactly one does: with two candidates a guess is worse than no opinion.
+fn pid_under(dir: &Path, pane_pid: i64) -> Option<i64> {
+    let candidates = pids_in(dir);
+    if candidates.is_empty() {
+        return None;
+    }
+    let parents = process_parents();
+    let mut found = candidates
+        .into_iter()
+        .filter(|pid| descends_from(&parents, *pid, pane_pid));
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
 }
 
 /// The registry's opinion on one session, as `q send` consumes it.
@@ -148,6 +227,39 @@ impl Verdict {
         matches!(self, Verdict::Busy { .. })
     }
 
+    /// Claude's own word that the session is between turns — enough to send to
+    /// a row no hook ever moved off `starting`.
+    pub fn agrees_idle(&self) -> bool {
+        matches!(self, Verdict::Idle { .. })
+    }
+
+    /// The registry status as a listing shows it, or `None` when it knows
+    /// nothing worth a column.
+    pub fn status(&self) -> Option<String> {
+        match self {
+            Verdict::Idle { .. } => Some("idle".to_string()),
+            Verdict::Busy {
+                status,
+                waiting_for: Some(what),
+                ..
+            } => Some(format!("{status}: {what}")),
+            Verdict::Busy { status, .. } => Some(status.clone()),
+            Verdict::Unknown { .. } => None,
+        }
+    }
+
+    /// What the user can do about a verdict that carries no information. The
+    /// registry is the only second opinion `q send` has, so a missing pid is
+    /// worth naming: it means `SessionStart` never ran.
+    pub fn hint(&self) -> Option<&'static str> {
+        match self {
+            Verdict::Unknown {
+                reason: NO_PID_REASON,
+            } => Some("`q hook install` may not have run — see `q doctor`"),
+            _ => None,
+        }
+    }
+
     /// The parenthetical in a refusal or a confirmation.
     pub fn describe(&self) -> String {
         match self {
@@ -163,17 +275,60 @@ impl Verdict {
     }
 }
 
-/// The verdict for the Claude process `pid`, looked up in `dir`.
-pub fn verdict_in(dir: Option<&Path>, pid: Option<i64>) -> Verdict {
+const NO_PID_REASON: &str = "no claude pid on record";
+
+/// How old an entry may be and still be believed. Claude rewrites the file on
+/// every status change, so an entry older than this belongs to a session that
+/// stopped reporting — no information, rather than a refusal that never lifts.
+pub const STALE_MS: i64 = 30 * 60 * 1000;
+
+/// What `q` knows about the session it is asking about, so an entry can be
+/// checked for identity and freshness before its status is believed.
+#[derive(Debug, Clone, Copy)]
+pub struct Ask<'a> {
+    /// `session.claude_pid`, when a `SessionStart` hook recorded one.
+    pub pid: Option<i64>,
+    /// The pane's own process id: Claude runs under it, which is how the pid
+    /// is found when no hook ever wrote one.
+    pub pane_pid: Option<i64>,
+    /// `session.claude_name`, when one is known.
+    pub name: Option<&'a str>,
+    /// Now, in milliseconds — the clock `statusUpdatedAt` uses.
+    pub now_ms: i64,
+}
+
+impl<'a> Ask<'a> {
+    pub fn new(pid: Option<i64>, pane_pid: Option<i64>, name: Option<&'a str>) -> Ask<'a> {
+        Ask {
+            pid,
+            pane_pid,
+            name,
+            now_ms: now_ms(),
+        }
+    }
+}
+
+pub fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// The verdict for one session, looked up in `dir`.
+pub fn verdict_in(dir: Option<&Path>, ask: Ask) -> Verdict {
     let Some(dir) = dir else {
         return Verdict::Unknown {
             reason: "no sessions directory",
         };
     };
-    // Until `SessionStart` fires there is no pid to look up.
-    let Some(pid) = pid.filter(|p| *p > 0) else {
+    // Until `SessionStart` fires there is no pid on the row; the pane's process
+    // tree is the fallback, so a fleet without hooks still gets a verdict.
+    let pid = ask.pid.filter(|p| *p > 0).or_else(|| {
+        ask.pane_pid
+            .filter(|p| *p > 0)
+            .and_then(|p| pid_under(dir, p))
+    });
+    let Some(pid) = pid else {
         return Verdict::Unknown {
-            reason: "no claude pid on record",
+            reason: NO_PID_REASON,
         };
     };
     let Some(entry) = read_in(dir, pid) else {
@@ -181,11 +336,28 @@ pub fn verdict_in(dir: Option<&Path>, pid: Option<i64>) -> Verdict {
             reason: "no entry for this session",
         };
     };
-    verdict_of(&entry)
+    verdict_of(&entry, ask)
 }
 
 /// The same decision as `verdict_in`, on an already-parsed entry.
-pub fn verdict_of(entry: &Entry) -> Verdict {
+pub fn verdict_of(entry: &Entry, ask: Ask) -> Verdict {
+    // A name Claude wrote that is not this session's means the file describes
+    // someone else — a reused pid, or one q never owned.
+    if let (Some(theirs), Some(ours)) = (entry.name.as_deref(), ask.name)
+        && theirs != ours
+    {
+        return Verdict::Unknown {
+            reason: "entry names another session",
+        };
+    }
+    if entry
+        .status_updated_at
+        .is_some_and(|t| ask.now_ms.saturating_sub(t) > STALE_MS)
+    {
+        return Verdict::Unknown {
+            reason: "entry is stale",
+        };
+    }
     match &entry.status {
         Some(Status::Idle) => Verdict::Idle {
             name: entry.name.clone(),
@@ -203,13 +375,23 @@ pub fn verdict_of(entry: &Entry) -> Verdict {
 }
 
 /// `verdict_in` against the configured directory.
-pub fn verdict(pid: Option<i64>) -> Verdict {
-    verdict_in(dir().as_deref(), pid)
+pub fn verdict(ask: Ask) -> Verdict {
+    verdict_in(dir().as_deref(), ask)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nothing known but the pid, on a clock that leaves every fixture fresh.
+    fn ask(pid: i64) -> Ask<'static> {
+        Ask {
+            pid: Some(pid),
+            pane_pid: None,
+            name: None,
+            now_ms: 0,
+        }
+    }
 
     /// A real file from `~/.claude/sessions/`, Claude Code 2.1.246.
     const REAL: &str = r#"{"pid":58391,"sessionId":"7f8a50ae-1cdb-47d3-8fa1-7640b846a8e9",
@@ -241,9 +423,9 @@ mod tests {
         let entry = parse(r#"{"status":"waiting","waitingFor":"permission_prompt"}"#).unwrap();
         assert_eq!(entry.status, Some(Status::Waiting));
         assert_eq!(entry.waiting_for.as_deref(), Some("permission_prompt"));
-        assert!(verdict_of(&entry).refuses());
+        assert!(verdict_of(&entry, ask(1)).refuses());
         assert_eq!(
-            verdict_of(&entry).describe(),
+            verdict_of(&entry, ask(1)).describe(),
             "registry: waiting, waiting for permission_prompt"
         );
     }
@@ -265,7 +447,7 @@ mod tests {
     #[test]
     fn an_unknown_status_never_reads_as_idle() {
         let entry = parse(r#"{"status":"hibernating"}"#).unwrap();
-        let verdict = verdict_of(&entry);
+        let verdict = verdict_of(&entry, ask(1));
         assert!(verdict.refuses(), "{verdict:?}");
         assert_eq!(verdict.describe(), "registry: hibernating");
     }
@@ -274,14 +456,17 @@ mod tests {
     fn an_older_entry_without_status_updated_at_falls_back_to_updated_at() {
         let entry = parse(r#"{"status":"idle","updatedAt":17}"#).unwrap();
         assert_eq!(entry.status_updated_at, Some(17));
-        assert_eq!(verdict_of(&entry), Verdict::Idle { name: None });
+        assert_eq!(verdict_of(&entry, ask(1)), Verdict::Idle { name: None });
     }
 
     #[test]
     fn an_entry_without_a_status_is_no_information() {
         let entry = parse(r#"{"pid":1,"name":"x"}"#).unwrap();
-        assert!(matches!(verdict_of(&entry), Verdict::Unknown { .. }));
-        assert!(!verdict_of(&entry).refuses());
+        assert!(matches!(
+            verdict_of(&entry, ask(1)),
+            Verdict::Unknown { .. }
+        ));
+        assert!(!verdict_of(&entry, ask(1)).refuses());
     }
 
     #[test]
@@ -306,16 +491,29 @@ mod tests {
         assert!(read_in(dir.path(), 4242).is_none());
         for (pid, reason) in [
             (Some(4242), "no entry for this session"),
-            (None, "no claude pid on record"),
-            (Some(0), "no claude pid on record"),
+            (None, NO_PID_REASON),
+            (Some(0), NO_PID_REASON),
         ] {
             assert_eq!(
-                verdict_in(Some(dir.path()), pid),
+                verdict_in(Some(dir.path()), Ask { pid, ..ask(0) }),
                 Verdict::Unknown { reason }
             );
         }
+        // A pid q never learned is worth a hint: it means no SessionStart hook.
+        assert!(
+            verdict_in(
+                Some(dir.path()),
+                Ask {
+                    pid: None,
+                    ..ask(0)
+                }
+            )
+            .hint()
+            .is_some()
+        );
+        assert!(verdict_in(Some(dir.path()), ask(4242)).hint().is_none());
         assert_eq!(
-            verdict_in(None, Some(1)),
+            verdict_in(None, ask(1)),
             Verdict::Unknown {
                 reason: "no sessions directory"
             }
@@ -325,12 +523,12 @@ mod tests {
     #[test]
     fn a_file_on_disk_is_read_by_pid() {
         let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("77.json"), REAL).unwrap();
+        std::fs::write(dir.path().join("58391.json"), REAL).unwrap();
         assert_eq!(
-            read_in(dir.path(), 77).unwrap().name.as_deref(),
+            read_in(dir.path(), 58391).unwrap().name.as_deref(),
             Some("work-28")
         );
-        let verdict = verdict_in(Some(dir.path()), Some(77));
+        let verdict = verdict_in(Some(dir.path()), ask(58391));
         assert!(verdict.refuses(), "{verdict:?}");
         assert_eq!(verdict.describe(), "registry: busy");
 
@@ -340,10 +538,153 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            verdict_in(Some(dir.path()), Some(78)),
+            verdict_in(Some(dir.path()), ask(78)),
             Verdict::Idle {
                 name: Some("alpha/master".to_string())
             }
         );
+    }
+
+    /// A `<pid>.json` whose `pid` field says otherwise was copied or renamed:
+    /// it describes some other process.
+    #[test]
+    fn an_entry_whose_pid_contradicts_its_file_name_is_ignored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("77.json"), REAL).unwrap();
+        assert!(read_in(dir.path(), 77).is_none());
+        assert_eq!(
+            verdict_in(Some(dir.path()), ask(77)),
+            Verdict::Unknown {
+                reason: "no entry for this session"
+            }
+        );
+        // No `pid` field at all is the older shape, and still trusted.
+        std::fs::write(dir.path().join("79.json"), r#"{"status":"idle"}"#).unwrap();
+        assert!(read_in(dir.path(), 79).is_some());
+    }
+
+    #[test]
+    fn an_entry_that_names_another_session_says_nothing_about_this_one() {
+        let entry = parse(r#"{"status":"busy","name":"beta/w1"}"#).unwrap();
+        let mine = Ask {
+            name: Some("alpha/master"),
+            ..ask(1)
+        };
+        assert_eq!(
+            verdict_of(&entry, mine),
+            Verdict::Unknown {
+                reason: "entry names another session"
+            }
+        );
+        // The same name agrees, and an entry with no name is still believed.
+        let theirs = Ask {
+            name: Some("beta/w1"),
+            ..ask(1)
+        };
+        assert!(verdict_of(&entry, theirs).refuses());
+        let nameless = parse(r#"{"status":"busy"}"#).unwrap();
+        assert!(verdict_of(&nameless, mine).refuses());
+    }
+
+    #[test]
+    fn an_entry_older_than_the_staleness_window_stops_being_believed() {
+        let entry = parse(r#"{"status":"waiting","statusUpdatedAt":1000}"#).unwrap();
+        let fresh = Ask {
+            now_ms: 1000 + STALE_MS,
+            ..ask(1)
+        };
+        assert!(verdict_of(&entry, fresh).refuses());
+        let stale = Ask {
+            now_ms: 1000 + STALE_MS + 1,
+            ..ask(1)
+        };
+        assert_eq!(
+            verdict_of(&entry, stale),
+            Verdict::Unknown {
+                reason: "entry is stale"
+            }
+        );
+        // No timestamp is no evidence of age, so the status still counts.
+        let undated = parse(r#"{"status":"waiting"}"#).unwrap();
+        assert!(verdict_of(&undated, stale).refuses());
+    }
+
+    #[test]
+    fn a_status_serializes_as_a_plain_string_in_every_arm() {
+        let json = serde_json::to_string(&parse(r#"{"status":"hibernating"}"#).unwrap()).unwrap();
+        assert!(json.contains(r#""status":"hibernating""#), "{json}");
+    }
+
+    #[test]
+    fn the_process_table_is_walked_upwards_to_the_pane() {
+        let parents = parse_parents(
+            "  100 1
+ 200 100
+ 300 200
+header junk
+",
+        );
+        assert_eq!(parents.len(), 3);
+        assert!(descends_from(&parents, 300, 100));
+        assert!(descends_from(&parents, 100, 100));
+        assert!(!descends_from(&parents, 100, 300));
+        assert!(!descends_from(&parents, 999, 100));
+        // A snapshot with a cycle must terminate rather than spin.
+        let cyclic = parse_parents(
+            "1 2
+2 1
+",
+        );
+        assert!(!descends_from(&cyclic, 1, 99));
+    }
+
+    #[test]
+    fn a_pid_without_one_on_the_row_is_found_under_the_pane() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // This process is its own descendant, so it stands in for Claude.
+        let me = std::process::id() as i64;
+        std::fs::write(
+            dir.path().join(format!("{me}.json")),
+            format!(r#"{{"pid":{me},"status":"idle"}}"#),
+        )
+        .unwrap();
+        assert_eq!(pids_in(dir.path()), vec![me]);
+        // A row that already carries a pid never pays for the process walk.
+        assert_eq!(
+            verdict_in(
+                Some(dir.path()),
+                Ask {
+                    pid: None,
+                    pane_pid: Some(me),
+                    ..ask(0)
+                }
+            ),
+            Verdict::Idle { name: None }
+        );
+        // An entry for a process that is not under the pane is filtered out.
+        std::fs::write(dir.path().join("1.json"), r#"{"pid":1,"status":"busy"}"#).unwrap();
+        assert_eq!(
+            verdict_in(
+                Some(dir.path()),
+                Ask {
+                    pid: None,
+                    pane_pid: Some(me),
+                    ..ask(0)
+                }
+            ),
+            Verdict::Idle { name: None }
+        );
+        // Two candidates under the same pane: a guess is worse than no opinion.
+        assert!(matches!(
+            verdict_in(
+                Some(dir.path()),
+                Ask {
+                    pid: None,
+                    pane_pid: Some(1),
+                    ..ask(0)
+                }
+            ),
+            Verdict::Unknown { .. }
+        ));
     }
 }

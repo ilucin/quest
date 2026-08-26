@@ -3965,6 +3965,19 @@ impl Env {
             .to_string()
     }
 
+    /// Every bracketed paste into a pane, in order, per the tmux fixture.
+    fn pastes(&self, pane_id: &str) -> Vec<String> {
+        self.fixture()["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["pane_id"] == pane_id)
+            .unwrap_or_else(|| panic!("no pane {pane_id}"))["pastes"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default()
+    }
+
     /// The `{"error": ..., "code": ...}` of a command that must fail.
     fn json_err(&self, args: &[&str]) -> serde_json::Value {
         let mut cmd = self.cmd();
@@ -4298,6 +4311,150 @@ fn force_sends_past_both_gates_and_records_that_it_did() {
         .success()
         .stdout(predicate::str::contains("forced past"))
         .stdout(predicate::str::contains("idle_prompt"));
+}
+
+/// A newline typed into a TUI is Enter, so multi-line text has to arrive as
+/// one bracketed paste instead. Verified against tmux 3.6b: `paste-buffer -p`
+/// wraps the bytes in `ESC[200~` / `ESC[201~` when the pane's application
+/// asked for bracketed paste, and sends them bare when it did not.
+#[test]
+fn multi_line_text_is_pasted_in_one_piece_rather_than_typed() {
+    let fleet = Fleet::new();
+    let out = fleet
+        .env
+        .json(&["send", "alpha/tests", "first line\nsecond line"]);
+    assert_eq!(out["pasted"], true);
+    assert_eq!(out["text"], "first line\nsecond line");
+    assert_eq!(
+        fleet.env.pastes(&fleet.worker_pane),
+        ["first line\nsecond line"]
+    );
+    assert_eq!(
+        fleet.env.buffer(&fleet.worker_pane),
+        "first line\nsecond line\n"
+    );
+    assert_eq!(
+        last_payload(&fleet.env, &fleet.quest_id, "session.send")["pasted"],
+        true
+    );
+
+    // A single line stays on the plain send-keys path.
+    let out = fleet.env.json(&["send", "alpha/tests", "one line"]);
+    assert_eq!(out["pasted"], false);
+    assert_eq!(
+        fleet.env.pastes(&fleet.worker_pane),
+        ["first line\nsecond line"]
+    );
+}
+
+#[test]
+fn text_that_starts_with_a_dash_is_text_and_not_a_flag() {
+    let fleet = Fleet::new();
+    let out = fleet
+        .env
+        .json(&["send", "alpha/tests", "-y --force is text"]);
+    assert_eq!(out["text"], "-y --force is text");
+    assert_eq!(out["forced"], false);
+    assert_eq!(fleet.env.buffer(&fleet.worker_pane), "-y --force is text\n");
+}
+
+/// The event log is an index, not a transcript: a long prompt is clipped the
+/// same way `session.prompt` clips one.
+#[test]
+fn a_long_send_is_truncated_in_the_event_log_but_not_in_the_pane() {
+    let fleet = Fleet::new();
+    let long = "x".repeat(500);
+    fleet.env.json(&["send", "alpha/tests", &long]);
+    let stored = last_payload(&fleet.env, &fleet.quest_id, "session.send")["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(stored.chars().count(), 200);
+    assert!(stored.ends_with('…'), "{stored}");
+    assert_eq!(fleet.env.buffer(&fleet.worker_pane), format!("{long}\n"));
+}
+
+/// Without the `SessionStart` hook the row never leaves `starting`, so Claude's
+/// own registry is the only evidence the session is up and between turns.
+#[test]
+fn a_starting_row_the_registry_calls_idle_can_be_sent_to() {
+    let fleet = Fleet::new();
+    fleet.env.set_status(&fleet.worker_id, "starting", None);
+    // No hook ran at all: no pid on the row either, and the error says where
+    // to look rather than leaving `--force` as the only way through.
+    fleet
+        .env
+        .conn()
+        .execute(
+            "UPDATE session SET claude_pid = NULL WHERE id = ?1",
+            [&fleet.worker_id],
+        )
+        .unwrap();
+    let err = fleet.env.json_err(&["send", "alpha/tests", "hello"]);
+    assert_eq!(err["code"], "conflict");
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains("q doctor"), "{msg}");
+
+    fleet
+        .env
+        .set_status(&fleet.worker_id, "starting", Some(1002));
+    fleet.env.registry(1002, r#"{"pid":1002,"status":"idle"}"#);
+    let out = fleet.env.json(&["send", "alpha/tests", "hello"]);
+    assert_eq!(out["status"], "starting");
+    assert_eq!(out["registry"]["verdict"], "idle");
+    assert_eq!(fleet.env.buffer(&fleet.worker_pane), "hello\n");
+}
+
+/// The registry is the second opinion on a row the hooks left behind: the
+/// listing shows it beside the row's own status rather than instead of it.
+#[test]
+fn sessions_shows_the_registry_when_it_contradicts_the_row() {
+    let fleet = Fleet::new();
+    let rows = fleet.env.json(&["sessions", "alpha"]);
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["registry"].is_null())
+    );
+
+    fleet.env.registry(
+        1002,
+        r#"{"pid":1002,"status":"waiting","waitingFor":"permission_prompt"}"#,
+    );
+    let rows = fleet.env.json(&["sessions", "alpha"]);
+    let worker = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["label"] == "tests")
+        .unwrap();
+    assert_eq!(worker["status"], "idle");
+    assert_eq!(worker["registry"], "waiting: permission_prompt");
+    let text = String::from_utf8(
+        fleet
+            .env
+            .cmd()
+            .args(["sessions", "alpha"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(text.contains("REG"), "{text}");
+    assert!(text.contains("permission_prompt"), "{text}");
+
+    // A registry that agrees adds no column.
+    fleet.env.registry(1002, r#"{"pid":1002,"status":"idle"}"#);
+    let rows = fleet.env.json(&["sessions", "alpha"]);
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["registry"].is_null())
+    );
 }
 
 #[test]

@@ -6,6 +6,7 @@ use crate::Ctx;
 use crate::commands::{fmt, sweep_quiet};
 use crate::model::{Quest, Session, SessionRole, SessionStatus};
 use crate::output;
+use crate::registry::{self, Ask};
 
 pub struct Args<'a> {
     pub quest: Option<&'a str>,
@@ -25,13 +26,18 @@ pub struct SessionView {
     pub session: Session,
     pub quest_slug: String,
     pub machine: String,
+    /// What Claude's own registry says, when it says anything and it differs
+    /// from the row. The hooks feed `status`; this is the second opinion that
+    /// shows a row has gone stale (SPEC §6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry: Option<String>,
 }
 
 pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     sweep_quiet(ctx)?;
     let db = ctx.db()?;
 
-    let views = match args.quest {
+    let mut views = match args.quest {
         Some(target) => {
             let quest = db.resolve_quest(target)?;
             let sessions = db.list_sessions_by_quest(&quest.id)?;
@@ -55,11 +61,42 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         }
     };
 
+    annotate(&mut views);
+
     if ctx.json || !ctx.quiet {
         let across_quests = args.quest.is_none();
         output::emit(ctx.json, &views, || human(&views, across_quests))?;
     }
     Ok(())
+}
+
+/// Fills in `registry` for the live rows Claude has a pid for: one file read
+/// each, and only when the registry disagrees with what the row says. A row
+/// without a pid is left alone — chasing it would cost a `ps` per session.
+fn annotate(views: &mut [SessionView]) {
+    let dir = registry::dir();
+    let now_ms = registry::now_ms();
+    for view in views
+        .iter_mut()
+        .filter(|v| v.session.status != SessionStatus::Ended)
+    {
+        let Some(pid) = view.session.claude_pid else {
+            continue;
+        };
+        let ask = Ask {
+            pid: Some(pid),
+            pane_pid: None,
+            name: view.session.claude_name.as_deref(),
+            now_ms,
+        };
+        let Some(said) = registry::verdict_in(dir.as_deref(), ask).status() else {
+            continue;
+        };
+        // The row already says this; a second column would only repeat it.
+        if said != status_cell(&view.session) {
+            view.registry = Some(said);
+        }
+    }
 }
 
 /// One Quest's rows: every live session, then the most recent ended ones
@@ -84,6 +121,7 @@ fn of_quest(quest: &Quest, sessions: Vec<Session>, all: bool) -> Vec<SessionView
             session,
             quest_slug: quest.slug.clone(),
             machine: quest.machine.clone(),
+            registry: None,
         })
         .collect()
 }
@@ -115,6 +153,14 @@ fn human(views: &[SessionView], across_quests: bool) -> String {
         header.insert(0, "QUEST");
         for (row, view) in rows.iter_mut().zip(views) {
             row.insert(0, view.quest_slug.clone());
+        }
+    }
+    // Only worth a column when the registry actually contradicts a row.
+    if views.iter().any(|v| v.registry.is_some()) {
+        let at = header.iter().position(|h| *h == "STATUS").unwrap() + 1;
+        header.insert(at, "REG");
+        for (row, view) in rows.iter_mut().zip(views) {
+            row.insert(at, fmt::or_dash(view.registry.as_deref()));
         }
     }
     header.push("LAST PROMPT");
@@ -215,6 +261,22 @@ mod tests {
         assert!(fleet.starts_with("QUEST"), "{fleet}");
         assert!(fleet.contains("alpha"), "{fleet}");
         assert!(fleet.lines().next().unwrap().ends_with("LAST PROMPT"));
+    }
+
+    #[test]
+    fn the_registry_column_appears_only_when_the_registry_disagrees() {
+        let q = quest();
+        let mut views = of_quest(&q, vec![session(&q, "w1", SessionStatus::Idle, 1)], false);
+        assert!(!human(&views, false).contains("REG"));
+        views[0].registry = Some("waiting: permission_prompt".to_string());
+        let text = human(&views, false);
+        assert!(text.contains("REG"), "{text}");
+        assert!(text.contains("permission_prompt"), "{text}");
+        // Between STATUS and PHASE, so the two opinions read side by side.
+        let header: Vec<&str> = text.lines().next().unwrap().split_whitespace().collect();
+        let at = header.iter().position(|h| *h == "REG").unwrap();
+        assert_eq!(header[at - 1], "STATUS");
+        assert_eq!(header[at + 1], "PHASE");
     }
 
     #[test]
