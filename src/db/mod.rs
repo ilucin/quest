@@ -77,6 +77,20 @@ impl Db {
         Ok(Db { conn })
     }
 
+    /// Runs `f` inside one `BEGIN IMMEDIATE` transaction: the write lock is
+    /// taken up front (or the busy timeout hits before anything is written),
+    /// and every statement in `f` commits or none does.
+    pub fn transaction<T>(&self, f: impl FnOnce(&Db) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_err)?;
+        let out = f(self)?;
+        tx.commit().map_err(db_err)?;
+        Ok(out)
+    }
+
     pub fn schema_version(&self) -> anyhow::Result<u32> {
         migrations::user_version(&self.conn)
     }

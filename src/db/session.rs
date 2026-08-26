@@ -117,17 +117,6 @@ impl Db {
         self.require_session(id)
     }
 
-    /// Self-reported phase (`q phase`).
-    pub fn update_session_phase(&self, id: &str, phase: &str) -> anyhow::Result<Session> {
-        self.conn
-            .execute(
-                "UPDATE session SET phase = ?1, updated_at = ?2 WHERE id = ?3",
-                params![phase, now(), id],
-            )
-            .map_err(db_err)?;
-        self.require_session(id)
-    }
-
     pub fn mark_session_ended(&self, id: &str, ended_at: i64) -> anyhow::Result<Session> {
         self.conn
             .execute(
@@ -237,14 +226,14 @@ impl Db {
         self.require_session(id)
     }
 
-    /// A prompt was submitted: `busy`, `last_prompt` always, `first_prompt`
-    /// only the first time.
-    pub fn record_session_prompt(&self, id: &str, prompt: &str) -> anyhow::Result<Session> {
+    /// A prompt was submitted: `busy`; when the text is known, `last_prompt`
+    /// always and `first_prompt` only the first time.
+    pub fn record_session_prompt(&self, id: &str, prompt: Option<&str>) -> anyhow::Result<Session> {
         self.conn
             .execute(
                 "UPDATE session SET status = 'busy', waiting_for = NULL, \
-                 first_prompt = COALESCE(first_prompt, ?1), last_prompt = ?1, updated_at = ?2 \
-                 WHERE id = ?3",
+                 first_prompt = COALESCE(first_prompt, ?1), \
+                 last_prompt = COALESCE(?1, last_prompt), updated_at = ?2 WHERE id = ?3",
                 params![prompt, now(), id],
             )
             .map_err(db_err)?;
@@ -477,13 +466,18 @@ mod tests {
         let db = db();
         let q = quest(&db, "alpha");
         let s = session(&db, &q.id, "w1", "%1");
-        let one = db.record_session_prompt(&s.id, "go").unwrap();
+        let one = db.record_session_prompt(&s.id, Some("go")).unwrap();
         assert_eq!(one.status, SessionStatus::Busy);
         assert_eq!(one.first_prompt.as_deref(), Some("go"));
         assert_eq!(one.last_prompt.as_deref(), Some("go"));
-        let two = db.record_session_prompt(&s.id, "more").unwrap();
+        let two = db.record_session_prompt(&s.id, Some("more")).unwrap();
         assert_eq!(two.first_prompt.as_deref(), Some("go"));
         assert_eq!(two.last_prompt.as_deref(), Some("more"));
+        db.update_session_status(&s.id, SessionStatus::Idle, None)
+            .unwrap();
+        let three = db.record_session_prompt(&s.id, None).unwrap();
+        assert_eq!(three.status, SessionStatus::Busy);
+        assert_eq!(three.last_prompt.as_deref(), Some("more"));
     }
 
     #[test]
