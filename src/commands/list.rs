@@ -1,42 +1,24 @@
 //! `q list` — every Quest with its derived state (SPEC §4, §16).
 
 use crate::Ctx;
-use crate::beads;
 use crate::cli::QuestState as StateFilter;
-use crate::commands::{QuestView, fmt, sweep_quiet};
+use crate::commands::{QuestRow, fill_progress, fmt, load_quests};
 use crate::model::DisplayState;
 use crate::output;
 
 pub fn run(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> anyhow::Result<()> {
-    sweep_quiet(ctx)?;
-    let db = ctx.db()?;
     let wanted = state.map(display_state_of);
     let include_finished = all || wanted == Some(DisplayState::Finished);
 
-    let mut views: Vec<QuestView> = Vec::new();
-    for quest in db.list_quests(include_finished)? {
-        // TODO(M4): a remote machine's Quests come over ssh, not out of this db.
-        if ctx.machine_filter().is_some_and(|m| m != quest.machine) {
-            continue;
-        }
-        let sessions = db.list_sessions_by_quest(&quest.id)?;
-        let view = QuestView::new(quest, &sessions);
-        if wanted.is_some_and(|w| w != view.display_state) {
-            continue;
-        }
-        views.push(view);
+    let mut rows = load_quests(ctx, include_finished)?;
+    if let Some(want) = wanted {
+        rows.retain(|r| r.view.display_state == want);
     }
-    sort(&mut views);
-    // One `bd` call for the whole listing, capped and cache-backed, so a slow
-    // or missing `bd` can never hold up `q list` (SPEC §13) — and not even
-    // that when nothing is going to be printed.
     if ctx.json || !ctx.quiet {
-        let quests: Vec<&crate::model::Quest> = views.iter().map(|v| &v.quest).collect();
-        let progress = beads::progress_all(&quests);
-        for view in &mut views {
-            view.progress = progress.get(&view.quest.id).copied();
-        }
-        output::emit(ctx.json, &views, || human(&views))?;
+        // Not even the one `bd` call when nothing is going to be printed.
+        fill_progress(&mut rows);
+        let views: Vec<&crate::commands::QuestView> = rows.iter().map(|r| &r.view).collect();
+        output::emit(ctx.json, &views, || human(&rows))?;
     }
     Ok(())
 }
@@ -49,34 +31,14 @@ fn display_state_of(state: StateFilter) -> DisplayState {
     }
 }
 
-/// What needs the human first, then what is running, then the rest; ties go to
-/// the most recently touched Quest.
-fn sort(views: &mut [QuestView]) {
-    views.sort_by(|a, b| {
-        rank(a)
-            .cmp(&rank(b))
-            .then(b.quest.updated_at.cmp(&a.quest.updated_at))
-    });
-}
-
-fn rank(view: &QuestView) -> u8 {
-    if view.needs_you {
-        return 0;
-    }
-    match view.display_state {
-        DisplayState::Active => 1,
-        DisplayState::Idle => 2,
-        DisplayState::Finished => 3,
-    }
-}
-
-fn human(views: &[QuestView]) -> String {
-    if views.is_empty() {
+fn human(rows: &[QuestRow]) -> String {
+    if rows.is_empty() {
         return "no quests".to_string();
     }
-    let rows: Vec<Vec<String>> = views
+    let cells: Vec<Vec<String>> = rows
         .iter()
-        .map(|v| {
+        .map(|r| {
+            let v = &r.view;
             vec![
                 v.quest.id.clone(),
                 v.quest.slug.clone(),
@@ -93,21 +55,17 @@ fn human(views: &[QuestView]) -> String {
         &[
             "ID", "SLUG", "STATE", "MACHINE", "SESS", "BEADS", "CWD", "AGE",
         ],
-        &rows,
+        &cells,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::{QuestView, sort_quests};
     use crate::model::{Quest, QuestState, Session, SessionRole, SessionStatus};
 
-    fn view(
-        slug: &str,
-        state: QuestState,
-        updated_at: i64,
-        statuses: &[SessionStatus],
-    ) -> QuestView {
+    fn row(slug: &str, state: QuestState, updated_at: i64, statuses: &[SessionStatus]) -> QuestRow {
         let mut quest = Quest::new(slug, "/tmp", "laptop");
         quest.state = state;
         quest.updated_at = updated_at;
@@ -119,22 +77,25 @@ mod tests {
                 s
             })
             .collect();
-        QuestView::new(quest, &sessions)
+        QuestRow {
+            view: QuestView::new(quest, &sessions),
+            sessions,
+        }
     }
 
     #[test]
     fn sorting_puts_needs_you_first_then_state_then_recency() {
         use QuestState as Q;
         use SessionStatus as S;
-        let mut views = vec![
-            view("finished", Q::Finished, 90, &[]),
-            view("idle-old", Q::Active, 10, &[S::Idle]),
-            view("active", Q::Active, 20, &[S::Busy]),
-            view("idle-new", Q::Active, 30, &[S::Idle]),
-            view("waiting", Q::Active, 1, &[S::Waiting]),
+        let mut rows = vec![
+            row("finished", Q::Finished, 90, &[]),
+            row("idle-old", Q::Active, 10, &[S::Idle]),
+            row("active", Q::Active, 20, &[S::Busy]),
+            row("idle-new", Q::Active, 30, &[S::Idle]),
+            row("waiting", Q::Active, 1, &[S::Waiting]),
         ];
-        sort(&mut views);
-        let order: Vec<&str> = views.iter().map(|v| v.quest.slug.as_str()).collect();
+        sort_quests(&mut rows);
+        let order: Vec<&str> = rows.iter().map(|r| r.view.quest.slug.as_str()).collect();
         assert_eq!(
             order,
             ["waiting", "active", "idle-new", "idle-old", "finished"]
@@ -143,12 +104,12 @@ mod tests {
 
     #[test]
     fn a_waiting_session_is_marked_in_the_state_cell() {
-        let v = view("x", QuestState::Active, 0, &[SessionStatus::Waiting]);
-        assert_eq!(v.state_cell(), "active · needs you");
-        assert_eq!(v.live_sessions, 1);
-        let v = view("x", QuestState::Active, 0, &[SessionStatus::Ended]);
-        assert_eq!(v.state_cell(), "idle");
-        assert_eq!(v.live_sessions, 0);
+        let r = row("x", QuestState::Active, 0, &[SessionStatus::Waiting]);
+        assert_eq!(r.view.state_cell(), "active · needs you");
+        assert_eq!(r.view.live_sessions, 1);
+        let r = row("x", QuestState::Active, 0, &[SessionStatus::Ended]);
+        assert_eq!(r.view.state_cell(), "idle");
+        assert_eq!(r.view.live_sessions, 0);
     }
 
     #[test]

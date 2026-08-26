@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use ratatui::layout::Rect;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// At or above this width a Quest row fits on two lines (SPEC §17).
 pub const WIDE_COLS: u16 = 100;
@@ -101,12 +101,20 @@ pub fn centered(area: Rect, w: u16, h: u16) -> Rect {
 }
 
 /// Display width of a string in terminal cells.
+///
+/// `UnicodeWidthStr` rather than a per-`char` sum: the two disagree on
+/// sequences the terminal paints as one glyph (an emoji followed by a
+/// variation selector, a base letter followed by combining marks), and only
+/// the string form measures what is actually drawn.
 pub fn width(s: &str) -> usize {
-    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+    UnicodeWidthStr::width(s)
 }
 
 /// Truncate to `max` display columns, ellipsising when anything was cut.
-/// Column-aware rather than char-aware, so CJK and emoji do not overflow.
+///
+/// Column-aware rather than char-aware, so CJK and emoji do not overflow, and
+/// zero-width characters travel with the character they modify: cutting
+/// between `e` and its combining acute would leave the accent on the ellipsis.
 pub fn truncate(s: &str, max: usize) -> String {
     if width(s) <= max {
         return s.to_string();
@@ -114,11 +122,21 @@ pub fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
+    let budget = max.saturating_sub(1);
     let mut out = String::new();
     let mut used = 0;
     for c in s.chars() {
         let cw = c.width().unwrap_or(0);
-        if used + cw > max.saturating_sub(1) {
+        // A zero-width char belongs to the cluster already emitted; dropping it
+        // would change the glyph and keeping it costs no columns. With nothing
+        // emitted yet there is no cluster to join, so it is skipped.
+        if cw == 0 {
+            if !out.is_empty() {
+                out.push(c);
+            }
+            continue;
+        }
+        if used + cw > budget {
             break;
         }
         out.push(c);
@@ -200,6 +218,25 @@ mod tests {
             centered(Rect::new(0, 0, 10, 4), 40, 10),
             Rect::new(0, 0, 10, 4)
         );
+    }
+
+    #[test]
+    fn width_measures_clusters_not_chars() {
+        // A base letter plus a combining acute paints one cell.
+        assert_eq!(width("e\u{301}"), 1);
+        assert_eq!(width("nai\u{308}ve"), 5);
+        // The SPEC §17 row glyphs are one column each.
+        assert_eq!(width("▸ ⏸ ▓░"), 6);
+    }
+
+    #[test]
+    fn truncate_never_splits_a_combining_sequence() {
+        // The cut lands between clusters, and the marks travel with their base.
+        let s = "e\u{301}e\u{301}e\u{301}e\u{301}";
+        assert_eq!(truncate(s, 3), "e\u{301}e\u{301}…");
+        assert_eq!(width(&truncate(s, 3)), 3);
+        // A string that is only marks has no cluster to join.
+        assert_eq!(truncate("\u{301}\u{301}", 5), "\u{301}\u{301}");
     }
 
     #[test]

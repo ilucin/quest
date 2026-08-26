@@ -67,7 +67,7 @@ pub enum Action {
     Quit,
 }
 
-/// One row of the `?` overlay.
+/// One row of the `?` overlay: the keys every tab answers to.
 pub const HELP: &[(&str, &str)] = &[
     ("Tab / S-Tab", "next / previous tab"),
     (
@@ -84,6 +84,21 @@ pub const HELP: &[(&str, &str)] = &[
     ("q / Esc", "close the help, or quit"),
     ("Ctrl-C", "quit"),
 ];
+
+/// The overlay for one tab: the shell's keys, then that tab's own. A tab with
+/// no keys of its own shows only the first half.
+pub fn help_rows(tab: Tab) -> Vec<(&'static str, &'static str)> {
+    let mut rows: Vec<(&str, &str)> = HELP.to_vec();
+    let own: &[(&str, &str)] = match tab {
+        Tab::Quests => quests::HELP,
+        _ => &[],
+    };
+    if !own.is_empty() {
+        rows.push(("", ""));
+        rows.extend_from_slice(own);
+    }
+    rows
+}
 
 /// One space before the first tab label, so the bar is not flush to the edge.
 const TAB_LEAD: u16 = 1;
@@ -141,8 +156,18 @@ pub struct App {
     /// bookkeeping off these.
     pub ticks: u64,
     pub refreshes: u64,
-    /// Transient one-line feedback in the status bar.
+    /// Transient one-line feedback in the status bar, set by a key handler.
     pub status: String,
+    /// The last reload that failed, kept apart from `status` so a tick's
+    /// success cannot wipe a message a keypress just wrote (and so a failure
+    /// survives until the next reload rather than until the next keypress).
+    pub refresh_error: Option<String>,
+    /// The Quest a tab handed to another tab — `s` on the Quests tab means
+    /// "the Sessions tab, filtered to this one" (SPEC §17).
+    pub focus_quest: Option<String>,
+    /// Whether the right-hand detail panel is up. Shell-level rather than
+    /// per-tab: it is one panel, and `Enter` means the same thing everywhere.
+    pub detail: bool,
     pub quests: quests::State,
     pub sessions: sessions::State,
     pub templates: templates::State,
@@ -165,6 +190,9 @@ impl App {
             ticks: 0,
             refreshes: 0,
             status: String::new(),
+            refresh_error: None,
+            focus_quest: None,
+            detail: false,
             quests: quests::State::default(),
             sessions: sessions::State::default(),
             templates: templates::State::default(),
@@ -192,7 +220,14 @@ impl App {
         if self.help {
             return self.handle_help(input);
         }
-        if let Some(action) = self.handle_global(input) {
+        // While a tab is capturing text (the `/` search box, and the forms of
+        // bd-8lz.4.4) the shell's bare-letter keys would eat the typing, so
+        // only the unconditional escape hatch is claimed above the tab.
+        if self.capturing() {
+            if input == Input::Ctrl('c') {
+                return self.quit();
+            }
+        } else if let Some(action) = self.handle_global(input) {
             return action;
         }
         match self.tab {
@@ -249,6 +284,19 @@ impl App {
                 Some(Action::None)
             }
         }
+    }
+
+    /// Whether the active tab is reading raw text rather than commands.
+    fn capturing(&self) -> bool {
+        match self.tab {
+            Tab::Quests => self.quests.capturing(),
+            _ => false,
+        }
+    }
+
+    /// One-line feedback for the next redraw.
+    pub fn say(&mut self, message: impl Into<String>) {
+        self.status = message.into();
     }
 
     fn select(&mut self, tab: Tab) {
@@ -404,7 +452,8 @@ mod tests {
         assert_eq!(a.refreshes, 1);
         assert!(!a.should_quit);
         // The refresh is synchronous and the redraw happens after it, so a
-        // "refreshing…" message could never be seen — and used to stick.
+        // "refreshing…" message would be painted only once the refresh it
+        // announced was already over — and then stick until the next keypress.
         assert!(a.status.is_empty(), "{:?}", a.status);
     }
 

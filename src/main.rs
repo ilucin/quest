@@ -108,6 +108,21 @@ impl Ctx {
     pub fn tmux(&self) -> &dyn Tmux {
         self.tmux.as_ref()
     }
+
+    /// A `Ctx` over an explicit database and tmux, for the in-crate tests.
+    /// Both are passed rather than discovered so a test never depends on the
+    /// process environment (`Q_DB`, `Q_FIXTURE`) another test may be changing.
+    #[cfg(test)]
+    pub fn for_tests(config: Config, db: Db, tmux: Box<dyn Tmux>) -> Ctx {
+        Ctx {
+            json: false,
+            quiet: true,
+            config,
+            machine_override: None,
+            db: Some(db),
+            tmux,
+        }
+    }
 }
 
 fn main() {

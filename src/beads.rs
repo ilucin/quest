@@ -84,6 +84,20 @@ impl Progress {
         format!("{}/{}", self.closed, self.total)
     }
 
+    /// The mini bar beside the cell (SPEC §17): `width` cells of `▓` for the
+    /// closed share, `░` for the rest. A Quest with no issues yet is all
+    /// empty rather than all full — nothing done is not everything done.
+    pub fn bar(&self, width: usize) -> String {
+        // Round down, but never claim "done" until it is: a single open issue
+        // keeps at least one empty cell.
+        let filled = match (self.closed * width).checked_div(self.total) {
+            None => 0,
+            Some(_) if self.closed >= self.total => width,
+            Some(exact) => exact.min(width.saturating_sub(1)),
+        };
+        "▓".repeat(filled) + &"░".repeat(width - filled)
+    }
+
     /// `3/7 closed · 2 open · 1 in progress · 1 blocked`. Empty buckets are
     /// left out, and the ones printed need not add up to the total — see the
     /// type's own docs for why.
@@ -855,6 +869,25 @@ mod tests {
             p.summary(),
             "1/5 closed · 1 open · 1 in progress · 1 blocked"
         );
+    }
+
+    #[test]
+    fn the_progress_bar_fills_with_the_closed_share() {
+        let p = |closed, total| Progress {
+            closed,
+            total,
+            ..Progress::default()
+        };
+        assert_eq!(p(0, 0).bar(7), "░░░░░░░");
+        assert_eq!(p(0, 7).bar(7), "░░░░░░░");
+        assert_eq!(p(3, 7).bar(7), "▓▓▓░░░░");
+        assert_eq!(p(7, 7).bar(7), "▓▓▓▓▓▓▓");
+        // One issue short of done never paints a full bar.
+        assert_eq!(p(99, 100).bar(7), "▓▓▓▓▓▓░");
+        assert_eq!(p(3, 7).bar(0), "");
+        for (closed, total) in [(0, 0), (0, 3), (1, 3), (3, 3), (99, 100)] {
+            assert_eq!(p(closed, total).bar(7).chars().count(), 7);
+        }
     }
 
     #[test]

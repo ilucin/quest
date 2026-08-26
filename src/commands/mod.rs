@@ -34,9 +34,11 @@ use std::io::{BufRead, IsTerminal, Write};
 use serde::Serialize;
 
 use crate::Ctx;
-use crate::beads::Progress;
+use crate::beads::{self, Progress};
 use crate::error::QError;
-use crate::model::{DisplayState, Quest, Session, SessionStatus, display_state, needs_you};
+use crate::model::{
+    DisplayState, Quest, Session, SessionStatus, display_state, master_ctx_pct, needs_you,
+};
 use crate::tmux;
 
 /// A Quest with the three fields SPEC §4 derives rather than stores. `q list`
@@ -48,6 +50,9 @@ pub struct QuestView {
     pub display_state: DisplayState,
     pub needs_you: bool,
     pub live_sessions: usize,
+    /// The live master's context reading (SPEC §8); `null` when there is no
+    /// live master, or the statusline hook has never reported one.
+    pub master_ctx_pct: Option<u8>,
     /// Beads counts (SPEC §13); `null` without an epic, or when `bd` has never
     /// answered for this Quest.
     pub progress: Option<Progress>,
@@ -59,6 +64,7 @@ impl QuestView {
             display_state: display_state(&quest, sessions),
             needs_you: needs_you(sessions),
             live_sessions: live(sessions).count(),
+            master_ctx_pct: master_ctx_pct(sessions),
             progress: None,
             quest,
         }
@@ -88,6 +94,71 @@ impl QuestView {
 
 pub fn live(sessions: &[Session]) -> impl Iterator<Item = &Session> {
     sessions.iter().filter(|s| s.status != SessionStatus::Ended)
+}
+
+/// A Quest's derived view together with the sessions it was derived from.
+/// `q list` only needs the view; the TUI's Quests tab also renders the
+/// sessions, so the one loader hands back both rather than querying twice.
+pub struct QuestRow {
+    pub view: QuestView,
+    pub sessions: Vec<Session>,
+}
+
+/// Every Quest this `q` speaks for, swept, machine-filtered and ranked.
+///
+/// The single definition of "the Quest listing": `q list` and the TUI's Quests
+/// tab both come through here, so they can never disagree about which Quests
+/// exist, what state they are in, or what order they belong in.
+pub fn load_quests(ctx: &Ctx, include_finished: bool) -> anyhow::Result<Vec<QuestRow>> {
+    sweep_quiet(ctx)?;
+    let db = ctx.db()?;
+    let mut rows: Vec<QuestRow> = Vec::new();
+    for quest in db.list_quests(include_finished)? {
+        // TODO(M4): a remote machine's Quests come over ssh, not out of this db.
+        if ctx.machine_filter().is_some_and(|m| m != quest.machine) {
+            continue;
+        }
+        let sessions = db.list_sessions_by_quest(&quest.id)?;
+        rows.push(QuestRow {
+            view: QuestView::new(quest, &sessions),
+            sessions,
+        });
+    }
+    sort_quests(&mut rows);
+    Ok(rows)
+}
+
+/// One `bd` call for the whole listing, capped and cache-backed, so a slow or
+/// missing `bd` can never hold up a listing or a TUI tick (SPEC §13).
+pub fn fill_progress(rows: &mut [QuestRow]) {
+    let quests: Vec<&Quest> = rows.iter().map(|r| &r.view.quest).collect();
+    let progress = beads::progress_all(&quests);
+    for row in rows.iter_mut() {
+        row.view.progress = progress.get(&row.view.quest.id).copied();
+    }
+}
+
+/// What needs the human first, then what is running, then the rest; ties go to
+/// the most recently touched Quest.
+pub fn sort_quests(rows: &mut [QuestRow]) {
+    rows.sort_by(|a, b| {
+        rank(&a.view)
+            .cmp(&rank(&b.view))
+            .then(b.view.quest.updated_at.cmp(&a.view.quest.updated_at))
+    });
+}
+
+/// The group a Quest belongs to, and the order the groups are shown in
+/// (SPEC §17: needs-you on top, then active, then idle, finished last).
+pub fn rank(view: &QuestView) -> u8 {
+    if view.needs_you {
+        return 0;
+    }
+    match view.display_state {
+        DisplayState::Active => 1,
+        DisplayState::Idle => 2,
+        DisplayState::Finished => 3,
+    }
 }
 
 /// The pane's own process id, when tmux still has that pane. `None` is an
