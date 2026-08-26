@@ -7,6 +7,8 @@
 //! the cursor hidden and ANY-MOTION mouse tracking armed — after which mouse
 //! movement is injected into the user's shell as literal text.
 //!
+//! [`HANDLED`] carries which signals are covered and which are knowingly not.
+//!
 //! Everything below the [`install`] call runs *inside a signal handler*, so it
 //! is held to async-signal-safety: no allocation, no locks, no `std::io`, no
 //! formatting. What is left is `write`, `tcsetattr`, `raise` and atomic loads
@@ -21,10 +23,21 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use super::{ALT_ON, MOUSE_ON, RAW_ON};
 
-/// The signals worth handling. SIGKILL and SIGSTOP cannot be caught at all,
-/// so a `kill -9` still leaves the terminal dirty — that is a property of the
-/// signal, not a gap here.
-const HANDLED: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
+/// The signals worth handling: every catchable way the process is *ended*
+/// from outside while the terminal is armed — `kill`, `kill -INT`,
+/// `kill -QUIT`, and the hangup a closed terminal window sends.
+///
+/// What is deliberately not here:
+/// - SIGKILL and SIGSTOP cannot be caught at all, so a `kill -9` still leaves
+///   the terminal dirty — a property of the signal, not a gap here.
+/// - SIGTSTP is catchable but *resumable*: handling it would mean restoring on
+///   the way down and re-arming from a SIGCONT handler on the way back, and
+///   half of that pair is worse than neither. Out of scope for this bead; an
+///   external `kill -TSTP` still suspends with the alternate screen up.
+///
+/// Raw mode clears `ISIG`, so an interactive Ctrl-C / Ctrl-\ / Ctrl-Z reaches
+/// the TUI as a key and never gets here — these cover the external sender.
+const HANDLED: [libc::c_int; 4] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT];
 
 /// DECTCEM on. First, and whatever else was armed: ratatui hides the cursor on
 /// every draw and leaving the alternate screen does not bring it back.
@@ -63,8 +76,15 @@ pub(super) fn plan(mouse: bool, alt: bool, raw: bool) -> Plan {
     }
 }
 
-/// Take the terminal state the way [`super::restore_with`] does, so a handler
-/// that runs alongside the guard cannot undo anything twice.
+/// Read the terminal state and clear it in one step, so the plan built from it
+/// covers everything still armed and a second pass through here writes nothing.
+///
+/// This is not an agreement with [`super::restore_with`] that a step is undone
+/// only once — that guard clears each flag *after* its own undo precisely so a
+/// signal in the middle still sees the rest as armed, and both may therefore
+/// undo the same step. Every undo is idempotent, and the handler never returns
+/// to let the guard resume, so the overlap costs nothing; see `restore_with`'s
+/// own doc for why that ordering is the safe one.
 pub(super) fn take_flags() -> (bool, bool, bool) {
     (
         MOUSE_ON.swap(false, Ordering::SeqCst),
@@ -187,51 +207,66 @@ fn errno_slot() -> *mut libc::c_int {
     std::ptr::null_mut()
 }
 
-/// Everything the handler does except dying: separated so it can be tested in
-/// process, where re-raising would take the test runner with it.
+/// Run `f` with `errno` saved and put back: a handler that returns to an
+/// interrupted call owes it the value it had, and every syscall in here
+/// (`write`, `tcsetattr`, `signal`, `raise`) may set it even on success.
 ///
-/// `errno` is saved and put back around the whole body: `write` and
-/// `tcsetattr` both clobber it, and a handler that returns to an interrupted
-/// call owes it the value it had. Free today only because the handler always
-/// re-raises with `SIG_DFL` and the process dies — which stops being true the
-/// moment anyone handles a non-fatal signal.
-pub(super) fn restore_from_signal() {
+/// Async-signal-safe: a statically dispatched call, one `libc` accessor and
+/// two loads through a thread-local pointer. Nests harmlessly, which is what
+/// lets both the whole handler and [`restore_from_signal`] on its own hold the
+/// guarantee.
+fn preserving_errno<T>(f: impl FnOnce() -> T) -> T {
     let slot = errno_slot();
     // Safety: `slot` is either null (checked) or libc's own thread-local.
     let saved = if slot.is_null() { 0 } else { unsafe { *slot } };
-
-    let (mouse, alt, raw) = take_flags();
-    let plan = plan(mouse, alt, raw);
-    for bytes in plan.bytes {
-        if !bytes.is_empty() {
-            write_all(bytes);
-        }
-    }
-    if plan.termios {
-        restore_termios();
-    }
-
+    let out = f();
     if !slot.is_null() {
         // Safety: as above.
         unsafe { *slot = saved };
     }
+    out
+}
+
+/// Everything the handler does except dying: separated so it can be tested in
+/// process, where re-raising would take the test runner with it.
+///
+/// Errno-neutral on its own, so the test can pin it without a signal.
+pub(super) fn restore_from_signal() {
+    preserving_errno(|| {
+        let (mouse, alt, raw) = take_flags();
+        let plan = plan(mouse, alt, raw);
+        for bytes in plan.bytes {
+            if !bytes.is_empty() {
+                write_all(bytes);
+            }
+        }
+        if plan.termios {
+            restore_termios();
+        }
+    });
 }
 
 extern "C" fn handler(sig: libc::c_int) {
-    restore_from_signal();
-    // Put the default disposition back and re-raise, so the process dies the
-    // way the sender asked it to rather than carrying on with a half-torn-down
-    // terminal. The signal is blocked for the length of its own handler, so
-    // the re-raised one lands the moment this returns.
-    //
-    // Explicitly rather than through `SA_RESETHAND`: macOS does not report
-    // that flag back through `sigaction`, so nothing could test it. Both
-    // `signal` and `raise` are async-signal-safe.
-    // Safety: two libc calls with no state of ours involved.
-    unsafe {
-        libc::signal(sig, libc::SIG_DFL);
-        libc::raise(sig);
-    }
+    // Around the *whole* body, not just the restore: `signal` and `raise` are
+    // allowed to set `errno` too, so anything narrower would leave the promise
+    // above only half kept. Free today — the re-raise never comes back — and
+    // still true the moment anyone handles a signal that does return.
+    preserving_errno(|| {
+        restore_from_signal();
+        // Put the default disposition back and re-raise, so the process dies
+        // the way the sender asked it to rather than carrying on with a
+        // half-torn-down terminal. The signal is blocked for the length of its
+        // own handler, so the re-raised one lands the moment this returns.
+        //
+        // Explicitly rather than through `SA_RESETHAND`: macOS does not report
+        // that flag back through `sigaction`, so nothing could test it. Both
+        // `signal` and `raise` are async-signal-safe.
+        // Safety: two libc calls with no state of ours involved.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    });
 }
 
 /// Run `f` with the handler's output pointed at a pipe, handing back what it
@@ -242,16 +277,44 @@ pub(super) fn capturing_output<T>(f: impl FnOnce() -> T) -> (T, Vec<u8>) {
     use std::io::Read;
     use std::os::fd::FromRawFd;
 
+    /// Puts `OUT_FD` back and closes whatever is still ours, even if `f`
+    /// unwinds. Without it a panicking test would leave the handler pointed at
+    /// a closed pipe for every test after it — `lifecycle_lock` is
+    /// poison-tolerant, so they keep running and would write nowhere.
+    struct Restore {
+        previous: libc::c_int,
+        fds: [libc::c_int; 2],
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OUT_FD.store(self.previous, Ordering::SeqCst);
+            for fd in self.fds {
+                if fd >= 0 {
+                    // Safety: ours, and taken off the guard once handed over.
+                    unsafe { libc::close(fd) };
+                }
+            }
+        }
+    }
+
     let mut fds = [0 as libc::c_int; 2];
     // Safety: `pipe` fills two descriptors into an array we own.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
     let previous = OUT_FD.swap(fds[1], Ordering::SeqCst);
+    let mut guard = Restore { previous, fds };
+
     let out = f();
+
+    // Explicitly, not just via the guard: nothing should point at the pipe
+    // while the read below blocks on it.
     OUT_FD.store(previous, Ordering::SeqCst);
     // Safety: both ends are ours; closing the write end is what ends the read.
     unsafe { libc::close(fds[1]) };
-    // Safety: `fds[0]` is an open descriptor nothing else owns.
+    guard.fds[1] = -1;
+    // Safety: `fds[0]` is an open descriptor nothing else owns — and the guard
+    // gives it up as the `File` takes it, so it is never closed twice.
     let mut read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    guard.fds[0] = -1;
     let mut buf = Vec::new();
     read.read_to_end(&mut buf)
         .expect("read the captured escapes");
@@ -359,6 +422,21 @@ mod tests {
         assert_eq!(plan(false, false, false).bytes, [b"", b"", b""]);
     }
 
+    /// The list itself is the contract: the test below walks `HANDLED` and so
+    /// would pass just as happily with a signal missing from it.
+    #[test]
+    fn every_catchable_ending_signal_is_handled() {
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            assert!(
+                HANDLED.contains(&sig),
+                "signal {sig} ends the process with the terminal still armed"
+            );
+        }
+        // Knowingly absent: SIGTSTP is resumable, so handling it without a
+        // SIGCONT re-arm would leave the TUI running on a restored terminal.
+        assert!(!HANDLED.contains(&libc::SIGTSTP));
+    }
+
     /// Every signal in `HANDLED` must actually end up armed, and installing
     /// twice must not disturb it.
     #[test]
@@ -447,5 +525,43 @@ mod tests {
             libc::ERANGE,
             "the restore clobbered errno (EBADF from the failed write)"
         );
+    }
+
+    /// The promise is the *handler's*, not just the restore's: `signal` and
+    /// `raise` run after `restore_from_signal` returns and may set `errno` too.
+    /// `handler` cannot be called in process — it re-raises with `SIG_DFL` and
+    /// would take the test runner with it — so what is pinned here is the
+    /// wrapper the handler and the restore share, with a body that clobbers
+    /// `errno` outside any restore.
+    #[test]
+    fn preserving_errno_covers_whatever_the_body_clobbers() {
+        let slot = errno_slot();
+        assert!(!slot.is_null(), "no errno accessor for this target");
+        // Safety: libc's thread-local slot for this thread.
+        unsafe { *slot = libc::ERANGE };
+        let out = preserving_errno(|| {
+            // Stands in for the two libc calls the handler makes after the
+            // restore: fails, sets `errno`, touches nothing of ours.
+            // Safety: closing a descriptor that cannot exist.
+            assert_eq!(unsafe { libc::close(-1) }, -1);
+            // Safety: as above.
+            assert_eq!(unsafe { *slot }, libc::EBADF, "the body must clobber it");
+            7u8
+        });
+        assert_eq!(out, 7);
+        // Safety: as above.
+        assert_eq!(unsafe { *slot }, libc::ERANGE);
+    }
+
+    /// A panicking body must not keep the swap: `lifecycle_lock` is
+    /// poison-tolerant, so every later test would run with the handler pointed
+    /// at a pipe that is already closed.
+    #[test]
+    fn the_capture_gives_the_descriptor_back_when_the_body_panics() {
+        let _lock = super::super::lifecycle_lock();
+        let before = OUT_FD.load(Ordering::SeqCst);
+        let result = std::panic::catch_unwind(|| capturing_output(|| panic!("the body failed")));
+        assert!(result.is_err(), "the panic must reach the caller");
+        assert_eq!(OUT_FD.load(Ordering::SeqCst), before);
     }
 }

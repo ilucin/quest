@@ -14,7 +14,7 @@ use crate::error::QError;
 const DEFAULT: &[&str] = &["less", "-R"];
 
 /// The pager to run: `$PAGER` when it is set to something, else [`DEFAULT`].
-pub fn command() -> Vec<String> {
+fn command() -> Vec<String> {
     #[cfg(test)]
     if let Some(argv) = test_override() {
         return argv;
