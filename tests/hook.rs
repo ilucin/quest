@@ -1657,7 +1657,7 @@ fn every_hook_is_a_no_op_inside_a_naming_subprocess() {
         "statusline",
     ] {
         let env = Env::new();
-        env.seed_master("auto", "busy");
+        env.seed_named_master("auto", "busy");
         env.seed_pane("q-alpha", "master", "%7");
         env.q()
             .env("Q_QUEST", "q-0001")
