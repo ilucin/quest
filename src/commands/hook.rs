@@ -5,8 +5,8 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -18,6 +18,7 @@ use crate::db::Db;
 use crate::error::QError;
 use crate::model::SessionStatus;
 use crate::output;
+use crate::proc;
 
 /// Claude Code event, the `q hook <sub>` that handles it, its matcher and
 /// timeout. Order is the order entries are written in.
@@ -75,7 +76,14 @@ const EVENTS: [Event; 7] = [
 
 const STATUSLINE_SUB: &str = "statusline";
 const CHAIN_KEY: &str = "statusline.chain";
-const CHAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the statusline chain gets before it is killed. `q doctor` sizes
+/// its probe from this, so the two never disagree about what "too slow" means.
+pub const CHAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Set by `q doctor`'s statusline probe: makes this handler report on stderr
+/// how the chain fared, which the probe captures. Claude Code never sets it —
+/// in a real refresh a failing chain must stay silent.
+pub const PROBE_ENV: &str = "Q_PROBE";
 
 fn known_sub(sub: &str) -> bool {
     sub == STATUSLINE_SUB || EVENTS.iter().any(|e| e.sub == sub)
@@ -83,14 +91,14 @@ fn known_sub(sub: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum State {
+pub enum State {
     Installed,
     Missing,
     Drifted,
 }
 
 impl State {
-    fn symbol(self) -> char {
+    pub fn symbol(self) -> char {
         match self {
             State::Installed => '✓',
             State::Missing => '✗',
@@ -98,7 +106,7 @@ impl State {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             State::Installed => "installed",
             State::Missing => "missing",
@@ -108,28 +116,28 @@ impl State {
 }
 
 #[derive(Debug, Serialize)]
-struct EventStatus {
-    event: &'static str,
-    state: State,
+pub struct EventStatus {
+    pub event: &'static str,
+    pub state: State,
 }
 
 #[derive(Debug, Serialize)]
-struct StatuslineStatus {
-    state: State,
-    command: Option<String>,
-    chain: String,
+pub struct StatuslineStatus {
+    pub state: State,
+    pub command: Option<String>,
+    pub chain: String,
 }
 
 #[derive(Debug, Serialize)]
-struct Status {
-    settings: PathBuf,
-    command: String,
-    ok: bool,
-    events: Vec<EventStatus>,
-    statusline: StatuslineStatus,
+pub struct Status {
+    pub settings: PathBuf,
+    pub command: String,
+    pub ok: bool,
+    pub events: Vec<EventStatus>,
+    pub statusline: StatuslineStatus,
     /// sha256 over the entry set `install` would write vs. the q entries found.
-    expected_hash: String,
-    actual_hash: String,
+    pub expected_hash: String,
+    pub actual_hash: String,
 }
 
 /// `$Q_CLAUDE_SETTINGS`, else `~/.claude/settings.json`. Symlinks are
@@ -226,9 +234,9 @@ fn read_settings(path: &Path) -> anyhow::Result<Value> {
         Ok(text) if text.trim().is_empty() => Ok(json!({})),
         Ok(text) => {
             let v: Value = serde_json::from_str(&text)
-                .map_err(|e| QError::Config(format!("{}: {e}", path.display())))?;
+                .map_err(|e| QError::Settings(format!("{}: {e}", path.display())))?;
             if !v.is_object() {
-                return Err(QError::Config(format!(
+                return Err(QError::Settings(format!(
                     "{}: expected a JSON object at the top level",
                     path.display()
                 ))
@@ -237,7 +245,7 @@ fn read_settings(path: &Path) -> anyhow::Result<Value> {
             Ok(v)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
-        Err(e) => Err(QError::Config(format!("{}: {e}", path.display())).into()),
+        Err(e) => Err(QError::Settings(format!("{}: {e}", path.display())).into()),
     }
 }
 
@@ -434,7 +442,7 @@ pub fn install(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
     // `null` counts as absent; anything else of the wrong shape is an error.
     if !matches!(before["statusLine"], Value::Null | Value::Object(_)) {
         return Err(
-            QError::Config(format!("{}: `statusLine` is not an object", path.display())).into(),
+            QError::Settings(format!("{}: `statusLine` is not an object", path.display())).into(),
         );
     }
 
@@ -451,7 +459,7 @@ pub fn install(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
         }
         if !hooks.is_object() {
             return Err(
-                QError::Config(format!("{}: `hooks` is not an object", path.display())).into(),
+                QError::Settings(format!("{}: `hooks` is not an object", path.display())).into(),
             );
         }
         let groups = hooks
@@ -463,7 +471,7 @@ pub fn install(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
             *groups = json!([]);
         }
         let Some(groups) = groups.as_array_mut() else {
-            return Err(QError::Config(format!(
+            return Err(QError::Settings(format!(
                 "{}: `hooks.{}` is not an array",
                 path.display(),
                 ev.name
@@ -585,10 +593,7 @@ pub fn uninstall(ctx: &Ctx) -> anyhow::Result<u8> {
 
 /// Exit 1 when anything is missing or drifted, so `q doctor` can lean on it.
 pub fn status(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
-    let path = settings_path()?;
-    let cmd = q_command(command)?;
-    let settings = read_settings(&path)?;
-    let status = compute_status(&settings, path, &cmd, &ctx.config.statusline.chain);
+    let status = installed_status(command, &ctx.config.statusline.chain)?;
     output::emit(ctx.json, &status, || status.human())?;
     Ok(u8::from(!status.ok))
 }
@@ -601,12 +606,18 @@ pub fn statusline(ctx: &Ctx) -> anyhow::Result<u8> {
     let mut input = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut input);
     let chain = ctx.config.statusline.chain.trim();
-    if !chain.is_empty()
-        && let Some(out) = run_chain(chain, &input, CHAIN_TIMEOUT)
-    {
-        let mut stdout = std::io::stdout().lock();
-        let _ = stdout.write_all(&out);
-        let _ = stdout.flush();
+    if !chain.is_empty() {
+        let out = run_chain(chain, &input, CHAIN_TIMEOUT);
+        if let Some(out) = &out {
+            let mut stdout = std::io::stdout().lock();
+            let _ = stdout.write_all(&out.stdout);
+            let _ = stdout.flush();
+        }
+        if env_var(PROBE_ENV).is_some()
+            && let Some(diag) = chain_diagnostic(out.as_ref())
+        {
+            eprintln!("{diag}");
+        }
     }
     record_ctx(&input);
     Ok(0)
@@ -668,43 +679,47 @@ fn ctx_pct(payload: &Value) -> Option<u8> {
 }
 
 /// Runs the chain with the payload on stdin. A chain that outlives `timeout`
-/// is killed and whatever it printed so far is kept.
-fn run_chain(chain: &str, input: &[u8], timeout: Duration) -> Option<Vec<u8>> {
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(chain)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let input = input.to_vec();
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(&input);
-        });
-    }
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
+/// is killed — process group and all — and whatever it printed so far is kept.
+/// `None` only when `sh` itself could not be started.
+fn run_chain(chain: &str, input: &[u8], timeout: Duration) -> Option<proc::Outcome> {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(chain);
+    proc::run(&mut cmd, input, timeout).ok()
+}
+
+/// What went wrong with the chain, in one line, for `q doctor`'s probe.
+/// `None` when it exited cleanly — the only case the user needs no report of.
+fn chain_diagnostic(out: Option<&proc::Outcome>) -> Option<String> {
+    let Some(out) = out else {
+        return Some("could not be started".to_string());
+    };
+    let what = if out.timed_out() {
+        format!("did not finish in {}s", CHAIN_TIMEOUT.as_secs())
+    } else {
+        match out.code() {
+            Some(0) => return None,
+            Some(code) => format!("exited {code}"),
+            None => "was killed by a signal".to_string(),
         }
+    };
+    // The chain's stderr is arbitrary output — colour, control bytes, any
+    // length — and this line has to survive being written to stderr and read
+    // back by `q doctor` as one line.
+    let stderr = out.stderr_text();
+    match stderr.lines().find(|l| !l.trim().is_empty()) {
+        Some(line) => Some(format!("{what}: {}", output::first_line(line, 120))),
+        None => Some(what),
     }
-    reader.join().ok()
+}
+
+/// The install state `q hook status` reports. `command` overrides the q
+/// invocation entries are compared against, `chain` is the configured
+/// statusline chain.
+pub fn installed_status(command: Option<&str>, chain: &str) -> anyhow::Result<Status> {
+    let path = settings_path()?;
+    let cmd = q_command(command)?;
+    let settings = read_settings(&path)?;
+    Ok(compute_status(&settings, path, &cmd, chain))
 }
 
 #[cfg(test)]
@@ -713,8 +728,42 @@ mod tests {
 
     #[test]
     fn a_timed_out_chain_keeps_its_partial_output() {
-        let out = run_chain("echo partial; sleep 30", b"", Duration::from_millis(200));
-        assert_eq!(out.as_deref(), Some(&b"partial\n"[..]));
+        let started = std::time::Instant::now();
+        let out = run_chain(
+            "echo partial; sleep 30 & wait",
+            b"",
+            Duration::from_millis(200),
+        )
+        .expect("sh ran");
+        assert_eq!(out.stdout, b"partial\n");
+        assert!(out.timed_out());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_chain_diagnostic_names_only_a_bad_outcome() {
+        let ran = |script: &str| run_chain(script, b"", Duration::from_millis(500));
+        assert_eq!(chain_diagnostic(ran("true").as_ref()), None);
+        assert_eq!(
+            chain_diagnostic(ran("exit 3").as_ref()),
+            Some("exited 3".to_string())
+        );
+        assert_eq!(
+            chain_diagnostic(ran("echo why >&2; exit 3").as_ref()),
+            Some("exited 3: why".to_string())
+        );
+        assert_eq!(
+            chain_diagnostic(ran("sleep 30 & wait").as_ref()),
+            Some(format!("did not finish in {}s", CHAIN_TIMEOUT.as_secs()))
+        );
+        assert_eq!(
+            chain_diagnostic(None),
+            Some("could not be started".to_string())
+        );
     }
 
     #[test]

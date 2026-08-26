@@ -32,6 +32,11 @@ pub enum QError {
     #[error("config: {0}")]
     Config(String),
 
+    /// Claude Code's `settings.json` cannot be read, parsed, or merged into.
+    /// Distinct from `Config`, which is q's own `config.toml`.
+    #[error("{0}")]
+    Settings(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -53,6 +58,7 @@ impl QError {
             QError::Tmux(_) => "tmux",
             QError::Db(_) => "db",
             QError::Config(_) => "config",
+            QError::Settings(_) => "settings",
             QError::Io(_) => "io",
             QError::NotImplemented(_) => "not_implemented",
             QError::Other(_) => "other",
