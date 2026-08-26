@@ -9,6 +9,14 @@ pub enum QError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// A name (slug, tmux session) the user asked for is already in use.
+    #[error("{0}")]
+    Conflict(String),
+
+    /// A flag value the grammar rejects.
+    #[error("{0}")]
+    Invalid(String),
+
     #[error("ambiguous target `{target}`: {}", candidates.join(", "))]
     Ambiguous {
         target: String,
@@ -43,6 +51,8 @@ impl QError {
     pub fn code(&self) -> &'static str {
         match self {
             QError::NotFound(_) => "not_found",
+            QError::Conflict(_) => "conflict",
+            QError::Invalid(_) => "invalid",
             QError::Ambiguous { .. } => "ambiguous",
             QError::Tmux(_) => "tmux",
             QError::Db(_) => "db",
