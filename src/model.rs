@@ -123,6 +123,8 @@ pub struct Quest {
     pub brain_session: Option<String>,
     /// NULL means "fall back to `[context] master_reset_pct`".
     pub ctx_reset_pct: Option<u8>,
+    /// NULL means "fall back to `[context] auto_reset`".
+    pub auto_reset: Option<bool>,
     pub created_at: i64,
     pub updated_at: i64,
     pub finished_at: Option<i64>,
@@ -147,6 +149,7 @@ impl Quest {
             beads_repo: None,
             brain_session: None,
             ctx_reset_pct: None,
+            auto_reset: None,
             created_at: ts,
             updated_at: ts,
             finished_at: None,

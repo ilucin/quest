@@ -210,9 +210,7 @@ fn stop(db: &Db, session: &Session, payload: &Value) {
     });
     // TODO(bd-8lz.3): master auto-name check (SPEC §10) — regenerate the slug
     // in the background when `name_source = auto` and the input hash changed.
-    // TODO(bd-8lz.3): master ctx reset check (SPEC §8) — when `ctx_pct` is at
-    // or above the threshold, log `session.reset_scheduled` and spawn
-    // `q reset <session> --delay 2` detached.
+    crate::commands::reset::maybe_schedule(db, session);
 }
 
 /// Only notifications that block on the user flip the session to `waiting`;

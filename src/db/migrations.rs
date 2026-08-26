@@ -8,9 +8,9 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::error::QError;
 
 /// The version this binary expects. Must equal the last entry in `MIGRATIONS`.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
-const MIGRATIONS: &[(u32, &str)] = &[(1, V1)];
+const MIGRATIONS: &[(u32, &str)] = &[(1, V1), (2, V2)];
 
 const V1: &str = r#"
 CREATE TABLE quest (
@@ -97,6 +97,12 @@ CREATE TABLE template (
 CREATE TABLE name_cache (          -- auto-naming: input_hash -> slug
   input_hash TEXT PRIMARY KEY, slug TEXT NOT NULL, created_at INTEGER NOT NULL
 );
+"#;
+
+/// SPEC §8 wants a per-Quest `auto_reset` override, which SPEC §4 never gave a
+/// column. Nullable like `ctx_reset_pct`: NULL follows `[context] auto_reset`.
+const V2: &str = r#"
+ALTER TABLE quest ADD COLUMN auto_reset INTEGER;   -- 1 | 0 | NULL = config
 "#;
 
 pub fn user_version(conn: &Connection) -> anyhow::Result<u32> {

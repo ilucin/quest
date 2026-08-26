@@ -1163,3 +1163,142 @@ fn malformed_stdin_and_unknown_sessions_exit_zero_silently() {
     }
     assert!(!bare.db().exists());
 }
+
+// ---------------------------------- Stop-hook auto-reset (bd-8lz.3.3)
+
+impl Env {
+    /// Quest `q-0001` (`alpha`) with a live **master** `s-0001` on pane `%7`,
+    /// `idle`, at `ctx_pct`. What the `Stop` hook sees when a reset is due.
+    fn seed_master(&self, ctx_pct: Option<i64>) {
+        self.q().arg("list").assert().success();
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO quest (id, slug, name_source, goal, cwd, machine, state, \
+             created_at, updated_at) VALUES ('q-0001', 'alpha', 'manual', 'ship it', \
+             '/tmp', 'laptop', 'active', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, quest_id, role, label, tmux_session, tmux_pane, \
+             status, ctx_pct, started_at, updated_at) VALUES ('s-0001', 'q-0001', 'master', \
+             'master', 'q-alpha', '%7', 'busy', ?1, 1, 1)",
+            [ctx_pct],
+        )
+        .unwrap();
+    }
+
+    fn set_quest(&self, sql: &str) {
+        self.conn().execute(sql, []).unwrap();
+    }
+
+    fn kinds(&self) -> Vec<String> {
+        self.events().into_iter().map(|(kind, _)| kind).collect()
+    }
+}
+
+#[test]
+fn stop_schedules_a_reset_once_the_master_crosses_the_threshold() {
+    let env = Env::new();
+    env.seed_master(Some(40));
+    env.hook("stop", &json!({})).success().stdout("");
+
+    assert_eq!(env.session()["status"], "idle");
+    assert_eq!(env.kinds(), ["session.stop", "session.reset_scheduled"]);
+    let payload = &env.events()[1].1;
+    assert_eq!(payload["ctx_pct"], 40);
+    assert_eq!(payload["threshold"], 35);
+    assert_eq!(payload["strategy"], "clear");
+    assert_eq!(payload["delay"], 2);
+    // `$Q_FIXTURE` is set, so the detached child is described rather than run.
+    assert_eq!(payload["spawned"], false);
+    let argv: Vec<String> = payload["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        argv[1..],
+        [
+            "reset",
+            "s-0001",
+            "--delay",
+            "2",
+            "--strategy",
+            "clear",
+            "--quiet"
+        ]
+    );
+
+    // The cooldown means the next turn does not schedule a second one.
+    env.hook("stop", &json!({})).success();
+    assert_eq!(
+        env.kinds(),
+        ["session.stop", "session.reset_scheduled", "session.stop"]
+    );
+}
+
+#[test]
+fn stop_does_not_schedule_below_the_threshold_or_without_a_reading() {
+    for ctx_pct in [None, Some(34)] {
+        let env = Env::new();
+        env.seed_master(ctx_pct);
+        env.hook("stop", &json!({})).success();
+        assert_eq!(env.kinds(), ["session.stop"], "{ctx_pct:?}");
+    }
+}
+
+#[test]
+fn stop_never_schedules_a_reset_for_a_worker() {
+    let env = Env::new();
+    // `seed` makes a worker; fill its context right up.
+    env.seed("busy");
+    env.conn()
+        .execute("UPDATE session SET ctx_pct = 99 WHERE id = 's-0001'", [])
+        .unwrap();
+    env.hook("stop", &json!({})).success();
+    assert_eq!(env.kinds(), ["session.stop"]);
+}
+
+#[test]
+fn auto_reset_off_in_the_config_or_on_the_quest_stops_the_scheduling() {
+    let env = Env::new();
+    env.seed_master(Some(90));
+    env.q()
+        .args(["config", "set", "context.auto_reset", "false"])
+        .assert()
+        .success();
+    env.hook("stop", &json!({})).success();
+    assert_eq!(env.kinds(), ["session.stop"]);
+
+    // The Quest column is a real override in both directions.
+    env.set_quest("UPDATE quest SET auto_reset = 1 WHERE id = 'q-0001'");
+    env.hook("stop", &json!({})).success();
+    assert_eq!(
+        env.kinds(),
+        ["session.stop", "session.stop", "session.reset_scheduled"]
+    );
+
+    let env = Env::new();
+    env.seed_master(Some(90));
+    env.set_quest("UPDATE quest SET auto_reset = 0 WHERE id = 'q-0001'");
+    env.hook("stop", &json!({})).success();
+    assert_eq!(env.kinds(), ["session.stop"]);
+}
+
+#[test]
+fn the_quest_threshold_overrides_the_configured_one() {
+    let env = Env::new();
+    env.seed_master(Some(50));
+    env.q()
+        .args(["config", "set", "context.master_reset_pct", "80"])
+        .assert()
+        .success();
+    env.hook("stop", &json!({})).success();
+    assert_eq!(env.kinds(), ["session.stop"]);
+
+    env.set_quest("UPDATE quest SET ctx_reset_pct = 45 WHERE id = 'q-0001'");
+    env.hook("stop", &json!({})).success();
+    assert_eq!(env.events()[2].1["threshold"], 45);
+}

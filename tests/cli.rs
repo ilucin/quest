@@ -67,7 +67,7 @@ fn help_lists_subcommands() {
     for sub in [
         "new", "list", "show", "enter", "close", "resume", "rename", "set", "rm", "brief",
         "events", "doctor", "config", "phase", "note", "link", "links", "artifact", "spawn",
-        "sessions", "peek", "send", "kill",
+        "sessions", "peek", "send", "reset", "kill",
     ] {
         assert!(out.contains(sub), "`{sub}` missing from --help:\n{out}");
     }
@@ -2268,8 +2268,26 @@ fn set_validates_its_values() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("expected 1-100"));
+    assert_eq!(
+        env.json(&["set", "foo", "auto_reset", "off"])["quest"]["auto_reset"],
+        false
+    );
+    assert_eq!(
+        env.json(&["set", "foo", "auto_reset", "on"])["quest"]["auto_reset"],
+        true
+    );
+    assert_eq!(
+        env.json(&["set", "foo", "auto_reset", "default"])["quest"]["auto_reset"],
+        serde_json::Value::Null
+    );
     env.cmd()
-        .args(["set", "foo", "auto_reset", "on"])
+        .args(["set", "foo", "auto_reset", "maybe"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("expected on, off"));
+    // `brain` still waits on the brain integration.
+    env.cmd()
+        .args(["set", "foo", "brain", "x"])
         .assert()
         .code(2);
 }
@@ -5970,4 +5988,293 @@ fn the_brief_names_the_epic_and_the_labels_agents_must_use() {
     );
     assert!(out.contains("**epic**: `bd-epic`"), "{out}");
     assert!(out.contains("[open] `bd-1`"), "{out}");
+}
+
+// -------------------------------------------------- q reset (bd-8lz.3.3)
+
+impl Env {
+    fn set_ctx(&self, session_id: &str, pct: i64) {
+        self.conn()
+            .execute(
+                "UPDATE session SET ctx_pct = ?1, ctx_updated_at = 2 WHERE id = ?2",
+                rusqlite::params![pct, session_id],
+            )
+            .unwrap();
+    }
+
+    /// The payload of the newest event of `kind`, for a Quest.
+    fn last_event(&self, quest_id: &str, kind: &str) -> serde_json::Value {
+        self.conn()
+            .query_row(
+                "SELECT payload FROM event WHERE quest_id = ?1 AND kind = ?2 \
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![quest_id, kind],
+                |r| {
+                    let raw: Option<String> = r.get(0)?;
+                    Ok(raw.map_or(serde_json::Value::Null, |p| {
+                        serde_json::from_str(&p).unwrap()
+                    }))
+                },
+            )
+            .unwrap_or_else(|e| panic!("no `{kind}` event for {quest_id}: {e}"))
+    }
+}
+
+/// The follow-up `q reset` types after `/clear`; mirrors the const in
+/// `src/commands/reset.rs`, which is the authority.
+const FOLLOW_UP: &str = "Nastavi rad na questu prema briefu.";
+
+#[test]
+fn reset_clears_and_then_types_the_follow_up() {
+    let fleet = Fleet::new();
+    fleet.env.set_ctx(&fleet.master_id, 61);
+    let master_pane = fleet.env.json(&["peek", "alpha/master"])["pane"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let out = fleet.env.json(&["reset", "alpha/master", "--delay", "0"]);
+    assert_eq!(out["action"], "reset");
+    assert_eq!(out["strategy"], "clear");
+    assert_eq!(out["ctx_pct"], 61);
+    assert_eq!(out["session"], fleet.master_id.as_str());
+
+    // Both keystrokes landed, in order, and each with its Enter.
+    let buffer = fleet.env.buffer(&master_pane);
+    let clear = buffer.find("/clear").expect(&buffer);
+    let follow = buffer.find(FOLLOW_UP).expect(&buffer);
+    assert!(clear < follow, "{buffer}");
+
+    let payload = fleet.env.last_event(&fleet.quest_id, "session.reset");
+    assert_eq!(payload["strategy"], "clear");
+    assert_eq!(payload["ctx_pct"], 61);
+    assert_eq!(payload["scheduled"], true);
+    assert_eq!(payload["follow_up"], FOLLOW_UP);
+    // No real Claude under the fixture, so no `SessionStart(source=clear)`
+    // ever arrives and the wait is bounded to nothing.
+    assert_eq!(payload["cleared"], false);
+}
+
+#[test]
+fn reset_compact_sends_the_quest_goal_as_the_focus() {
+    let env = Env::new();
+    let work = env.work("repo");
+    let created = env.json(&[
+        "new",
+        "--name",
+        "alpha",
+        "--goal",
+        "make the  backfill\nidempotent",
+        "--dir",
+        work.to_str().unwrap(),
+        "-d",
+    ]);
+    let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
+    let master_id = created["session"]["id"].as_str().unwrap().to_string();
+    let pane = created["session"]["tmux_pane"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.set_status(&master_id, "idle", Some(1001));
+
+    let out = env.json(&["reset", "alpha/master", "--strategy", "compact"]);
+    assert_eq!(out["strategy"], "compact");
+    let buffer = env.buffer(&pane);
+    assert!(
+        buffer.contains("/compact make the backfill idempotent"),
+        "{buffer}"
+    );
+    assert!(!buffer.contains(FOLLOW_UP), "{buffer}");
+
+    let payload = env.last_event(&quest_id, "session.reset");
+    assert_eq!(payload["focus"], "make the backfill idempotent");
+    // No `--delay`: a manual reset.
+    assert_eq!(payload["scheduled"], false);
+}
+
+#[test]
+fn reset_without_a_goal_sends_a_bare_compact() {
+    let fleet = Fleet::new();
+    let pane = fleet.env.json(&["peek", "alpha/master"])["pane"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fleet
+        .env
+        .json(&["reset", "alpha/master", "--strategy", "compact"]);
+    assert_eq!(fleet.env.buffer(&pane).trim(), "/compact");
+    assert_eq!(
+        fleet.env.last_event(&fleet.quest_id, "session.reset")["focus"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn the_default_strategy_comes_from_the_config() {
+    let fleet = Fleet::new();
+    let pane = fleet.env.json(&["peek", "alpha/master"])["pane"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fleet
+        .env
+        .cmd()
+        .args(["config", "set", "context.reset_strategy", "compact"])
+        .assert()
+        .success();
+    assert_eq!(
+        fleet.env.json(&["reset", "alpha/master", "--delay", "0"])["strategy"],
+        "compact"
+    );
+    assert!(fleet.env.buffer(&pane).contains("/compact"));
+}
+
+#[test]
+fn a_scheduled_reset_of_a_busy_session_is_a_skip_and_a_manual_one_is_an_error() {
+    let fleet = Fleet::new();
+    let pane = fleet.env.json(&["peek", "alpha/master"])["pane"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for status in ["busy", "waiting", "starting"] {
+        fleet.env.set_status(&fleet.master_id, status, None);
+
+        // The scheduled path: nobody reads its exit code, so a skip is a
+        // success that leaves a trail.
+        let out = fleet.env.json(&["reset", "alpha/master", "--delay", "0"]);
+        assert_eq!(out["action"], "skipped", "{status}");
+        let reason = out["reason"].as_str().unwrap();
+        assert!(reason.contains(status), "{reason}");
+        let payload = fleet
+            .env
+            .last_event(&fleet.quest_id, "session.reset_skipped");
+        assert_eq!(payload["status"], status);
+        assert_eq!(payload["scheduled"], true);
+
+        // Typed by hand, the same refusal is an error.
+        let err = fleet.env.json_err(&["reset", "alpha/master"]);
+        assert_eq!(err["code"], "conflict", "{status}");
+        assert!(err["error"].as_str().unwrap().contains(status), "{err}");
+    }
+    // Nothing was ever typed into the pane.
+    assert_eq!(fleet.env.buffer(&pane), "");
+}
+
+#[test]
+fn a_reset_is_skipped_when_the_registry_says_the_session_is_waiting() {
+    let fleet = Fleet::new();
+    let pane = fleet.env.json(&["peek", "alpha/master"])["pane"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fleet.env.registry(
+        1001,
+        r#"{"pid":1001,"status":"waiting","waitingFor":"permission_prompt"}"#,
+    );
+    let out = fleet.env.json(&["reset", "alpha/master", "--delay", "0"]);
+    assert_eq!(out["action"], "skipped");
+    assert!(
+        out["reason"]
+            .as_str()
+            .unwrap()
+            .contains("permission_prompt"),
+        "{out}"
+    );
+    assert_eq!(fleet.env.buffer(&pane), "");
+
+    // A registry that agrees the session is idle lets it through.
+    fleet.env.registry(1001, r#"{"pid":1001,"status":"idle"}"#);
+    assert_eq!(
+        fleet.env.json(&["reset", "alpha/master", "--delay", "0"])["action"],
+        "reset"
+    );
+}
+
+#[test]
+fn a_reset_of_an_ended_session_goes_through_the_same_gate() {
+    let fleet = Fleet::new();
+    fleet.env.json(&["kill", "alpha/tests", "-f"]);
+    // A session that ended between scheduling and waking is a skip, not a
+    // failure the detached process could do anything about.
+    let out = fleet.env.json(&["reset", "alpha/tests", "--delay", "0"]);
+    assert_eq!(out["action"], "skipped");
+    assert!(out["reason"].as_str().unwrap().contains("ended"), "{out}");
+    // By hand it is an error, like every other non-idle state.
+    let err = fleet.env.json_err(&["reset", "alpha/tests"]);
+    assert_eq!(err["code"], "conflict");
+    assert!(err["error"].as_str().unwrap().contains("ended"), "{err}");
+}
+
+#[test]
+fn reset_help_lists_its_flags() {
+    let assert = q().args(["reset", "--help"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    for flag in ["--delay", "--strategy"] {
+        assert!(out.contains(flag), "`{flag}` missing:\n{out}");
+    }
+}
+
+#[test]
+fn new_can_opt_a_quest_out_of_auto_reset() {
+    let env = Env::new();
+    let work = env.work("repo");
+    let out = env.json(&[
+        "new",
+        "--name",
+        "alpha",
+        "--no-auto-reset",
+        "--dir",
+        work.to_str().unwrap(),
+        "-d",
+    ]);
+    assert_eq!(out["quest"]["auto_reset"], false);
+    // Without the flag the column stays NULL and follows the config.
+    let plain = env.new_quest("beta");
+    assert_eq!(plain["quest"]["auto_reset"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_clear_waits_for_the_session_start_the_hook_records() {
+    let fleet = Fleet::new();
+    let quest_id = fleet.quest_id.clone();
+    let master_id = fleet.master_id.clone();
+    let db = fleet.env.dir.path().join("q.db");
+    let config = fleet.env.dir.path().join("config.toml");
+    let fixture = fleet.env.dir.path().join("tmux.json");
+    let registry = fleet.env.dir.path().join("registry");
+
+    // A generous poll budget, so the event below lands inside it.
+    let reset = std::thread::spawn(move || {
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("q"))
+            .args(["reset", &master_id, "--delay", "0", "--json"])
+            .env("Q_DB", db)
+            .env("Q_CONFIG", config)
+            .env("Q_FIXTURE", fixture)
+            .env("Q_CLAUDE_SESSIONS_DIR", registry)
+            .env("Q_RESET_ITERATIONS", "40")
+            .env_remove("Q_QUEST")
+            .output()
+            .unwrap()
+    });
+
+    // Stand in for the `SessionStart` hook the `/clear` would have fired.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    fleet.env.seed_event(
+        &quest_id,
+        Some(&fleet.master_id),
+        "session.start",
+        r#"{"source":"clear"}"#,
+    );
+
+    let out = reset.join().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    assert_eq!(parsed["action"], "reset");
+    assert_eq!(parsed["detail"]["cleared"], true);
+    assert_eq!(
+        fleet.env.last_event(&quest_id, "session.reset")["cleared"],
+        true
+    );
 }

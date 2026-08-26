@@ -12,6 +12,7 @@ pub mod list;
 pub mod new;
 pub mod peek;
 pub mod rename;
+pub mod reset;
 pub mod resume;
 pub mod rm;
 pub mod send;

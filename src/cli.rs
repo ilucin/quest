@@ -52,6 +52,9 @@ pub enum Command {
         /// First prompt for the master, from a file (`-` reads stdin)
         #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
         prompt_file: Option<String>,
+        /// Never auto-reset this Quest's master at the context threshold
+        #[arg(long)]
+        no_auto_reset: bool,
         /// Do not attach after creating
         #[arg(short = 'd', long)]
         detach: bool,
@@ -148,6 +151,20 @@ pub enum Command {
         /// Send even though the session is busy, waiting or starting
         #[arg(long)]
         force: bool,
+    },
+
+    /// Hand a session a fresh context window: `/clear` (plus a follow-up
+    /// prompt) or `/compact <goal>`
+    Reset {
+        /// `<quest>/<label>`, a session id, or `<label>` inside a Quest
+        session: String,
+        /// Seconds to wait first; also marks the scheduled path, where a
+        /// session that turned out busy is a skip rather than an error
+        #[arg(long, value_name = "N")]
+        delay: Option<u64>,
+        /// Defaults to `[context] reset_strategy`
+        #[arg(long, value_enum, value_name = "STRATEGY")]
+        strategy: Option<ResetStrategy>,
     },
 
     /// Kill a worker session's tmux window and end its row
@@ -390,17 +407,34 @@ pub enum QuestState {
     Finished,
 }
 
-/// TODO(M2): `auto_reset` has no column of its own in SPEC §4, and `brain`
-/// waits on the brain integration — neither is offered yet.
+/// TODO(M6): `brain` waits on the brain integration, so it is not offered yet.
 #[derive(ValueEnum, Clone, Copy, Debug)]
 #[value(rename_all = "snake_case")]
 pub enum SetKey {
     Goal,
     Cwd,
     Workflow,
+    AutoReset,
     CtxResetPct,
     BeadsEpic,
     BeadsRepo,
+}
+
+/// `[context] reset_strategy`, as `q reset --strategy` spells it.
+#[derive(ValueEnum, Clone, Copy, Debug)]
+#[value(rename_all = "lowercase")]
+pub enum ResetStrategy {
+    Clear,
+    Compact,
+}
+
+impl From<ResetStrategy> for crate::commands::reset::Strategy {
+    fn from(strategy: ResetStrategy) -> Self {
+        match strategy {
+            ResetStrategy::Clear => Self::Clear,
+            ResetStrategy::Compact => Self::Compact,
+        }
+    }
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
