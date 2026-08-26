@@ -96,10 +96,14 @@ impl Db {
             })
     }
 
-    /// Oldest first, so the master (window 0) leads the list.
+    /// Oldest first, so the master (window 0) leads the list. `started_at` is
+    /// second-precision and ids are random, so `rowid` — monotonic per insert —
+    /// breaks a same-second tie into spawn order.
     pub fn list_sessions_by_quest(&self, quest_id: &str) -> anyhow::Result<Vec<Session>> {
         self.query_sessions(
-            &format!("SELECT {COLUMNS} FROM session WHERE quest_id = ?1 ORDER BY started_at, id"),
+            &format!(
+                "SELECT {COLUMNS} FROM session WHERE quest_id = ?1 ORDER BY started_at, rowid"
+            ),
             [quest_id],
         )
     }
@@ -108,7 +112,7 @@ impl Db {
     pub fn list_live_sessions(&self) -> anyhow::Result<Vec<Session>> {
         self.query_sessions(
             &format!(
-                "SELECT {COLUMNS} FROM session WHERE status != 'ended' ORDER BY started_at, id"
+                "SELECT {COLUMNS} FROM session WHERE status != 'ended' ORDER BY started_at, rowid"
             ),
             [],
         )
@@ -184,7 +188,7 @@ impl Db {
             .query_row(
                 &format!(
                     "SELECT {COLUMNS} FROM session WHERE tmux_pane = ?1 AND status != 'ended' \
-                     ORDER BY started_at DESC, id DESC LIMIT 1"
+                     ORDER BY started_at DESC, rowid DESC LIMIT 1"
                 ),
                 [tmux_pane],
                 row_to_session,
@@ -228,7 +232,7 @@ impl Db {
                 &format!(
                     "SELECT {COLUMNS} FROM session WHERE claude_session_id = ?1 \
                      AND status != 'ended' AND (?2 IS NULL OR tmux_pane = ?2) \
-                     ORDER BY started_at DESC, id DESC LIMIT 1"
+                     ORDER BY started_at DESC, rowid DESC LIMIT 1"
                 ),
                 params![claude_session_id, tmux_pane],
                 row_to_session,

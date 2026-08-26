@@ -69,9 +69,12 @@ fn of_quest(quest: &Quest, sessions: Vec<Session>, all: bool) -> Vec<SessionView
         .into_iter()
         .partition(|s| s.status != SessionStatus::Ended);
     // Window order: the master is window 0, workers follow in spawn order.
-    // `started_at` is second-precision, so the id breaks a same-second tie.
-    live.sort_by_key(|s| (s.role != SessionRole::Master, s.started_at, s.id.clone()));
-    ended.sort_by(|a, b| b.ended_at.cmp(&a.ended_at).then(b.id.cmp(&a.id)));
+    // Both sorts are stable and the rows arrive in `rowid` order, so a
+    // same-second tie keeps the order the sessions were inserted in — never
+    // the random id's.
+    live.sort_by_key(|s| (s.role != SessionRole::Master, s.started_at));
+    ended.reverse();
+    ended.sort_by_key(|s| std::cmp::Reverse(s.ended_at));
     if !all {
         ended.truncate(RECENT_ENDED);
     }
@@ -169,6 +172,27 @@ mod tests {
         assert_eq!(
             labels(&of_quest(&q, rows, false)),
             ["master", "w1", "w2", "gone-new", "gone-old"]
+        );
+    }
+
+    /// Everything starting in the same second is the common case — a Quest and
+    /// its first workers — and the order must not depend on the random ids.
+    #[test]
+    fn a_same_second_tie_keeps_the_order_the_rows_arrived_in() {
+        let q = quest();
+        let live: Vec<Session> = ["w1", "w2", "w3"]
+            .iter()
+            .map(|l| session(&q, l, SessionStatus::Idle, 500))
+            .collect();
+        let ended: Vec<Session> = ["g1", "g2"]
+            .iter()
+            .map(|l| session(&q, l, SessionStatus::Ended, 500))
+            .collect();
+        let mut rows = live;
+        rows.extend(ended);
+        assert_eq!(
+            labels(&of_quest(&q, rows, false)),
+            ["w1", "w2", "w3", "g2", "g1"]
         );
     }
 

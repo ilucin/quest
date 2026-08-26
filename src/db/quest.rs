@@ -102,9 +102,13 @@ impl Db {
     }
 
     /// Newest first. Finished Quests are hidden unless asked for.
+    ///
+    /// `created_at` is second-precision and ids are random, so the tie-break is
+    /// `rowid`: SQLite hands it out monotonically, which makes "newest first"
+    /// mean insertion order whenever two Quests land in the same second.
     pub fn list_quests(&self, include_finished: bool) -> anyhow::Result<Vec<Quest>> {
         let sql = format!(
-            "SELECT {COLUMNS} FROM quest {} ORDER BY created_at DESC, id DESC",
+            "SELECT {COLUMNS} FROM quest {} ORDER BY created_at DESC, rowid DESC",
             if include_finished {
                 ""
             } else {
