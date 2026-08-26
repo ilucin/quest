@@ -30,6 +30,16 @@ pub fn stamp(ts: i64) -> String {
         .unwrap_or_else(|| ts.to_string())
 }
 
+/// UTC wall clock, second precision — for logs that are compared across
+/// machines.
+pub fn stamp_utc(ts: i64) -> String {
+    use chrono::{TimeZone, Utc};
+    Utc.timestamp_opt(ts, 0)
+        .single()
+        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
 /// `$HOME/x` as `~/x`. A path that merely starts with the same characters is
 /// left alone.
 pub fn tilde(path: &str) -> String {
@@ -71,7 +81,7 @@ pub fn or_dash(value: Option<&str>) -> String {
 }
 
 /// An event payload as `k=v k=v`; anything that is not an object falls back to
-/// its compact JSON.
+/// its compact JSON. Absent or empty payloads render as `-`.
 pub fn payload(payload: Option<&Value>, max: usize) -> String {
     let Some(value) = payload else {
         return "-".to_string();
@@ -85,6 +95,9 @@ pub fn payload(payload: Option<&Value>, max: usize) -> String {
             .join(" "),
         other => scalar(other),
     };
+    if text.is_empty() {
+        return "-".to_string();
+    }
     oneline(&text, max)
 }
 
@@ -149,6 +162,12 @@ mod tests {
     }
 
     #[test]
+    fn stamp_utc_is_second_precision_utc() {
+        assert_eq!(stamp_utc(0), "1970-01-01 00:00:00");
+        assert_eq!(stamp_utc(1_700_000_000), "2023-11-14 22:13:20");
+    }
+
+    #[test]
     fn tilde_only_replaces_a_whole_home_component() {
         assert_eq!(tilde_at("/Users/x", "/Users/x/Code/q"), "~/Code/q");
         assert_eq!(tilde_at("/Users/x/", "/Users/x"), "~");
@@ -173,6 +192,8 @@ mod tests {
         assert_eq!(payload(None, 80), "-");
         assert_eq!(payload(Some(&serde_json::Value::Null), 80), "-");
         assert_eq!(payload(Some(&serde_json::json!("plain")), 80), "plain");
+        assert_eq!(payload(Some(&serde_json::json!({})), 80), "-");
+        assert_eq!(payload(Some(&serde_json::json!("")), 80), "-");
     }
 
     #[test]
