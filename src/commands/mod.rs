@@ -7,14 +7,19 @@ pub mod events;
 pub mod fmt;
 pub mod hook;
 pub mod hook_capture;
+pub mod kill;
 pub mod list;
 pub mod new;
+pub mod peek;
 pub mod rename;
 pub mod resume;
 pub mod rm;
+pub mod send;
+pub mod sessions;
 pub mod set;
 pub mod show;
 pub mod spawn;
+pub mod target;
 
 // Agent self-report (bd-8lz.2.5).
 pub mod link;

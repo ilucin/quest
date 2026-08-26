@@ -29,7 +29,9 @@ fn q() -> TestCmd {
     // a real tmux server.
     cmd.env("Q_DB", dir.path().join("q.db"))
         .env("Q_CONFIG", dir.path().join("config.toml"))
-        .env("Q_FIXTURE", dir.path().join("tmux.json"));
+        .env("Q_FIXTURE", dir.path().join("tmux.json"))
+        // Never read the real `~/.claude/sessions`.
+        .env("Q_CLAUDE_SESSIONS_DIR", dir.path().join("registry"));
     TestCmd { dir, cmd }
 }
 
@@ -48,6 +50,7 @@ fn help_lists_subcommands() {
     for sub in [
         "new", "list", "show", "enter", "close", "resume", "rename", "set", "rm", "brief",
         "events", "doctor", "config", "phase", "note", "link", "links", "artifact", "spawn",
+        "sessions", "peek", "send", "kill",
     ] {
         assert!(out.contains(sub), "`{sub}` missing from --help:\n{out}");
     }
@@ -524,6 +527,9 @@ impl Env {
         cmd.env("Q_DB", self.dir.path().join("q.db"))
             .env("Q_CONFIG", self.dir.path().join("config.toml"))
             .env("Q_FIXTURE", self.dir.path().join("tmux.json"))
+            // Never read the real `~/.claude/sessions`; a test that wants a
+            // registry entry writes one with `Env::registry`.
+            .env("Q_CLAUDE_SESSIONS_DIR", self.dir.path().join("registry"))
             // The attach mode and the confirm refusal depend on them, so
             // neither leaks in from the terminal `cargo test` runs in.
             .env_remove("TMUX")
@@ -3914,4 +3920,500 @@ fn spawn_help_only_lists_the_implemented_flags() {
             "`{flag}` missing from `q spawn --help`:\n{out}"
         );
     }
+}
+
+// ------------------------------- q sessions / peek / send / kill (bd-8lz.3.2)
+
+impl Env {
+    /// Forces a session row where the hooks would have put it.
+    fn set_status(&self, session_id: &str, status: &str, claude_pid: Option<i64>) {
+        self.conn()
+            .execute(
+                "UPDATE session SET status = ?1, claude_pid = COALESCE(?2, claude_pid) WHERE id = ?3",
+                rusqlite::params![status, claude_pid, session_id],
+            )
+            .unwrap();
+    }
+
+    fn status_of(&self, session_id: &str) -> String {
+        self.conn()
+            .query_row(
+                "SELECT status FROM session WHERE id = ?1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// One `<pid>.json` in the stubbed Claude session registry.
+    fn registry(&self, pid: i64, json: &str) {
+        let dir = self.dir.path().join("registry");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{pid}.json")), json).unwrap();
+    }
+
+    /// What `send_keys` has written into a pane, per the tmux fixture.
+    fn buffer(&self, pane_id: &str) -> String {
+        self.fixture()["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["pane_id"] == pane_id)
+            .unwrap_or_else(|| panic!("no pane {pane_id}"))["buffer"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The `{"error": ..., "code": ...}` of a command that must fail.
+    fn json_err(&self, args: &[&str]) -> serde_json::Value {
+        let mut cmd = self.cmd();
+        let assert = cmd.args(args).arg("--json").assert().failure();
+        error_json(&assert)
+    }
+}
+
+/// A Quest with an idle worker: the state `q send` is designed for.
+struct Fleet {
+    env: Env,
+    quest_id: String,
+    master_id: String,
+    worker_id: String,
+    worker_pane: String,
+}
+
+impl Fleet {
+    fn new() -> Fleet {
+        let env = Env::new();
+        let created = env.new_quest("alpha");
+        let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
+        let master_id = created["session"]["id"].as_str().unwrap().to_string();
+        let worker = env.json(&["spawn", "alpha", "write the tests", "--label", "tests"]);
+        let worker_id = worker["session"]["id"].as_str().unwrap().to_string();
+        let worker_pane = worker["session"]["tmux_pane"].as_str().unwrap().to_string();
+        // Claude came up in both windows: `SessionStart` would say idle.
+        env.set_status(&master_id, "idle", Some(1001));
+        env.set_status(&worker_id, "idle", Some(1002));
+        Fleet {
+            env,
+            quest_id,
+            master_id,
+            worker_id,
+            worker_pane,
+        }
+    }
+}
+
+#[test]
+fn sessions_lists_the_fleet_and_one_quest() {
+    let fleet = Fleet::new();
+    let other = fleet.env.new_quest("beta");
+    let other_master = other["session"]["id"].as_str().unwrap().to_string();
+
+    // No target: every live session of every active Quest, master first.
+    let rows = fleet.env.json(&["sessions"]);
+    let names: Vec<(&str, &str)> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["quest_slug"].as_str().unwrap(),
+                r["label"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [("beta", "master"), ("alpha", "master"), ("alpha", "tests"),]
+    );
+    // The shape carries the whole session row plus its Quest.
+    let worker = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["label"] == "tests")
+        .unwrap();
+    assert_eq!(worker["id"], fleet.worker_id.as_str());
+    assert_eq!(worker["role"], "worker");
+    assert_eq!(worker["status"], "idle");
+    assert_eq!(worker["tmux_pane"], fleet.worker_pane.as_str());
+    assert_eq!(worker["machine"], rows[0]["machine"]);
+    assert!(worker["quest_slug"] == "alpha");
+
+    // A target: only that Quest's sessions, and no QUEST column is needed.
+    let alpha = fleet.env.json(&["sessions", "alpha"]);
+    assert_eq!(alpha.as_array().unwrap().len(), 2);
+    assert!(
+        alpha
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["quest_slug"] == "alpha")
+    );
+    assert_eq!(other_master.len(), fleet.master_id.len());
+
+    let text = String::from_utf8(
+        fleet
+            .env
+            .cmd()
+            .args(["sessions"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(text.starts_with("QUEST  LABEL"), "{text}");
+    assert!(text.contains("LAST PROMPT"), "{text}");
+    let scoped = String::from_utf8(
+        fleet
+            .env
+            .cmd()
+            .args(["sessions", "alpha"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(scoped.starts_with("LABEL"), "{scoped}");
+    assert!(!scoped.contains("beta"), "{scoped}");
+}
+
+#[test]
+fn sessions_hides_ended_rows_from_the_fleet_but_keeps_them_in_a_quest() {
+    let fleet = Fleet::new();
+    fleet.env.json(&["kill", "alpha/tests", "-f"]);
+
+    // Fleet view: only what is running.
+    let live: Vec<String> = fleet
+        .env
+        .json(&["sessions"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["label"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(live, ["master"]);
+
+    // Quest view: the ended worker is still there, after the live rows.
+    let rows = fleet.env.json(&["sessions", "alpha"]);
+    let shape: Vec<(&str, &str)> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["label"].as_str().unwrap(), r["status"].as_str().unwrap()))
+        .collect();
+    assert_eq!(shape, [("master", "idle"), ("tests", "ended")]);
+
+    // `--all` brings finished Quests and their ended sessions back.
+    fleet.env.json(&["close", "alpha", "-f"]);
+    assert_eq!(fleet.env.json(&["sessions"]).as_array().unwrap().len(), 0);
+    assert_eq!(
+        fleet
+            .env
+            .json(&["sessions", "--all"])
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    fleet
+        .env
+        .cmd()
+        .args(["sessions"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no sessions"));
+}
+
+#[test]
+fn peek_returns_the_panes_capture() {
+    let fleet = Fleet::new();
+    for line in ["one", "two", "three"] {
+        fleet.env.json(&["send", "alpha/tests", line]);
+    }
+
+    let out = fleet.env.json(&["peek", "alpha/tests"]);
+    assert_eq!(out["session"], fleet.worker_id.as_str());
+    assert_eq!(out["quest"], "alpha");
+    assert_eq!(out["label"], "tests");
+    assert_eq!(out["pane"], fleet.worker_pane.as_str());
+    assert_eq!(out["lines"], 40);
+    assert_eq!(out["text"], "one\ntwo\nthree");
+
+    // `--lines` is a tail, and the human rendering is the raw capture.
+    assert_eq!(
+        fleet.env.json(&["peek", "alpha/tests", "--lines", "2"])["text"],
+        "two\nthree"
+    );
+    fleet
+        .env
+        .cmd()
+        .args(["peek", "alpha/tests"])
+        .assert()
+        .success()
+        .stdout("one\ntwo\nthree\n");
+    assert_eq!(
+        fleet.env.json_err(&["peek", "alpha/tests", "--lines", "0"])["code"],
+        "invalid"
+    );
+}
+
+#[test]
+fn peek_and_send_refuse_an_ended_session() {
+    let fleet = Fleet::new();
+    fleet.env.json(&["kill", "alpha/tests", "-f"]);
+    for args in [
+        vec!["peek", "alpha/tests"],
+        vec!["send", "alpha/tests", "hello"],
+    ] {
+        let err = fleet.env.json_err(&args);
+        assert!(
+            err["error"].as_str().unwrap().contains("has ended"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn send_writes_into_the_pane_when_the_session_is_idle() {
+    let fleet = Fleet::new();
+    let out = fleet.env.json(&["send", "alpha/tests", "carry on"]);
+    assert_eq!(out["session"], fleet.worker_id.as_str());
+    assert_eq!(out["quest"], "alpha");
+    assert_eq!(out["text"], "carry on");
+    assert_eq!(out["forced"], false);
+    assert_eq!(out["status"], "idle");
+    // No registry entry for pid 1002: the database's `idle` stands alone.
+    assert_eq!(out["registry"]["verdict"], "unknown");
+
+    assert_eq!(fleet.env.buffer(&fleet.worker_pane), "carry on\n");
+    let payload = last_payload(&fleet.env, &fleet.quest_id, "session.send");
+    assert_eq!(payload["text"], "carry on");
+    assert_eq!(payload["forced"], false);
+    let session_of_event: String = fleet
+        .env
+        .conn()
+        .query_row(
+            "SELECT session_id FROM event WHERE quest_id = ?1 AND kind = 'session.send'",
+            [&fleet.quest_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(session_of_event, fleet.worker_id);
+
+    fleet
+        .env
+        .cmd()
+        .args(["send", "alpha/tests", "again"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sent to alpha/tests"));
+    assert_eq!(fleet.env.buffer(&fleet.worker_pane), "carry on\nagain\n");
+
+    assert_eq!(
+        fleet.env.json_err(&["send", "alpha/tests", "   "])["code"],
+        "invalid"
+    );
+}
+
+#[test]
+fn send_is_refused_when_the_database_says_the_session_is_not_idle() {
+    let fleet = Fleet::new();
+    for status in ["busy", "waiting", "starting"] {
+        fleet.env.set_status(&fleet.worker_id, status, None);
+        let err = fleet.env.json_err(&["send", "alpha/tests", "hello"]);
+        assert_eq!(err["code"], "conflict", "{err}");
+        let msg = err["error"].as_str().unwrap();
+        assert!(msg.contains(status), "{msg}");
+        assert!(msg.contains("--force"), "{msg}");
+        assert_eq!(fleet.env.buffer(&fleet.worker_pane), "");
+    }
+    // Nothing was sent, so nothing was logged.
+    assert_eq!(
+        fleet
+            .env
+            .count("SELECT count(*) FROM event WHERE kind = 'session.send'"),
+        0
+    );
+}
+
+#[test]
+fn send_is_refused_when_the_registry_says_the_session_is_waiting() {
+    let fleet = Fleet::new();
+    // The database is stale: the `Notification` hook never fired.
+    fleet.env.registry(
+        1002,
+        r#"{"pid":1002,"name":"alpha/tests","status":"waiting","waitingFor":"permission_prompt"}"#,
+    );
+    let err = fleet.env.json_err(&["send", "alpha/tests", "yes"]);
+    assert_eq!(err["code"], "conflict");
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains("permission_prompt"), "{msg}");
+    assert!(msg.contains("--force"), "{msg}");
+    assert_eq!(fleet.env.buffer(&fleet.worker_pane), "");
+
+    // A registry that says busy blocks too; one that says idle agrees.
+    fleet.env.registry(1002, r#"{"pid":1002,"status":"busy"}"#);
+    assert_eq!(
+        fleet.env.json_err(&["send", "alpha/tests", "yes"])["code"],
+        "conflict"
+    );
+    fleet.env.registry(1002, r#"{"pid":1002,"status":"idle"}"#);
+    let out = fleet.env.json(&["send", "alpha/tests", "yes"]);
+    assert_eq!(out["registry"]["verdict"], "idle");
+    assert_eq!(fleet.env.buffer(&fleet.worker_pane), "yes\n");
+
+    // Unparseable is no information at all, not a refusal.
+    fleet.env.registry(1002, "half-writ");
+    fleet.env.json(&["send", "alpha/tests", "still fine"]);
+    assert_eq!(fleet.env.buffer(&fleet.worker_pane), "yes\nstill fine\n");
+}
+
+#[test]
+fn force_sends_past_both_gates_and_records_that_it_did() {
+    let fleet = Fleet::new();
+    fleet.env.set_status(&fleet.worker_id, "busy", None);
+    let out = fleet.env.json(&["send", "alpha/tests", "stop", "--force"]);
+    assert_eq!(out["forced"], true);
+    assert_eq!(fleet.env.buffer(&fleet.worker_pane), "stop\n");
+    assert_eq!(
+        last_payload(&fleet.env, &fleet.quest_id, "session.send")["forced"],
+        true
+    );
+
+    fleet
+        .env
+        .registry(1002, r#"{"status":"waiting","waitingFor":"idle_prompt"}"#);
+    fleet.env.set_status(&fleet.worker_id, "idle", None);
+    fleet
+        .env
+        .cmd()
+        .args(["send", "alpha/tests", "go", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("forced past"))
+        .stdout(predicate::str::contains("idle_prompt"));
+}
+
+#[test]
+fn kill_ends_the_worker_and_removes_its_window() {
+    let fleet = Fleet::new();
+    let out = fleet.env.json(&["kill", "alpha/tests", "-f"]);
+    assert_eq!(out["session"]["id"], fleet.worker_id.as_str());
+    assert_eq!(out["session"]["status"], "ended");
+    assert_eq!(out["already_ended"], false);
+    assert_eq!(out["pane_killed"], true);
+    assert!(out["session"]["ended_at"].is_i64());
+
+    assert_eq!(fleet.env.status_of(&fleet.worker_id), "ended");
+    // The window is gone; the master's is not.
+    let panes = fleet.env.fixture()["panes"].as_array().unwrap().clone();
+    assert_eq!(panes.len(), 1);
+    assert_eq!(panes[0]["window_name"], "master");
+
+    let payload = last_payload(&fleet.env, &fleet.quest_id, "session.end");
+    assert_eq!(payload["reason"], "killed");
+    assert_eq!(payload["pane_killed"], true);
+    assert!(
+        event_kinds(&fleet.env, &fleet.quest_id).contains(&"session.end".to_string()),
+        "{:?}",
+        event_kinds(&fleet.env, &fleet.quest_id)
+    );
+
+    // Killing again is a no-op, not a second event.
+    let again = fleet.env.json(&["kill", "alpha/tests", "-f"]);
+    assert_eq!(again["already_ended"], true);
+    assert_eq!(
+        fleet
+            .env
+            .count("SELECT count(*) FROM event WHERE kind = 'session.end'"),
+        1
+    );
+}
+
+#[test]
+fn kill_refuses_the_master_even_with_force() {
+    let fleet = Fleet::new();
+    for args in [
+        vec!["kill", "alpha/master"],
+        vec!["kill", "alpha/master", "-f"],
+    ] {
+        let err = fleet.env.json_err(&args);
+        assert_eq!(err["code"], "invalid", "{err}");
+        let msg = err["error"].as_str().unwrap();
+        assert!(msg.contains("q close alpha"), "{msg}");
+    }
+    assert_eq!(fleet.env.status_of(&fleet.master_id), "idle");
+    assert_eq!(fleet.env.fixture()["panes"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn kill_asks_before_it_acts_unless_forced() {
+    let fleet = Fleet::new();
+    // Not a terminal, and `--json` refuses to ask at all.
+    let err = fleet.env.json_err(&["kill", "alpha/tests"]);
+    assert!(err["error"].as_str().unwrap().contains("-f"), "{err}");
+    assert_eq!(fleet.env.status_of(&fleet.worker_id), "idle");
+}
+
+#[test]
+fn a_session_target_resolves_by_id_bare_label_and_quest_fragment() {
+    let fleet = Fleet::new();
+
+    // A session id, from anywhere.
+    assert_eq!(
+        fleet.env.json(&["peek", &fleet.worker_id])["label"],
+        "tests"
+    );
+    // A Quest fragment plus a label.
+    assert_eq!(fleet.env.json(&["peek", "alp/tests"])["quest"], "alpha");
+
+    // A bare label needs `$Q_QUEST` — or a fleet-wide unique match.
+    let mut cmd = fleet.env.cmd();
+    let assert = cmd
+        .env("Q_QUEST", &fleet.quest_id)
+        .args(["peek", "tests", "--json"])
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["session"], fleet.worker_id.as_str());
+    assert_eq!(fleet.env.json(&["peek", "tests"])["quest"], "alpha");
+
+    // An unknown label lists what the Quest does have.
+    let err = fleet.env.json_err(&["peek", "alpha/nope"]);
+    assert_eq!(err["code"], "not_found");
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains("live: master, tests"), "{msg}");
+    assert_eq!(err["code"], "not_found");
+    assert_eq!(fleet.env.json_err(&["peek", "nope"])["code"], "not_found");
+}
+
+#[test]
+fn an_ambiguous_bare_label_lists_the_candidates() {
+    let fleet = Fleet::new();
+    // A second Quest with a worker of the same label.
+    fleet.env.new_quest("beta");
+    fleet
+        .env
+        .json(&["spawn", "beta", "and here too", "--label", "tests"]);
+
+    let err = fleet.env.json_err(&["peek", "tests"]);
+    assert_eq!(err["code"], "ambiguous");
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains("alpha/tests"), "{msg}");
+    assert!(msg.contains("beta/tests"), "{msg}");
+
+    // `$Q_QUEST` disambiguates, and so does an explicit Quest.
+    let mut cmd = fleet.env.cmd();
+    let assert = cmd
+        .env("Q_QUEST", &fleet.quest_id)
+        .args(["peek", "tests", "--json"])
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["quest"], "alpha");
+    assert_eq!(fleet.env.json(&["peek", "beta/tests"])["quest"], "beta");
 }

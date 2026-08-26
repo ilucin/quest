@@ -110,6 +110,43 @@ pub enum Command {
         no_attach: bool,
     },
 
+    /// List sessions: one Quest's, or every live one across active Quests
+    Sessions {
+        /// Defaults to every active Quest
+        quest: Option<String>,
+        /// Include ended sessions and finished Quests
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Print what a session's pane currently shows
+    Peek {
+        /// `<quest>/<label>`, a session id, or `<label>` inside a Quest
+        session: String,
+        /// How many trailing lines to capture
+        #[arg(long, value_name = "N", default_value_t = crate::commands::peek::DEFAULT_LINES)]
+        lines: usize,
+    },
+
+    /// Type a line into a session, if it is idle
+    Send {
+        /// `<quest>/<label>`, a session id, or `<label>` inside a Quest
+        session: String,
+        text: String,
+        /// Send even though the session is busy, waiting or starting
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Kill a worker session's tmux window and end its row
+    Kill {
+        /// `<quest>/<label>`, a session id, or `<label>` inside a Quest
+        session: String,
+        /// Do not ask for confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
+
     /// Rename a Quest's slug
     Rename { quest: String, slug: String },
 
