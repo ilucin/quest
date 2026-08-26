@@ -472,7 +472,7 @@ fn to_json(value: &toml::Value) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::to_value(value)?)
 }
 
-fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
     let io_err =
         |op: &str, e: std::io::Error| QError::Config(format!("{}: {op}: {e}", path.display()));
 
@@ -487,6 +487,10 @@ fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
         .unwrap_or_else(|| "config.toml".to_string());
     let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
     fs::write(&tmp, contents).map_err(|e| io_err("write", e))?;
+    // Keep the original mode (e.g. 600) instead of the tmp file's umask default.
+    if let Ok(meta) = fs::metadata(path) {
+        fs::set_permissions(&tmp, meta.permissions()).map_err(|e| io_err("chmod", e))?;
+    }
     fs::rename(&tmp, path).map_err(|e| io_err("rename", e))?;
     Ok(())
 }
@@ -529,15 +533,22 @@ fn get(ctx: &Ctx, key: Option<&str>) -> anyhow::Result<()> {
     )
 }
 
-fn set(ctx: &Ctx, key: &str, raw: &str) -> anyhow::Result<()> {
-    // Deliberately re-read the file rather than using `ctx.config`, so a
-    // `--machine` override for this invocation is never persisted.
-    // Parsed without validating: an invalid file can still be repaired by
-    // setting the one key that fixes it — only the result is validated.
+/// `q config set` as a library call. Deliberately re-reads the file rather
+/// than using `ctx.config`, so a `--machine` override for this invocation is
+/// never persisted. Parsed without validating: an invalid file can still be
+/// repaired by setting the one key that fixes it — only the result is
+/// validated.
+pub(crate) fn set_and_write(key: &str, raw: &str) -> anyhow::Result<Config> {
     let path = Config::path()?;
     let current = Config::parse_unchecked(&path)?;
     let updated = current.set_key(key, raw)?;
     write_atomic(&path, &updated.to_toml_string()?)?;
+    Ok(updated)
+}
+
+fn set(ctx: &Ctx, key: &str, raw: &str) -> anyhow::Result<()> {
+    let path = Config::path()?;
+    let updated = set_and_write(key, raw)?;
 
     let value = updated.get_key(key)?;
     let json = to_json(&value)?;
