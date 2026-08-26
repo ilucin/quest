@@ -4410,6 +4410,31 @@ fn multi_line_text_is_pasted_in_one_piece_rather_than_typed() {
     );
 }
 
+/// `\n` is not the only hazard: tmux rewrites a bare `\r` into one, and every
+/// other control byte typed into a TUI is the key it stands for (ESC leaves the
+/// prompt, Tab completes). Anything non-printable takes the paste path.
+#[test]
+fn carriage_returns_escapes_and_tabs_are_pasted_rather_than_typed() {
+    let fleet = Fleet::new();
+    let hazards = ["aaa\rbbb", "before\u{1b}[Aafter", "tab\there"];
+    for text in hazards {
+        let out = fleet.env.json(&["send", "alpha/tests", text]);
+        assert_eq!(out["pasted"], true, "{text:?}");
+        assert_eq!(out["text"], text);
+        assert_eq!(
+            last_payload(&fleet.env, &fleet.quest_id, "session.send")["pasted"],
+            true
+        );
+    }
+    assert_eq!(fleet.env.pastes(&fleet.worker_pane), hazards);
+
+    // A trailing `\r` is a line ending, not text: it is trimmed, and what is
+    // left is printable.
+    let out = fleet.env.json(&["send", "alpha/tests", "plain\r"]);
+    assert_eq!(out["pasted"], false);
+    assert_eq!(out["text"], "plain");
+}
+
 #[test]
 fn text_that_starts_with_a_dash_is_text_and_not_a_flag() {
     let fleet = Fleet::new();

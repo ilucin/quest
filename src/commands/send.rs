@@ -65,9 +65,12 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     }
 
     // A newline typed into a TUI is Enter, so a multi-line prompt would submit
-    // once per line. Bracketed paste is how a terminal says "these newlines
-    // are text"; a single line keeps the plain, verified send-keys path.
-    let pasted = text.contains('\n');
+    // once per line — and tmux rewrites a lone `\r` to the same thing. Every
+    // other control byte is a key of its own once typed (ESC leaves the prompt,
+    // Tab completes), so text carrying any of them goes in as a bracketed
+    // paste, which is how a terminal says "this is text". Plain text keeps the
+    // verified send-keys path.
+    let pasted = text.chars().any(char::is_control);
     if pasted {
         ctx.tmux().paste(&session.tmux_pane, text, true)?;
     } else {
