@@ -179,6 +179,26 @@ pub enum Command {
     /// Rename a Quest's slug
     Rename { quest: String, slug: String },
 
+    /// Propose (and optionally apply) an auto-generated slug (SPEC §10)
+    Name {
+        quest: String,
+        /// Ask `claude -p` for a slug, falling back to a heuristic
+        #[arg(long)]
+        auto: bool,
+        /// Rename the Quest to the proposal instead of only printing it
+        #[arg(long, requires = "auto")]
+        apply: bool,
+        /// Ignore any cached proposal for the same input
+        #[arg(long, requires = "auto")]
+        refresh: bool,
+        /// Re-run this command in the background and return immediately
+        #[arg(long, requires = "auto")]
+        detach: bool,
+        /// Let auto-naming take over a Quest that was named by hand
+        #[arg(long, requires = "apply")]
+        force: bool,
+    },
+
     /// Set a Quest property
     Set {
         quest: String,

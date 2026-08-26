@@ -9,7 +9,8 @@ use crate::model::{Session, SessionRole, SessionStatus, new_id, now};
 
 const COLUMNS: &str = "id, quest_id, role, label, tmux_session, tmux_pane, claude_pid, \
      claude_session_id, claude_name, workflow, phase, status, waiting_for, ctx_pct, \
-     ctx_updated_at, first_prompt, last_prompt, started_at, ended_at, updated_at";
+     ctx_updated_at, first_prompt, last_prompt, pending_rename, started_at, ended_at, \
+     updated_at";
 
 impl Db {
     /// Inserts `session`, regenerating its id on collision.
@@ -32,7 +33,7 @@ impl Db {
             &format!(
                 "INSERT INTO session ({COLUMNS}) VALUES \
                  (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-                  ?18, ?19, ?20)"
+                  ?18, ?19, ?20, ?21)"
             ),
             params![
                 s.id,
@@ -52,6 +53,7 @@ impl Db {
                 s.ctx_updated_at,
                 s.first_prompt,
                 s.last_prompt,
+                s.pending_rename,
                 s.started_at,
                 s.ended_at,
                 s.updated_at,
@@ -291,6 +293,32 @@ impl Db {
         self.require_session(id)
     }
 
+    /// The `/rename` this session still owes, or `None` to clear it (SPEC §10).
+    pub fn set_pending_rename(&self, id: &str, name: Option<&str>) -> anyhow::Result<Session> {
+        self.conn
+            .execute(
+                "UPDATE session SET pending_rename = ?1, updated_at = ?2 WHERE id = ?3",
+                params![name, now(), id],
+            )
+            .map_err(db_err)?;
+        self.require_session(id)
+    }
+
+    /// A `/rename` just went out: `name` is what Claude answers to from now on,
+    /// and nothing is owed any more. Recorded because the registry's identity
+    /// check is only as good as q's memory of the name it launched — and last
+    /// told — this session (SPEC §6, §10).
+    pub fn record_claude_name(&self, id: &str, name: &str) -> anyhow::Result<Session> {
+        self.conn
+            .execute(
+                "UPDATE session SET claude_name = ?1, pending_rename = NULL, \
+                 updated_at = ?2 WHERE id = ?3",
+                params![name, now(), id],
+            )
+            .map_err(db_err)?;
+        self.require_session(id)
+    }
+
     fn require_session(&self, id: &str) -> anyhow::Result<Session> {
         self.get_session(id)?
             .ok_or_else(|| QError::NotFound(format!("session `{id}`")).into())
@@ -316,6 +344,7 @@ fn row_to_session(row: &Row) -> rusqlite::Result<Session> {
         ctx_updated_at: row.get("ctx_updated_at")?,
         first_prompt: row.get("first_prompt")?,
         last_prompt: row.get("last_prompt")?,
+        pending_rename: row.get("pending_rename")?,
         started_at: row.get("started_at")?,
         ended_at: row.get("ended_at")?,
         updated_at: row.get("updated_at")?,

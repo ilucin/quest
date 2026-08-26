@@ -7,6 +7,10 @@
 //! ever writes to stdout (the brief as `additionalContext`). Outside a Quest
 //! pane — no `$Q_QUEST` — or without an existing database, nothing is read or
 //! written; a hook never creates the database.
+//!
+//! Inside a process q started for its own bookkeeping (`$Q_NAMING`, SPEC §10)
+//! no handler here runs at all: the dispatcher in `main.rs` short-circuits
+//! every `q hook <event>` on `naming::suppressed`.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -222,8 +226,11 @@ fn stop(db: &Db, session: &Session, payload: &Value) {
             json!({ "stop_hook_active": payload.get("stop_hook_active").and_then(Value::as_bool) }),
         )
     });
-    // TODO(bd-8lz.3): master auto-name check (SPEC §10) — regenerate the slug
-    // in the background when `name_source = auto` and the input hash changed.
+    // Both checks are non-blocking and independent; naming runs first because
+    // it is the cheaper one to rule out (a hash comparison, and a `/rename`
+    // that only types when one is held), and because a held `/rename` should
+    // reach Claude before a scheduled `/clear` does.
+    crate::naming::maybe_rename(db, session);
     crate::commands::reset::maybe_schedule(db, session);
 }
 

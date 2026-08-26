@@ -9,6 +9,7 @@ pub mod hook;
 pub mod hook_capture;
 pub mod kill;
 pub mod list;
+pub mod name;
 pub mod new;
 pub mod peek;
 pub mod rename;

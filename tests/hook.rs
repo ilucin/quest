@@ -32,6 +32,8 @@ impl Env {
             .env("Q_CONFIG", self.config())
             .env("Q_FIXTURE", self.dir.path().join("tmux.json"))
             .env("Q_CLAUDE_SETTINGS", self.settings())
+            // Never read the real `~/.claude/sessions`.
+            .env("Q_CLAUDE_SESSIONS_DIR", self.dir.path().join("registry"))
             // The handlers key off these; none may leak in from the terminal
             // `cargo test` runs in.
             .env_remove("Q_QUEST")
@@ -1391,4 +1393,304 @@ fn a_stale_context_reading_never_schedules_a_second_reset() {
             "session.reset_scheduled"
         ]
     );
+}
+
+// ------------------------------ auto-naming on the master's Stop (bd-8lz.3.5)
+
+/// A Quest whose master is the session the `hook` helper talks to, so the
+/// `Stop` handler sees the master of an auto-named Quest (SPEC §10).
+impl Env {
+    /// Quest `q-0001` (`alpha`, `name_source`) with its master `s-0001` on
+    /// pane `%7`, in `status`. The Quest's cwd is a plain temp directory, so
+    /// no git branch is in play.
+    fn seed_named_master(&self, name_source: &str, status: &str) {
+        self.q().arg("list").assert().success();
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO quest (id, slug, name_source, goal, cwd, machine, state, \
+             created_at, updated_at) VALUES ('q-0001', 'alpha', ?1, 'retry the backfill', \
+             ?2, 'laptop', 'active', 1, 1)",
+            rusqlite::params![name_source, self.dir.path().to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, quest_id, role, label, tmux_session, tmux_pane, \
+             status, first_prompt, started_at, updated_at) VALUES ('s-0001', 'q-0001', \
+             'master', 'master', 'q-alpha', '%7', ?1, 'retry the cdc backfill', 1, 1)",
+            [status],
+        )
+        .unwrap();
+    }
+
+    /// One pane in the tmux fixture, so send-keys has somewhere to land.
+    fn seed_pane(&self, session: &str, window: &str, pane_id: &str) {
+        std::fs::write(
+            self.dir.path().join("tmux.json"),
+            json!({
+                "panes": [{
+                    "pane_id": pane_id,
+                    "session_name": session,
+                    "window_name": window,
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn pane_buffer(&self, pane_id: &str) -> String {
+        let text = std::fs::read_to_string(self.dir.path().join("tmux.json")).unwrap();
+        let fixture: Value = serde_json::from_str(&text).unwrap();
+        fixture["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["pane_id"] == pane_id)
+            .unwrap_or_else(|| panic!("no pane {pane_id}: {fixture}"))["buffer"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Where a detached spawn records the argv it would have run.
+    fn spawns_path(&self) -> PathBuf {
+        self.dir.path().join("spawns.jsonl")
+    }
+
+    fn spawns(&self) -> Vec<Value> {
+        match fs::read_to_string(self.spawns_path()) {
+            Ok(text) => text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// `q hook <sub>` with the detached spawn stubbed out.
+    fn hook_no_detach(&self, sub: &str, payload: &Value) -> assert_cmd::assert::Assert {
+        self.q()
+            .env("Q_QUEST", "q-0001")
+            .env("Q_SESSION", "s-0001")
+            .env("Q_NO_DETACH", self.spawns_path())
+            .args(["hook", sub])
+            .write_stdin(payload.to_string())
+            .assert()
+    }
+
+    fn quest_column(&self, column: &str) -> Option<String> {
+        self.conn()
+            .query_row(
+                &format!("SELECT {column} FROM quest WHERE id = 'q-0001'"),
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+    }
+}
+
+#[test]
+fn the_masters_stop_hook_schedules_a_rename_when_the_naming_input_changed() {
+    let env = Env::new();
+    env.seed_named_master("auto", "busy");
+
+    env.hook_no_detach("stop", &json!({})).success().stdout("");
+
+    let spawns = env.spawns();
+    assert_eq!(spawns.len(), 1, "{spawns:?}");
+    // No `--detach`: the spawn already is the detach, and the flag would make
+    // the child fork a grandchild and exit (round-2 review, low #4).
+    assert_eq!(
+        spawns[0]["args"],
+        json!(["name", "q-0001", "--auto", "--apply"])
+    );
+    assert!(
+        spawns[0]["exe"].as_str().unwrap().ends_with("q"),
+        "{spawns:?}"
+    );
+
+    let kinds: Vec<String> = env.events().into_iter().map(|(k, _)| k).collect();
+    assert!(kinds.contains(&"name.scheduled".to_string()), "{kinds:?}");
+    let scheduled = env
+        .events()
+        .into_iter()
+        .find(|(k, _)| k == "name.scheduled")
+        .unwrap()
+        .1;
+    // The hook only records the hash; `q name --apply` is what stores it.
+    assert_eq!(scheduled["input_hash"].as_str().unwrap().len(), 64);
+    assert_eq!(env.quest_column("name_input_hash"), None);
+}
+
+#[test]
+fn a_manual_name_or_naming_auto_off_never_schedules_a_rename() {
+    for name_source in ["manual", "template"] {
+        let env = Env::new();
+        env.seed_named_master(name_source, "busy");
+        env.hook_no_detach("stop", &json!({})).success();
+        assert!(env.spawns().is_empty(), "{name_source} scheduled a rename");
+    }
+
+    let env = Env::new();
+    env.seed_named_master("auto", "busy");
+    env.q()
+        .args(["config", "set", "naming.auto", "false"])
+        .assert()
+        .success();
+    env.hook_no_detach("stop", &json!({})).success();
+    assert!(env.spawns().is_empty(), "naming.auto = false scheduled one");
+    let kinds: Vec<String> = env.events().into_iter().map(|(k, _)| k).collect();
+    assert!(!kinds.contains(&"name.scheduled".to_string()), "{kinds:?}");
+}
+
+#[test]
+fn an_unchanged_naming_input_is_not_scheduled_twice() {
+    let env = Env::new();
+    env.seed_named_master("auto", "busy");
+    env.seed_pane("q-alpha", "master", "%7");
+
+    // A real apply stamps `name_input_hash` from the same input the hook hashes.
+    let canned = env.dir.path().join("claude-name");
+    fs::write(&canned, "cdc-backfill\n").unwrap();
+    env.q()
+        .env("Q_FIXTURE_CLAUDE_NAME", &canned)
+        .args(["name", "q-0001", "--auto", "--apply"])
+        .assert()
+        .success();
+    assert_eq!(env.quest_column("slug").as_deref(), Some("cdc-backfill"));
+    let hash = env.quest_column("name_input_hash").unwrap();
+
+    env.hook_no_detach("stop", &json!({})).success();
+    assert!(env.spawns().is_empty(), "an unchanged input scheduled one");
+
+    // Change the goal and the same hook does schedule.
+    env.conn()
+        .execute(
+            "UPDATE quest SET goal = 'something else' WHERE id = 'q-0001'",
+            [],
+        )
+        .unwrap();
+    env.hook_no_detach("stop", &json!({})).success();
+    let spawns = env.spawns();
+    assert_eq!(spawns.len(), 1, "{spawns:?}");
+    assert_eq!(env.quest_column("name_input_hash"), Some(hash));
+}
+
+#[test]
+fn a_stop_hook_flushes_the_rename_its_session_still_owes() {
+    let env = Env::new();
+    env.seed_named_master("manual", "busy");
+    env.seed_pane("q-alpha", "master", "%7");
+    env.conn()
+        .execute(
+            "UPDATE session SET pending_rename = 'alpha/master' WHERE id = 's-0001'",
+            [],
+        )
+        .unwrap();
+
+    env.hook_no_detach("stop", &json!({})).success();
+
+    assert_eq!(env.pane_buffer("%7"), "/rename alpha/master\n");
+    assert_eq!(
+        env.conn()
+            .query_row(
+                "SELECT pending_rename FROM session WHERE id = 's-0001'",
+                [],
+                |r| r.get::<_, Option<String>>(0)
+            )
+            .unwrap(),
+        None
+    );
+    let kinds: Vec<String> = env.events().into_iter().map(|(k, _)| k).collect();
+    assert!(kinds.contains(&"name.synced".to_string()), "{kinds:?}");
+}
+
+#[test]
+fn a_stop_hook_holds_the_rename_while_claudes_registry_disagrees() {
+    let env = Env::new();
+    env.seed_named_master("manual", "busy");
+    env.seed_pane("q-alpha", "master", "%7");
+    env.conn()
+        .execute(
+            "UPDATE session SET pending_rename = 'alpha/master', claude_pid = 4242 \
+             WHERE id = 's-0001'",
+            [],
+        )
+        .unwrap();
+    let registry = env.dir.path().join("registry");
+    fs::create_dir_all(&registry).unwrap();
+    fs::write(
+        registry.join("4242.json"),
+        r#"{"status":"waiting","waitingFor":"permission_prompt"}"#,
+    )
+    .unwrap();
+
+    env.hook_no_detach("stop", &json!({})).success();
+
+    assert_eq!(env.pane_buffer("%7"), "", "sent into a permission prompt");
+    assert_eq!(
+        env.conn()
+            .query_row(
+                "SELECT pending_rename FROM session WHERE id = 's-0001'",
+                [],
+                |r| r.get::<_, Option<String>>(0)
+            )
+            .unwrap(),
+        Some("alpha/master".to_string())
+    );
+}
+
+/// The last line of defence for round-1 review blocking #1: `$Q_NAMING` marks
+/// a process q started to name a Quest, and no hook fired inside one may write
+/// — even with a full Quest environment around it. Without this, q's own hooks
+/// running inside the naming `claude -p` would overwrite the master's row,
+/// inject its brief into the naming prompt and schedule naming all over again.
+#[test]
+fn every_hook_is_a_no_op_inside_a_naming_subprocess() {
+    for sub in [
+        "session-start",
+        "user-prompt-submit",
+        "stop",
+        "notification",
+        "pre-compact",
+        "session-end",
+        "post-tool-use",
+        "statusline",
+    ] {
+        let env = Env::new();
+        env.seed_named_master("auto", "busy");
+        env.seed_pane("q-alpha", "master", "%7");
+        env.q()
+            .env("Q_QUEST", "q-0001")
+            .env("Q_SESSION", "s-0001")
+            .env("Q_NAMING", "1")
+            .env("Q_NO_DETACH", env.spawns_path())
+            .args(["hook", sub])
+            .write_stdin(json!({ "session_id": "abc", "prompt": "hello" }).to_string())
+            .assert()
+            .success()
+            .stdout("");
+        assert!(env.events().is_empty(), "{sub} wrote an event");
+        assert!(env.spawns().is_empty(), "{sub} spawned a naming run");
+        assert_eq!(env.pane_buffer("%7"), "", "{sub} typed into the pane");
+        assert_eq!(
+            env.conn()
+                .query_row("SELECT status FROM session WHERE id = 's-0001'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+            "busy",
+            "{sub} moved the session"
+        );
+    }
+}
+
+#[test]
+fn a_stop_hook_without_a_pending_rename_sends_nothing() {
+    let env = Env::new();
+    env.seed_named_master("manual", "busy");
+    env.seed_pane("q-alpha", "master", "%7");
+    env.hook_no_detach("stop", &json!({})).success();
+    assert_eq!(env.pane_buffer("%7"), "");
 }

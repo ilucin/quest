@@ -519,6 +519,10 @@ pub struct FixtureState {
     /// caller's cleanup path is reachable. Real tmux fails for its own reasons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fail_new_window: Option<String>,
+    /// The same for `rename_session`, which is how a rename fails once the
+    /// slug itself has been checked (SPEC §10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_rename_session: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -823,6 +827,9 @@ impl Tmux for FixtureTmux {
 
     fn rename_session(&self, old: &str, new: &str) -> anyhow::Result<()> {
         self.edit(|state| {
+            if let Some(msg) = &state.fail_rename_session {
+                return Err(QError::Tmux(msg.clone()).into());
+            }
             let mut found = false;
             for pane in state.panes.iter_mut().filter(|p| p.session_name == old) {
                 pane.session_name = new.to_string();
