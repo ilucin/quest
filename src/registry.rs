@@ -283,7 +283,9 @@ const NO_PID_REASON: &str = "no claude pid on record";
 pub const STALE_MS: i64 = 30 * 60 * 1000;
 
 /// What `q` knows about the session it is asking about, so an entry can be
-/// checked for identity and freshness before its status is believed.
+/// checked for identity and freshness before its status is believed. Every
+/// field is spelled out at the call site on purpose: an identity check that
+/// silently gets `None` is no check at all.
 #[derive(Debug, Clone, Copy)]
 pub struct Ask<'a> {
     /// `session.claude_pid`, when a `SessionStart` hook recorded one.
@@ -291,21 +293,14 @@ pub struct Ask<'a> {
     /// The pane's own process id: Claude runs under it, which is how the pid
     /// is found when no hook ever wrote one.
     pub pane_pid: Option<i64>,
-    /// `session.claude_name`, when one is known.
+    /// `<slug>/<label>` — the name `q` launched this session with (`claude -n
+    /// <slug>/<label>`, SPEC §6). Claude writes it back to the registry
+    /// verbatim, slash included (verified against Claude Code 2.1.246).
     pub name: Option<&'a str>,
+    /// `session.claude_session_id`, when a `SessionStart` hook recorded one.
+    pub session_id: Option<&'a str>,
     /// Now, in milliseconds — the clock `statusUpdatedAt` uses.
     pub now_ms: i64,
-}
-
-impl<'a> Ask<'a> {
-    pub fn new(pid: Option<i64>, pane_pid: Option<i64>, name: Option<&'a str>) -> Ask<'a> {
-        Ask {
-            pid,
-            pane_pid,
-            name,
-            now_ms: now_ms(),
-        }
-    }
 }
 
 pub fn now_ms() -> i64 {
@@ -341,14 +336,8 @@ pub fn verdict_in(dir: Option<&Path>, ask: Ask) -> Verdict {
 
 /// The same decision as `verdict_in`, on an already-parsed entry.
 pub fn verdict_of(entry: &Entry, ask: Ask) -> Verdict {
-    // A name Claude wrote that is not this session's means the file describes
-    // someone else — a reused pid, or one q never owned.
-    if let (Some(theirs), Some(ours)) = (entry.name.as_deref(), ask.name)
-        && theirs != ours
-    {
-        return Verdict::Unknown {
-            reason: "entry names another session",
-        };
+    if let Some(reason) = mismatch(entry, ask) {
+        return Verdict::Unknown { reason };
     }
     if entry
         .status_updated_at
@@ -374,6 +363,26 @@ pub fn verdict_of(entry: &Entry, ask: Ask) -> Verdict {
     }
 }
 
+/// Why this entry is about some other session, or `None` when nothing
+/// contradicts.
+///
+/// Pids are recycled and a registry file can outlive the process it described,
+/// so a file found by pid still has to prove whose it is. `sessionId` is the
+/// exact answer and is checked first; a Claude session can be renamed while it
+/// runs, so a name never overrules a `sessionId` that matches. When only one
+/// side has a `sessionId` the launch name is all there is to go on.
+fn mismatch(entry: &Entry, ask: Ask) -> Option<&'static str> {
+    match (entry.session_id.as_deref(), ask.session_id) {
+        (Some(theirs), Some(ours)) => {
+            (theirs != ours).then_some("entry is a different claude session")
+        }
+        _ => match (entry.name.as_deref(), ask.name) {
+            (Some(theirs), Some(ours)) => (theirs != ours).then_some("entry names another session"),
+            _ => None,
+        },
+    }
+}
+
 /// `verdict_in` against the configured directory.
 pub fn verdict(ask: Ask) -> Verdict {
     verdict_in(dir().as_deref(), ask)
@@ -389,6 +398,7 @@ mod tests {
             pid: Some(pid),
             pane_pid: None,
             name: None,
+            session_id: None,
             now_ms: 0,
         }
     }
@@ -613,6 +623,45 @@ mod tests {
     fn a_status_serializes_as_a_plain_string_in_every_arm() {
         let json = serde_json::to_string(&parse(r#"{"status":"hibernating"}"#).unwrap()).unwrap();
         assert!(json.contains(r#""status":"hibernating""#), "{json}");
+    }
+
+    /// `sessionId` is the exact identity, so it settles the question the name
+    /// can only guess at — including for a session the user renamed under q.
+    #[test]
+    fn a_session_id_decides_identity_and_a_rename_cannot_overrule_it() {
+        let entry =
+            parse(r#"{"status":"idle","sessionId":"s-1","name":"renamed by hand"}"#).unwrap();
+        let mine = Ask {
+            name: Some("alpha/master"),
+            session_id: Some("s-1"),
+            ..ask(1)
+        };
+        assert!(verdict_of(&entry, mine).agrees_idle());
+
+        let other = Ask {
+            session_id: Some("s-2"),
+            ..mine
+        };
+        assert_eq!(
+            verdict_of(&entry, other),
+            Verdict::Unknown {
+                reason: "entry is a different claude session"
+            }
+        );
+
+        // Only one side knowing a session id falls back to the launch name.
+        let no_id_on_the_row = Ask {
+            session_id: None,
+            ..mine
+        };
+        assert_eq!(
+            verdict_of(&entry, no_id_on_the_row),
+            Verdict::Unknown {
+                reason: "entry names another session"
+            }
+        );
+        let no_id_in_the_entry = parse(r#"{"status":"idle","name":"alpha/master"}"#).unwrap();
+        assert!(verdict_of(&no_id_in_the_entry, mine).agrees_idle());
     }
 
     #[test]

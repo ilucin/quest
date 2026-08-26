@@ -39,11 +39,17 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         .is_none()
         .then(|| pane_pid(ctx, &session.tmux_pane))
         .flatten();
-    let verdict = registry::verdict(Ask::new(
-        session.claude_pid,
-        pane,
-        session.claude_name.as_deref(),
-    ));
+    // Identity, so a recycled pid cannot make another session's entry speak
+    // for this one: `<slug>/<label>` is the name q launched Claude with, and
+    // the session id is the exact match when a hook recorded one.
+    let name = found.name();
+    let verdict = registry::verdict(Ask {
+        pid: session.claude_pid,
+        pane_pid: pane,
+        name: Some(&name),
+        session_id: session.claude_session_id.as_deref(),
+        now_ms: registry::now_ms(),
+    });
     let refusal = gate(session.status, &verdict);
     if let Some(reason) = &refusal
         && !args.force
@@ -53,8 +59,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
             .map(|h| format!(" ({h})"))
             .unwrap_or_default();
         return Err(QError::Conflict(format!(
-            "{} is not idle: {reason}{hint}. Pass --force to send anyway",
-            found.name()
+            "{name} is not idle: {reason}{hint}. Pass --force to send anyway"
         ))
         .into());
     }
@@ -93,12 +98,9 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
                 "status": session.status,
                 "registry": verdict,
             }),
-            || {
-                let name = found.name();
-                match &refusal {
-                    Some(reason) => format!("sent to {name} (forced past: {reason})"),
-                    None => format!("sent to {name}"),
-                }
+            || match &refusal {
+                Some(reason) => format!("sent to {name} (forced past: {reason})"),
+                None => format!("sent to {name}"),
             },
         )?;
     }

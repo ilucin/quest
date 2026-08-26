@@ -83,10 +83,12 @@ fn annotate(views: &mut [SessionView]) {
         let Some(pid) = view.session.claude_pid else {
             continue;
         };
+        let name = format!("{}/{}", view.quest_slug, view.session.label);
         let ask = Ask {
             pid: Some(pid),
             pane_pid: None,
-            name: view.session.claude_name.as_deref(),
+            name: Some(&name),
+            session_id: view.session.claude_session_id.as_deref(),
             now_ms,
         };
         let Some(said) = registry::verdict_in(dir.as_deref(), ask).status() else {

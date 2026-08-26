@@ -3935,6 +3935,16 @@ impl Env {
             .unwrap();
     }
 
+    /// The identity a `SessionStart` hook would have recorded.
+    fn set_claude_session_id(&self, session_id: &str, claude_session_id: &str) {
+        self.conn()
+            .execute(
+                "UPDATE session SET claude_session_id = ?1 WHERE id = ?2",
+                rusqlite::params![claude_session_id, session_id],
+            )
+            .unwrap();
+    }
+
     fn status_of(&self, session_id: &str) -> String {
         self.conn()
             .query_row(
@@ -4285,6 +4295,59 @@ fn send_is_refused_when_the_registry_says_the_session_is_waiting() {
     fleet.env.registry(1002, "half-writ");
     fleet.env.json(&["send", "alpha/tests", "still fine"]);
     assert_eq!(fleet.env.buffer(&fleet.worker_pane), "yes\nstill fine\n");
+}
+
+/// A registry entry found by pid can belong to another Claude: pids are
+/// recycled, and a file outlives the process it described. `q` asks about a
+/// session it named itself (`claude -n <slug>/<label>`) and — once a hook has
+/// run — about one exact session id; an entry matching neither is no evidence,
+/// in either direction.
+#[test]
+fn a_registry_entry_for_another_session_is_neither_believed_nor_a_refusal() {
+    let fleet = Fleet::new();
+    // Someone else's session, sitting on a permission prompt. Believing it
+    // would refuse a send the database has every right to allow.
+    fleet.env.registry(
+        1002,
+        r#"{"pid":1002,"name":"beta/other","status":"waiting","waitingFor":"permission_prompt"}"#,
+    );
+    let out = fleet.env.json(&["send", "alpha/tests", "carry on"]);
+    assert_eq!(out["registry"]["verdict"], "unknown");
+    assert_eq!(out["registry"]["reason"], "entry names another session");
+    assert_eq!(fleet.env.buffer(&fleet.worker_pane), "carry on\n");
+
+    // The other direction is the dangerous one: a foreign `idle` must not
+    // unlock a row that no hook ever moved off `starting`.
+    fleet.env.set_status(&fleet.worker_id, "starting", None);
+    fleet
+        .env
+        .registry(1002, r#"{"pid":1002,"name":"beta/other","status":"idle"}"#);
+    let err = fleet.env.json_err(&["send", "alpha/tests", "hello"]);
+    assert_eq!(err["code"], "conflict");
+    assert!(err["error"].as_str().unwrap().contains("starting"), "{err}");
+    assert_eq!(fleet.env.buffer(&fleet.worker_pane), "carry on\n");
+
+    // With a session id on the row, the name matching is not enough: this
+    // entry is a different Claude in the same pane's pid.
+    fleet.env.set_claude_session_id(&fleet.worker_id, "s-mine");
+    fleet.env.registry(
+        1002,
+        r#"{"pid":1002,"name":"alpha/tests","sessionId":"s-theirs","status":"idle"}"#,
+    );
+    assert_eq!(
+        fleet.env.json_err(&["send", "alpha/tests", "hello"])["code"],
+        "conflict"
+    );
+    assert_eq!(fleet.env.buffer(&fleet.worker_pane), "carry on\n");
+
+    // The session's own entry is believed, and unlocks the `starting` row.
+    fleet.env.registry(
+        1002,
+        r#"{"pid":1002,"name":"alpha/tests","sessionId":"s-mine","status":"idle"}"#,
+    );
+    let out = fleet.env.json(&["send", "alpha/tests", "hello"]);
+    assert_eq!(out["registry"]["verdict"], "idle");
+    assert_eq!(fleet.env.buffer(&fleet.worker_pane), "carry on\nhello\n");
 }
 
 #[test]
