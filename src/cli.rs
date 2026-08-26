@@ -121,6 +121,24 @@ pub enum Command {
         session: Option<String>,
     },
 
+    /// A Quest's event log, oldest first; `--follow` tails it (SPEC §16)
+    Events {
+        /// Defaults to $Q_QUEST
+        quest: Option<String>,
+        /// Keep polling and print new events as they arrive
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Only these kinds; exact (`note`) or prefix glob (`session.*`), repeatable
+        #[arg(short = 'k', long = "kind", value_name = "KIND")]
+        kinds: Vec<String>,
+        /// How many of the most recent events to show first
+        #[arg(short = 'n', long = "limit", value_name = "N", default_value_t = 50)]
+        limit: usize,
+        /// Only events of this session (id or label)
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+    },
+
     /// Check the local environment
     Doctor {
         /// Repair what can be repaired

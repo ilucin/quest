@@ -3,6 +3,7 @@
 pub mod brief;
 pub mod close;
 pub mod enter;
+pub mod events;
 pub mod fmt;
 pub mod hook;
 pub mod list;

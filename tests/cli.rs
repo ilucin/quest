@@ -47,7 +47,7 @@ fn help_lists_subcommands() {
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     for sub in [
         "new", "list", "show", "enter", "close", "resume", "rename", "set", "rm", "brief",
-        "doctor", "config",
+        "events", "doctor", "config",
     ] {
         assert!(out.contains(sub), "`{sub}` missing from --help:\n{out}");
     }
@@ -2166,4 +2166,260 @@ fn brief_reads_bd_and_brain_from_fixtures() {
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(out.contains("unavailable (bd missing or failed)"), "{out}");
     assert!(out.contains("_(brain note unavailable)_"), "{out}");
+}
+// ------------------------------------------------------------------ q events
+
+impl Env {
+    /// Appends an event directly, returning its id. `ts` climbs with the id so
+    /// ordering by either agrees.
+    fn seed_event(
+        &self,
+        quest_id: &str,
+        session_id: Option<&str>,
+        kind: &str,
+        payload: &str,
+    ) -> i64 {
+        let conn = self.conn();
+        let ts: i64 = conn
+            .query_row("SELECT COALESCE(MAX(ts), 0) + 1 FROM event", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO event (quest_id, session_id, ts, kind, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![quest_id, session_id, ts, kind, payload],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn master_id(&self, quest_id: &str) -> String {
+        self.conn()
+            .query_row(
+                "SELECT id FROM session WHERE quest_id = ?1 AND label = 'master'",
+                [quest_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn stdout(&self, args: &[&str]) -> String {
+        let mut cmd = self.cmd();
+        let assert = cmd.args(args).assert().success();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+    }
+}
+
+/// A quest whose log, after `q new`'s own events, holds the same five rows
+/// every events test reads.
+fn events_env(slug: &str) -> (Env, String, String) {
+    let env = Env::new();
+    let quest = env.new_quest(slug);
+    let id = quest["quest"]["id"].as_str().unwrap().to_string();
+    let master = env.master_id(&id);
+    env.seed_event(&id, Some(&master), "session.start", "null");
+    env.seed_event(&id, Some(&master), "note", r#"{"text":"first note"}"#);
+    env.seed_event(&id, None, "note", r#"{"text":"cli note"}"#);
+    env.seed_event(&id, Some(&master), "phase", r#"{"phase":"implementing"}"#);
+    env.seed_event(&id, Some(&master), "session.stop", "null");
+    (env, id, master)
+}
+
+fn kinds_in(out: &str) -> Vec<String> {
+    out.lines()
+        .map(|l| l.split("  ").nth(1).unwrap().trim().to_string())
+        .collect()
+}
+
+#[test]
+fn events_default_page_is_chronological_with_session_labels() {
+    let (env, _id, _master) = events_env("evt");
+    let out = env.stdout(&["events", "evt"]);
+    let kinds = kinds_in(&out);
+    assert_eq!(
+        &kinds[kinds.len() - 5..],
+        ["session.start", "note", "note", "phase", "session.stop"]
+    );
+    // `q new` recorded its own creation first.
+    assert_eq!(kinds[0], "quest.created", "{out}");
+    let note = out.lines().find(|l| l.contains("first note")).unwrap();
+    assert!(note.contains("[master]"), "{note}");
+    assert!(note.contains("text=first note"), "{note}");
+    let cli = out.lines().find(|l| l.contains("cli note")).unwrap();
+    assert!(cli.contains("[-]"), "{cli}");
+    // `YYYY-MM-DD HH:MM:SS` then two spaces.
+    let stamp = &note[..21];
+    assert!(
+        stamp.len() == 21
+            && &stamp[4..5] == "-"
+            && &stamp[10..11] == " "
+            && &stamp[13..14] == ":"
+            && &stamp[16..17] == ":"
+            && &stamp[19..21] == "  ",
+        "{note}"
+    );
+}
+
+#[test]
+fn events_limit_keeps_the_newest_n_oldest_first() {
+    let (env, _id, _master) = events_env("evt");
+    let out = env.stdout(&["events", "evt", "-n", "2"]);
+    assert_eq!(kinds_in(&out), ["phase", "session.stop"]);
+}
+
+#[test]
+fn events_kind_filters_exact_glob_and_multi() {
+    let (env, _id, _master) = events_env("evt");
+    assert_eq!(
+        kinds_in(&env.stdout(&["events", "evt", "--kind", "note"])),
+        ["note", "note"]
+    );
+    assert_eq!(
+        kinds_in(&env.stdout(&["events", "evt", "-k", "session.*"])),
+        ["session.start", "session.stop"]
+    );
+    assert_eq!(
+        kinds_in(&env.stdout(&["events", "evt", "-k", "phase", "-k", "session.stop"])),
+        ["phase", "session.stop"]
+    );
+    env.cmd()
+        .args(["events", "evt", "-k", "se*sion"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("trailing"));
+}
+
+#[test]
+fn events_session_filters_by_label_or_id() {
+    let (env, id, master) = events_env("evt");
+    let by_label = kinds_in(&env.stdout(&["events", "evt", "--session", "master", "-k", "note"]));
+    assert_eq!(by_label, ["note"]);
+    let by_id = env.json(&["events", &id, "--session", &master, "-k", "note"]);
+    assert_eq!(by_id.as_array().unwrap().len(), 1);
+    assert_eq!(by_id[0]["session_id"], master.as_str());
+    let mut cmd = env.cmd();
+    let assert = cmd
+        .args(["events", "evt", "--session", "ghost", "--json"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "not_found");
+}
+
+#[test]
+fn events_json_is_an_array_of_events() {
+    let (env, id, master) = events_env("evt");
+    let json = env.json(&["events", "evt", "-n", "3"]);
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[0]["kind"], "note");
+    assert_eq!(arr[0]["quest_id"], id.as_str());
+    assert_eq!(arr[0]["payload"]["text"], "cli note");
+    assert_eq!(arr[2]["kind"], "session.stop");
+    assert_eq!(arr[2]["session_id"], master.as_str());
+    assert!(arr[0]["id"].as_i64().unwrap() < arr[2]["id"].as_i64().unwrap());
+}
+
+#[test]
+fn events_resolves_the_quest_from_env_and_errors_without_one() {
+    let (env, id, _master) = events_env("evt");
+    env.cmd()
+        .arg("events")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Q_QUEST"));
+    let mut cmd = env.cmd();
+    let assert = cmd
+        .env("Q_QUEST", &id)
+        .args(["events", "-n", "1", "--json"])
+        .assert()
+        .success();
+    let json = json_of(&assert);
+    assert_eq!(json[0]["kind"], "session.stop");
+}
+
+#[test]
+fn events_follow_prints_rows_inserted_between_polls() {
+    let (env, id, master) = events_env("evt");
+    let db_path = env.dir.path().join("q.db");
+    let quest_id = id.clone();
+    let session_id = master.clone();
+    let inserter = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO event (quest_id, session_id, ts, kind, payload) \
+             VALUES (?1, ?2, 999999, 'note', '{\"text\":\"late\"}')",
+            rusqlite::params![quest_id, session_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO event (quest_id, session_id, ts, kind, payload) \
+             VALUES (?1, NULL, 999999, 'phase', '{\"phase\":\"done\"}')",
+            [&quest_id],
+        )
+        .unwrap();
+    });
+
+    let mut cmd = env.cmd();
+    let assert = cmd
+        .env("Q_FOLLOW_ITERATIONS", "4")
+        .args([
+            "events", "evt", "--follow", "-n", "1", "-k", "note", "--json",
+        ])
+        .assert()
+        .success();
+    inserter.join().unwrap();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    // NDJSON: the initial page and the late row, one object per line; the
+    // `phase` row is filtered out.
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l}")))
+        .collect();
+    assert_eq!(rows.len(), 2, "{out}");
+    assert_eq!(rows[0]["payload"]["text"], "cli note");
+    assert_eq!(rows[1]["payload"]["text"], "late");
+    assert_eq!(rows[1]["session_id"], master.as_str());
+
+    // Human follow renders the same stream as lines.
+    let mut cmd = env.cmd();
+    let assert = cmd
+        .env("Q_FOLLOW_ITERATIONS", "1")
+        .args(["events", "evt", "-f", "-n", "1"])
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_eq!(kinds_in(&out), ["phase"]);
+}
+
+#[test]
+fn events_follow_survives_a_closed_pipe() {
+    let (env, _id, _master) = events_env("evt");
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("q"))
+        .env("Q_DB", env.dir.path().join("q.db"))
+        .env("Q_CONFIG", env.dir.path().join("config.toml"))
+        .env("Q_FIXTURE", env.dir.path().join("tmux.json"))
+        .env("Q_FOLLOW_ITERATIONS", "1")
+        .env_remove("Q_QUEST")
+        .args(["events", "evt", "--follow"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

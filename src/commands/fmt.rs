@@ -30,6 +30,16 @@ pub fn stamp(ts: i64) -> String {
         .unwrap_or_else(|| ts.to_string())
 }
 
+/// UTC wall clock, second precision — for logs that are compared across
+/// machines.
+pub fn stamp_utc(ts: i64) -> String {
+    use chrono::{TimeZone, Utc};
+    Utc.timestamp_opt(ts, 0)
+        .single()
+        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
 /// `$HOME/x` as `~/x`. A path that merely starts with the same characters is
 /// left alone.
 pub fn tilde(path: &str) -> String {
@@ -146,6 +156,12 @@ mod tests {
         assert_eq!(age_at(now, now - 3 * 86_400), "3d");
         // A clock that went backwards must not print a negative age.
         assert_eq!(age_at(now, now + 500), "0s");
+    }
+
+    #[test]
+    fn stamp_utc_is_second_precision_utc() {
+        assert_eq!(stamp_utc(0), "1970-01-01 00:00:00");
+        assert_eq!(stamp_utc(1_700_000_000), "2023-11-14 22:13:20");
     }
 
     #[test]

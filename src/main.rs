@@ -240,6 +240,26 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             )
             .map(|()| 0)
         }
+        Command::Events {
+            quest,
+            follow,
+            kinds,
+            limit,
+            session,
+        } => {
+            let ctx = Ctx::with_db(args)?;
+            commands::events::run(
+                &ctx,
+                &commands::events::Args {
+                    quest: quest.as_deref(),
+                    kinds,
+                    session: session.as_deref(),
+                    limit: *limit,
+                    follow: *follow,
+                },
+            )
+            .map(|()| 0)
+        }
         Command::Rm { quest, force } => {
             let ctx = Ctx::with_db(args)?;
             commands::rm::run(&ctx, quest, *force).map(|()| 0)
