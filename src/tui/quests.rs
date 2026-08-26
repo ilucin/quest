@@ -1,5 +1,6 @@
 //! Quests tab (SPEC §17): grouped two-line rows, the beads bar, the master's
-//! context reading, and the detail panel behind `Enter`.
+//! context reading, the detail panel behind `Enter` and the attach behind
+//! `o`.
 //!
 //! The listing itself is not computed here — [`crate::commands::load_quests`]
 //! is the one definition of "the Quest listing", shared with `q list`, so the
@@ -14,7 +15,7 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::Ctx;
 use crate::commands::{QuestRow, fill_progress, fmt, load_quests};
-use crate::model::{DisplayState, Event, Link, Session, SessionRole, SessionStatus};
+use crate::model::{DisplayState, Event, Link, Quest, Session, SessionRole, SessionStatus};
 
 use super::app::{Action, App, Tab};
 use super::keys::Input;
@@ -22,7 +23,8 @@ use super::layout::{self, RowMode};
 
 /// The tab's own half of the `?` overlay.
 pub const HELP: &[(&str, &str)] = &[
-    ("Enter / o", "toggle the detail panel"),
+    ("o", "enter the master (attach to its tmux session)"),
+    ("Enter", "toggle the detail panel"),
     ("s", "this Quest's sessions"),
     ("n", "new Quest"),
     ("r / c / R", "rename · close · resume"),
@@ -322,10 +324,17 @@ pub fn handle(app: &mut App, input: Input) -> Action {
             app.quests.move_to(usize::MAX, page);
             Action::None
         }
-        // SPEC §17 binds Enter to attaching to the master. Attaching suspends
-        // the TUI and execs tmux, which is bd-8lz.4.3; until then Enter is the
-        // detail panel, which is what `o` will keep meaning afterwards.
-        Input::Enter | Input::Char('o') => toggle_detail(app),
+        // SPEC §17 contradicts itself: `Enter` toggles the detail panel two
+        // lines above, and `⏎/o` is "enter master (attach)" below. Reading it
+        // the other way — both keys attach — would leave the detail panel, an
+        // explicitly specified feature, with no binding at all, so this is the
+        // only self-consistent split. `o` attaches; `Enter`, the key that gets
+        // pressed by accident, only opens the panel rather than taking over
+        // the terminal. (Nothing to do with phone keyboards: §17 gives `Ctrl-J`
+        // as the Enter alias precisely for clients where Enter never arrives,
+        // so either reading is reachable there.)
+        Input::Char('o') => attach_selection(app),
+        Input::Enter => toggle_detail(app),
         Input::Esc => {
             if app.detail {
                 app.detail = false;
@@ -361,7 +370,7 @@ pub fn handle(app: &mut App, input: Input) -> Action {
         Input::Char('r') => selection_todo(app, "rename", "bd-8lz.4.4"),
         Input::Char('c') => selection_todo(app, "close", "bd-8lz.4.4"),
         Input::Char('R') => selection_todo(app, "resume", "bd-8lz.4.4"),
-        Input::Char('b') => selection_todo(app, "brief in a pager", "bd-8lz.4.3"),
+        Input::Char('b') => brief_selection(app),
         Input::Char('l') => show_links(app),
         _ => Action::None,
     }
@@ -418,6 +427,28 @@ fn typing(app: &mut App) {
     let query = app.quests.query.clone();
     let matched = app.quests.visible().len();
     app.say(format!("/{query}\u{2588}  {matched} matching"));
+}
+
+/// The Quest an attach or a brief would run against, cloned so the borrow of
+/// `app` ends with the lookup.
+pub fn selected_quest(app: &App) -> Option<Quest> {
+    app.quests.selected_row().map(|r| r.view.quest.clone())
+}
+
+/// `o` — the loop does the attaching; `handle` only says which key was hit.
+fn attach_selection(app: &mut App) -> Action {
+    match app.quests.selected_row() {
+        Some(_) => Action::Attach,
+        None => Action::None,
+    }
+}
+
+/// `b` — same shape: the pager is the loop's business (SPEC §17).
+fn brief_selection(app: &mut App) -> Action {
+    match app.quests.selected_row() {
+        Some(_) => Action::Brief,
+        None => Action::None,
+    }
 }
 
 fn toggle_detail(app: &mut App) -> Action {
@@ -1206,8 +1237,10 @@ mod tests {
         }
         // Still shows the list beside it at this width.
         assert!(text.contains("running"), "{text}");
-        // `o` is the same toggle.
-        handle(&mut app, Input::Char('o'));
+        // Enter closes it again; `o` is the attach and leaves it alone.
+        assert_eq!(handle(&mut app, Input::Char('o')), Action::Attach);
+        assert!(app.detail);
+        handle(&mut app, Input::Enter);
         assert!(!app.detail);
     }
 
@@ -1500,7 +1533,6 @@ mod tests {
             ('r', "bd-8lz.4.4"),
             ('c', "bd-8lz.4.4"),
             ('R', "bd-8lz.4.4"),
-            ('b', "bd-8lz.4.3"),
         ] {
             assert_eq!(handle(&mut app, Input::Char(key)), Action::None);
             assert!(app.status.contains(want), "{key}: {}", app.status);

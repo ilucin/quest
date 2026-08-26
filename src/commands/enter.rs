@@ -6,14 +6,26 @@ use crate::Ctx;
 use crate::commands::new::MASTER;
 use crate::commands::{attach_mode, live, sweep_quiet};
 use crate::error::QError;
-use crate::model::QuestState;
+use crate::model::{Quest, QuestState, Session};
 use crate::output;
 use crate::tmux::{session_name, window_of};
 
-pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
-    sweep_quiet(ctx)?;
-    let db = ctx.db()?;
-    let quest = db.resolve_quest(target)?;
+/// Where an attach would land. Every error building one is a reason not to
+/// attach at all, which is why the TUI (bd-8lz.4.3) resolves through here
+/// rather than growing a second attach path.
+pub struct Target {
+    pub tmux_session: String,
+    /// The `q` session the attach lands in — proven live by `resolve`.
+    pub session: Session,
+    /// The pane that *is* the session's identity (SPEC §6).
+    pub pane: String,
+    /// What tmux calls that pane's window, for the message; falls back to the
+    /// `q` session label when tmux cannot say.
+    pub window: String,
+}
+
+/// The tmux session and pane `label` (default: the master) names in `quest`.
+pub fn resolve(ctx: &Ctx, quest: &Quest, label: Option<&str>) -> anyhow::Result<Target> {
     if quest.state == QuestState::Finished {
         return Err(QError::Other(format!(
             "quest {} is finished; run `q resume {}`",
@@ -30,7 +42,7 @@ pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
         .into());
     }
 
-    let sessions = db.list_sessions_by_quest(&quest.id)?;
+    let sessions = ctx.db()?.list_sessions_by_quest(&quest.id)?;
     let wanted = label.unwrap_or(MASTER);
     let session = match live(&sessions).find(|s| s.label == wanted) {
         Some(session) => session,
@@ -72,21 +84,34 @@ pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
     // ever reported, and tmux is the one that knows it.
     let pane = session.tmux_pane.clone();
     let window = window_of(ctx.tmux(), &pane).unwrap_or_else(|| session.label.clone());
+    Ok(Target {
+        tmux_session,
+        session: session.clone(),
+        pane,
+        window,
+    })
+}
+
+pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
+    sweep_quiet(ctx)?;
+    let db = ctx.db()?;
+    let quest = db.resolve_quest(target)?;
+    let found = resolve(ctx, &quest, label)?;
 
     if ctx.json || !ctx.quiet {
         output::emit(
             ctx.json,
             &serde_json::json!({
                 "quest": quest,
-                "session": session,
-                "tmux_session": tmux_session,
-                "window": window,
+                "session": found.session,
+                "tmux_session": found.tmux_session,
+                "window": found.window,
                 "attach": attach_mode(ctx, true),
             }),
-            || format!("attaching to {tmux_session}:{window}"),
+            || format!("attaching to {}:{}", found.tmux_session, found.window),
         )?;
     }
     // A real attach replaces this process, so nothing buffered survives it.
     std::io::stdout().flush()?;
-    ctx.tmux().attach(&tmux_session, Some(&pane))
+    ctx.tmux().attach(&found.tmux_session, Some(&found.pane))
 }

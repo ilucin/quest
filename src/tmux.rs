@@ -86,6 +86,12 @@ pub trait Tmux {
     /// with `tmux attach` and therefore does not return on success. `pane`
     /// selects its window first.
     fn attach(&self, session: &str, pane: Option<&str>) -> anyhow::Result<()>;
+    /// [`Tmux::attach`] for a caller that needs its process back: outside tmux
+    /// the attach runs as a *child* and returns when the client detaches,
+    /// rather than replacing us. Inside tmux the two are the same thing — a
+    /// `switch-client` returns either way. The TUI's `[ui] return_after_detach`
+    /// is the only reason this exists.
+    fn attach_child(&self, session: &str, pane: Option<&str>) -> anyhow::Result<()>;
     fn send_keys(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()>;
     /// One bracketed paste, then Enter when asked — for text a TUI has to read
     /// as a single input even though it spans lines.
@@ -372,6 +378,43 @@ impl RealTmux {
             .into_iter()
             .find_map(|p| (p.pane_id == pane).then_some(p.session_name))
     }
+
+    /// The half both attach paths share: select the target window, and, when
+    /// we are already inside tmux, move the client there. `Ok(true)` means
+    /// that was the whole job and there is nothing left to `exec` or spawn.
+    fn switch_if_inside(&self, session: &str, pane: Option<&str>) -> anyhow::Result<bool> {
+        if let Some(p) = pane {
+            self.select_window(p)?;
+        }
+        if !in_tmux() {
+            return Ok(false);
+        }
+        // Already inside the target session: the window is selected and there
+        // is no client to move. `switch-client` would either be a no-op or
+        // fail on a session nobody is attached to.
+        if self.current_session().as_deref() == Some(session) {
+            return Ok(true);
+        }
+        match run(&args_switch_client(session)) {
+            Ok(_) => Ok(true),
+            // A detached session (`q new -d`, or the user let go of it) has no
+            // client to switch. The window is selected, so the next real
+            // attach lands on it — not worth failing the command over.
+            Err(e) if is_no_client(&e) => {
+                eprintln!("warning: {e:#}");
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// The two ways spawning `tmux attach` can fail before tmux itself runs.
+fn attach_failed(session: &str, e: &std::io::Error) -> QError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => QError::Tmux(TMUX_MISSING.to_string()),
+        _ => QError::Tmux(format!("cannot attach to `{session}`: {e}")),
+    }
 }
 
 impl Tmux for RealTmux {
@@ -409,35 +452,30 @@ impl Tmux for RealTmux {
     }
 
     fn attach(&self, session: &str, pane: Option<&str>) -> anyhow::Result<()> {
-        if let Some(p) = pane {
-            self.select_window(p)?;
-        }
-        if in_tmux() {
-            // Already inside the target session: the window is selected and
-            // there is no client to move. `switch-client` would either be a
-            // no-op or fail on a session nobody is attached to.
-            if self.current_session().as_deref() == Some(session) {
-                return Ok(());
-            }
-            if let Err(e) = run(&args_switch_client(session)) {
-                // A detached session (`q new -d`, or the user let go of it) has
-                // no client to switch. The window is selected, so the next real
-                // attach lands on it — not worth failing the command over.
-                if is_no_client(&e) {
-                    eprintln!("warning: {e:#}");
-                    return Ok(());
-                }
-                return Err(e);
-            }
+        if self.switch_if_inside(session, pane)? {
             return Ok(());
         }
         use std::os::unix::process::CommandExt;
         let e = Command::new("tmux").args(args_attach(session)).exec();
-        Err(match e.kind() {
-            std::io::ErrorKind::NotFound => QError::Tmux(TMUX_MISSING.to_string()),
-            _ => QError::Tmux(format!("cannot attach to `{session}`: {e}")),
+        Err(attach_failed(session, &e).into())
+    }
+
+    fn attach_child(&self, session: &str, pane: Option<&str>) -> anyhow::Result<()> {
+        if self.switch_if_inside(session, pane)? {
+            return Ok(());
         }
-        .into())
+        // Inherited stdio on purpose: `tmux attach` *is* the terminal until it
+        // detaches, and this call blocks for exactly that long.
+        let status = Command::new("tmux")
+            .args(args_attach(session))
+            .status()
+            .map_err(|e| attach_failed(session, &e))?;
+        if !status.success() {
+            return Err(
+                QError::Tmux(format!("`tmux attach` on `{session}` exited with {status}")).into(),
+            );
+        }
+        Ok(())
     }
 
     fn send_keys(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()> {
@@ -515,6 +553,18 @@ pub struct FixtureState {
     /// `attach` that precedes it.
     #[serde(default)]
     pub selected: Option<String>,
+    /// How the last attach would have been carried out by the real thing:
+    /// `switch` inside tmux, else `exec` (`q enter`, which never returns) or
+    /// `child` (the TUI's `[ui] return_after_detach`, which does). Recorded
+    /// because a fixture cannot imitate any of the three — it never replaces
+    /// or suspends its own process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_mode: Option<String>,
+    /// Poses as being inside (or outside) tmux, so a test need not write to
+    /// `$TMUX` — process-global state another test may be changing. `None`
+    /// falls back to the environment, like the real thing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_tmux: Option<bool>,
     /// Makes `new_window` fail with this message until a test clears it, so the
     /// caller's cleanup path is reachable. Real tmux fails for its own reasons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -652,6 +702,37 @@ impl FixtureTmux {
         self.save(&state)?;
         Ok(out)
     }
+
+    /// Both attaches, which differ only in what they do to the *caller's*
+    /// process — nothing a fixture can imitate, so it records which was asked
+    /// for instead.
+    fn record_attach(&self, session: &str, pane: Option<&str>, child: bool) -> anyhow::Result<()> {
+        let mode = if self.in_tmux() {
+            "switch"
+        } else if child {
+            "child"
+        } else {
+            "exec"
+        };
+        self.edit(|state| {
+            if !state.panes.iter().any(|p| p.session_name == session) {
+                return Err(QError::Tmux(format!("can't find session: {session}")).into());
+            }
+            if let Some(id) = pane {
+                // Real tmux would switch the client to wherever the pane lives;
+                // asking for one outside `session` is a bug in the caller.
+                if state.pane_mut(id)?.session_name != session {
+                    return Err(
+                        QError::Tmux(format!("pane {id} is not in session {session}")).into(),
+                    );
+                }
+                state.selected = Some(id.to_string());
+            }
+            state.attached = Some((session.to_string(), pane.map(str::to_string)));
+            state.attach_mode = Some(mode.to_string());
+            Ok(())
+        })
+    }
 }
 
 fn suffixed(path: &Path, suffix: &str) -> PathBuf {
@@ -777,23 +858,11 @@ impl Tmux for FixtureTmux {
     }
 
     fn attach(&self, session: &str, pane: Option<&str>) -> anyhow::Result<()> {
-        self.edit(|state| {
-            if !state.panes.iter().any(|p| p.session_name == session) {
-                return Err(QError::Tmux(format!("can't find session: {session}")).into());
-            }
-            if let Some(id) = pane {
-                // Real tmux would switch the client to wherever the pane lives;
-                // asking for one outside `session` is a bug in the caller.
-                if state.pane_mut(id)?.session_name != session {
-                    return Err(
-                        QError::Tmux(format!("pane {id} is not in session {session}")).into(),
-                    );
-                }
-                state.selected = Some(id.to_string());
-            }
-            state.attached = Some((session.to_string(), pane.map(str::to_string)));
-            Ok(())
-        })
+        self.record_attach(session, pane, false)
+    }
+
+    fn attach_child(&self, session: &str, pane: Option<&str>) -> anyhow::Result<()> {
+        self.record_attach(session, pane, true)
     }
 
     fn send_keys(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()> {
@@ -877,7 +946,10 @@ impl Tmux for FixtureTmux {
     }
 
     fn in_tmux(&self) -> bool {
-        in_tmux()
+        self.load()
+            .ok()
+            .and_then(|s| s.in_tmux)
+            .unwrap_or_else(in_tmux)
     }
 
     fn version(&self) -> anyhow::Result<String> {
@@ -1903,6 +1975,9 @@ mod tests {
             unreachable!()
         }
         fn attach(&self, _: &str, _: Option<&str>) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn attach_child(&self, _: &str, _: Option<&str>) -> anyhow::Result<()> {
             unreachable!()
         }
         fn send_keys(&self, _: &str, _: &str, _: bool) -> anyhow::Result<()> {

@@ -5,7 +5,8 @@
 //! * [`app`] is the pure key → state machine,
 //! * [`layout`] holds the responsive arithmetic,
 //! * `render` draws an `App` into any ratatui backend (`TestBackend` included),
-//! * only `run` below talks to a real terminal.
+//! * only `run` below talks to a real terminal, and [`handoff`] is the one
+//!   place that hands it to somebody else (tmux, a pager) and takes it back.
 //!
 //! The tab bodies (`quests`, `sessions`, `templates`, `events`) are stubs that
 //! later beads fill in against the seams they already expose.
@@ -14,8 +15,10 @@ pub mod app;
 pub mod events;
 pub mod keys;
 pub mod layout;
+pub mod pager;
 pub mod quests;
 pub mod sessions;
+mod signals;
 pub mod templates;
 
 use std::io::{self, Stdout, Write};
@@ -33,13 +36,15 @@ use crossterm::terminal::{
 };
 use ratatui::Frame;
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::Ctx;
+use crate::brief;
+use crate::commands::enter;
 
 use app::{Action, App, Tab};
 
@@ -103,6 +108,9 @@ struct Stdio;
 impl TermIo for Stdio {
     fn raw(&mut self, on: bool) -> io::Result<()> {
         if on {
+            // Before crossterm changes it, so a signal handler has the
+            // pristine line discipline to put back (bd-8lz.4.7).
+            signals::save_termios();
             enable_raw_mode()
         } else {
             disable_raw_mode()
@@ -188,7 +196,8 @@ fn arm_steps<T: TermIo>(io: &mut T, mouse: bool) -> io::Result<()> {
 }
 
 /// A terminal left in raw mode is the worst way for this to fail, so the hook
-/// goes in before raw mode does.
+/// — and the signal handlers that cover the other uncontrolled exit — go in
+/// before raw mode does.
 fn install_hook() {
     HOOK.call_once(|| {
         let previous = std::panic::take_hook();
@@ -197,6 +206,7 @@ fn install_hook() {
             previous(info);
         }));
     });
+    signals::install();
 }
 
 fn restore() {
@@ -205,10 +215,19 @@ fn restore() {
 
 /// Undoes exactly what is on, and nothing when nothing is: safe from the panic
 /// hook and the guard, in either order.
+///
+/// Each flag is cleared *after* its own undo, not all three up front: a signal
+/// landing between the two would otherwise find `plan(false, false, false)`,
+/// write nothing, and re-raise — leaving the process dead with ANY-MOTION
+/// mouse tracking still armed, which `signals`' own module doc calls the worst
+/// outcome there is. The cost is that the handler and this may both undo a
+/// step; every one of them (`?25h`, the mouse-off run, `?1049l`, `tcsetattr`)
+/// is idempotent, and the handler always dies, so no `Guard::drop` can follow
+/// it.
 fn restore_with<T: TermIo>(io: &mut T) {
-    let mouse = MOUSE_ON.swap(false, Ordering::SeqCst);
-    let alt = ALT_ON.swap(false, Ordering::SeqCst);
-    let raw = RAW_ON.swap(false, Ordering::SeqCst);
+    let mouse = MOUSE_ON.load(Ordering::SeqCst);
+    let alt = ALT_ON.load(Ordering::SeqCst);
+    let raw = RAW_ON.load(Ordering::SeqCst);
     if !(mouse || alt || raw) {
         return;
     }
@@ -219,14 +238,142 @@ fn restore_with<T: TermIo>(io: &mut T) {
     let _ = io.show_cursor();
     if mouse {
         let _ = io.mouse(false);
+        MOUSE_ON.store(false, Ordering::SeqCst);
     }
     if alt {
         let _ = io.alt(false);
+        ALT_ON.store(false, Ordering::SeqCst);
     }
     if raw {
         let _ = io.raw(false);
+        RAW_ON.store(false, Ordering::SeqCst);
     }
     let _ = io.flush();
+}
+
+// --------------------------------------------------------- handing it over
+
+/// Leave TUI mode, let `body` own the terminal, then take it back and force a
+/// full redraw.
+///
+/// The *one* mechanism: attaching to tmux and paging the brief are the same
+/// problem — a child that needs an ordinary terminal — and a second copy of
+/// this would be a second way to leak one. `body` is infallible from here;
+/// what it reports is the caller's to put in the status bar, while an `Err`
+/// out of `handoff` itself means the terminal did not come back and the TUI
+/// has to end.
+fn handoff<B, T, R>(
+    io: &mut T,
+    terminal: &mut Terminal<B>,
+    mouse: bool,
+    body: impl FnOnce() -> R,
+) -> anyhow::Result<R>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+    T: TermIo,
+{
+    restore_with(io);
+    let out = body();
+    // Re-armed whatever `body` did: an attach that failed must not leave the
+    // user staring at a shell with `q` still running and eating their keys.
+    // `arm_steps` sets each flag before the call that applies it, so a failure
+    // here still leaves the guard something to undo.
+    arm_steps(io, mouse)?;
+    // The alternate screen comes back blank while ratatui still believes it
+    // holds the last frame, so without this the next diff would draw nothing.
+    terminal.clear()?;
+    Ok(out)
+}
+
+/// `o` on the Quests tab (SPEC §17): hand the terminal to tmux.
+///
+/// Resolved through [`enter::resolve`] — the same check `q enter` makes — so a
+/// finished Quest, a tmux session that is gone and a master window that ended
+/// all say the same thing here as they do on the command line.
+fn attach<B, T>(
+    ctx: &Ctx,
+    io: &mut T,
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> anyhow::Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+    T: TermIo,
+{
+    let Some(quest) = quests::selected_quest(app) else {
+        return Ok(());
+    };
+    // The listing is as old as the last tick, and a master that died in the
+    // meantime would otherwise be attached to as if it were live — `q enter`
+    // sweeps first for the same reason. A sweep that fails is not reported
+    // here: `resolve` is about to consult the same tmux and will say so.
+    let _ = crate::commands::sweep_quiet(ctx);
+    let target = match enter::resolve(ctx, &quest, None) {
+        Ok(target) => target,
+        Err(e) => {
+            app.say(format!("cannot enter {}: {e:#}", quest.slug));
+            return Ok(());
+        }
+    };
+    if !ctx.config.ui.return_after_detach {
+        // Hand the terminal back for good: outside tmux the attach replaces
+        // this process and never returns, and inside it the client moves to
+        // the Quest, leaving nothing here worth drawing.
+        restore_with(io);
+        ctx.tmux()
+            .attach(&target.tmux_session, Some(&target.pane))?;
+        app.should_quit = true;
+        return Ok(());
+    }
+    let attached = handoff(io, terminal, app.mouse, || {
+        ctx.tmux()
+            .attach_child(&target.tmux_session, Some(&target.pane))
+    })?;
+    app.say(match attached {
+        // Inside tmux the attach is a `switch-client`: the client moves to the
+        // Quest and this process never lost anything, so "back from" would be
+        // reporting a round trip that did not happen.
+        Ok(()) if ctx.tmux().in_tmux() => format!("switched to {}", quest.slug),
+        Ok(()) => format!("back from {}", quest.slug),
+        Err(e) => format!("cannot enter {}: {e:#}", quest.slug),
+    });
+    Ok(())
+}
+
+/// `b` on the Quests tab (SPEC §17): the brief, in a pager.
+fn brief_in_pager<B, T>(
+    ctx: &Ctx,
+    io: &mut T,
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> anyhow::Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+    T: TermIo,
+{
+    let Some(quest) = quests::selected_quest(app) else {
+        return Ok(());
+    };
+    // Rendered before the handoff: a brief that cannot be built is a status
+    // message, not a reason to blank the screen and start a pager on nothing.
+    let markdown = match ctx
+        .db()
+        .and_then(|db| brief::render(db, &quest, &brief::Opts::default()))
+    {
+        Ok(markdown) => markdown,
+        Err(e) => {
+            app.say(format!("cannot brief {}: {e:#}", quest.slug));
+            return Ok(());
+        }
+    };
+    let paged = handoff(io, terminal, app.mouse, || pager::show(&markdown))?;
+    if let Err(e) = paged {
+        app.say(format!("cannot page the brief: {e:#}"));
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ the loop
@@ -296,6 +443,17 @@ fn event_loop(
             match action {
                 Action::Quit => break,
                 Action::Refresh => refresh_due = true,
+                // Both take the terminal away and give it back, so both need
+                // the screen rebuilt — and after an attach the Quest has very
+                // likely moved on, so the listing is reloaded too.
+                Action::Attach => {
+                    attach(ctx, &mut Stdio, terminal, app)?;
+                    refresh_due = true;
+                }
+                Action::Brief => {
+                    brief_in_pager(ctx, &mut Stdio, terminal, app)?;
+                    dirty = true;
+                }
                 Action::None => {}
             }
         }
@@ -429,11 +587,27 @@ fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+/// The right-hand chrome: the keys worth advertising on this tab.
+///
+/// The two that take over the terminal lead on Quests — nothing else on screen
+/// would say which key hands it to tmux or to a pager, and both are one
+/// keystroke from a blank screen. `x` gives way to them there and stays in the
+/// help overlay, which lists every binding: the segment is capped at two
+/// thirds of the row (`layout::right_segment`), and a hint that outgrows that
+/// is silently truncated from the right — losing `q quit`, the one key a stuck
+/// user needs. `the_status_hint_fits_the_segment_it_is_given` pins that.
+fn hint(tab: Tab) -> &'static str {
+    match tab {
+        Tab::Quests => " ? help · o attach · b brief · q quit ",
+        _ => " ? help · x refresh · q quit ",
+    }
+}
+
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     if area.height == 0 {
         return;
     }
-    let hint = " ? help · x refresh · q quit ";
+    let hint = hint(app.tab);
     // A reload that failed outranks a keypress's feedback: it is the reason
     // what is on screen may be stale.
     let left = match (app.refresh_error.as_deref(), app.current_status()) {
@@ -546,6 +720,18 @@ pub(crate) fn placeholder(frame: &mut Frame, area: Rect, title: &str, bead: &str
     );
 }
 
+/// The lifecycle flags are process-global, so every test that touches them —
+/// here and in [`signals`] — takes this first and always leaves them clear.
+#[cfg(test)]
+pub(super) fn lifecycle_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LIFECYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    RAW_ON.store(false, Ordering::SeqCst);
+    ALT_ON.store(false, Ordering::SeqCst);
+    MOUSE_ON.store(false, Ordering::SeqCst);
+    guard
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,7 +741,6 @@ mod tests {
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use ratatui::backend::TestBackend;
-    use std::sync::{Mutex, MutexGuard};
 
     fn draw(app: &mut App, w: u16, h: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -581,14 +766,6 @@ mod tests {
     // The statics `arm`/`restore` drive are process-global, so these tests take
     // a lock and always leave them clear.
 
-    static LIFECYCLE: Mutex<()> = Mutex::new(());
-
-    fn lifecycle_lock() -> MutexGuard<'static, ()> {
-        let guard = LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
-        clear_flags();
-        guard
-    }
-
     fn clear_flags() {
         RAW_ON.store(false, Ordering::SeqCst);
         ALT_ON.store(false, Ordering::SeqCst);
@@ -604,25 +781,35 @@ mod tests {
     }
 
     /// Records the escape/termios steps instead of performing them, and can be
-    /// told to fail at one of them.
+    /// told to fail at one of them — or to let a signal land after one.
     #[derive(Debug, Default)]
     struct FakeTerm {
         calls: Vec<&'static str>,
+        /// `(step, (raw, alt, mouse))` as each step was issued, so a teardown
+        /// that drops a flag too early is visible rather than merely narrow.
+        snapshots: Vec<(&'static str, (bool, bool, bool))>,
         fail_on: Option<&'static str>,
+        signal_after: Option<&'static str>,
     }
 
     impl FakeTerm {
         fn failing_at(step: &'static str) -> FakeTerm {
             FakeTerm {
-                calls: Vec::new(),
                 fail_on: Some(step),
+                ..FakeTerm::default()
             }
         }
 
         fn step(&mut self, name: &'static str) -> io::Result<()> {
             self.calls.push(name);
+            self.snapshots.push((name, flags()));
             if self.fail_on == Some(name) {
                 return Err(io::Error::other(name));
+            }
+            if self.signal_after == Some(name) {
+                // The real race: a SIGTERM delivered part way through the
+                // guard's own teardown.
+                signals::restore_from_signal();
             }
             Ok(())
         }
@@ -772,6 +959,65 @@ mod tests {
         restore_with(&mut term);
         assert_eq!(term.calls[0], "cursor show");
         assert!(term.calls.contains(&"alt off"));
+    }
+
+    /// N1 (round 1): the three flags used to be swapped to `false` *before*
+    /// any of the undo I/O, so a signal landing in that window found nothing
+    /// armed, wrote nothing, and re-raised — killing the process with
+    /// ANY-MOTION mouse tracking still on. Each flag now falls only once its
+    /// own step has actually run.
+    #[test]
+    fn every_flag_outlives_the_step_that_undoes_it() {
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        term.calls.clear();
+        term.snapshots.clear();
+
+        restore_with(&mut term);
+        assert_eq!(
+            term.snapshots,
+            [
+                // (raw, alt, mouse) as each step was issued.
+                ("cursor show", (true, true, true)),
+                ("mouse off", (true, true, true)),
+                ("alt off", (true, true, false)),
+                ("raw off", (true, false, false)),
+                ("flush", (false, false, false)),
+            ]
+        );
+        assert_eq!(flags(), (false, false, false));
+    }
+
+    /// The other half of N1: a signal really landing mid-teardown restores
+    /// everything the guard has not reached, and the guard walking its own
+    /// remaining steps on top of that is harmless — each one is idempotent.
+    #[test]
+    fn a_signal_part_way_through_the_teardown_undoes_the_rest() {
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        term.calls.clear();
+        term.snapshots.clear();
+        // After the cursor came back, before the mouse did.
+        term.signal_after = Some("cursor show");
+
+        let ((), escapes) = signals::capturing_output(|| restore_with(&mut term));
+
+        // The handler found the mouse and the alternate screen still armed.
+        let mut want = Vec::new();
+        want.extend_from_slice(b"\x1b[?25h");
+        want.extend_from_slice(b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+        want.extend_from_slice(b"\x1b[?1049l");
+        assert_eq!(escapes, want, "the signal restored nothing");
+        // And the guard finished its own sequence regardless.
+        assert_eq!(
+            term.calls,
+            ["cursor show", "mouse off", "alt off", "raw off", "flush"]
+        );
+        assert_eq!(flags(), (false, false, false));
     }
 
     /// The panic hook and the guard both restore, in whichever order they run.
@@ -1098,6 +1344,68 @@ mod tests {
         assert!(status.contains("q quit"), "{status:?}");
     }
 
+    /// N6 (round 1): the only status-bar assertion checked `? help`, which
+    /// both branches carry — swapping the two arms would have passed.
+    #[test]
+    fn the_status_hint_names_the_keys_the_tab_actually_has() {
+        // Quests' headline actions are the two that take over the terminal.
+        let quests = hint(Tab::Quests);
+        assert!(quests.contains("o attach"), "{quests:?}");
+        assert!(quests.contains("b brief"), "{quests:?}");
+        // The stub tabs have neither, and advertise the reload instead.
+        for tab in [Tab::Sessions, Tab::Templates, Tab::Events] {
+            let other = hint(tab);
+            assert!(!other.contains("attach"), "{tab:?}: {other:?}");
+            assert!(!other.contains("brief"), "{tab:?}: {other:?}");
+            assert!(other.contains("x refresh"), "{tab:?}: {other:?}");
+        }
+        // `?` and `q` are on every tab: one opens the list of everything the
+        // hint had no room for, the other is the way out.
+        for tab in Tab::ALL {
+            let h = hint(tab);
+            assert!(h.contains("? help"), "{tab:?}: {h:?}");
+            assert!(h.contains("q quit"), "{tab:?}: {h:?}");
+        }
+        // And `x` is still reachable on Quests, just from the overlay.
+        assert!(
+            app::help_rows(Tab::Quests)
+                .iter()
+                .any(|(k, _)| k.contains('x')),
+            "x fell out of the help overlay too"
+        );
+    }
+
+    /// The segment is capped at two thirds of the row, and `truncate` cuts
+    /// from the *right* — so a hint that outgrows its budget loses `q quit`
+    /// silently. 70 columns is the narrowest width the render sweep asserts
+    /// the chrome at.
+    #[test]
+    fn the_status_hint_fits_the_segment_it_is_given() {
+        for tab in Tab::ALL {
+            let h = hint(tab);
+            let want = layout::width(h) as u16;
+            assert_eq!(
+                layout::right_segment(70, want),
+                want,
+                "{tab:?}: {h:?} is {want} columns and does not fit at 70"
+            );
+        }
+    }
+
+    /// Rendered, not just returned: the arms have to reach the actual bar.
+    #[test]
+    fn the_status_bar_draws_the_active_tabs_hint() {
+        let mut app = app();
+        let quests = draw(&mut app, 100, 20).last().unwrap().clone();
+        assert!(quests.contains("o attach"), "{quests:?}");
+        assert!(quests.contains("b brief"), "{quests:?}");
+
+        app.handle(Input::Char('4'));
+        let events = draw(&mut app, 100, 20).last().unwrap().clone();
+        assert!(events.contains("x refresh"), "{events:?}");
+        assert!(!events.contains("o attach"), "{events:?}");
+    }
+
     #[test]
     fn the_status_bar_reports_the_narrow_row_mode() {
         let mut app = app();
@@ -1163,5 +1471,450 @@ mod tests {
         app.handle(Input::Char('?'));
         let lines = draw(&mut app, 20, 2);
         assert_eq!(lines.len(), 2);
+    }
+    // -------------------------------------------------- handing the terminal over
+    //
+    // The suspend/resume half of the TUI is the one a `TestBackend` cannot
+    // reach, and bd-8lz.4.1 shipped two terminal-leak blockers precisely
+    // because it went untested. `FakeTerm` records the escape/termios steps,
+    // so these assert the real ordered sequence.
+
+    /// A Quest with a live master, its tmux session, and a `Ctx` over both.
+    fn quest_ctx(
+        slug: &str,
+        state: crate::model::QuestState,
+        live_master: bool,
+        panes: &[(&str, &str)],
+    ) -> (Ctx, tempfile::TempDir) {
+        use crate::model::{Quest, Session, SessionRole, SessionStatus};
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let mut quest = Quest::new(slug, "/tmp/work", "laptop");
+        quest.goal = Some(format!("the goal of {slug}"));
+        quest.state = state;
+        let quest = db.insert_quest(&quest).unwrap();
+        let tmux_session = format!("q-{slug}");
+        let mut master = Session::new(
+            &quest.id,
+            SessionRole::Master,
+            "master",
+            &tmux_session,
+            "%1",
+        );
+        if !live_master {
+            master.status = SessionStatus::Ended;
+        }
+        db.insert_session(&master).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tmux.json");
+        let state = crate::tmux::FixtureState {
+            next_pane: 9,
+            panes: panes
+                .iter()
+                .map(|(session, id)| crate::tmux::FixturePane {
+                    pane_id: (*id).to_string(),
+                    pane_pid: 1234,
+                    session_name: (*session).to_string(),
+                    window_name: "master".to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
+        let tmux = Box::new(crate::tmux::FixtureTmux::new(path));
+        (Ctx::for_tests(Config::default(), db, tmux), dir)
+    }
+
+    /// The `Ctx` owns its `Box<dyn Tmux>` and will not hand it back, so what
+    /// an attach did is read off the fixture file itself.
+    fn fixture_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        dir.path().join("tmux.json")
+    }
+
+    fn fixture(dir: &tempfile::TempDir) -> crate::tmux::FixtureState {
+        crate::tmux::FixtureTmux::new(fixture_path(dir))
+            .load()
+            .unwrap()
+    }
+
+    fn loaded(ctx: &Ctx) -> App {
+        let mut app = App::new(&ctx.config, "laptop");
+        app.set_size(120, 30);
+        refresh_now(ctx, &mut app);
+        app
+    }
+
+    fn test_terminal() -> Terminal<TestBackend> {
+        Terminal::new(TestBackend::new(120, 30)).unwrap()
+    }
+
+    /// The whole point of `handoff`: the body runs on a terminal that is back
+    /// to normal, and TUI mode is rebuilt afterwards.
+    #[test]
+    fn a_handoff_leaves_tui_mode_and_comes_back_into_it() {
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        term.calls.clear();
+
+        let mut terminal = test_terminal();
+        let seen = handoff(&mut term, &mut terminal, true, || {
+            // tmux and the pager both need an ordinary terminal, and this is
+            // the only assertion that can prove they get one.
+            flags()
+        })
+        .expect("handoff");
+        assert_eq!(seen, (false, false, false), "the body ran in TUI mode");
+        assert_eq!(flags(), (true, true, true), "TUI mode never came back");
+        assert_eq!(
+            term.calls,
+            [
+                "cursor show",
+                "mouse off",
+                "alt off",
+                "raw off",
+                "flush",
+                "raw on",
+                "alt on",
+                "mouse on",
+            ]
+        );
+        restore_with(&mut term);
+    }
+
+    /// `[ui] mouse = false`: nothing is armed on the way back that was not
+    /// armed on the way in.
+    #[test]
+    fn a_handoff_does_not_arm_mouse_capture_the_config_turned_off() {
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, false).expect("arm");
+        std::mem::forget(guard);
+        term.calls.clear();
+
+        let mut terminal = test_terminal();
+        handoff(&mut term, &mut terminal, false, || ()).expect("handoff");
+        assert_eq!(flags(), (true, true, false));
+        assert_eq!(
+            term.calls,
+            [
+                "cursor show",
+                "alt off",
+                "raw off",
+                "flush",
+                "raw on",
+                "alt on"
+            ]
+        );
+        restore_with(&mut term);
+    }
+
+    /// bd-8lz.4.1 left this as the one way its `restore_with` early-return
+    /// could become reachable: a resume that fails half way has to leave the
+    /// guard something to undo, or the cursor stays hidden for good.
+    #[test]
+    fn a_resume_that_fails_still_leaves_the_guard_something_to_undo() {
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::failing_at("alt on");
+        RAW_ON.store(true, Ordering::SeqCst);
+        ALT_ON.store(true, Ordering::SeqCst);
+
+        let mut terminal = test_terminal();
+        let err = handoff(&mut term, &mut terminal, false, || ()).unwrap_err();
+        assert!(err.to_string().contains("alt on"), "{err}");
+        // Half armed — and armed is what makes the undo run at all.
+        assert_eq!(flags(), (true, true, false));
+        term.calls.clear();
+        restore_with(&mut term);
+        assert_eq!(term.calls[0], "cursor show");
+        assert_eq!(flags(), (false, false, false));
+    }
+
+    // ------------------------------------------------------------- attaching
+
+    #[test]
+    fn o_hands_the_terminal_to_tmux_and_takes_it_back() {
+        let (ctx, _dir) = quest_ctx(
+            "needs-me",
+            crate::model::QuestState::Active,
+            true,
+            &[("q-needs-me", "%1")],
+        );
+        let mut app = loaded(&ctx);
+        assert_eq!(app.handle(Input::Char('o')), Action::Attach);
+
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        term.calls.clear();
+        let mut terminal = test_terminal();
+        attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
+
+        let state = fixture(&_dir);
+        assert_eq!(
+            state.attached,
+            Some(("q-needs-me".to_string(), Some("%1".to_string())))
+        );
+        // Not `exec`: the TUI has to get its process back to redraw.
+        assert_eq!(state.attach_mode.as_deref(), Some("child"));
+        assert!(app.status.contains("back from needs-me"), "{}", app.status);
+        assert!(!app.should_quit);
+        assert_eq!(flags(), (true, true, true), "the TUI did not come back");
+        assert!(term.calls.contains(&"raw off"), "{:?}", term.calls);
+        assert!(term.calls.ends_with(&["mouse on"]), "{:?}", term.calls);
+        restore_with(&mut term);
+    }
+
+    /// Inside tmux there is no process to replace and nothing to wait for:
+    /// the client switches and the TUI keeps running in its own pane.
+    #[test]
+    fn attaching_from_inside_tmux_switches_the_client_instead() {
+        let (ctx, _dir) = quest_ctx(
+            "needs-me",
+            crate::model::QuestState::Active,
+            true,
+            &[("q-needs-me", "%1")],
+        );
+        let tmux = crate::tmux::FixtureTmux::new(fixture_path(&_dir));
+        let mut state = tmux.load().unwrap();
+        state.in_tmux = Some(true);
+        tmux.save(&state).unwrap();
+
+        let mut app = loaded(&ctx);
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        let mut terminal = test_terminal();
+        attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
+
+        assert_eq!(fixture(&_dir).attach_mode.as_deref(), Some("switch"));
+        // N9a: the client moved, this process never left — "back from" would
+        // be reporting a round trip that did not happen.
+        assert!(
+            app.status.contains("switched to needs-me"),
+            "{}",
+            app.status
+        );
+        assert!(!app.status.contains("back from"), "{}", app.status);
+        assert_eq!(flags(), (true, true, true));
+        restore_with(&mut term);
+    }
+
+    /// `[ui] return_after_detach = false`: the terminal is handed over for
+    /// good, so it must be restored *before* the attach and never taken back.
+    #[test]
+    fn return_after_detach_off_gives_the_terminal_away_and_quits() {
+        let (mut ctx, _dir) = quest_ctx(
+            "needs-me",
+            crate::model::QuestState::Active,
+            true,
+            &[("q-needs-me", "%1")],
+        );
+        ctx.config.ui.return_after_detach = false;
+        let mut app = loaded(&ctx);
+
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        term.calls.clear();
+        let mut terminal = test_terminal();
+        attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
+
+        assert_eq!(fixture(&_dir).attach_mode.as_deref(), Some("exec"));
+        assert!(app.should_quit, "the TUI kept running with no terminal");
+        assert_eq!(flags(), (false, false, false));
+        assert_eq!(
+            term.calls,
+            ["cursor show", "mouse off", "alt off", "raw off", "flush"],
+            "the terminal was not handed back before the exec"
+        );
+    }
+
+    /// Every reason not to attach is the same reason `q enter` gives, and none
+    /// of them may cost the user their screen.
+    #[test]
+    fn a_quest_that_cannot_be_entered_says_so_and_keeps_the_screen() {
+        for (what, live_master, panes, want) in [
+            ("no tmux session", true, &[][..], "no tmux session"),
+            (
+                "master ended",
+                false,
+                &[("q-needs-me", "%1")][..],
+                "master session of needs-me ended",
+            ),
+        ] {
+            let (ctx, _dir) = quest_ctx(
+                "needs-me",
+                crate::model::QuestState::Active,
+                live_master,
+                panes,
+            );
+            let mut app = loaded(&ctx);
+            let _lock = lifecycle_lock();
+            let mut term = FakeTerm::default();
+            let guard = arm(&mut term, true).expect("arm");
+            std::mem::forget(guard);
+            term.calls.clear();
+            let mut terminal = test_terminal();
+            attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
+
+            assert!(app.status.contains(want), "{what}: {}", app.status);
+            assert!(fixture(&_dir).attached.is_none(), "{what}: it attached");
+            // The screen was never given away, so there is nothing to rebuild.
+            assert!(term.calls.is_empty(), "{what}: {:?}", term.calls);
+            assert_eq!(flags(), (true, true, true), "{what}");
+            assert!(!app.should_quit, "{what}");
+            restore_with(&mut term);
+        }
+    }
+
+    /// A finished Quest is `q resume`'s business, from here as from the CLI.
+    #[test]
+    fn a_finished_quest_is_not_attachable_from_the_tui_either() {
+        let (ctx, _dir) = quest_ctx(
+            "shipped",
+            crate::model::QuestState::Finished,
+            true,
+            &[("q-shipped", "%1")],
+        );
+        let mut app = loaded(&ctx);
+        // Finished Quests are hidden until `f`, which needs the reload it asks
+        // for before there is anything to select.
+        assert_eq!(app.handle(Input::Char('f')), Action::Refresh);
+        refresh_now(&ctx, &mut app);
+
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let mut terminal = test_terminal();
+        attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
+        assert!(app.status.contains("is finished"), "{}", app.status);
+        assert!(fixture(&_dir).attached.is_none());
+    }
+
+    /// With nothing selected there is nothing to attach to, and the loop must
+    /// not blank the screen to find that out.
+    #[test]
+    fn attaching_with_an_empty_listing_does_nothing_at_all() {
+        let (ctx, _dir) = quest_ctx(
+            "needs-me",
+            crate::model::QuestState::Active,
+            true,
+            &[("q-needs-me", "%1")],
+        );
+        let mut app = App::new(&ctx.config, "laptop");
+        app.set_size(120, 30);
+        assert_eq!(app.handle(Input::Char('o')), Action::None);
+
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let mut terminal = test_terminal();
+        attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
+        assert!(term.calls.is_empty(), "{:?}", term.calls);
+        assert!(fixture(&_dir).attached.is_none());
+    }
+
+    // ---------------------------------------------------------- the `b` pager
+
+    #[test]
+    fn b_pages_the_selections_brief_through_the_same_handoff() {
+        let (ctx, _dir) = quest_ctx(
+            "needs-me",
+            crate::model::QuestState::Active,
+            true,
+            &[("q-needs-me", "%1")],
+        );
+        let mut app = loaded(&ctx);
+        assert_eq!(app.handle(Input::Char('b')), Action::Brief);
+
+        let out = _dir.path().join("paged.md");
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        term.calls.clear();
+        let mut terminal = test_terminal();
+        pager::with_pager(Some(&format!("tee {}", out.display())), || {
+            brief_in_pager(&ctx, &mut term, &mut terminal, &mut app).expect("brief");
+        });
+
+        let paged = std::fs::read_to_string(&out).unwrap();
+        assert!(paged.contains("needs-me"), "{paged}");
+        assert!(paged.contains("the goal of needs-me"), "{paged}");
+        // Same one mechanism as the attach, in the same order.
+        assert_eq!(
+            term.calls,
+            [
+                "cursor show",
+                "mouse off",
+                "alt off",
+                "raw off",
+                "flush",
+                "raw on",
+                "alt on",
+                "mouse on",
+            ]
+        );
+        assert_eq!(flags(), (true, true, true));
+        restore_with(&mut term);
+    }
+
+    /// A pager that will not start is a status message; the TUI is still there
+    /// underneath it.
+    #[test]
+    fn a_pager_that_cannot_start_is_reported_and_the_tui_comes_back() {
+        let (ctx, _dir) = quest_ctx(
+            "needs-me",
+            crate::model::QuestState::Active,
+            true,
+            &[("q-needs-me", "%1")],
+        );
+        let mut app = loaded(&ctx);
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        let mut terminal = test_terminal();
+        pager::with_pager(Some("q-no-such-pager-exists"), || {
+            brief_in_pager(&ctx, &mut term, &mut terminal, &mut app).expect("brief");
+        });
+        assert!(
+            app.status.contains("cannot page the brief"),
+            "{}",
+            app.status
+        );
+        assert_eq!(flags(), (true, true, true));
+        restore_with(&mut term);
+    }
+
+    // ----------------------------------------------------------- signals (4.7)
+
+    /// bd-8lz.4.7: a signal has to undo exactly what the guard would have, and
+    /// the two must not both do it — whichever gets there first wins.
+    #[test]
+    fn a_signal_restore_and_the_guard_cannot_both_undo_the_terminal() {
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        term.calls.clear();
+
+        // Everything the handler does short of re-raising, which would take
+        // the test runner with it — with its output pointed at a pipe, since
+        // `libc::write` bypasses libtest's capture and would otherwise put
+        // these escapes on the developer's own terminal.
+        let ((), escapes) = signals::capturing_output(signals::restore_from_signal);
+        assert!(!escapes.is_empty(), "the handler restored nothing");
+        assert!(escapes.starts_with(b"\x1b[?25h"), "{escapes:?}");
+        assert_eq!(flags(), (false, false, false));
+
+        // The guard now has nothing left to do, so a `q` that was killed mid
+        // teardown cannot double-write the escapes.
+        restore_with(&mut term);
+        assert!(term.calls.is_empty(), "{:?}", term.calls);
     }
 }
