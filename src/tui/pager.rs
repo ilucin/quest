@@ -14,13 +14,26 @@ use crate::error::QError;
 const DEFAULT: &[&str] = &["less", "-R"];
 
 /// The pager to run: `$PAGER` when it is set to something, else [`DEFAULT`].
+pub fn command() -> Vec<String> {
+    #[cfg(test)]
+    if let Some(argv) = test_override() {
+        return argv;
+    }
+    command_from(std::env::var("PAGER").ok().as_deref())
+}
+
+/// The whole decision, as a pure function of what `$PAGER` says — so the
+/// parsing is tested without a process environment anywhere near it.
 ///
 /// Split on whitespace rather than run through a shell: `$PAGER` is a command
 /// with flags (`less -R`), not a script, and a TUI must not hand a user's
 /// environment to `sh -c`.
-pub fn command() -> Vec<String> {
-    let configured = std::env::var("PAGER").unwrap_or_default();
-    let parts: Vec<String> = configured.split_whitespace().map(str::to_string).collect();
+fn command_from(configured: Option<&str>) -> Vec<String> {
+    let parts: Vec<String> = configured
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
     if parts.is_empty() {
         return DEFAULT.iter().map(|s| (*s).to_string()).collect();
     }
@@ -32,7 +45,10 @@ pub fn command() -> Vec<String> {
 /// The terminal is already out of TUI mode by the time this runs, so the child
 /// inherits a normal one and can do whatever it likes with it.
 pub fn show(text: &str) -> anyhow::Result<()> {
-    let argv = command();
+    show_with(&command(), text)
+}
+
+fn show_with(argv: &[String], text: &str) -> anyhow::Result<()> {
     let (program, args) = argv.split_first().expect("command is never empty");
     let mut child = Command::new(program)
         .args(args)
@@ -57,29 +73,41 @@ pub fn show(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run `f` with `$PAGER` set to `value`, then put the environment back.
-/// The variable is process-global, so every test that sets it — here and in
-/// the TUI's own — has to share this one lock.
+/// What [`command`] returns while a test is steering it.
+#[cfg(test)]
+static OVERRIDE: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn test_override() -> Option<Vec<String>> {
+    OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Run `f` as if `$PAGER` were `value`.
+///
+/// Deliberately *not* `set_var`/`remove_var`: `setenv(3)` is unsafe against
+/// concurrent *readers*, not just writers, so no lock held by the setters can
+/// make it sound — and this binary's other tests read the environment
+/// (`Q_DB`, `Q_CONFIG`, `Q_FIXTURE`, `TMUX`) on other threads throughout.
+/// An override [`command`] consults instead is the same steering with none of
+/// the process-global blast radius; the serial lock only keeps two tests from
+/// steering it at once.
 #[cfg(test)]
 pub(super) fn with_pager<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
-    static PAGER_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _lock = PAGER_ENV.lock().unwrap_or_else(|e| e.into_inner());
-    let previous = std::env::var_os("PAGER");
-    // Safety: single-threaded within the lock, and put back below.
-    unsafe {
-        match value {
-            Some(v) => std::env::set_var("PAGER", v),
-            None => std::env::remove_var("PAGER"),
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            *OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
-    let out = f();
-    unsafe {
-        match previous {
-            Some(v) => std::env::set_var("PAGER", v),
-            None => std::env::remove_var("PAGER"),
-        }
-    }
-    out
+
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // Declared after the lock, so it clears the override before releasing it —
+    // and clears it even if `f` unwinds.
+    let _reset = Reset;
+    *OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(command_from(value));
+    f()
 }
 
 #[cfg(test)]
@@ -88,15 +116,34 @@ mod tests {
 
     #[test]
     fn the_pager_comes_from_the_environment_with_a_working_default() {
-        with_pager(None, || assert_eq!(command(), DEFAULT));
+        assert_eq!(command_from(None), DEFAULT);
         // Set but empty, and set to nothing but spaces: both mean "unset".
-        with_pager(Some(""), || assert_eq!(command(), DEFAULT));
-        with_pager(Some("   "), || assert_eq!(command(), DEFAULT));
+        assert_eq!(command_from(Some("")), DEFAULT);
+        assert_eq!(command_from(Some("   ")), DEFAULT);
         // Flags come along; the program is never handed to a shell.
-        with_pager(Some("less -R"), || assert_eq!(command(), ["less", "-R"]));
-        with_pager(Some("bat  --paging always"), || {
-            assert_eq!(command(), ["bat", "--paging", "always"]);
+        assert_eq!(command_from(Some("less -R")), ["less", "-R"]);
+        assert_eq!(
+            command_from(Some("bat  --paging always")),
+            ["bat", "--paging", "always"]
+        );
+    }
+
+    /// B1 (round 1): `with_pager` used to `setenv`, which is UB against every
+    /// other thread of a parallel test binary that reads the environment.
+    /// Steering the pager must leave `environ` exactly as it found it.
+    #[test]
+    fn steering_the_pager_never_touches_the_process_environment() {
+        let before = std::env::var_os("PAGER");
+        with_pager(Some("tee /dev/null"), || {
+            assert_eq!(command(), ["tee", "/dev/null"]);
+            assert_eq!(std::env::var_os("PAGER"), before, "$PAGER was written");
         });
+        assert_eq!(std::env::var_os("PAGER"), before, "$PAGER was left behind");
+        // And the override is gone, so an unsteered call reads the real thing.
+        assert_eq!(
+            command(),
+            command_from(std::env::var("PAGER").ok().as_deref())
+        );
     }
 
     /// The brief has to reach the pager's stdin, and the call has to come back
@@ -105,9 +152,8 @@ mod tests {
     fn the_text_reaches_the_pager_and_the_call_returns() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("paged");
-        with_pager(Some(&format!("tee {}", out.display())), || {
-            show("# brief\n\nsecond line\n").unwrap();
-        });
+        let argv = command_from(Some(&format!("tee {}", out.display())));
+        show_with(&argv, "# brief\n\nsecond line\n").unwrap();
         let seen = std::fs::read_to_string(&out).unwrap();
         assert!(seen.contains("second line"), "{seen}");
     }
@@ -116,9 +162,8 @@ mod tests {
     /// session.
     #[test]
     fn a_missing_pager_is_reported_rather_than_swallowed() {
-        with_pager(Some("q-no-such-pager-exists"), || {
-            let e = show("text").unwrap_err();
-            assert!(format!("{e:#}").contains("cannot run pager"), "{e:#}");
-        });
+        let argv = command_from(Some("q-no-such-pager-exists"));
+        let e = show_with(&argv, "text").unwrap_err();
+        assert!(format!("{e:#}").contains("cannot run pager"), "{e:#}");
     }
 }

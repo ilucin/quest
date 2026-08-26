@@ -141,20 +141,22 @@ fn restore_termios() {
 
 // ----------------------------------------------------------------- handling
 
+/// Where the escapes go. Stdout, except while a test points it at a pipe:
+/// `libc::write` bypasses libtest's stdout capture, so without this a plain
+/// `cargo test` fires DisableMouseCapture and LeaveAlternateScreen at whatever
+/// terminal the developer happens to be sitting in. An atomic load is
+/// async-signal-safe, which a `#[cfg(test)]` lock would not be.
+static OUT_FD: AtomicI32 = AtomicI32::new(libc::STDOUT_FILENO);
+
 /// Write every byte, or give up. Async-signal-safe: `write` is on the list,
 /// and `EINTR` is the one failure worth retrying.
 fn write_all(bytes: &[u8]) {
+    let fd = OUT_FD.load(Ordering::Relaxed);
     let mut at = 0;
     while at < bytes.len() {
         // Safety: writing `bytes` to a descriptor we do not own is still just
         // a write of a valid pointer and length.
-        let n = unsafe {
-            libc::write(
-                libc::STDOUT_FILENO,
-                bytes[at..].as_ptr().cast(),
-                bytes.len() - at,
-            )
-        };
+        let n = unsafe { libc::write(fd, bytes[at..].as_ptr().cast(), bytes.len() - at) };
         if n > 0 {
             at += n as usize;
             continue;
@@ -167,9 +169,37 @@ fn write_all(bytes: &[u8]) {
     }
 }
 
+/// `errno`'s address for the calling thread, or null where libc's accessor is
+/// not one we know. Both CI targets are covered; anywhere else the handler
+/// simply skips the save.
+fn errno_slot() -> *mut libc::c_int {
+    // Safety: libc's own accessor, valid for the calling thread, and on
+    // POSIX's async-signal-safe list.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::__errno_location()
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::__error()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    std::ptr::null_mut()
+}
+
 /// Everything the handler does except dying: separated so it can be tested in
 /// process, where re-raising would take the test runner with it.
+///
+/// `errno` is saved and put back around the whole body: `write` and
+/// `tcsetattr` both clobber it, and a handler that returns to an interrupted
+/// call owes it the value it had. Free today only because the handler always
+/// re-raises with `SIG_DFL` and the process dies — which stops being true the
+/// moment anyone handles a non-fatal signal.
 pub(super) fn restore_from_signal() {
+    let slot = errno_slot();
+    // Safety: `slot` is either null (checked) or libc's own thread-local.
+    let saved = if slot.is_null() { 0 } else { unsafe { *slot } };
+
     let (mouse, alt, raw) = take_flags();
     let plan = plan(mouse, alt, raw);
     for bytes in plan.bytes {
@@ -179,6 +209,11 @@ pub(super) fn restore_from_signal() {
     }
     if plan.termios {
         restore_termios();
+    }
+
+    if !slot.is_null() {
+        // Safety: as above.
+        unsafe { *slot = saved };
     }
 }
 
@@ -199,6 +234,30 @@ extern "C" fn handler(sig: libc::c_int) {
     }
 }
 
+/// Run `f` with the handler's output pointed at a pipe, handing back what it
+/// wrote. `OUT_FD` is process-global, so callers hold [`super::lifecycle_lock`]
+/// — the same lock every flag-touching test already takes.
+#[cfg(test)]
+pub(super) fn capturing_output<T>(f: impl FnOnce() -> T) -> (T, Vec<u8>) {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    let mut fds = [0 as libc::c_int; 2];
+    // Safety: `pipe` fills two descriptors into an array we own.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let previous = OUT_FD.swap(fds[1], Ordering::SeqCst);
+    let out = f();
+    OUT_FD.store(previous, Ordering::SeqCst);
+    // Safety: both ends are ours; closing the write end is what ends the read.
+    unsafe { libc::close(fds[1]) };
+    // Safety: `fds[0]` is an open descriptor nothing else owns.
+    let mut read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let mut buf = Vec::new();
+    read.read_to_end(&mut buf)
+        .expect("read the captured escapes");
+    (out, buf)
+}
+
 static INSTALLED: Once = Once::new();
 
 /// Arm the handlers. Idempotent, and cheap enough to call on every `enter`.
@@ -206,8 +265,10 @@ pub(super) fn install() {
     INSTALLED.call_once(|| {
         for sig in HANDLED {
             // No `SA_RESTART`: the handler never returns to the interrupted
-            // call anyway. No extra blocked signals either — the handler is
-            // three writes and a `tcsetattr`.
+            // call anyway. The mask carries every *other* handled signal:
+            // only the delivered one is blocked automatically, so without it a
+            // SIGINT could re-enter this handler in the middle of
+            // `take_flags()` and leave half the terminal restored.
             // Safety: a zeroed `sigaction` with the handler filled in is
             // exactly what the call wants.
             unsafe {
@@ -215,6 +276,9 @@ pub(super) fn install() {
                 action.sa_sigaction = handler as *const () as usize;
                 action.sa_flags = 0;
                 libc::sigemptyset(&mut action.sa_mask);
+                for other in HANDLED {
+                    libc::sigaddset(&mut action.sa_mask, other);
+                }
                 libc::sigaction(sig, &action, std::ptr::null_mut());
             }
         }
@@ -310,13 +374,78 @@ mod tests {
             );
             assert_eq!(
                 old.sa_sigaction, handler as *const () as usize,
-                "signal {sig}"
-            );
-            assert_ne!(
-                old.sa_sigaction,
-                libc::SIG_DFL,
                 "signal {sig} is still on the disposition that leaks the terminal"
             );
+            // N3: the other handled signals are blocked for the length of the
+            // handler, so one cannot re-enter it mid-`take_flags`.
+            for other in HANDLED {
+                assert_eq!(
+                    unsafe { libc::sigismember(&old.sa_mask, other) },
+                    1,
+                    "signal {sig} does not block {other}"
+                );
+            }
         }
+    }
+
+    /// N2: the escapes have to reach a descriptor a test can point somewhere
+    /// harmless. Writing them to `STDOUT_FILENO` unconditionally bypasses
+    /// libtest's capture and lands in the developer's own terminal.
+    #[test]
+    fn the_restore_writes_the_plan_to_a_descriptor_a_test_can_redirect() {
+        let _lock = super::super::lifecycle_lock();
+        RAW_ON.store(true, Ordering::SeqCst);
+        ALT_ON.store(true, Ordering::SeqCst);
+        MOUSE_ON.store(true, Ordering::SeqCst);
+
+        let ((), written) = capturing_output(restore_from_signal);
+        let mut want = Vec::new();
+        want.extend_from_slice(SHOW_CURSOR);
+        want.extend_from_slice(MOUSE_OFF);
+        want.extend_from_slice(ALT_OFF);
+        assert_eq!(written, want);
+        assert_eq!(take_flags(), (false, false, false));
+
+        // Nothing armed writes nothing at all — a signal outside the TUI must
+        // not spray escapes at a shell that never asked for them.
+        let ((), written) = capturing_output(restore_from_signal);
+        assert!(written.is_empty(), "{written:?}");
+
+        // And the descriptor is back where it belongs.
+        assert_eq!(OUT_FD.load(Ordering::SeqCst), libc::STDOUT_FILENO);
+    }
+
+    /// N4: `write` and `tcsetattr` clobber `errno`, and a handler that returns
+    /// owes the interrupted call the value it had.
+    #[test]
+    fn the_restore_puts_errno_back() {
+        let _lock = super::super::lifecycle_lock();
+        // A descriptor writes fail on, without the fd-reuse race a *closed*
+        // one would have in a parallel test binary.
+        // Safety: opening a path this process may read.
+        let ro = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(ro >= 0, "open /dev/null");
+        let previous = OUT_FD.swap(ro, Ordering::SeqCst);
+
+        RAW_ON.store(true, Ordering::SeqCst);
+        ALT_ON.store(true, Ordering::SeqCst);
+        MOUSE_ON.store(true, Ordering::SeqCst);
+
+        let slot = errno_slot();
+        assert!(!slot.is_null(), "no errno accessor for this target");
+        // Safety: libc's thread-local slot for this thread.
+        unsafe { *slot = libc::ERANGE };
+        restore_from_signal();
+        // Safety: as above.
+        let after = unsafe { *slot };
+
+        OUT_FD.store(previous, Ordering::SeqCst);
+        // Safety: our descriptor.
+        unsafe { libc::close(ro) };
+        assert_eq!(
+            after,
+            libc::ERANGE,
+            "the restore clobbered errno (EBADF from the failed write)"
+        );
     }
 }

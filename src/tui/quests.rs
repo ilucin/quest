@@ -324,12 +324,15 @@ pub fn handle(app: &mut App, input: Input) -> Action {
             app.quests.move_to(usize::MAX, page);
             Action::None
         }
-        // SPEC §17 pairs `⏎/o` as "enter master (attach)" and, two lines
-        // above, gives `Enter` to the detail panel. Both halves of the pair
-        // survive here rather than one overruling the other: `o` attaches —
-        // and stays reachable on the phone keyboards §17 cares about, where
-        // Enter never arrives — while `Enter`, the key that gets pressed by
-        // accident, only opens the panel instead of taking over the terminal.
+        // SPEC §17 contradicts itself: `Enter` toggles the detail panel two
+        // lines above, and `⏎/o` is "enter master (attach)" below. Reading it
+        // the other way — both keys attach — would leave the detail panel, an
+        // explicitly specified feature, with no binding at all, so this is the
+        // only self-consistent split. `o` attaches; `Enter`, the key that gets
+        // pressed by accident, only opens the panel rather than taking over
+        // the terminal. (Nothing to do with phone keyboards: §17 gives `Ctrl-J`
+        // as the Enter alias precisely for clients where Enter never arrives,
+        // so either reading is reachable there.)
         Input::Char('o') => attach_selection(app),
         Input::Enter => toggle_detail(app),
         Input::Esc => {

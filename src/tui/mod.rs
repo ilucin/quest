@@ -215,10 +215,19 @@ fn restore() {
 
 /// Undoes exactly what is on, and nothing when nothing is: safe from the panic
 /// hook and the guard, in either order.
+///
+/// Each flag is cleared *after* its own undo, not all three up front: a signal
+/// landing between the two would otherwise find `plan(false, false, false)`,
+/// write nothing, and re-raise — leaving the process dead with ANY-MOTION
+/// mouse tracking still armed, which `signals`' own module doc calls the worst
+/// outcome there is. The cost is that the handler and this may both undo a
+/// step; every one of them (`?25h`, the mouse-off run, `?1049l`, `tcsetattr`)
+/// is idempotent, and the handler always dies, so no `Guard::drop` can follow
+/// it.
 fn restore_with<T: TermIo>(io: &mut T) {
-    let mouse = MOUSE_ON.swap(false, Ordering::SeqCst);
-    let alt = ALT_ON.swap(false, Ordering::SeqCst);
-    let raw = RAW_ON.swap(false, Ordering::SeqCst);
+    let mouse = MOUSE_ON.load(Ordering::SeqCst);
+    let alt = ALT_ON.load(Ordering::SeqCst);
+    let raw = RAW_ON.load(Ordering::SeqCst);
     if !(mouse || alt || raw) {
         return;
     }
@@ -229,12 +238,15 @@ fn restore_with<T: TermIo>(io: &mut T) {
     let _ = io.show_cursor();
     if mouse {
         let _ = io.mouse(false);
+        MOUSE_ON.store(false, Ordering::SeqCst);
     }
     if alt {
         let _ = io.alt(false);
+        ALT_ON.store(false, Ordering::SeqCst);
     }
     if raw {
         let _ = io.raw(false);
+        RAW_ON.store(false, Ordering::SeqCst);
     }
     let _ = io.flush();
 }
@@ -320,6 +332,10 @@ where
             .attach_child(&target.tmux_session, Some(&target.pane))
     })?;
     app.say(match attached {
+        // Inside tmux the attach is a `switch-client`: the client moves to the
+        // Quest and this process never lost anything, so "back from" would be
+        // reporting a round trip that did not happen.
+        Ok(()) if ctx.tmux().in_tmux() => format!("switched to {}", quest.slug),
         Ok(()) => format!("back from {}", quest.slug),
         Err(e) => format!("cannot enter {}: {e:#}", quest.slug),
     });
@@ -571,12 +587,18 @@ fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
-/// The right-hand chrome: the keys worth advertising on this tab. `o` is
-/// there because the Quests tab's headline action takes over the terminal,
-/// and nothing else on screen would say which key does it.
+/// The right-hand chrome: the keys worth advertising on this tab.
+///
+/// The two that take over the terminal lead on Quests — nothing else on screen
+/// would say which key hands it to tmux or to a pager, and both are one
+/// keystroke from a blank screen. `x` gives way to them there and stays in the
+/// help overlay, which lists every binding: the segment is capped at two
+/// thirds of the row (`layout::right_segment`), and a hint that outgrows that
+/// is silently truncated from the right — losing `q quit`, the one key a stuck
+/// user needs. `the_status_hint_fits_the_segment_it_is_given` pins that.
 fn hint(tab: Tab) -> &'static str {
     match tab {
-        Tab::Quests => " ? help · o attach · q quit ",
+        Tab::Quests => " ? help · o attach · b brief · q quit ",
         _ => " ? help · x refresh · q quit ",
     }
 }
@@ -759,25 +781,35 @@ mod tests {
     }
 
     /// Records the escape/termios steps instead of performing them, and can be
-    /// told to fail at one of them.
+    /// told to fail at one of them — or to let a signal land after one.
     #[derive(Debug, Default)]
     struct FakeTerm {
         calls: Vec<&'static str>,
+        /// `(step, (raw, alt, mouse))` as each step was issued, so a teardown
+        /// that drops a flag too early is visible rather than merely narrow.
+        snapshots: Vec<(&'static str, (bool, bool, bool))>,
         fail_on: Option<&'static str>,
+        signal_after: Option<&'static str>,
     }
 
     impl FakeTerm {
         fn failing_at(step: &'static str) -> FakeTerm {
             FakeTerm {
-                calls: Vec::new(),
                 fail_on: Some(step),
+                ..FakeTerm::default()
             }
         }
 
         fn step(&mut self, name: &'static str) -> io::Result<()> {
             self.calls.push(name);
+            self.snapshots.push((name, flags()));
             if self.fail_on == Some(name) {
                 return Err(io::Error::other(name));
+            }
+            if self.signal_after == Some(name) {
+                // The real race: a SIGTERM delivered part way through the
+                // guard's own teardown.
+                signals::restore_from_signal();
             }
             Ok(())
         }
@@ -927,6 +959,65 @@ mod tests {
         restore_with(&mut term);
         assert_eq!(term.calls[0], "cursor show");
         assert!(term.calls.contains(&"alt off"));
+    }
+
+    /// N1 (round 1): the three flags used to be swapped to `false` *before*
+    /// any of the undo I/O, so a signal landing in that window found nothing
+    /// armed, wrote nothing, and re-raised — killing the process with
+    /// ANY-MOTION mouse tracking still on. Each flag now falls only once its
+    /// own step has actually run.
+    #[test]
+    fn every_flag_outlives_the_step_that_undoes_it() {
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        term.calls.clear();
+        term.snapshots.clear();
+
+        restore_with(&mut term);
+        assert_eq!(
+            term.snapshots,
+            [
+                // (raw, alt, mouse) as each step was issued.
+                ("cursor show", (true, true, true)),
+                ("mouse off", (true, true, true)),
+                ("alt off", (true, true, false)),
+                ("raw off", (true, false, false)),
+                ("flush", (false, false, false)),
+            ]
+        );
+        assert_eq!(flags(), (false, false, false));
+    }
+
+    /// The other half of N1: a signal really landing mid-teardown restores
+    /// everything the guard has not reached, and the guard walking its own
+    /// remaining steps on top of that is harmless — each one is idempotent.
+    #[test]
+    fn a_signal_part_way_through_the_teardown_undoes_the_rest() {
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        term.calls.clear();
+        term.snapshots.clear();
+        // After the cursor came back, before the mouse did.
+        term.signal_after = Some("cursor show");
+
+        let ((), escapes) = signals::capturing_output(|| restore_with(&mut term));
+
+        // The handler found the mouse and the alternate screen still armed.
+        let mut want = Vec::new();
+        want.extend_from_slice(b"\x1b[?25h");
+        want.extend_from_slice(b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+        want.extend_from_slice(b"\x1b[?1049l");
+        assert_eq!(escapes, want, "the signal restored nothing");
+        // And the guard finished its own sequence regardless.
+        assert_eq!(
+            term.calls,
+            ["cursor show", "mouse off", "alt off", "raw off", "flush"]
+        );
+        assert_eq!(flags(), (false, false, false));
     }
 
     /// The panic hook and the guard both restore, in whichever order they run.
@@ -1253,6 +1344,68 @@ mod tests {
         assert!(status.contains("q quit"), "{status:?}");
     }
 
+    /// N6 (round 1): the only status-bar assertion checked `? help`, which
+    /// both branches carry — swapping the two arms would have passed.
+    #[test]
+    fn the_status_hint_names_the_keys_the_tab_actually_has() {
+        // Quests' headline actions are the two that take over the terminal.
+        let quests = hint(Tab::Quests);
+        assert!(quests.contains("o attach"), "{quests:?}");
+        assert!(quests.contains("b brief"), "{quests:?}");
+        // The stub tabs have neither, and advertise the reload instead.
+        for tab in [Tab::Sessions, Tab::Templates, Tab::Events] {
+            let other = hint(tab);
+            assert!(!other.contains("attach"), "{tab:?}: {other:?}");
+            assert!(!other.contains("brief"), "{tab:?}: {other:?}");
+            assert!(other.contains("x refresh"), "{tab:?}: {other:?}");
+        }
+        // `?` and `q` are on every tab: one opens the list of everything the
+        // hint had no room for, the other is the way out.
+        for tab in Tab::ALL {
+            let h = hint(tab);
+            assert!(h.contains("? help"), "{tab:?}: {h:?}");
+            assert!(h.contains("q quit"), "{tab:?}: {h:?}");
+        }
+        // And `x` is still reachable on Quests, just from the overlay.
+        assert!(
+            app::help_rows(Tab::Quests)
+                .iter()
+                .any(|(k, _)| k.contains('x')),
+            "x fell out of the help overlay too"
+        );
+    }
+
+    /// The segment is capped at two thirds of the row, and `truncate` cuts
+    /// from the *right* — so a hint that outgrows its budget loses `q quit`
+    /// silently. 70 columns is the narrowest width the render sweep asserts
+    /// the chrome at.
+    #[test]
+    fn the_status_hint_fits_the_segment_it_is_given() {
+        for tab in Tab::ALL {
+            let h = hint(tab);
+            let want = layout::width(h) as u16;
+            assert_eq!(
+                layout::right_segment(70, want),
+                want,
+                "{tab:?}: {h:?} is {want} columns and does not fit at 70"
+            );
+        }
+    }
+
+    /// Rendered, not just returned: the arms have to reach the actual bar.
+    #[test]
+    fn the_status_bar_draws_the_active_tabs_hint() {
+        let mut app = app();
+        let quests = draw(&mut app, 100, 20).last().unwrap().clone();
+        assert!(quests.contains("o attach"), "{quests:?}");
+        assert!(quests.contains("b brief"), "{quests:?}");
+
+        app.handle(Input::Char('4'));
+        let events = draw(&mut app, 100, 20).last().unwrap().clone();
+        assert!(events.contains("x refresh"), "{events:?}");
+        assert!(!events.contains("o attach"), "{events:?}");
+    }
+
     #[test]
     fn the_status_bar_reports_the_narrow_row_mode() {
         let mut app = app();
@@ -1539,6 +1692,14 @@ mod tests {
         attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
 
         assert_eq!(fixture(&_dir).attach_mode.as_deref(), Some("switch"));
+        // N9a: the client moved, this process never left — "back from" would
+        // be reporting a round trip that did not happen.
+        assert!(
+            app.status.contains("switched to needs-me"),
+            "{}",
+            app.status
+        );
+        assert!(!app.status.contains("back from"), "{}", app.status);
         assert_eq!(flags(), (true, true, true));
         restore_with(&mut term);
     }
@@ -1743,8 +1904,12 @@ mod tests {
         term.calls.clear();
 
         // Everything the handler does short of re-raising, which would take
-        // the test runner with it.
-        signals::restore_from_signal();
+        // the test runner with it — with its output pointed at a pipe, since
+        // `libc::write` bypasses libtest's capture and would otherwise put
+        // these escapes on the developer's own terminal.
+        let ((), escapes) = signals::capturing_output(signals::restore_from_signal);
+        assert!(!escapes.is_empty(), "the handler restored nothing");
+        assert!(escapes.starts_with(b"\x1b[?25h"), "{escapes:?}");
         assert_eq!(flags(), (false, false, false));
 
         // The guard now has nothing left to do, so a `q` that was killed mid
