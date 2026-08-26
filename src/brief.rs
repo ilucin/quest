@@ -209,7 +209,17 @@ pub fn resolve_session<'a>(
         Some(_) => return None,
         None => target,
     };
-    sessions.iter().find(|s| s.id == target || s.label == label)
+    // A label is reused across a Quest's life, so a live row wins over the
+    // ended one it replaced; an id is unique and matches outright.
+    sessions
+        .iter()
+        .find(|s| s.id == target)
+        .or_else(|| {
+            sessions
+                .iter()
+                .find(|s| s.label == label && s.status != SessionStatus::Ended)
+        })
+        .or_else(|| sessions.iter().find(|s| s.label == label))
 }
 
 // ------------------------------------------------------------------ rendering
@@ -749,6 +759,31 @@ mod tests {
         fn brain_show(&self, _: &str) -> Option<String> {
             self.brain.clone()
         }
+    }
+
+    #[test]
+    fn a_reused_label_resolves_to_the_live_session() {
+        let quest = Quest::new("alpha", "/tmp/repo", "laptop");
+        let mut ended = Session::new(&quest.id, SessionRole::Worker, "tests", "q-alpha", "%1");
+        ended.status = SessionStatus::Ended;
+        let mut live = Session::new(&quest.id, SessionRole::Worker, "tests", "q-alpha", "%2");
+        live.status = SessionStatus::Busy;
+        // Oldest first, as `list_sessions_by_quest` returns them.
+        let rows = vec![ended.clone(), live.clone()];
+
+        let id = |target: &str| resolve_session(&quest, &rows, target).map(|s| s.id.clone());
+        for target in ["tests", "alpha/tests", &format!("{}/tests", quest.id)] {
+            assert_eq!(id(target).as_deref(), Some(live.id.as_str()), "{target}");
+        }
+        // An id is unique, so it still reaches the ended row.
+        assert_eq!(id(&ended.id).as_deref(), Some(ended.id.as_str()));
+        // With no live row the history is the best answer there is.
+        assert_eq!(
+            resolve_session(&quest, std::slice::from_ref(&ended), "tests").map(|s| s.id.as_str()),
+            Some(ended.id.as_str())
+        );
+        assert!(resolve_session(&quest, &rows, "other/tests").is_none());
+        assert!(resolve_session(&quest, &rows, "nope").is_none());
     }
 
     fn seeded() -> (Db, Quest) {
