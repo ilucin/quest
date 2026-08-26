@@ -2346,7 +2346,7 @@ fn events_follow_prints_rows_inserted_between_polls() {
     let quest_id = id.clone();
     let session_id = master.clone();
     let inserter = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        std::thread::sleep(std::time::Duration::from_millis(300));
         let conn = rusqlite::Connection::open(db_path).unwrap();
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .unwrap();
@@ -2366,7 +2366,7 @@ fn events_follow_prints_rows_inserted_between_polls() {
 
     let mut cmd = env.cmd();
     let assert = cmd
-        .env("Q_FOLLOW_ITERATIONS", "4")
+        .env("Q_FOLLOW_ITERATIONS", "6")
         .args([
             "events", "evt", "--follow", "-n", "1", "-k", "note", "--json",
         ])
@@ -2397,20 +2397,58 @@ fn events_follow_prints_rows_inserted_between_polls() {
 }
 
 #[test]
+fn events_follow_with_an_empty_first_page_tails_from_the_end() {
+    let (env, id, _master) = events_env("evt");
+    let db_path = env.dir.path().join("q.db");
+    let quest_id = id.clone();
+    let inserter = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO event (quest_id, session_id, ts, kind, payload) \
+             VALUES (?1, NULL, 999999, 'note', '{\"text\":\"only this\"}')",
+            [&quest_id],
+        )
+        .unwrap();
+    });
+    let mut cmd = env.cmd();
+    let assert = cmd
+        .env("Q_FOLLOW_ITERATIONS", "6")
+        .args(["events", "evt", "-n", "0", "-f", "--json"])
+        .assert()
+        .success();
+    inserter.join().unwrap();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    // History is not replayed; only the row inserted after start shows up.
+    assert_eq!(rows.len(), 1, "{out}");
+    assert_eq!(rows[0]["payload"]["text"], "only this");
+}
+
+#[test]
 fn events_follow_survives_a_closed_pipe() {
-    let (env, _id, _master) = events_env("evt");
+    // The initial page is empty, so the first write happens on the second
+    // poll — after the reader has gone away — and must hit EPIPE, not fail.
+    let (env, id, _master) = events_env("evt");
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("q"))
         .env("Q_DB", env.dir.path().join("q.db"))
         .env("Q_CONFIG", env.dir.path().join("config.toml"))
         .env("Q_FIXTURE", env.dir.path().join("tmux.json"))
-        .env("Q_FOLLOW_ITERATIONS", "1")
+        .env("Q_FOLLOW_ITERATIONS", "6")
         .env_remove("Q_QUEST")
-        .args(["events", "evt", "--follow"])
+        .args(["events", "evt", "--follow", "-n", "0"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     drop(child.stdout.take());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    env.seed_event(&id, None, "note", r#"{"text":"into the void"}"#);
     let out = child.wait_with_output().unwrap();
     assert!(
         out.status.success(),

@@ -81,7 +81,7 @@ pub fn or_dash(value: Option<&str>) -> String {
 }
 
 /// An event payload as `k=v k=v`; anything that is not an object falls back to
-/// its compact JSON.
+/// its compact JSON. Absent or empty payloads render as `-`.
 pub fn payload(payload: Option<&Value>, max: usize) -> String {
     let Some(value) = payload else {
         return "-".to_string();
@@ -95,6 +95,9 @@ pub fn payload(payload: Option<&Value>, max: usize) -> String {
             .join(" "),
         other => scalar(other),
     };
+    if text.is_empty() {
+        return "-".to_string();
+    }
     oneline(&text, max)
 }
 
@@ -189,6 +192,8 @@ mod tests {
         assert_eq!(payload(None, 80), "-");
         assert_eq!(payload(Some(&serde_json::Value::Null), 80), "-");
         assert_eq!(payload(Some(&serde_json::json!("plain")), 80), "plain");
+        assert_eq!(payload(Some(&serde_json::json!({})), 80), "-");
+        assert_eq!(payload(Some(&serde_json::json!("")), 80), "-");
     }
 
     #[test]

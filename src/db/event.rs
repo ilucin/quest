@@ -150,30 +150,28 @@ impl Db {
         if kinds.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = (0..kinds.len())
-            .map(|i| format!("?{}", i + 3))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut stmt = self
-            .conn
-            .prepare(&format!(
-                "SELECT {COLUMNS} FROM event WHERE quest_id = ?1 AND kind IN ({placeholders}) \
-                 ORDER BY ts DESC, id DESC LIMIT ?2"
-            ))
-            .map_err(db_err)?;
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-            Box::new(quest_id.to_string()),
-            Box::new(i64::try_from(limit).unwrap_or(i64::MAX)),
-        ];
-        params.extend(
-            kinds
+        let filter = EventFilter {
+            kinds: kinds
                 .iter()
-                .map(|k| Box::new(k.to_string()) as Box<dyn rusqlite::ToSql>),
-        );
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(params.iter()), row_to_event)
-            .map_err(db_err)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+                .map(|k| KindPattern::Exact(k.to_string()))
+                .collect(),
+            session_id: None,
+        };
+        let mut events = self.list_events_latest(quest_id, &filter, limit)?;
+        events.reverse();
+        Ok(events)
+    }
+
+    /// Highest event id for a Quest, `0` when it has none. The `--follow`
+    /// cursor starts here when the first page is empty.
+    pub fn last_event_id(&self, quest_id: &str) -> anyhow::Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM event WHERE quest_id = ?1",
+                params![quest_id],
+                |r| r.get(0),
+            )
+            .map_err(db_err)
     }
 
     /// The last `limit` events matching `filter`, oldest first — the page

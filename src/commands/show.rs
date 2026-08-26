@@ -114,7 +114,7 @@ fn human(view: &QuestView, tmux_session: &str, sessions: &[Session], events: &[E
             .iter()
             .map(|e| {
                 vec![
-                    fmt::stamp(e.ts),
+                    fmt::stamp_utc(e.ts),
                     e.kind.clone(),
                     fmt::payload(e.payload.as_ref(), PAYLOAD_WIDTH),
                 ]

@@ -27,7 +27,7 @@ const KIND_WIDTH: usize = 16;
 const PAYLOAD_WIDTH: usize = 100;
 
 pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
-    // Read-only: tmux being down must not hide the log.
+    // The sweep only tidies session state; tmux being down must not hide the log.
     let _ = sweep_quiet(ctx);
     let db = ctx.db()?;
     let quest = db.resolve_quest(&brief::default_target(args.quest)?)?;
@@ -46,7 +46,12 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         sessions.into_iter().map(|s| (s.id, s.label)).collect();
 
     let events = db.list_events_latest(&quest.id, &filter, args.limit)?;
-    let mut last_id = events.last().map_or(0, |e| e.id);
+    // An empty first page (`-n 0`, or a filter nothing matches yet) must not
+    // make the tail replay the whole history: start from the newest row.
+    let mut last_id = match events.last() {
+        Some(e) => e.id,
+        None => db.last_event_id(&quest.id)?,
+    };
 
     if !args.follow {
         if ctx.json || !ctx.quiet {
