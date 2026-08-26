@@ -66,6 +66,14 @@ impl Db {
         Ok(Db { conn })
     }
 
+    /// Shortens how long a write waits on a locked database. For callers that
+    /// would rather skip than stall — the statusline runs after every message.
+    pub fn set_busy_timeout(&self, ms: u32) -> anyhow::Result<()> {
+        self.conn
+            .pragma_update(None, "busy_timeout", ms)
+            .map_err(db_err)
+    }
+
     pub fn schema_version(&self) -> anyhow::Result<u32> {
         migrations::user_version(&self.conn)
     }

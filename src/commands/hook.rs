@@ -1,6 +1,6 @@
 //! `q hook install | uninstall | status` — merges q's hooks and statusline
 //! into Claude Code's `settings.json` (SPEC §7), touching only q-owned
-//! entries. The event handlers themselves live in later beads.
+//! entries — plus `q hook statusline`. The event handlers live in later beads.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::Ctx;
 use crate::config;
+use crate::db::Db;
 use crate::error::QError;
 use crate::output;
 
@@ -598,13 +599,14 @@ pub fn noop() -> anyhow::Result<u8> {
     Ok(0)
 }
 
-/// Pass-through statusline: forwards Claude's payload to the chained
-/// command and prints whatever it prints. Never fails and never hangs —
-/// a broken or slow chain just yields an empty statusline.
-// TODO(bd-8lz.2.3): parse ctx_pct from the payload and render q's own segment.
+/// Statusline refresh (SPEC §7): records the context-window % Claude
+/// reports for the session this pane belongs to, then forwards the raw
+/// payload to the chained command and prints whatever it prints. Runs after
+/// every message, so it never fails, never hangs, and skips a busy database.
 pub fn statusline(ctx: &Ctx) -> anyhow::Result<u8> {
     let mut input = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut input);
+    record_ctx(&input);
     let chain = ctx.config.statusline.chain.trim();
     if chain.is_empty() {
         return Ok(0);
@@ -615,6 +617,43 @@ pub fn statusline(ctx: &Ctx) -> anyhow::Result<u8> {
         let _ = stdout.flush();
     }
     Ok(0)
+}
+
+const CTX_DB_BUSY_MS: u32 = 200;
+
+/// Best effort: any failure just means this refresh is not recorded.
+fn record_ctx(input: &[u8]) {
+    let Ok(payload) = serde_json::from_slice::<Value>(input) else {
+        return;
+    };
+    let Some(pct) = ctx_pct(&payload) else {
+        return;
+    };
+    let claude_id = payload["session_id"].as_str().filter(|s| !s.is_empty());
+    let q_session = std::env::var("Q_SESSION").ok().filter(|s| !s.is_empty());
+    if q_session.is_none() && claude_id.is_none() {
+        return;
+    }
+    let Ok(db) = Db::open_default() else {
+        return;
+    };
+    let _ = db.set_busy_timeout(CTX_DB_BUSY_MS);
+    let session = match q_session {
+        Some(id) => db.get_session(&id),
+        None => db.find_session_by_claude_id(claude_id.unwrap_or_default()),
+    };
+    let Ok(Some(session)) = session else {
+        return;
+    };
+    let _ = db.update_session_ctx(&session.id, pct, claude_id);
+}
+
+fn ctx_pct(payload: &Value) -> Option<u8> {
+    let used = payload["context_window"]["used_percentage"].as_f64()?;
+    if !used.is_finite() {
+        return None;
+    }
+    Some(used.round().clamp(0.0, 100.0) as u8)
 }
 
 fn run_chain(chain: &str, input: &[u8]) -> Option<Vec<u8>> {
@@ -658,6 +697,28 @@ fn run_chain(chain: &str, input: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctx_pct_rounds_and_tolerates_missing_fields() {
+        assert_eq!(
+            ctx_pct(&json!({"context_window": {"used_percentage": 42.6}})),
+            Some(43)
+        );
+        assert_eq!(
+            ctx_pct(&json!({"context_window": {"used_percentage": 100.4}})),
+            Some(100)
+        );
+        assert_eq!(
+            ctx_pct(&json!({"context_window": {"used_percentage": 7}})),
+            Some(7)
+        );
+        assert_eq!(ctx_pct(&json!({"context_window": {}})), None);
+        assert_eq!(ctx_pct(&json!({"session_id": "x"})), None);
+        assert_eq!(
+            ctx_pct(&json!({"context_window": {"used_percentage": "42"}})),
+            None
+        );
+    }
 
     #[test]
     fn ownership_is_any_binary_followed_by_a_known_hook_sub() {
