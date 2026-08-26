@@ -3173,13 +3173,42 @@ fn post_tool_use_captures_written_artifacts() {
 }
 
 #[test]
+fn post_tool_use_without_a_session_env_captures_at_quest_level() {
+    let pane = Pane::new();
+    let cwd = pane.env.work("alpha");
+    let pr = "https://github.com/acme/api/pull/7";
+    let mut cmd = pane.env.cmd();
+    cmd.env("Q_QUEST", &pane.quest_id)
+        .env_remove("Q_SESSION")
+        .env_remove("TMUX_PANE");
+    post_tool_use(&mut cmd, &bash_payload(&cwd, "gh pr create", pr));
+
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 1);
+    assert_eq!(
+        pane.env
+            .count("SELECT count(*) FROM link WHERE session_id IS NULL"),
+        1
+    );
+    let (kind, session, _) = pane.last_event();
+    assert_eq!(kind, "link.added");
+    assert_eq!(session, None);
+}
+
+#[test]
 fn post_tool_use_is_a_noop_outside_a_quest_and_never_creates_the_database() {
     // A live database, but no Q_QUEST: untouched.
     let pane = Pane::new();
     let cwd = pane.env.work("alpha");
-    let payload = bash_payload(&cwd, "gh", "https://github.com/acme/api/pull/1");
+    let payload = bash_payload(&cwd, "gh pr view", "https://github.com/acme/api/pull/1");
     let mut cmd = pane.env.cmd();
     cmd.env("Q_SESSION", &pane.session_id);
+    post_tool_use(&mut cmd, &payload);
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 0);
+
+    // A session that does not exist named in the env: nothing captured.
+    let mut cmd = pane.env.cmd();
+    cmd.env("Q_QUEST", &pane.quest_id)
+        .env("Q_SESSION", "s-nope");
     post_tool_use(&mut cmd, &payload);
     assert_eq!(pane.env.count("SELECT count(*) FROM link"), 0);
 

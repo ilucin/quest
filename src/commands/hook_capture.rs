@@ -19,6 +19,7 @@ use crate::model::{Link, SessionStatus};
 const DB_BUSY_MS: u32 = 2000;
 const MAX_CAPTURES: usize = 20;
 const MAX_BEADS: usize = 10;
+const MAX_OUTPUT_TASKS: usize = 3;
 const WRITE_NOTE: &str = "auto-captured (Write)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,9 +108,9 @@ fn capture(input: &[u8]) {
     }
 }
 
-/// `Some(None)` when no session env is present (quest-level capture);
-/// `None` when the session that is named does not belong to this Quest or
-/// has ended — then nothing is captured at all.
+/// `Some(None)` only when no session env is present at all (quest-level
+/// capture); once `$Q_SESSION` or `$TMUX_PANE` names a session it must be a
+/// live one of this Quest, otherwise nothing is captured.
 fn resolve_session(db: &Db, quest_id: &str) -> Option<Option<String>> {
     let session = match (env_var("Q_SESSION"), env_var("TMUX_PANE")) {
         (Some(id), _) => db.get_session(&id).ok()?,
@@ -117,9 +118,8 @@ fn resolve_session(db: &Db, quest_id: &str) -> Option<Option<String>> {
         (None, None) => return Some(None),
     };
     match session {
-        None => Some(None),
         Some(s) if s.quest_id == quest_id && s.status != SessionStatus::Ended => Some(Some(s.id)),
-        Some(_) => None,
+        _ => None,
     }
 }
 
@@ -141,9 +141,30 @@ fn url_re() -> &'static Regex {
     )
 }
 
+/// Commands whose output is about one PR or task, so URLs printed by them
+/// are worth linking; anything else (`gh pr list`, `git log`, `cat`) is not.
+fn pr_cmd_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    re(
+        &RE,
+        r"\bgh\s+pr\s+(?:create|view|merge|checkout|status|edit|ready|comment|review)\b|\bgit\s+push\b",
+    )
+}
+
+/// `&&`, `||`, `;` and newlines — the boundaries a `cd` reaches across.
+fn segment_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    re(&RE, r"&&|\|\||;|\n")
+}
+
+fn cd_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    re(&RE, r"^\(*\s*cd\s+([^\s)]+)\s*$")
+}
+
 fn worktree_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    re(&RE, r"(?:^|[\s;&|(])git\s+worktree\s+add\s+([^;&|\n]*)")
+    re(&RE, r"(?:^|[\s(])git\s+worktree\s+add\s+([^|\n]*)")
 }
 
 fn bd_cmd_re() -> &'static Regex {
@@ -166,10 +187,12 @@ pub fn extract(
 ) -> Vec<Capture> {
     let mut out: Vec<Capture> = Vec::new();
     let mut seen: BTreeSet<(&'static str, String)> = BTreeSet::new();
-    let mut push = |c: Capture| {
-        if out.len() < MAX_CAPTURES && seen.insert((c.kind.as_str(), c.r#ref.clone())) {
+    let mut push = |c: Capture| -> bool {
+        let fresh = out.len() < MAX_CAPTURES && seen.insert((c.kind.as_str(), c.r#ref.clone()));
+        if fresh {
             out.push(c);
         }
+        fresh
     };
     match tool_name {
         "Bash" => extract_bash(tool_input, tool_response, cwd, &mut push),
@@ -202,33 +225,31 @@ fn response_text(response: &Value) -> (String, String) {
     }
 }
 
-fn extract_bash(input: &Value, response: &Value, cwd: &Path, push: &mut impl FnMut(Capture)) {
+fn extract_bash(
+    input: &Value,
+    response: &Value,
+    cwd: &Path,
+    push: &mut impl FnMut(Capture) -> bool,
+) {
     let command = input["command"].as_str().unwrap_or("");
     let (stdout, stderr) = response_text(response);
     let interrupted = response["interrupted"].as_bool().unwrap_or(false);
 
-    for text in [command, stdout.as_str(), stderr.as_str()] {
-        for m in url_re().find_iter(text) {
-            let url = m.as_str().trim_end_matches(['.', ',', ':', ';']);
-            let Some(rest) = link::strip_scheme(url) else {
-                continue;
-            };
-            if link::is_github_pr(rest) {
-                push(Capture::new(LinkKind::Pr, link::normalize_pr_url(url)));
-            } else if link::is_productive_task(rest) {
-                push(Capture::new(LinkKind::Task, url));
-            }
-        }
-    }
-
-    // A worktree that failed to be added is not a worktree.
+    // Worktrees and beads first: they are rarer than URLs and must not be
+    // starved by the cap. A worktree that failed to be added is not one.
     let failed = interrupted || stderr.contains("fatal:");
     if !failed {
-        for m in worktree_re().captures_iter(command) {
-            if let Some((path, branch)) = parse_worktree_add(&m[1]) {
-                push(Capture::new(LinkKind::Worktree, resolve(cwd, &path)));
-                if let Some(b) = branch {
-                    push(Capture::new(LinkKind::Branch, b));
+        let mut base = cwd.to_path_buf();
+        for segment in segment_re().split(command) {
+            let segment = segment.trim();
+            if let Some(m) = cd_re().captures(segment) {
+                base = PathBuf::from(resolve(&base, m[1].trim_matches(['"', '\''])));
+            } else if let Some(m) = worktree_re().captures(segment) {
+                if let Some((path, branch)) = parse_worktree_add(m[1].trim_end_matches(')')) {
+                    push(Capture::new(LinkKind::Worktree, resolve(&base, &path)));
+                    if let Some(b) = branch {
+                        push(Capture::new(LinkKind::Branch, b));
+                    }
                 }
             }
         }
@@ -239,10 +260,45 @@ fn extract_bash(input: &Value, response: &Value, cwd: &Path, push: &mut impl FnM
             push(Capture::new(LinkKind::Beads, m.as_str()));
         }
     }
+
+    // URLs in the command are the agent's own intent; URLs in the output
+    // only count when the command is about a PR/task (`gh pr list`, `git
+    // log` and `cat CHANGELOG` print many PRs that are not this Quest's).
+    let output_prs = pr_cmd_re().is_match(command);
+    let output_tasks = output_prs || command.contains("productive");
+    let mut tasks_from_output = 0;
+    for (text, from_command) in [
+        (command, true),
+        (stdout.as_str(), false),
+        (stderr.as_str(), false),
+    ] {
+        for m in url_re().find_iter(text) {
+            let url = m.as_str().trim_end_matches(['.', ',', ':', ';']);
+            let Some(rest) = link::strip_scheme(url) else {
+                continue;
+            };
+            if link::is_github_pr(rest) {
+                if from_command || output_prs {
+                    push(Capture::new(LinkKind::Pr, link::normalize_pr_url(url)));
+                }
+            } else if link::is_productive_task(rest) {
+                if from_command {
+                    push(Capture::new(LinkKind::Task, url));
+                } else if output_tasks
+                    && tasks_from_output < MAX_OUTPUT_TASKS
+                    && push(Capture::new(LinkKind::Task, url))
+                {
+                    tasks_from_output += 1;
+                }
+            }
+        }
+    }
 }
 
-/// The `<path> [<commit-ish>]` and `-b/-B <branch>` of one `git worktree add`
-/// argument list. Quotes are stripped; other flags are skipped.
+/// The `<path>` and `-b/-B <branch>` of one `git worktree add` argument
+/// list. A positional commit-ish is not a branch of this Quest (it is often
+/// `main`, a SHA or `origin/x`), so only `-b/-B` yields one. Quotes are
+/// stripped; other flags are skipped.
 fn parse_worktree_add(args: &str) -> Option<(String, Option<String>)> {
     let mut path = None;
     let mut branch = None;
@@ -257,11 +313,7 @@ fn parse_worktree_add(args: &str) -> Option<(String, Option<String>)> {
             }
             _ if w.starts_with('-') => {}
             _ if path.is_none() => path = Some(w.to_string()),
-            _ => {
-                if branch.is_none() {
-                    branch = Some(w.to_string());
-                }
-            }
+            _ => {}
         }
     }
     let path = path.filter(|p| !p.is_empty())?;
@@ -381,6 +433,34 @@ mod tests {
                 vec![cap(K::Pr, pr)],
             ),
             (
+                "pr urls in gh pr list output → none",
+                "Bash",
+                bash(
+                    "gh pr list",
+                    &format!("{pr}\nhttps://github.com/acme/api/pull/43"),
+                    "",
+                ),
+                vec![],
+            ),
+            (
+                "pr urls in git log output → none",
+                "Bash",
+                bash("git log --oneline", &format!("abc merge {pr}"), ""),
+                vec![],
+            ),
+            (
+                "pr url in cat output → none",
+                "Bash",
+                bash("cat CHANGELOG.md", pr, ""),
+                vec![],
+            ),
+            (
+                "pr url in git push stderr → captured",
+                "Bash",
+                bash("git push -u origin feat/x", "", &format!("remote: {pr}")),
+                vec![cap(K::Pr, pr)],
+            ),
+            (
                 "github issue url → none",
                 "Bash",
                 bash("gh issue view", "https://github.com/acme/api/issues/42", ""),
@@ -409,6 +489,34 @@ mod tests {
                 ],
             ),
             (
+                "task url in output of an unrelated command → none",
+                "Bash",
+                bash(
+                    "cat notes.txt",
+                    "https://app.productive.io/1-acme/tasks/456",
+                    "",
+                ),
+                vec![],
+            ),
+            (
+                "task urls from output are capped at three",
+                "Bash",
+                bash(
+                    "curl productive-api",
+                    "https://app.productive.io/1-acme/tasks/1 \
+                     https://app.productive.io/1-acme/tasks/2 \
+                     https://app.productive.io/1-acme/tasks/1 \
+                     https://app.productive.io/1-acme/tasks/3 \
+                     https://app.productive.io/1-acme/tasks/4",
+                    "",
+                ),
+                vec![
+                    cap(K::Task, "https://app.productive.io/1-acme/tasks/1"),
+                    cap(K::Task, "https://app.productive.io/1-acme/tasks/2"),
+                    cap(K::Task, "https://app.productive.io/1-acme/tasks/3"),
+                ],
+            ),
+            (
                 "productive non-task url → none",
                 "Bash",
                 bash("x", "https://app.productive.io/1-acme/projects/9", ""),
@@ -424,10 +532,42 @@ mod tests {
                 ],
             ),
             (
-                "worktree add with positional branch, absolute path, chained",
+                "worktree add with positional commit-ish, absolute path, chained → no branch",
                 "Bash",
                 bash("cd /r && git worktree add /r/.wt/y main && ls", "", ""),
-                vec![cap(K::Worktree, "/r/.wt/y"), cap(K::Branch, "main")],
+                vec![cap(K::Worktree, "/r/.wt/y")],
+            ),
+            (
+                "worktree add after cd resolves against the new directory",
+                "Bash",
+                bash("cd repos/api && git worktree add ../wt/y", "", ""),
+                vec![cap(K::Worktree, "/nope/work/repos/wt/y")],
+            ),
+            (
+                "worktree add after cd in a subshell",
+                "Bash",
+                bash("(cd /r/api; git worktree add ../w -b f) && ls", "", ""),
+                vec![cap(K::Worktree, "/r/w"), cap(K::Branch, "f")],
+            ),
+            (
+                "worktree add before a cd is unaffected",
+                "Bash",
+                bash("git worktree add .wt/x && cd .wt/x", "", ""),
+                vec![cap(K::Worktree, "/nope/work/.wt/x")],
+            ),
+            (
+                "worktree and beads come before urls",
+                "Bash",
+                bash(
+                    "git worktree add .wt/a -b x && gh pr create",
+                    &format!("{pr}\n"),
+                    "",
+                ),
+                vec![
+                    cap(K::Worktree, "/nope/work/.wt/a"),
+                    cap(K::Branch, "x"),
+                    cap(K::Pr, pr),
+                ],
             ),
             (
                 "worktree add path only",
@@ -576,7 +716,7 @@ mod tests {
         let urls: Vec<String> = (0..30)
             .map(|i| format!("https://github.com/a/b/pull/{i}"))
             .collect();
-        let (i, r) = bash("gh", &urls.join("\n"), "");
+        let (i, r) = bash("gh pr view", &urls.join("\n"), "");
         assert_eq!(extract("Bash", &i, &r, Path::new("/w")).len(), MAX_CAPTURES);
     }
 
@@ -587,6 +727,10 @@ mod tests {
             Some(("a".into(), Some("x".into())))
         );
         assert_eq!(parse_worktree_add("-f p"), Some(("p".into(), None)));
+        assert_eq!(
+            parse_worktree_add("p origin/main"),
+            Some(("p".into(), None))
+        );
         assert_eq!(parse_worktree_add("--lock"), None);
         assert_eq!(parse_worktree_add(""), None);
     }
