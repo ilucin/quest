@@ -1,6 +1,6 @@
 //! `q hook install | uninstall | status` — merges q's hooks and statusline
 //! into Claude Code's `settings.json` (SPEC §7), touching only q-owned
-//! entries. The event handlers themselves live in later beads.
+//! entries — plus `q hook statusline`. The event handlers live in later beads.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 
 use crate::Ctx;
 use crate::config;
+use crate::db::Db;
 use crate::error::QError;
+use crate::model::SessionStatus;
 use crate::output;
 
 /// Claude Code event, the `q hook <sub>` that handles it, its matcher and
@@ -598,26 +600,83 @@ pub fn noop() -> anyhow::Result<u8> {
     Ok(0)
 }
 
-/// Pass-through statusline: forwards Claude's payload to the chained
-/// command and prints whatever it prints. Never fails and never hangs —
-/// a broken or slow chain just yields an empty statusline.
-// TODO(bd-8lz.2.3): parse ctx_pct from the payload and render q's own segment.
+/// Statusline refresh (SPEC §7): forwards the raw payload to the chained
+/// command and prints whatever it prints, then records the context-window %
+/// Claude reports for the session this pane belongs to. Runs after every
+/// message, so it never fails, never hangs, and skips a busy database.
 pub fn statusline(ctx: &Ctx) -> anyhow::Result<u8> {
     let mut input = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut input);
     let chain = ctx.config.statusline.chain.trim();
-    if chain.is_empty() {
-        return Ok(0);
-    }
-    if let Some(out) = run_chain(chain, &input) {
+    if !chain.is_empty()
+        && let Some(out) = run_chain(chain, &input, CHAIN_TIMEOUT)
+    {
         let mut stdout = std::io::stdout().lock();
         let _ = stdout.write_all(&out);
         let _ = stdout.flush();
     }
+    record_ctx(&input);
     Ok(0)
 }
 
-fn run_chain(chain: &str, input: &[u8]) -> Option<Vec<u8>> {
+const CTX_DB_BUSY_MS: u32 = 200;
+
+/// Best effort: any failure just means this refresh is not recorded. The
+/// session is `$Q_SESSION` when q started this pane; otherwise the live
+/// session Claude's `session_id` was last recorded on — narrowed to
+/// `$TMUX_PANE` when set, since `claude --resume` replays an id elsewhere.
+/// Never creates the database: Claude calls this in every session, most of
+/// them nothing to do with q.
+fn record_ctx(input: &[u8]) {
+    let Ok(payload) = serde_json::from_slice::<Value>(input) else {
+        return;
+    };
+    let Some(pct) = ctx_pct(&payload) else {
+        return;
+    };
+    let claude_id = payload["session_id"].as_str().filter(|s| !s.is_empty());
+    let q_session = env_var("Q_SESSION");
+    if q_session.is_none() && claude_id.is_none() {
+        return;
+    }
+    let Ok(path) = Db::path() else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
+    let Ok(db) = Db::open_with_timeout(&path, CTX_DB_BUSY_MS) else {
+        return;
+    };
+    let session = match (q_session, claude_id) {
+        (Some(id), _) => db.get_session(&id),
+        (None, Some(cid)) => db.find_session_by_claude_id(cid, env_var("TMUX_PANE").as_deref()),
+        (None, None) => return,
+    };
+    let Ok(Some(session)) = session else {
+        return;
+    };
+    if session.status == SessionStatus::Ended {
+        return;
+    }
+    let _ = db.update_session_ctx(&session.id, pct, claude_id);
+}
+
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|s| !s.is_empty())
+}
+
+fn ctx_pct(payload: &Value) -> Option<u8> {
+    let used = payload["context_window"]["used_percentage"].as_f64()?;
+    if !used.is_finite() {
+        return None;
+    }
+    Some(used.round().clamp(0.0, 100.0) as u8)
+}
+
+/// Runs the chain with the payload on stdin. A chain that outlives `timeout`
+/// is killed and whatever it printed so far is kept.
+fn run_chain(chain: &str, input: &[u8], timeout: Duration) -> Option<Vec<u8>> {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(chain)
@@ -638,7 +697,7 @@ fn run_chain(chain: &str, input: &[u8]) -> Option<Vec<u8>> {
         let _ = stdout.read_to_end(&mut buf);
         buf
     });
-    let deadline = Instant::now() + CHAIN_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -648,7 +707,7 @@ fn run_chain(chain: &str, input: &[u8]) -> Option<Vec<u8>> {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                break;
             }
         }
     }
@@ -658,6 +717,34 @@ fn run_chain(chain: &str, input: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timed_out_chain_keeps_its_partial_output() {
+        let out = run_chain("echo partial; sleep 30", b"", Duration::from_millis(200));
+        assert_eq!(out.as_deref(), Some(&b"partial\n"[..]));
+    }
+
+    #[test]
+    fn ctx_pct_rounds_and_tolerates_missing_fields() {
+        assert_eq!(
+            ctx_pct(&json!({"context_window": {"used_percentage": 42.6}})),
+            Some(43)
+        );
+        assert_eq!(
+            ctx_pct(&json!({"context_window": {"used_percentage": 100.4}})),
+            Some(100)
+        );
+        assert_eq!(
+            ctx_pct(&json!({"context_window": {"used_percentage": 7}})),
+            Some(7)
+        );
+        assert_eq!(ctx_pct(&json!({"context_window": {}})), None);
+        assert_eq!(ctx_pct(&json!({"session_id": "x"})), None);
+        assert_eq!(
+            ctx_pct(&json!({"context_window": {"used_percentage": "42"}})),
+            None
+        );
+    }
 
     #[test]
     fn ownership_is_any_binary_followed_by_a_known_hook_sub() {

@@ -163,6 +163,50 @@ impl Db {
             })
     }
 
+    /// Statusline refresh: last known context-window % and, when Claude
+    /// reports one, its current session id (it changes across `/clear`).
+    pub fn update_session_ctx(
+        &self,
+        id: &str,
+        ctx_pct: u8,
+        claude_session_id: Option<&str>,
+    ) -> anyhow::Result<usize> {
+        let ts = now();
+        self.conn
+            .execute(
+                "UPDATE session SET ctx_pct = ?1, ctx_updated_at = ?2, \
+                 claude_session_id = COALESCE(?3, claude_session_id), updated_at = ?2 \
+                 WHERE id = ?4",
+                params![ctx_pct, ts, claude_session_id, id],
+            )
+            .map_err(db_err)
+    }
+
+    /// The live session Claude last reported this session id for, narrowed to
+    /// `tmux_pane` when given — `claude --resume` can replay the same id from
+    /// another pane, and the pane is the session's identity.
+    pub fn find_session_by_claude_id(
+        &self,
+        claude_session_id: &str,
+        tmux_pane: Option<&str>,
+    ) -> anyhow::Result<Option<Session>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {COLUMNS} FROM session WHERE claude_session_id = ?1 \
+                     AND status != 'ended' AND (?2 IS NULL OR tmux_pane = ?2) \
+                     ORDER BY started_at DESC, id DESC LIMIT 1"
+                ),
+                params![claude_session_id, tmux_pane],
+                row_to_session,
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(db_err(other)),
+            })
+    }
+
     fn require_session(&self, id: &str) -> anyhow::Result<Session> {
         self.get_session(id)?
             .ok_or_else(|| QError::NotFound(format!("session `{id}`")).into())

@@ -38,6 +38,14 @@ impl Db {
     }
 
     pub fn open(path: &Path) -> anyhow::Result<Db> {
+        Db::open_with_timeout(path, BUSY_TIMEOUT_MS)
+    }
+
+    /// `open` with its own lock budget, for callers that would rather skip
+    /// than stall — the statusline runs after every message. Opening a
+    /// database, WAL switch and migrations included, waits at most `busy_ms`
+    /// per statement.
+    pub fn open_with_timeout(path: &Path, busy_ms: u32) -> anyhow::Result<Db> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -46,20 +54,23 @@ impl Db {
         }
         let conn = Connection::open(path)
             .map_err(|e| QError::Db(format!("cannot open {}: {e}", path.display())))?;
-        Db::prepare(conn)
+        Db::prepare(conn, busy_ms)
     }
 
     #[cfg(test)]
     pub fn open_in_memory() -> anyhow::Result<Db> {
-        Db::prepare(Connection::open_in_memory().map_err(db_err)?)
+        Db::prepare(
+            Connection::open_in_memory().map_err(db_err)?,
+            BUSY_TIMEOUT_MS,
+        )
     }
 
-    fn prepare(mut conn: Connection) -> anyhow::Result<Db> {
+    fn prepare(mut conn: Connection, busy_ms: u32) -> anyhow::Result<Db> {
         // Before anything that can contend, so every later statement waits its
         // turn instead of failing.
-        conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)
+        conn.pragma_update(None, "busy_timeout", busy_ms)
             .map_err(db_err)?;
-        set_wal(&conn)?;
+        set_wal(&conn, busy_ms)?;
         conn.pragma_update(None, "foreign_keys", true)
             .map_err(db_err)?;
         migrations::migrate(&mut conn)?;
@@ -88,7 +99,7 @@ fn path_from(env: Option<std::ffi::OsString>) -> anyhow::Result<PathBuf> {
     Ok(home.join(".local").join("share").join("q").join("q.db"))
 }
 
-/// How long any statement waits on a lock held by another `q`.
+/// How long any statement waits on a lock held by another `q`, by default.
 const BUSY_TIMEOUT_MS: u32 = 5000;
 
 /// Switches the file to WAL. In-memory databases stay on the "memory" journal;
@@ -97,9 +108,8 @@ const BUSY_TIMEOUT_MS: u32 = 5000;
 /// The mode change needs a brief exclusive lock and, unlike ordinary
 /// statements, is refused outright rather than routed through the busy handler
 /// — so N processes opening the same fresh file have to be retried by hand.
-fn set_wal(conn: &Connection) -> anyhow::Result<()> {
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(BUSY_TIMEOUT_MS));
+fn set_wal(conn: &Connection, busy_ms: u32) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(u64::from(busy_ms));
     loop {
         match conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(())) {
             Ok(()) => return Ok(()),
