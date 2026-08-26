@@ -5,8 +5,8 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -18,6 +18,7 @@ use crate::db::Db;
 use crate::error::QError;
 use crate::model::SessionStatus;
 use crate::output;
+use crate::proc;
 
 /// Claude Code event, the `q hook <sub>` that handles it, its matcher and
 /// timeout. Order is the order entries are written in.
@@ -83,14 +84,14 @@ fn known_sub(sub: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum State {
+pub enum State {
     Installed,
     Missing,
     Drifted,
 }
 
 impl State {
-    fn symbol(self) -> char {
+    pub fn symbol(self) -> char {
         match self {
             State::Installed => '✓',
             State::Missing => '✗',
@@ -98,7 +99,7 @@ impl State {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             State::Installed => "installed",
             State::Missing => "missing",
@@ -108,28 +109,28 @@ impl State {
 }
 
 #[derive(Debug, Serialize)]
-struct EventStatus {
-    event: &'static str,
-    state: State,
+pub struct EventStatus {
+    pub event: &'static str,
+    pub state: State,
 }
 
 #[derive(Debug, Serialize)]
-struct StatuslineStatus {
-    state: State,
-    command: Option<String>,
-    chain: String,
+pub struct StatuslineStatus {
+    pub state: State,
+    pub command: Option<String>,
+    pub chain: String,
 }
 
 #[derive(Debug, Serialize)]
-struct Status {
-    settings: PathBuf,
-    command: String,
-    ok: bool,
-    events: Vec<EventStatus>,
-    statusline: StatuslineStatus,
+pub struct Status {
+    pub settings: PathBuf,
+    pub command: String,
+    pub ok: bool,
+    pub events: Vec<EventStatus>,
+    pub statusline: StatuslineStatus,
     /// sha256 over the entry set `install` would write vs. the q entries found.
-    expected_hash: String,
-    actual_hash: String,
+    pub expected_hash: String,
+    pub actual_hash: String,
 }
 
 /// `$Q_CLAUDE_SETTINGS`, else `~/.claude/settings.json`. Symlinks are
@@ -670,41 +671,28 @@ fn ctx_pct(payload: &Value) -> Option<u8> {
 /// Runs the chain with the payload on stdin. A chain that outlives `timeout`
 /// is killed and whatever it printed so far is kept.
 fn run_chain(chain: &str, input: &[u8], timeout: Duration) -> Option<Vec<u8>> {
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(chain)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let input = input.to_vec();
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(&input);
-        });
-    }
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-        }
-    }
-    reader.join().ok()
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(chain);
+    proc::run(&mut cmd, input, timeout).ok().map(|o| o.stdout)
+}
+
+/// The install state `q hook status` reports, for callers that only want to
+/// read it — `q doctor`. `chain` is the configured statusline chain.
+pub fn installed_status(chain: &str) -> anyhow::Result<Status> {
+    let path = settings_path()?;
+    let cmd = q_command(None)?;
+    let settings = read_settings(&path)?;
+    Ok(compute_status(&settings, path, &cmd, chain))
+}
+
+/// Directory holding Claude Code's user files, i.e. where `settings.json`
+/// lives. `q doctor` looks for credentials next to it.
+pub fn claude_dir() -> anyhow::Result<PathBuf> {
+    let path = settings_path()?;
+    Ok(path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".")))
 }
 
 #[cfg(test)]

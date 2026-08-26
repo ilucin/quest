@@ -31,7 +31,12 @@ fn q() -> TestCmd {
         .env("Q_CONFIG", dir.path().join("config.toml"))
         .env("Q_FIXTURE", dir.path().join("tmux.json"))
         // Never read the real `~/.claude/sessions`.
-        .env("Q_CLAUDE_SESSIONS_DIR", dir.path().join("registry"));
+        .env("Q_CLAUDE_SESSIONS_DIR", dir.path().join("registry"))
+        // `q doctor` reads Claude's settings.json; no test may see the real one.
+        .env(
+            "Q_CLAUDE_SETTINGS",
+            dir.path().join("claude").join("settings.json"),
+        );
     TestCmd { dir, cmd }
 }
 
@@ -1147,9 +1152,44 @@ fn stub_exe(dir: &std::path::Path, name: &str) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// A `claude` stub answering the two calls `q doctor` makes: `--version` and
+/// `auth status --json`. An empty `auth` makes the latter fail, the way an
+/// older Claude Code without an `auth` subcommand would.
+fn stub_claude(dir: &std::path::Path, version: &str, auth: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let answer = if auth.is_empty() {
+        "exit 1".to_string()
+    } else {
+        // Single-quoted: the payload is JSON, so it holds no single quotes.
+        format!("echo '{auth}'")
+    };
+    let path = dir.join("claude");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\ncase \"$1\" in\n--version) echo '{version}' ;;\nauth) {answer} ;;\n*) exit 0 ;;\nesac\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// `sh` inside the sandboxed `PATH`, for the checks that run a shell.
+fn link_sh(bin: &std::path::Path) {
+    std::os::unix::fs::symlink("/bin/sh", bin.join("sh")).unwrap();
+}
+
+fn bin_dir(cmd: &TestCmd) -> std::path::PathBuf {
+    cmd.dir.path().join("bin")
+}
+
+fn settings_path(cmd: &TestCmd) -> std::path::PathBuf {
+    cmd.dir.path().join("claude").join("settings.json")
+}
+
 /// `q` with a `PATH` holding exactly `names` — `PATH`-dependent checks then
-/// report the same thing on every machine.
-fn doctor(names: &[&str]) -> TestCmd {
+/// report the same thing on every machine. The hook checks are left failing:
+/// `doctor` installs them, this does not.
+fn doctor_bare(names: &[&str]) -> TestCmd {
     let mut cmd = q();
     let bin = cmd.dir.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -1158,6 +1198,31 @@ fn doctor(names: &[&str]) -> TestCmd {
     }
     cmd.env("PATH", &bin);
     cmd
+}
+
+/// `doctor_bare` plus q's hooks installed into the temp settings.json, so a
+/// test about some other check is not drowned in hook failures.
+fn doctor(names: &[&str]) -> TestCmd {
+    let cmd = doctor_bare(names);
+    install_hooks(&cmd);
+    cmd
+}
+
+/// `q hook install` against this command's temp settings.json.
+fn install_hooks(cmd: &TestCmd) {
+    let dir = cmd.dir.path();
+    Command::cargo_bin("q")
+        .unwrap()
+        .env("Q_DB", dir.join("q.db"))
+        .env("Q_CONFIG", dir.join("config.toml"))
+        .env("Q_FIXTURE", dir.join("tmux.json"))
+        .env(
+            "Q_CLAUDE_SETTINGS",
+            dir.join("claude").join("settings.json"),
+        )
+        .args(["hook", "install"])
+        .assert()
+        .success();
 }
 
 fn fixture_path(cmd: &TestCmd) -> std::path::PathBuf {
@@ -1192,7 +1257,7 @@ fn seed_session(db: &std::path::Path, tmux_session: &str, pane: &str) {
 }
 
 #[test]
-fn doctor_json_reports_every_m0_check() {
+fn doctor_json_reports_every_check() {
     let mut cmd = doctor(&["claude"]);
     let assert = cmd.args(["doctor", "--json"]).assert().success();
     let parsed = json_of(&assert);
@@ -1209,9 +1274,19 @@ fn doctor_json_reports_every_m0_check() {
             "config",
             "tmux",
             "claude",
+            "claude login",
             "db",
             "q on PATH",
-            "orphan sessions"
+            "hook SessionStart",
+            "hook UserPromptSubmit",
+            "hook Stop",
+            "hook Notification",
+            "hook PreCompact",
+            "hook SessionEnd",
+            "hook PostToolUse",
+            "hook statusLine",
+            "statusline chain",
+            "orphan sessions",
         ]
     );
     assert_eq!(parsed["ok"], true);
@@ -1339,8 +1414,9 @@ fn doctor_fails_on_an_invalid_config() {
         "{parsed}"
     );
     // Every other check still ran.
-    assert_eq!(parsed["checks"].as_array().unwrap().len(), 6);
+    assert_eq!(parsed["checks"].as_array().unwrap().len(), 16);
     assert_eq!(check(&parsed, "tmux")["status"], "ok");
+    assert_eq!(check(&parsed, "hook Stop")["status"], "ok");
 }
 
 #[test]
@@ -1476,6 +1552,248 @@ fn doctor_says_when_it_created_the_database() {
         "{parsed}"
     );
 }
+// ------------------------------------------- doctor: hooks, statusline, login
+
+/// Every hook check, in report order.
+fn hook_checks(report: &serde_json::Value) -> Vec<(&str, &str)> {
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| {
+            let name = c["name"].as_str().unwrap();
+            name.strip_prefix("hook ")
+                .map(|n| (n, c["status"].as_str().unwrap()))
+        })
+        .collect()
+}
+
+#[test]
+fn doctor_fails_when_the_hooks_are_not_installed() {
+    let mut cmd = doctor_bare(&["claude"]);
+    let settings = settings_path(&cmd);
+    assert!(!settings.exists());
+
+    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    let parsed = json_of(&assert);
+    assert_eq!(parsed["ok"], false);
+
+    let hooks = hook_checks(&parsed);
+    assert_eq!(hooks.len(), 8, "{parsed}");
+    for (name, status) in &hooks {
+        assert_eq!(*status, "fail", "hook {name} in {parsed}");
+    }
+    let stop = check(&parsed, "hook Stop");
+    assert_eq!(stop["detail"], "missing");
+    assert_eq!(stop["fix_hint"], "q hook install");
+    // The probe still runs, and the handler itself is fine.
+    assert_eq!(check(&parsed, "statusline chain")["status"], "ok");
+    // Nothing wrote the settings file just to inspect it.
+    assert!(!settings.exists());
+}
+
+#[test]
+fn doctor_passes_once_the_hooks_are_installed() {
+    let mut cmd = doctor(&["claude"]);
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+
+    for (name, status) in hook_checks(&parsed) {
+        assert_eq!(status, "ok", "hook {name} in {parsed}");
+    }
+    let statusline = check(&parsed, "hook statusLine");
+    assert!(
+        statusline["detail"]
+            .as_str()
+            .unwrap()
+            .contains("hook statusline"),
+        "{parsed}"
+    );
+    assert!(statusline["fix_hint"].is_null());
+}
+
+#[test]
+fn doctor_fails_a_hook_that_drifted() {
+    let mut cmd = doctor(&["claude"]);
+    let settings = settings_path(&cmd);
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    // A stale timeout: installed, but not what this q would write.
+    json["hooks"]["Stop"][0]["hooks"][0]["timeout"] = serde_json::json!(99);
+    json["statusLine"]["command"] = serde_json::json!("/old/q hook statusline");
+    std::fs::write(&settings, json.to_string()).unwrap();
+
+    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    let parsed = json_of(&assert);
+    assert_eq!(check(&parsed, "hook Stop")["status"], "fail");
+    assert_eq!(check(&parsed, "hook Stop")["detail"], "drifted");
+    assert_eq!(check(&parsed, "hook Stop")["fix_hint"], "q hook install");
+    assert_eq!(check(&parsed, "hook statusLine")["status"], "fail");
+    // The untouched entries still pass.
+    assert_eq!(check(&parsed, "hook SessionStart")["status"], "ok");
+}
+
+#[test]
+fn doctor_reports_unreadable_claude_settings_as_one_hook_failure() {
+    let mut cmd = doctor_bare(&["claude"]);
+    let settings = settings_path(&cmd);
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, "{ not json").unwrap();
+
+    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    let parsed = json_of(&assert);
+    let hooks = check(&parsed, "hooks");
+    assert_eq!(hooks["status"], "fail");
+    assert_eq!(hooks["fix_hint"], "q hook install");
+    assert!(
+        hooks["detail"].as_str().unwrap().contains("settings.json"),
+        "{parsed}"
+    );
+    assert_eq!(hook_checks(&parsed).len(), 0);
+}
+
+#[test]
+fn doctor_probes_a_configured_statusline_chain() {
+    let mut cmd = doctor(&["claude"]);
+    link_sh(&bin_dir(&cmd));
+    std::fs::write(config_path(&cmd), "[statusline]\nchain = \"/bin/cat\"\n").unwrap();
+
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    let probe = check(&parsed, "statusline chain");
+    assert_eq!(probe["status"], "ok");
+    let detail = probe["detail"].as_str().unwrap();
+    // The chain echoed the sample payload back, so the whole path works.
+    assert!(detail.starts_with("`/bin/cat` → {"), "{detail}");
+    assert!(detail.contains("hook_event_name"), "{detail}");
+}
+
+#[test]
+fn doctor_warns_when_the_statusline_chain_says_nothing() {
+    let mut cmd = doctor(&["claude"]);
+    link_sh(&bin_dir(&cmd));
+    std::fs::write(
+        config_path(&cmd),
+        "[statusline]\nchain = \"/bin/cat > /dev/null\"\n",
+    )
+    .unwrap();
+
+    // A warning, not a failure: the report still exits 0.
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    let probe = check(&parsed, "statusline chain");
+    assert_eq!(probe["status"], "warn");
+    assert!(
+        probe["detail"]
+            .as_str()
+            .unwrap()
+            .contains("printed nothing"),
+        "{parsed}"
+    );
+    assert!(probe["fix_hint"].is_string());
+}
+
+#[test]
+fn doctor_reports_the_claude_version_and_who_is_logged_in() {
+    let mut cmd = doctor_bare(&[]);
+    stub_claude(
+        &bin_dir(&cmd),
+        "2.1.246 (Claude Code)",
+        r#"{"loggedIn":true,"authMethod":"claude.ai","email":"a@b.c","subscriptionType":"team"}"#,
+    );
+    install_hooks(&cmd);
+
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    let claude = check(&parsed, "claude");
+    assert_eq!(claude["status"], "ok");
+    assert!(
+        claude["detail"].as_str().unwrap().starts_with("2.1.246 · "),
+        "{parsed}"
+    );
+    let login = check(&parsed, "claude login");
+    assert_eq!(login["status"], "ok");
+    assert_eq!(login["detail"], "logged in · claude.ai · a@b.c · team");
+}
+
+#[test]
+fn doctor_fails_when_claude_is_logged_out() {
+    let mut cmd = doctor_bare(&[]);
+    stub_claude(
+        &bin_dir(&cmd),
+        "2.1.246 (Claude Code)",
+        r#"{"loggedIn":false}"#,
+    );
+    install_hooks(&cmd);
+
+    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    let parsed = json_of(&assert);
+    let login = check(&parsed, "claude login");
+    assert_eq!(login["status"], "fail");
+    assert_eq!(login["detail"], "not logged in");
+    assert_eq!(login["fix_hint"], "claude auth login");
+}
+
+#[test]
+fn doctor_falls_back_to_the_credentials_file_then_to_a_warning() {
+    // No `claude auth status` (an older Claude Code) and no credentials file:
+    // the login state is unknown, which warns rather than fails.
+    let mut cmd = doctor_bare(&[]);
+    stub_claude(&bin_dir(&cmd), "1.0.0 (Claude Code)", "");
+    install_hooks(&cmd);
+    let creds = settings_path(&cmd)
+        .parent()
+        .unwrap()
+        .join(".credentials.json");
+
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    let login = check(&parsed, "claude login");
+    assert_eq!(login["status"], "warn");
+    assert!(
+        login["detail"].as_str().unwrap().starts_with("unknown: "),
+        "{parsed}"
+    );
+
+    // The same run with a credentials file next to settings.json passes.
+    let mut cmd = doctor_bare(&[]);
+    stub_claude(&bin_dir(&cmd), "1.0.0 (Claude Code)", "");
+    install_hooks(&cmd);
+    std::fs::write(
+        settings_path(&cmd)
+            .parent()
+            .unwrap()
+            .join(".credentials.json"),
+        "{}",
+    )
+    .unwrap();
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    let login = check(&parsed, "claude login");
+    assert_eq!(login["status"], "ok");
+    assert!(
+        login["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("credentials at "),
+        "{parsed}"
+    );
+    // The first run really had none.
+    assert!(!creds.exists());
+}
+
+#[test]
+fn doctor_human_output_lists_the_hooks_and_the_probe() {
+    doctor(&["claude"])
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("✓ hook SessionStart installed"))
+        .stdout(predicate::str::contains(
+            "✓ statusline chain no chain configured",
+        ));
+}
+
 // ------------------------------------------------------- lifecycle commands
 
 impl Env {

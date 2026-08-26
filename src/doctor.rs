@@ -1,20 +1,25 @@
 //! `q doctor` (SPEC §19): checks the local environment and, with `--fix`,
-//! repairs what it can. Only the M0 check set lives here — the rest arrive
-//! with the features they diagnose.
+//! repairs what it can. Checks arrive with the features they diagnose; the
+//! rest of §19 (remotes, `brain`, `gh`) is still to come.
 //!
 //! Every check is independent and swallows its own errors, so a broken
 //! environment still produces a full report instead of a single failure.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
 use serde::Serialize;
+use serde_json::{Value, json};
 
 use crate::Ctx;
+use crate::commands::hook;
 use crate::config::Config;
 use crate::db::Db;
 use crate::model::{Session, now};
 use crate::output;
+use crate::proc;
 use crate::tmux::{self, Tmux};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -37,7 +42,7 @@ impl Status {
 
 #[derive(Debug, Serialize)]
 pub struct Check {
-    pub name: &'static str,
+    pub name: String,
     pub status: Status,
     pub detail: String,
     pub fix_hint: Option<String>,
@@ -82,9 +87,9 @@ impl Report {
     }
 }
 
-fn check(name: &'static str, status: Status, detail: impl Into<String>) -> Check {
+fn check(name: impl Into<String>, status: Status, detail: impl Into<String>) -> Check {
     Check {
-        name,
+        name: name.into(),
         status,
         detail: detail.into(),
         fix_hint: None,
@@ -202,16 +207,256 @@ fn check_tmux(tmux: &dyn Tmux) -> Check {
     }
 }
 
-// TODO(M1): also check that `claude` is logged in; running it costs a process
-// spawn and a network round trip, so it waits for the milestone that needs it.
-fn check_claude() -> Check {
-    match which("claude") {
-        Some(path) => check("claude", Status::Ok, path.display().to_string()),
-        None => with_hint(
+/// Budget for the two `claude` calls; both read local state, so a slow answer
+/// means something is wrong rather than merely busy.
+const CLAUDE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Budget for the statusline probe. Claude calls the statusline after every
+/// message, so anything slower than this is already a problem.
+const STATUSLINE_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn check_claude(claude: Option<&Path>) -> Check {
+    let Some(path) = claude else {
+        return with_hint(
             check("claude", Status::Fail, "not found on PATH"),
             "install Claude Code (https://claude.com/claude-code)",
-        ),
+        );
+    };
+    let version = claude_version(path);
+    let detail = match &version {
+        Some(v) => format!("{v} · {}", path.display()),
+        None => path.display().to_string(),
+    };
+    check("claude", Status::Ok, detail)
+}
+
+/// An unreadable version is not a problem of its own — the check reports the
+/// path either way — so this returns `None` rather than a status.
+fn claude_version(claude: &Path) -> Option<String> {
+    let mut cmd = Command::new(claude);
+    cmd.arg("--version");
+    let out = proc::run(&mut cmd, b"", CLAUDE_TIMEOUT).ok()?;
+    out.success().then(|| parse_claude_version(&out.text()))?
+}
+
+/// `claude --version` answers `2.1.246 (Claude Code)`.
+fn parse_claude_version(out: &str) -> Option<String> {
+    let word = out.lines().next()?.split_whitespace().next()?;
+    word.starts_with(|c: char| c.is_ascii_digit())
+        .then(|| word.to_string())
+}
+
+/// What `claude auth status --json` says about the local credentials.
+enum Login {
+    In(String),
+    Out,
+}
+
+/// Claude Code 2.x answers `claude auth status --json` from local state, no
+/// network round trip: `{"loggedIn": true, "authMethod": …, "email": …}`.
+fn parse_auth_status(out: &str) -> Option<Login> {
+    let payload: Value = serde_json::from_str(out).ok()?;
+    if !payload.get("loggedIn")?.as_bool()? {
+        return Some(Login::Out);
     }
+    let who: Vec<&str> = ["authMethod", "email", "subscriptionType"]
+        .iter()
+        .filter_map(|k| payload.get(*k).and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .collect();
+    Some(Login::In(who.join(" · ")))
+}
+
+const LOGIN: &str = "claude login";
+
+fn check_claude_login(claude: Option<&Path>) -> Check {
+    let Some(claude) = claude else {
+        return check(LOGIN, Status::Warn, "skipped: no claude on PATH");
+    };
+    let mut cmd = Command::new(claude);
+    cmd.args(["auth", "status", "--json"]);
+    let out = proc::run(&mut cmd, b"", CLAUDE_TIMEOUT).ok();
+    let answered = out.as_ref().filter(|o| o.success());
+    match answered.and_then(|o| parse_auth_status(&o.text())) {
+        Some(Login::In(who)) if who.is_empty() => check(LOGIN, Status::Ok, "logged in"),
+        Some(Login::In(who)) => check(LOGIN, Status::Ok, format!("logged in · {who}")),
+        Some(Login::Out) => with_hint(
+            check(LOGIN, Status::Fail, "not logged in"),
+            "claude auth login",
+        ),
+        None => credentials_fallback(out.is_some_and(|o| o.timed_out())),
+    }
+}
+
+/// No usable `claude auth status` (an older Claude Code has no `auth`
+/// subcommand): fall back to the credentials file. It is absent when the
+/// token lives in the macOS keychain, so its absence is only a warning —
+/// nothing here proves the user is logged *out*.
+fn credentials_fallback(timed_out: bool) -> Check {
+    let creds = hook::claude_dir().map(|d| d.join(".credentials.json"));
+    match creds {
+        Ok(path) if path.exists() => check(
+            LOGIN,
+            Status::Ok,
+            format!("credentials at {}", path.display()),
+        ),
+        _ => {
+            let why = if timed_out {
+                "`claude auth status` timed out"
+            } else {
+                "`claude auth status` gave no answer"
+            };
+            with_hint(
+                check(LOGIN, Status::Warn, format!("unknown: {why}")),
+                "claude auth login",
+            )
+        }
+    }
+}
+
+// -------------------------------------------------------------------- hooks
+
+/// One line per Claude Code hook q owns, plus the statusline entry. `drifted`
+/// is a failure like `missing` is: it means the entry points at another binary
+/// or carries a stale timeout, which is exactly what `q hook install` fixes.
+fn check_hooks(chain: &str) -> Vec<Check> {
+    let status = match hook::installed_status(chain) {
+        Ok(status) => status,
+        Err(e) => {
+            return vec![with_hint(
+                check("hooks", Status::Fail, detail("hooks", &e)),
+                "q hook install",
+            )];
+        }
+    };
+    let mut checks: Vec<Check> = status
+        .events
+        .iter()
+        .map(|e| hook_check(format!("hook {}", e.event), e.state, None))
+        .collect();
+    checks.push(hook_check(
+        "hook statusLine".to_string(),
+        status.statusline.state,
+        status.statusline.command.as_deref(),
+    ));
+    checks
+}
+
+fn hook_check(name: String, state: hook::State, command: Option<&str>) -> Check {
+    let mut text = state.label().to_string();
+    if let Some(command) = command {
+        text.push_str(&format!(" · {command}"));
+    }
+    match state {
+        hook::State::Installed => check(name, Status::Ok, text),
+        _ => with_hint(check(name, Status::Fail, text), "q hook install"),
+    }
+}
+
+// --------------------------------------------------------------- statusline
+
+const STATUSLINE: &str = "statusline chain";
+
+/// A statusline payload shaped like the one Claude Code 2.1.x sends
+/// (SPEC §23 #1) — enough for `q hook statusline` to take its normal path.
+fn probe_payload() -> String {
+    json!({
+        "hook_event_name": "Status",
+        "session_id": "q-doctor-probe",
+        "cwd": "/",
+        "model": { "id": "q-doctor-probe", "display_name": "Doctor" },
+        "context_window": {
+            "used_percentage": 42.0,
+            "remaining_percentage": 58.0,
+            "context_window_size": 200_000,
+        },
+    })
+    .to_string()
+}
+
+/// Runs the real handler end to end — this binary, `q hook statusline`, the
+/// sample payload on stdin — so a broken chain shows up here instead of in
+/// the user's status bar. `Q_DB` points at a path that does not exist, and
+/// the handler only records the context window when the database is already
+/// there, so the probe writes nothing.
+fn check_statusline(chain: &str) -> Check {
+    let chain = chain.trim();
+    let Ok(exe) = std::env::current_exe() else {
+        return check(
+            STATUSLINE,
+            Status::Warn,
+            "skipped: cannot locate the running binary",
+        );
+    };
+    let mut cmd = Command::new(exe);
+    cmd.args(["hook", "statusline"])
+        .env("Q_DB", probe_db())
+        .env_remove("Q_SESSION")
+        .env_remove("Q_QUEST")
+        .env_remove("TMUX_PANE");
+    match proc::run(&mut cmd, probe_payload().as_bytes(), STATUSLINE_TIMEOUT) {
+        Ok(out) => evaluate_statusline(out.timed_out(), out.code(), &out.text(), chain),
+        Err(e) => check(STATUSLINE, Status::Fail, format!("cannot probe: {e}")),
+    }
+}
+
+/// A database path nothing ever creates, so the probe stays side-effect free.
+fn probe_db() -> PathBuf {
+    std::env::temp_dir().join(format!("q-doctor-probe-{}.db", std::process::id()))
+}
+
+/// A configured chain that prints nothing only warns: it may legitimately
+/// have nothing to say about a synthetic payload, and a red doctor over a
+/// cosmetic status bar would be worse than a quiet one.
+fn evaluate_statusline(timed_out: bool, code: Option<i32>, out: &str, chain: &str) -> Check {
+    let secs = STATUSLINE_TIMEOUT.as_secs();
+    if timed_out {
+        return with_hint(
+            check(
+                STATUSLINE,
+                Status::Fail,
+                format!("`q hook statusline` did not finish in {secs}s"),
+            ),
+            "check the [statusline] chain command for a hang",
+        );
+    }
+    if code != Some(0) {
+        let shown = code.map_or_else(|| "a signal".to_string(), |c| format!("{c}"));
+        return check(
+            STATUSLINE,
+            Status::Fail,
+            format!("`q hook statusline` exited {shown}"),
+        );
+    }
+    if chain.is_empty() {
+        return check(STATUSLINE, Status::Ok, "no chain configured");
+    }
+    if out.is_empty() {
+        return with_hint(
+            check(
+                STATUSLINE,
+                Status::Warn,
+                format!("`{chain}` printed nothing"),
+            ),
+            "q config set statusline.chain <command>",
+        );
+    }
+    check(
+        STATUSLINE,
+        Status::Ok,
+        format!("`{chain}` → {}", first_line(out, 60)),
+    )
+}
+
+/// First line, at most `max` chars, ellipsised — a statusline is wide and
+/// often coloured, and one report line has room for neither.
+fn first_line(s: &str, max: usize) -> String {
+    let line = s.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= max {
+        return line.to_string();
+    }
+    let mut out: String = line.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// The database check doubles as the handle the orphan check needs.
@@ -341,17 +586,26 @@ fn describe(db: &Db, session: &Session) -> String {
 fn report(ctx: &Ctx, fix: bool) -> Report {
     let mut fixed = Vec::new();
     let (db_check, db) = check_db();
-    let checks = vec![
+    let claude = which("claude");
+    let chain = &ctx.config.statusline.chain;
+    let mut checks = vec![
         check_config(),
         check_tmux(ctx.tmux()),
-        check_claude(),
+        check_claude(claude.as_deref()),
+        check_claude_login(claude.as_deref()),
         db_check,
+        // SPEC §23 #8 is only half checkable: which `q` a shell runs is
+        // answered here, but a shell *alias* or function named `q` would take
+        // `$SHELL -ic 'type q'` to find — sourcing the user's rc files for a
+        // diagnostic is not worth the side effects, so it is left unprobed.
         check_q_on_path(
             std::env::current_exe().ok().as_deref(),
             which("q").as_deref(),
         ),
-        check_orphans(db.as_ref(), ctx.tmux(), fix, &mut fixed),
     ];
+    checks.extend(check_hooks(chain));
+    checks.push(check_statusline(chain));
+    checks.push(check_orphans(db.as_ref(), ctx.tmux(), fix, &mut fixed));
     Report::new(checks, fixed)
 }
 
@@ -486,6 +740,124 @@ mod tests {
         assert_eq!(shadowed.status, Status::Warn);
         assert!(shadowed.detail.contains("shadows"), "{shadowed:?}");
         assert!(shadowed.fix_hint.is_some());
+    }
+
+    #[test]
+    fn claude_version_is_the_leading_number_of_the_first_line() {
+        assert_eq!(
+            parse_claude_version("2.1.246 (Claude Code)"),
+            Some("2.1.246".to_string())
+        );
+        assert_eq!(
+            parse_claude_version("  1.0.0-beta (Claude Code)\nnoise\n"),
+            Some("1.0.0-beta".to_string())
+        );
+        assert_eq!(parse_claude_version("claude 2.1.246"), None);
+        assert_eq!(parse_claude_version(""), None);
+    }
+
+    #[test]
+    fn auth_status_reads_logged_in_and_who() {
+        let Some(Login::In(who)) = parse_auth_status(
+            r#"{"loggedIn":true,"authMethod":"claude.ai","email":"a@b.c","subscriptionType":"team"}"#,
+        ) else {
+            panic!("expected a logged-in answer");
+        };
+        assert_eq!(who, "claude.ai · a@b.c · team");
+
+        let Some(Login::In(who)) = parse_auth_status(r#"{"loggedIn":true}"#) else {
+            panic!("expected a logged-in answer");
+        };
+        assert!(who.is_empty());
+
+        assert!(matches!(
+            parse_auth_status(r#"{"loggedIn":false}"#),
+            Some(Login::Out)
+        ));
+        // Anything unparsable falls through to the credentials fallback.
+        assert!(parse_auth_status("").is_none());
+        assert!(parse_auth_status("not json").is_none());
+        assert!(parse_auth_status(r#"{"loggedIn":"yes"}"#).is_none());
+        assert!(parse_auth_status(r#"{"authMethod":"claude.ai"}"#).is_none());
+    }
+
+    #[test]
+    fn a_login_check_without_claude_is_skipped_not_failed() {
+        let skipped = check_claude_login(None);
+        assert_eq!(skipped.status, Status::Warn);
+        assert!(skipped.detail.contains("skipped"), "{skipped:?}");
+    }
+
+    #[test]
+    fn claude_missing_from_path_fails_with_an_install_hint() {
+        let missing = check_claude(None);
+        assert_eq!(missing.status, Status::Fail);
+        assert!(missing.fix_hint.is_some());
+    }
+
+    #[test]
+    fn statusline_probe_grades_the_handler_then_the_chain() {
+        // The handler itself must exit 0.
+        let timeout = evaluate_statusline(true, None, "", "ccusage");
+        assert_eq!(timeout.status, Status::Fail);
+        assert!(timeout.detail.contains("did not finish"), "{timeout:?}");
+        assert!(timeout.fix_hint.is_some());
+
+        let failed = evaluate_statusline(false, Some(2), "", "");
+        assert_eq!(failed.status, Status::Fail);
+        assert!(failed.detail.contains("exited 2"), "{failed:?}");
+        assert_eq!(
+            evaluate_statusline(false, None, "", "").detail,
+            "`q hook statusline` exited a signal"
+        );
+
+        // No chain: nothing to echo, and that is fine.
+        let none = evaluate_statusline(false, Some(0), "", "");
+        assert_eq!(none.status, Status::Ok);
+        assert_eq!(none.detail, "no chain configured");
+
+        // A configured chain that says nothing is suspicious, not fatal.
+        let silent = evaluate_statusline(false, Some(0), "", "ccusage");
+        assert_eq!(silent.status, Status::Warn);
+        assert!(silent.detail.contains("printed nothing"), "{silent:?}");
+
+        let echoed = evaluate_statusline(false, Some(0), "ctx 42%\nsecond", "ccusage");
+        assert_eq!(echoed.status, Status::Ok);
+        assert_eq!(echoed.detail, "`ccusage` → ctx 42%");
+    }
+
+    #[test]
+    fn first_line_is_one_line_and_bounded() {
+        assert_eq!(first_line("  a  \nb", 10), "a");
+        assert_eq!(first_line("", 10), "");
+        assert_eq!(first_line("čćžšđ", 3), "čć…");
+        assert_eq!(first_line("čćžšđ", 5), "čćžšđ");
+    }
+
+    #[test]
+    fn a_hook_is_ok_only_when_installed() {
+        let ok = hook_check("hook Stop".to_string(), hook::State::Installed, None);
+        assert_eq!(ok.status, Status::Ok);
+        assert_eq!(ok.detail, "installed");
+        assert!(ok.fix_hint.is_none());
+
+        for state in [hook::State::Missing, hook::State::Drifted] {
+            let bad = hook_check(
+                "hook statusLine".to_string(),
+                state,
+                Some("/old/q hook statusline"),
+            );
+            assert_eq!(bad.status, Status::Fail, "{state:?}");
+            assert!(bad.detail.ends_with("· /old/q hook statusline"), "{bad:?}");
+            assert_eq!(bad.fix_hint.as_deref(), Some("q hook install"));
+        }
+    }
+
+    #[test]
+    fn the_probe_payload_carries_the_field_the_handler_reads() {
+        let payload: Value = serde_json::from_str(&probe_payload()).unwrap();
+        assert!(payload["context_window"]["used_percentage"].is_number());
+        assert!(payload["session_id"].as_str().is_some());
     }
 
     #[test]

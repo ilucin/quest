@@ -8,6 +8,7 @@ mod error;
 mod hooks;
 mod model;
 mod output;
+mod proc;
 mod registry;
 mod tmux;
 
