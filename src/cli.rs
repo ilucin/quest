@@ -121,6 +121,47 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<ConfigAction>,
     },
+
+    /// Claude Code hooks: install into settings.json, or run one (internal)
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HookAction {
+    /// Merge q's hooks and statusline into Claude Code's settings.json
+    Install {
+        /// Command to invoke q with (default: absolute path of this binary)
+        #[arg(long, value_name = "CMD")]
+        command: Option<String>,
+    },
+    /// Remove q's entries from settings.json, restoring the chained statusline
+    Uninstall,
+    /// Report which q entries are installed, missing or drifted
+    Status {
+        /// Compare against this command instead of this binary's path
+        #[arg(long, value_name = "CMD")]
+        command: Option<String>,
+    },
+    // Hook handlers Claude Code invokes; each reads the hook payload on stdin.
+    #[command(hide = true)]
+    SessionStart,
+    #[command(hide = true)]
+    UserPromptSubmit,
+    #[command(hide = true)]
+    Stop,
+    #[command(hide = true)]
+    Notification,
+    #[command(hide = true)]
+    PreCompact,
+    #[command(hide = true)]
+    SessionEnd,
+    #[command(hide = true)]
+    PostToolUse,
+    #[command(hide = true)]
+    Statusline,
 }
 
 #[derive(Subcommand, Debug)]

@@ -3,6 +3,7 @@
 pub mod close;
 pub mod enter;
 pub mod fmt;
+pub mod hook;
 pub mod list;
 pub mod new;
 pub mod rename;

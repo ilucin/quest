@@ -10,7 +10,7 @@ mod tmux;
 
 use clap::Parser;
 
-use cli::{Cli, Command, ConfigAction};
+use cli::{Cli, Command, ConfigAction, HookAction};
 use config::Config;
 use db::Db;
 use error::QError;
@@ -226,6 +226,18 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             let ctx = Ctx::with_db(args)?;
             commands::rm::run(&ctx, quest, *force).map(|()| 0)
         }
+        Command::Hook { action } => match action {
+            HookAction::Install { command } => {
+                commands::hook::install(&Ctx::config_only(args)?, command.as_deref())
+            }
+            HookAction::Uninstall => commands::hook::uninstall(&Ctx::config_only(args)?),
+            HookAction::Status { command } => {
+                commands::hook::status(&Ctx::config_only(args)?, command.as_deref())
+            }
+            // TODO(bd-8lz.2.2, bd-8lz.2.3): real handlers; until then every
+            // hook drains stdin and exits 0 so Claude Code never blocks on us.
+            _ => commands::hook::noop(),
+        },
     }
 }
 

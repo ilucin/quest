@@ -167,8 +167,9 @@ mod tests {
 
     #[test]
     fn payload_renders_an_object_as_key_values() {
+        // `preserve_order`: keys render in the order the payload was built.
         let value = serde_json::json!({ "from": "a", "to": "b", "n": 2 });
-        assert_eq!(payload(Some(&value), 80), "from=a n=2 to=b");
+        assert_eq!(payload(Some(&value), 80), "from=a to=b n=2");
         assert_eq!(payload(None, 80), "-");
         assert_eq!(payload(Some(&serde_json::Value::Null), 80), "-");
         assert_eq!(payload(Some(&serde_json::json!("plain")), 80), "plain");
