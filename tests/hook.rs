@@ -31,8 +31,95 @@ impl Env {
         cmd.env("Q_DB", self.dir.path().join("q.db"))
             .env("Q_CONFIG", self.config())
             .env("Q_FIXTURE", self.dir.path().join("tmux.json"))
-            .env("Q_CLAUDE_SETTINGS", self.settings());
+            .env("Q_CLAUDE_SETTINGS", self.settings())
+            // The handlers key off these; none may leak in from the terminal
+            // `cargo test` runs in.
+            .env_remove("Q_QUEST")
+            .env_remove("Q_SESSION")
+            .env_remove("TMUX_PANE");
         cmd
+    }
+
+    fn db(&self) -> PathBuf {
+        self.dir.path().join("q.db")
+    }
+
+    fn conn(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.db()).unwrap()
+    }
+
+    /// Quest `q-0001` (`alpha`) with one live worker session `s-0001` on
+    /// pane `%7`, in `status`.
+    fn seed(&self, status: &str) {
+        // `list` creates and migrates the database.
+        self.q().arg("list").assert().success();
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO quest (id, slug, name_source, goal, cwd, machine, state, \
+             created_at, updated_at) VALUES ('q-0001', 'alpha', 'manual', 'ship it', \
+             '/tmp', 'laptop', 'active', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, quest_id, role, label, tmux_session, tmux_pane, \
+             status, started_at, updated_at) VALUES ('s-0001', 'q-0001', 'worker', 'w1', \
+             'q-alpha', '%7', ?1, 1, 1)",
+            [status],
+        )
+        .unwrap();
+    }
+
+    /// `q hook <sub>` inside the seeded Quest pane, fed `payload`.
+    fn hook(&self, sub: &str, payload: &Value) -> assert_cmd::assert::Assert {
+        self.q()
+            .env("Q_QUEST", "q-0001")
+            .env("Q_SESSION", "s-0001")
+            .args(["hook", sub])
+            .write_stdin(payload.to_string())
+            .assert()
+    }
+
+    fn session(&self) -> Value {
+        self.conn()
+            .query_row(
+                "SELECT status, waiting_for, claude_session_id, claude_pid, first_prompt, \
+                 last_prompt, ended_at, updated_at FROM session WHERE id = 's-0001'",
+                [],
+                |r| {
+                    Ok(json!({
+                        "status": r.get::<_, String>(0)?,
+                        "waiting_for": r.get::<_, Option<String>>(1)?,
+                        "claude_session_id": r.get::<_, Option<String>>(2)?,
+                        "claude_pid": r.get::<_, Option<i64>>(3)?,
+                        "first_prompt": r.get::<_, Option<String>>(4)?,
+                        "last_prompt": r.get::<_, Option<String>>(5)?,
+                        "ended_at": r.get::<_, Option<i64>>(6)?,
+                        "updated_at": r.get::<_, i64>(7)?,
+                    }))
+                },
+            )
+            .unwrap()
+    }
+
+    /// `(kind, payload)` of every event, oldest first.
+    fn events(&self) -> Vec<(String, Value)> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT kind, payload FROM event ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| {
+            let payload: Option<String> = r.get(1)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                payload
+                    .map(|p| serde_json::from_str(&p).unwrap())
+                    .unwrap_or(Value::Null),
+            ))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
     }
 
     fn read(&self) -> Value {
@@ -727,4 +814,352 @@ fn statusline_with_unknown_q_session_is_a_quiet_noop() {
         .assert()
         .success()
         .stdout("");
+}
+
+// ------------------------------------------------------------ hook handlers
+
+const HANDLERS: [&str; 6] = [
+    "session-start",
+    "user-prompt-submit",
+    "stop",
+    "notification",
+    "pre-compact",
+    "session-end",
+];
+
+#[test]
+fn without_q_quest_handlers_are_silent_and_touch_nothing() {
+    let env = Env::new();
+    env.seed("idle");
+    let before = env.session();
+    for sub in HANDLERS {
+        env.q()
+            .env("Q_SESSION", "s-0001")
+            .args(["hook", sub])
+            .write_stdin(json!({ "session_id": "cs-1", "prompt": "hi" }).to_string())
+            .assert()
+            .success()
+            .stdout("");
+    }
+    assert_eq!(env.session(), before);
+    assert!(env.events().is_empty());
+}
+
+#[test]
+fn session_start_records_identity_and_injects_the_brief() {
+    let env = Env::new();
+    env.seed("starting");
+    let assert = env
+        .hook(
+            "session-start",
+            &json!({ "session_id": "cs-42", "source": "startup", "cwd": "/tmp" }),
+        )
+        .success();
+    let out: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    let hso = &out["hookSpecificOutput"];
+    assert_eq!(hso["hookEventName"], "SessionStart");
+    let ctx = hso["additionalContext"].as_str().unwrap();
+    assert!(
+        ctx.starts_with("You are running inside Quest `alpha` (q)"),
+        "{ctx}"
+    );
+    assert!(ctx.contains("session `w1` (worker)"), "{ctx}");
+    assert!(ctx.contains("# Quest q-0001 `alpha`"), "{ctx}");
+    assert!(ctx.contains("## 1. Quest"), "{ctx}");
+    assert!(ctx.contains("## 2. How you work here"), "{ctx}");
+
+    let s = env.session();
+    assert_eq!(s["status"], "idle");
+    assert_eq!(s["claude_session_id"], "cs-42");
+    assert!(s["claude_pid"].as_i64().unwrap() > 0);
+    assert!(s["updated_at"].as_i64().unwrap() > 1);
+    assert_eq!(
+        env.events(),
+        [("session.start".to_string(), json!({ "source": "startup" }))]
+    );
+}
+
+#[test]
+fn session_start_resumes_an_ended_session() {
+    let env = Env::new();
+    env.seed("ended");
+    env.conn()
+        .execute("UPDATE session SET ended_at = 99 WHERE id = 's-0001'", [])
+        .unwrap();
+    env.hook("session-start", &json!({ "source": "resume" }))
+        .success();
+    let s = env.session();
+    assert_eq!(s["status"], "idle");
+    assert_eq!(s["ended_at"], Value::Null);
+}
+
+#[test]
+fn prompt_marks_busy_and_sets_first_prompt_once() {
+    let env = Env::new();
+    env.seed("idle");
+    env.hook(
+        "user-prompt-submit",
+        &json!({ "prompt": "  first thing  " }),
+    )
+    .success()
+    .stdout("");
+    let s = env.session();
+    assert_eq!(s["status"], "busy");
+    assert_eq!(s["first_prompt"], "first thing");
+    assert_eq!(s["last_prompt"], "first thing");
+
+    let long = "x".repeat(700);
+    env.hook("user-prompt-submit", &json!({ "prompt": long }))
+        .success();
+    let s = env.session();
+    assert_eq!(s["first_prompt"], "first thing");
+    let last = s["last_prompt"].as_str().unwrap();
+    assert_eq!(last.chars().count(), 500, "{last}");
+    assert!(last.ends_with('…'));
+
+    let events = env.events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].0, "session.prompt");
+    assert_eq!(events[0].1["prompt"], "first thing");
+    assert_eq!(events[1].1["prompt"].as_str().unwrap().chars().count(), 200);
+
+    // No prompt text: still busy, the stored prompts stay.
+    env.hook("stop", &json!({})).success();
+    env.hook("user-prompt-submit", &json!({})).success();
+    let s = env.session();
+    assert_eq!(s["status"], "busy");
+    assert_eq!(s["first_prompt"], "first thing");
+    assert_eq!(s["last_prompt"], last);
+    assert_eq!(env.events().len(), 4);
+    assert_eq!(env.events()[3].1["prompt"], Value::Null);
+}
+
+#[test]
+fn session_start_after_clear_overwrites_the_claude_session_id() {
+    let env = Env::new();
+    env.seed("idle");
+    env.hook(
+        "session-start",
+        &json!({ "session_id": "cs-1", "source": "startup" }),
+    )
+    .success();
+    assert_eq!(env.session()["claude_session_id"], "cs-1");
+    env.hook(
+        "session-start",
+        &json!({ "session_id": "cs-2", "source": "clear" }),
+    )
+    .success();
+    assert_eq!(env.session()["claude_session_id"], "cs-2");
+    // A start without an id keeps the last known one.
+    env.hook("session-start", &json!({ "source": "resume" }))
+        .success();
+    assert_eq!(env.session()["claude_session_id"], "cs-2");
+    assert_eq!(env.events().len(), 3);
+}
+
+#[test]
+fn non_blocking_notifications_only_log_an_event() {
+    let env = Env::new();
+    env.seed("idle");
+    for kind in ["auth_success", "idle_prompt"] {
+        env.hook(
+            "notification",
+            &json!({ "notification_type": kind, "message": "hello" }),
+        )
+        .success()
+        .stdout("");
+        let s = env.session();
+        assert_eq!(s["status"], "idle", "{kind}");
+        assert_eq!(s["waiting_for"], Value::Null, "{kind}");
+    }
+    env.hook(
+        "notification",
+        &json!({ "notification_type": "elicitation_dialog", "message": "Pick one" }),
+    )
+    .success();
+    let s = env.session();
+    assert_eq!(s["status"], "waiting");
+    assert_eq!(s["waiting_for"], "input");
+
+    let events = env.events();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].0, "session.notification");
+    assert_eq!(events[0].1["type"], "auth_success");
+    assert_eq!(events[0].1["waiting_for"], Value::Null);
+    assert_eq!(events[1].0, "session.notification");
+    assert_eq!(events[2].0, "session.waiting");
+    assert_eq!(events[2].1["waiting_for"], "input");
+}
+
+#[test]
+fn a_held_write_lock_makes_the_hook_give_up_quickly_and_atomically() {
+    use std::time::{Duration, Instant};
+    let env = Env::new();
+    env.seed("idle");
+    let holder = env.conn();
+    holder
+        .execute_batch("BEGIN IMMEDIATE; UPDATE quest SET updated_at = 2;")
+        .unwrap();
+    // Held well past the upper bound below so the hook is guaranteed to give
+    // up (via busy_timeout) and return before the lock is ever released.
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(10));
+        holder.execute_batch("COMMIT").unwrap();
+    });
+
+    let started = Instant::now();
+    env.hook("user-prompt-submit", &json!({ "prompt": "blocked" }))
+        .success()
+        .stdout("");
+    let took = started.elapsed();
+    assert!(took >= Duration::from_millis(2500), "{took:?}");
+    // Upper bound is intentionally loose (busy_timeout is ~3s) to absorb
+    // wall-clock jitter on slower/loaded CI runners (observed up to ~4.3s on
+    // macOS); it still proves the hook returned well before the 10s lock
+    // release above, so nothing partially written is ever observed.
+    assert!(took <= Duration::from_millis(8000), "{took:?}");
+    release.join().unwrap();
+
+    let s = env.session();
+    assert_eq!(s["status"], "idle", "nothing partially written");
+    assert_eq!(s["last_prompt"], Value::Null);
+    assert!(env.events().is_empty());
+}
+
+#[test]
+fn stop_notification_compact_and_end_update_status_and_log_events() {
+    let env = Env::new();
+    env.seed("busy");
+
+    env.hook("stop", &json!({ "stop_hook_active": false }))
+        .success()
+        .stdout("");
+    assert_eq!(env.session()["status"], "idle");
+
+    env.hook(
+        "notification",
+        &json!({ "notification_type": "permission_prompt", "message": "Claude needs your permission to use Bash" }),
+    )
+    .success()
+    .stdout("");
+    let s = env.session();
+    assert_eq!(s["status"], "waiting");
+    assert_eq!(s["waiting_for"], "permission");
+
+    env.hook(
+        "notification",
+        &json!({ "message": "Claude is waiting for your input" }),
+    )
+    .success();
+    assert_eq!(env.session()["waiting_for"], "input");
+
+    env.hook("pre-compact", &json!({ "trigger": "auto" }))
+        .success()
+        .stdout("");
+    assert_eq!(
+        env.session()["status"],
+        "waiting",
+        "compact leaves status alone"
+    );
+
+    env.hook("session-end", &json!({ "reason": "exit" }))
+        .success()
+        .stdout("");
+    let s = env.session();
+    assert_eq!(s["status"], "ended");
+    assert_eq!(s["waiting_for"], Value::Null);
+    assert!(s["ended_at"].as_i64().unwrap() > 1);
+
+    let events = env.events();
+    let kinds: Vec<&str> = events.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "session.stop",
+            "session.waiting",
+            "session.waiting",
+            "session.compact",
+            "session.end"
+        ]
+    );
+    assert_eq!(events[0].1["stop_hook_active"], false);
+    assert_eq!(events[1].1["type"], "permission_prompt");
+    assert_eq!(events[1].1["waiting_for"], "permission");
+    assert_eq!(events[2].1["type"], Value::Null);
+    assert_eq!(events[2].1["waiting_for"], "input");
+    assert_eq!(
+        events[1].1["message"],
+        "Claude needs your permission to use Bash"
+    );
+    assert_eq!(events[3].1["trigger"], "auto");
+    assert_eq!(events[4].1["reason"], "exit");
+}
+
+#[test]
+fn tmux_pane_resolves_the_session_when_q_session_is_missing() {
+    let env = Env::new();
+    env.seed("idle");
+    env.q()
+        .env("Q_QUEST", "q-0001")
+        .env("TMUX_PANE", "%7")
+        .args(["hook", "user-prompt-submit"])
+        .write_stdin(json!({ "prompt": "via pane" }).to_string())
+        .assert()
+        .success();
+    assert_eq!(env.session()["last_prompt"], "via pane");
+
+    // An unknown pane, or a session from another Quest, is not ours.
+    for (quest, pane) in [("q-0001", "%99"), ("q-other", "%7")] {
+        env.q()
+            .env("Q_QUEST", quest)
+            .env("TMUX_PANE", pane)
+            .args(["hook", "stop"])
+            .write_stdin("{}")
+            .assert()
+            .success()
+            .stdout("");
+    }
+    assert_eq!(env.session()["status"], "busy");
+    assert_eq!(env.events().len(), 1);
+}
+
+#[test]
+fn malformed_stdin_and_unknown_sessions_exit_zero_silently() {
+    let env = Env::new();
+    env.seed("idle");
+    for sub in HANDLERS {
+        env.q()
+            .env("Q_QUEST", "q-0001")
+            .env("Q_SESSION", "s-0001")
+            .args(["hook", sub])
+            .write_stdin("this is not json")
+            .assert()
+            .success();
+        env.q()
+            .env("Q_QUEST", "q-0001")
+            .env("Q_SESSION", "s-nope")
+            .args(["hook", sub])
+            .write_stdin("{}")
+            .assert()
+            .success()
+            .stdout("");
+    }
+    // Neither a malformed payload nor an unknown session leaves a trace.
+    let events = env.events();
+    assert!(events.is_empty(), "{events:?}");
+    assert_eq!(env.session()["status"], "idle");
+
+    // No database at all: still silent, and the hook never creates one.
+    let bare = Env::new();
+    for sub in HANDLERS {
+        bare.q()
+            .env("Q_QUEST", "q-0001")
+            .env("Q_SESSION", "s-0001")
+            .args(["hook", sub])
+            .write_stdin("{}")
+            .assert()
+            .success()
+            .stdout("");
+    }
+    assert!(!bare.db().exists());
 }

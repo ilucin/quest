@@ -117,17 +117,6 @@ impl Db {
         self.require_session(id)
     }
 
-    /// Self-reported phase (`q phase`).
-    pub fn update_session_phase(&self, id: &str, phase: &str) -> anyhow::Result<Session> {
-        self.conn
-            .execute(
-                "UPDATE session SET phase = ?1, updated_at = ?2 WHERE id = ?3",
-                params![phase, now(), id],
-            )
-            .map_err(db_err)?;
-        self.require_session(id)
-    }
-
     pub fn mark_session_ended(&self, id: &str, ended_at: i64) -> anyhow::Result<Session> {
         self.conn
             .execute(
@@ -216,6 +205,39 @@ impl Db {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(db_err(other)),
             })
+    }
+
+    /// A Claude session (re)started in this pane: new identity, back to
+    /// `idle`. An `ended` row resumes — `ended_at` is cleared.
+    pub fn record_session_start(
+        &self,
+        id: &str,
+        claude_session_id: Option<&str>,
+        claude_pid: Option<i64>,
+    ) -> anyhow::Result<Session> {
+        self.conn
+            .execute(
+                "UPDATE session SET status = 'idle', waiting_for = NULL, ended_at = NULL, \
+                 claude_session_id = COALESCE(?1, claude_session_id), \
+                 claude_pid = COALESCE(?2, claude_pid), updated_at = ?3 WHERE id = ?4",
+                params![claude_session_id, claude_pid, now(), id],
+            )
+            .map_err(db_err)?;
+        self.require_session(id)
+    }
+
+    /// A prompt was submitted: `busy`; when the text is known, `last_prompt`
+    /// always and `first_prompt` only the first time.
+    pub fn record_session_prompt(&self, id: &str, prompt: Option<&str>) -> anyhow::Result<Session> {
+        self.conn
+            .execute(
+                "UPDATE session SET status = 'busy', waiting_for = NULL, \
+                 first_prompt = COALESCE(first_prompt, ?1), \
+                 last_prompt = COALESCE(?1, last_prompt), updated_at = ?2 WHERE id = ?3",
+                params![prompt, now(), id],
+            )
+            .map_err(db_err)?;
+        self.require_session(id)
     }
 
     fn require_session(&self, id: &str) -> anyhow::Result<Session> {
@@ -417,6 +439,45 @@ mod tests {
         assert_eq!(name(&live.id), "q-omega");
         assert_eq!(name(&ended.id), "q-alpha");
         assert_eq!(name(&other.id), "q-alpha");
+    }
+
+    #[test]
+    fn session_start_resumes_an_ended_row_and_keeps_known_identity() {
+        let db = db();
+        let q = quest(&db, "alpha");
+        let s = session(&db, &q.id, "w1", "%1");
+        db.mark_session_ended(&s.id, 7).unwrap();
+
+        let started = db
+            .record_session_start(&s.id, Some("cs-1"), Some(42))
+            .unwrap();
+        assert_eq!(started.status, SessionStatus::Idle);
+        assert_eq!(started.ended_at, None);
+        assert_eq!(started.claude_session_id.as_deref(), Some("cs-1"));
+        assert_eq!(started.claude_pid, Some(42));
+
+        let again = db.record_session_start(&s.id, None, None).unwrap();
+        assert_eq!(again.claude_session_id.as_deref(), Some("cs-1"));
+        assert_eq!(again.claude_pid, Some(42));
+    }
+
+    #[test]
+    fn prompts_set_first_once_and_last_always() {
+        let db = db();
+        let q = quest(&db, "alpha");
+        let s = session(&db, &q.id, "w1", "%1");
+        let one = db.record_session_prompt(&s.id, Some("go")).unwrap();
+        assert_eq!(one.status, SessionStatus::Busy);
+        assert_eq!(one.first_prompt.as_deref(), Some("go"));
+        assert_eq!(one.last_prompt.as_deref(), Some("go"));
+        let two = db.record_session_prompt(&s.id, Some("more")).unwrap();
+        assert_eq!(two.first_prompt.as_deref(), Some("go"));
+        assert_eq!(two.last_prompt.as_deref(), Some("more"));
+        db.update_session_status(&s.id, SessionStatus::Idle, None)
+            .unwrap();
+        let three = db.record_session_prompt(&s.id, None).unwrap();
+        assert_eq!(three.status, SessionStatus::Busy);
+        assert_eq!(three.last_prompt.as_deref(), Some("more"));
     }
 
     #[test]
