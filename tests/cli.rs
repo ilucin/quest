@@ -1501,6 +1501,90 @@ fn event_kinds(env: &Env, quest_id: &str) -> Vec<String> {
         .unwrap()
 }
 
+/// The pane ids of every session row, keyed by quest slug.
+fn live_panes_by_slug(env: &Env) -> Vec<(String, String, String)> {
+    env.conn()
+        .prepare(
+            "SELECT quest.slug, session.tmux_session, session.tmux_pane
+             FROM session JOIN quest ON quest.id = session.quest_id
+             WHERE session.ended_at IS NULL ORDER BY quest.slug",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn two_quests_get_distinct_panes_and_both_stay_alive() {
+    let env = Env::new();
+    let alpha = env.new_quest("alpha");
+    let beta = env.new_quest("beta");
+
+    assert_ne!(alpha["session"]["tmux_pane"], beta["session"]["tmux_pane"]);
+    assert_eq!(
+        live_panes_by_slug(&env),
+        vec![
+            (
+                "alpha".to_string(),
+                "q-alpha".to_string(),
+                alpha["session"]["tmux_pane"].as_str().unwrap().to_string()
+            ),
+            (
+                "beta".to_string(),
+                "q-beta".to_string(),
+                beta["session"]["tmux_pane"].as_str().unwrap().to_string()
+            ),
+        ]
+    );
+
+    // The second `q new` must not have swept the first quest's session.
+    let list = env.json(&["list"]);
+    for row in list.as_array().unwrap() {
+        assert_eq!(row["display_state"], "active", "{row}");
+        assert_eq!(row["live_sessions"], 1, "{row}");
+    }
+    for slug in ["alpha", "beta"] {
+        let shown = env.json(&["show", slug]);
+        assert_eq!(shown["live_sessions"], 1, "{shown}");
+        assert_eq!(shown["sessions"][0]["status"], "starting", "{shown}");
+        assert!(shown["sessions"][0]["ended_at"].is_null(), "{shown}");
+    }
+    assert!(
+        !event_kinds(&env, alpha["quest"]["id"].as_str().unwrap())
+            .contains(&"session.end".to_string())
+    );
+}
+
+/// The fixture's `next_pane` defaults, so a hand-seeded file can omit it. That
+/// must not hand the next session a pane id another session already holds.
+#[test]
+fn a_fixture_seeded_without_a_pane_counter_keeps_pane_ids_unique() {
+    let env = Env::new();
+    let alpha = env.new_quest("alpha");
+    let mut fixture = env.fixture();
+    fixture.as_object_mut().unwrap().remove("next_pane");
+    env.write_fixture(fixture);
+
+    let beta = env.new_quest("beta");
+    assert_ne!(alpha["session"]["tmux_pane"], beta["session"]["tmux_pane"]);
+
+    let panes = env.fixture();
+    let ids: Vec<&str> = panes["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["pane_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["%1", "%2"], "{panes}");
+    // Both sessions are still live and each keeps its own pane.
+    assert_eq!(live_panes_by_slug(&env).len(), 2);
+    for slug in ["alpha", "beta"] {
+        assert_eq!(env.json(&["show", slug])["live_sessions"], 1);
+    }
+}
+
 #[test]
 fn the_full_quest_lifecycle() {
     let env = Env::new();

@@ -430,8 +430,7 @@ impl FixtureState {
         spec_env: &[(String, String)],
         command: Option<&str>,
     ) -> Pane {
-        self.next_pane += 1;
-        let n = self.next_pane;
+        let n = self.claim_pane_number();
         let pane = FixturePane {
             pane_id: format!("%{n}"),
             pane_pid: 90000 + n as i32,
@@ -445,6 +444,22 @@ impl FixtureState {
         let out = pane.as_pane();
         self.panes.push(pane);
         out
+    }
+
+    /// A pane number no live pane holds. Real tmux never hands out an id twice
+    /// while the pane lives, and pane ids are a session's identity (SPEC §6),
+    /// so a hand-seeded fixture whose `next_pane` lags its panes — or omits the
+    /// field entirely — must not mint a duplicate.
+    fn claim_pane_number(&mut self) -> u32 {
+        let highest = self
+            .panes
+            .iter()
+            .filter_map(|p| p.pane_id.strip_prefix('%'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0);
+        self.next_pane = self.next_pane.max(highest) + 1;
+        self.next_pane
     }
 
     fn pane_mut(&mut self, pane_id: &str) -> anyhow::Result<&mut FixturePane> {
@@ -1265,6 +1280,55 @@ mod tests {
         assert_eq!(panes[0].pane_id, "%42");
         assert!(t.has_session("q-alpha").unwrap());
         assert_eq!(t.version().unwrap(), FIXTURE_VERSION);
+    }
+
+    #[test]
+    fn a_fixture_without_a_counter_still_mints_unique_pane_ids() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tmux.json");
+        // `next_pane` omitted, as any hand-written fixture may leave it: it
+        // must not put `%1` on top of the pane that already holds it.
+        std::fs::write(
+            &path,
+            r#"{"panes": [{"pane_id": "%1", "session_name": "q-alpha"}]}"#,
+        )
+        .unwrap();
+        let t = FixtureTmux::new(&path);
+        let pane = t
+            .new_session(&NewSession {
+                name: "q-beta".to_string(),
+                window_name: "master".to_string(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        assert_eq!(pane.pane_id, "%2");
+
+        let ids: Vec<String> = t
+            .list_panes()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.pane_id)
+            .collect();
+        assert_eq!(ids, vec!["%1".to_string(), "%2".to_string()]);
+    }
+
+    #[test]
+    fn a_stale_counter_never_reuses_a_live_pane_id() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tmux.json");
+        std::fs::write(
+            &path,
+            r#"{"next_pane": 1, "panes": [{"pane_id": "%7", "session_name": "q-alpha"}]}"#,
+        )
+        .unwrap();
+        let t = FixtureTmux::new(&path);
+        let pane = t
+            .new_session(&NewSession {
+                name: "q-beta".to_string(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        assert_eq!(pane.pane_id, "%8");
     }
 
     fn seeded_db() -> (Db, Quest) {
