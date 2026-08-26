@@ -167,12 +167,6 @@ fn q_command(override_cmd: Option<&str>) -> anyhow::Result<String> {
             shell_quote(&exe.to_string_lossy())
         }
     };
-    if owned_sub(&statusline_command(&cmd)) != Some(STATUSLINE_SUB) {
-        return Err(QError::Invalid(format!(
-            "--command {cmd:?} would produce hook entries q cannot recognise as its own"
-        ))
-        .into());
-    }
     Ok(cmd)
 }
 
@@ -633,7 +627,10 @@ fn run_chain(chain: &str, input: &[u8]) -> Option<Vec<u8>> {
         .spawn()
         .ok()?;
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(input);
+        let input = input.to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
     }
     let mut stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {

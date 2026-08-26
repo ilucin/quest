@@ -270,7 +270,7 @@ fn hook_handlers_parse_and_exit_silently() {
 }
 
 #[test]
-fn command_with_spaces_is_quoted_and_recognised() {
+fn command_override_with_spaces_is_written_unquoted_and_recognised() {
     let env = Env::new();
     env.write(&foreign_settings());
     let cmd = "/opt/my q/q";
