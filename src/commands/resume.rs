@@ -4,7 +4,7 @@
 use std::io::Write;
 
 use crate::Ctx;
-use crate::commands::new::{MASTER, spawn_master};
+use crate::commands::new::spawn_master;
 use crate::commands::{NONE, attach_mode, live, sweep_quiet};
 use crate::error::QError;
 use crate::model::QuestState;
@@ -77,7 +77,8 @@ pub fn run(ctx: &Ctx, target: &str, prompt: Option<&str>, detach: bool) -> anyho
     if attach != NONE {
         // An exec attach replaces this process, so nothing buffered survives it.
         std::io::stdout().flush()?;
-        ctx.tmux().attach(&master.tmux_session, Some(MASTER))?;
+        ctx.tmux()
+            .attach(&master.tmux_session, Some(&master.session.tmux_pane))?;
     }
     Ok(())
 }

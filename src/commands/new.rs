@@ -93,7 +93,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     if attach != NONE {
         // An exec attach replaces this process, so nothing buffered survives it.
         std::io::stdout().flush()?;
-        ctx.tmux().attach(&tmux_session, Some(MASTER))?;
+        ctx.tmux().attach(&tmux_session, Some(&session.tmux_pane))?;
     }
     Ok(())
 }

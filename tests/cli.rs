@@ -720,11 +720,15 @@ fn new_attaches_to_the_master_window_unless_detached() {
         ])
         .assert()
         .success();
-    assert_eq!(json_of(&assert)["attach"], "exec");
+    let out = json_of(&assert);
+    assert_eq!(out["attach"], "exec");
+    // Attach targets are pane ids: the window name is not an address (SPEC §6).
+    let master_pane = out["session"]["tmux_pane"].as_str().unwrap();
     assert_eq!(
         env.fixture()["attached"],
-        serde_json::json!(["q-foo", "master"])
+        serde_json::json!(["q-foo", master_pane])
     );
+    assert_eq!(env.fixture()["selected"], master_pane);
 }
 
 #[test]
@@ -1615,10 +1619,11 @@ fn the_full_quest_lifecycle() {
     let entered = env.json(&["enter", "foo"]);
     assert_eq!(entered["tmux_session"], "q-foo");
     assert_eq!(entered["window"], "master");
+    assert_eq!(entered["session"]["id"], created["session"]["id"]);
     assert_eq!(entered["attach"], "exec");
     assert_eq!(
         env.fixture()["attached"],
-        serde_json::json!(["q-foo", "master"])
+        serde_json::json!(["q-foo", created["session"]["tmux_pane"].as_str().unwrap()])
     );
     env.cmd()
         .args(["enter", "foo", "--session", "nope"])
@@ -3648,26 +3653,33 @@ fn spawn_selects_the_new_window_only_from_inside_the_quests_session() {
         .as_str()
         .unwrap()
         .to_string();
+    // A second Quest is a second real tmux session to stand in.
+    let elsewhere = env.new_quest("bar");
+    let elsewhere_pane = elsewhere["session"]["tmux_pane"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Outside tmux: the window is opened, but no client is moved.
     assert_eq!(
         env.json(&["spawn", "foo", "a", "--label", "outside"])["attach"],
         "none"
     );
-    assert_eq!(env.fixture()["attached"], serde_json::Value::Null);
+    assert_eq!(env.fixture()["selected"], serde_json::Value::Null);
 
     // Inside another tmux session: still not ours to switch.
     let mut cmd = env.cmd();
     let assert = cmd
         .env("TMUX", "/tmp/tmux-0/default,1,0")
-        .env("TMUX_PANE", "%999")
+        .env("TMUX_PANE", &elsewhere_pane)
         .args(["spawn", "foo", "b", "--label", "elsewhere", "--json"])
         .assert()
         .success();
     assert_eq!(json_of(&assert)["attach"], "none");
-    assert_eq!(env.fixture()["attached"], serde_json::Value::Null);
+    assert_eq!(env.fixture()["selected"], serde_json::Value::Null);
 
-    // From the master's own pane: the client follows the worker.
+    // From the master's own pane: the client follows the worker. `new-window -d`
+    // never moves it on its own, so the selection is this step's alone.
     let mut cmd = env.cmd();
     let assert = cmd
         .env("TMUX", "/tmp/tmux-0/default,1,0")
@@ -3675,11 +3687,13 @@ fn spawn_selects_the_new_window_only_from_inside_the_quests_session() {
         .args(["spawn", "foo", "c", "--label", "inside", "--json"])
         .assert()
         .success();
-    assert_eq!(json_of(&assert)["attach"], "select");
-    assert_eq!(
-        env.fixture()["attached"],
-        serde_json::json!(["q-foo", "w3-inside"])
-    );
+    let out = json_of(&assert);
+    assert_eq!(out["attach"], "switch");
+    assert_eq!(out["window"], "w3-inside");
+    let worker_pane = out["session"]["tmux_pane"].as_str().unwrap().to_string();
+    assert_eq!(env.fixture()["selected"], worker_pane.as_str());
+    // Selecting a window is not attaching: no client changed sessions.
+    assert_eq!(env.fixture()["attached"], serde_json::Value::Null);
 
     // ... unless told not to.
     let mut cmd = env.cmd();
@@ -3692,8 +3706,8 @@ fn spawn_selects_the_new_window_only_from_inside_the_quests_session() {
         .success();
     assert_eq!(json_of(&assert)["attach"], "none");
     assert_eq!(
-        env.fixture()["attached"],
-        serde_json::json!(["q-foo", "w3-inside"]),
+        env.fixture()["selected"],
+        worker_pane.as_str(),
         "--no-attach moved the client anyway"
     );
 }
@@ -3710,7 +3724,88 @@ fn spawn_falls_back_to_q_quest_when_the_pane_id_is_missing() {
         .args(["spawn", "foo", "a", "--label", "tests", "--json"])
         .assert()
         .success();
-    assert_eq!(json_of(&assert)["attach"], "select");
+    assert_eq!(json_of(&assert)["attach"], "switch");
+}
+
+#[test]
+fn enter_reaches_a_worker_by_label_through_its_pane() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let spawned = env.json(&["spawn", "foo", "write the tests", "--label", "tests"]);
+    let worker_pane = spawned["session"]["tmux_pane"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The command `q spawn` printed has to work: the worker's window is
+    // `w1-tests`, but it is addressed by pane id, so the label is enough.
+    let entered = env.json(&["enter", "foo", "--session", "tests"]);
+    assert_eq!(entered["tmux_session"], "q-foo");
+    assert_eq!(entered["window"], "w1-tests");
+    assert_eq!(entered["session"]["id"], spawned["session"]["id"]);
+    assert_eq!(entered["attach"], "exec");
+    assert_eq!(
+        env.fixture()["attached"],
+        serde_json::json!(["q-foo", worker_pane.as_str()])
+    );
+    assert_eq!(env.fixture()["selected"], worker_pane.as_str());
+
+    // A rename of the window leaves the label addressable.
+    let mut fixture = env.fixture();
+    for pane in fixture["panes"].as_array_mut().unwrap() {
+        if pane["pane_id"] == worker_pane.as_str() {
+            pane["window_name"] = serde_json::json!("renamed");
+        }
+    }
+    env.write_fixture(fixture);
+    let again = env.json(&["enter", "foo", "--session", "tests"]);
+    assert_eq!(again["window"], "renamed");
+    assert_eq!(
+        env.fixture()["attached"],
+        serde_json::json!(["q-foo", worker_pane.as_str()])
+    );
+
+    // Without `--session` it is still the master.
+    let master = env.json(&["enter", "foo"]);
+    assert_eq!(master["window"], "master");
+}
+
+#[test]
+fn a_spawn_whose_window_never_opens_leaves_no_session_behind() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let mut fixture = env.fixture();
+    fixture["fail_new_window"] = serde_json::json!("no space left for windows");
+    env.write_fixture(fixture);
+
+    env.cmd()
+        .args(["spawn", "foo", "go", "--label", "tests"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("no space left for windows"));
+
+    // The row is inserted before the window (the `SessionStart` hook resolves
+    // `$Q_SESSION` the moment Claude starts), so it has to be taken back.
+    assert_eq!(env.count("SELECT count(*) FROM session"), 1);
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE role = 'worker'"),
+        0
+    );
+    assert_eq!(env.fixture()["panes"].as_array().unwrap().len(), 1);
+    let quest_id = env.json(&["show", "foo"])["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(event_kinds(&env, &quest_id), vec!["quest.created"]);
+
+    // The next spawn works, and the failed one did not consume a number.
+    let mut fixture = env.fixture();
+    fixture.as_object_mut().unwrap().remove("fail_new_window");
+    env.write_fixture(fixture);
+    assert_eq!(
+        env.json(&["spawn", "foo", "go", "--label", "tests"])["window"],
+        "w1-tests"
+    );
 }
 
 #[test]

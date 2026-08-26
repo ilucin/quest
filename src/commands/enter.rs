@@ -8,7 +8,7 @@ use crate::commands::{attach_mode, live, sweep_quiet};
 use crate::error::QError;
 use crate::model::QuestState;
 use crate::output;
-use crate::tmux::session_name;
+use crate::tmux::{session_name, window_of};
 
 pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
     sweep_quiet(ctx)?;
@@ -31,42 +31,43 @@ pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
     }
 
     let sessions = db.list_sessions_by_quest(&quest.id)?;
-    let window = match label {
+    let wanted = label.unwrap_or(MASTER);
+    let session = match live(&sessions).find(|s| s.label == wanted) {
+        Some(session) => session,
         // The tmux session can outlive its master window; attaching would then
         // land on whatever window is left instead of the Quest's master.
-        None => {
-            if !live(&sessions).any(|s| s.label == MASTER) {
-                return Err(QError::Other(format!(
-                    "master session of {} ended; run `q resume {}`",
-                    quest.slug, quest.slug
-                ))
-                .into());
-            }
-            MASTER.to_string()
+        None if label.is_none() => {
+            return Err(QError::Other(format!(
+                "master session of {} ended; run `q resume {}`",
+                quest.slug, quest.slug
+            ))
+            .into());
         }
-        Some(label) => {
+        None => {
             let known: Vec<&str> = live(&sessions).map(|s| s.label.as_str()).collect();
-            if !known.contains(&label) {
-                let live_labels = if known.is_empty() {
-                    "none".to_string()
-                } else {
-                    known.join(", ")
-                };
-                return Err(QError::NotFound(format!(
-                    "session `{label}` in quest {} (live: {live_labels})",
-                    quest.slug
-                ))
-                .into());
-            }
-            label.to_string()
+            let live_labels = if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            };
+            return Err(QError::NotFound(format!(
+                "session `{wanted}` in quest {} (live: {live_labels})",
+                quest.slug
+            ))
+            .into());
         }
     };
+    // The pane is the session's identity (SPEC §6); the window name is only
+    // ever reported, and tmux is the one that knows it.
+    let pane = session.tmux_pane.clone();
+    let window = window_of(ctx.tmux(), &pane).unwrap_or_else(|| session.label.clone());
 
     if ctx.json || !ctx.quiet {
         output::emit(
             ctx.json,
             &serde_json::json!({
                 "quest": quest,
+                "session": session,
                 "tmux_session": tmux_session,
                 "window": window,
                 "attach": attach_mode(ctx, true),
@@ -76,5 +77,5 @@ pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
     }
     // A real attach replaces this process, so nothing buffered survives it.
     std::io::stdout().flush()?;
-    ctx.tmux().attach(&tmux_session, Some(&window))
+    ctx.tmux().attach(&tmux_session, Some(&pane))
 }

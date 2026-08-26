@@ -5,15 +5,11 @@ use std::io::Write;
 
 use crate::Ctx;
 use crate::commands::new::{MASTER, claude_command, fresh_session_id, resolve_dir, validate_label};
-use crate::commands::{NONE, live, sweep_quiet};
+use crate::commands::{attach_mode, live, sweep_quiet};
 use crate::error::QError;
 use crate::model::{QuestState, Session, SessionRole, SessionStatus};
 use crate::output;
 use crate::tmux::{NewWindow, Tmux, config_override, db_override, quest_env, session_name};
-
-/// The caller's tmux client moves to the new window. `q new`'s `switch`/`exec`
-/// modes do not apply: `q spawn` never attaches from outside the session.
-const SELECT: &str = "select";
 
 #[derive(Debug)]
 pub struct Args<'a> {
@@ -72,9 +68,38 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         None => quest.cwd.clone(),
     };
 
-    // The session id goes into the window's environment, so it has to exist
-    // before the pane it will be stored against.
+    // The row goes in before the window: `$Q_SESSION` is in the window's
+    // environment, and Claude's `SessionStart` hook fires against it as soon as
+    // the window exists. The pane — the session's identity — is filled in right
+    // after tmux hands it over.
     let session_id = fresh_session_id(db)?;
+    let mut row = Session::new(
+        &quest.id,
+        SessionRole::Worker,
+        args.label,
+        &tmux_session,
+        "",
+    );
+    row.id = session_id.clone();
+    row.status = SessionStatus::Starting;
+    // Without `--workflow` a worker runs the Quest's, as the master does.
+    // TODO(M5): validate `--workflow` against the workflow registry.
+    row.workflow = args
+        .workflow
+        .map(str::to_string)
+        .or_else(|| quest.workflow.clone());
+    row.first_prompt = Some(prompt.to_string());
+    // `session.start` is the hook's to append once Claude comes up.
+    let pending = db.insert_session(&row)?;
+    if pending.id != session_id {
+        // A regenerated id would no longer match `Q_SESSION` in the window.
+        let _ = db.delete_session(&pending.id);
+        return Err(QError::Db(format!(
+            "session id `{session_id}` was taken between allocating and inserting it"
+        ))
+        .into());
+    }
+
     let spec = NewWindow {
         session: tmux_session.clone(),
         window_name: window.clone(),
@@ -91,41 +116,15 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         // also how `q send`/`q peek` address the session (SPEC §6, §16).
         command: Some(claude_command(&quest.slug, args.label, Some(prompt))),
     };
-    let pane = ctx.tmux().new_window(&spec)?;
-
-    let mut row = Session::new(
-        &quest.id,
-        SessionRole::Worker,
-        args.label,
-        &tmux_session,
-        &pane.pane_id,
-    );
-    row.id = session_id.clone();
-    row.status = SessionStatus::Starting;
-    // Without `--workflow` a worker runs the Quest's, as the master does.
-    // TODO(M5): validate `--workflow` against the workflow registry.
-    row.workflow = args
-        .workflow
-        .map(str::to_string)
-        .or_else(|| quest.workflow.clone());
-    row.first_prompt = Some(prompt.to_string());
-    // `session.start` is the hook's to append once Claude comes up.
-    let session = match db.insert_session(&row) {
-        // A regenerated id would no longer match `Q_SESSION` in the window.
-        Ok(session) if session.id != session_id => {
-            let _ = ctx.tmux().kill_window(&pane.pane_id);
-            return Err(QError::Db(format!(
-                "session id `{session_id}` was taken between allocating and inserting it"
-            ))
-            .into());
-        }
-        Ok(session) => session,
-        // Only this window was opened, so the Quest's session stays untouched.
+    let pane = match ctx.tmux().new_window(&spec) {
+        Ok(pane) => pane,
+        // Nothing was opened, so the row would only be a session that never ran.
         Err(e) => {
-            let _ = ctx.tmux().kill_window(&pane.pane_id);
+            let _ = db.delete_session(&session_id);
             return Err(e);
         }
     };
+    let session = db.update_session_pane(&session_id, &pane.pane_id)?;
     db.append_event(
         &quest.id,
         Some(&session.id),
@@ -140,11 +139,10 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         }),
     )?;
 
-    let attach = if args.no_attach || !in_tmux_session(ctx, &quest.id, &tmux_session) {
-        NONE
-    } else {
-        SELECT
-    };
+    // `new-window -d` left the caller's client alone; only the same-session
+    // case selects the worker's window, and `attach_mode` calls that `switch`.
+    let attaching = !args.no_attach && in_tmux_session(ctx, &quest.id, &tmux_session);
+    let attach = attach_mode(ctx, attaching);
     if ctx.json || !ctx.quiet {
         output::emit(
             ctx.json,
@@ -163,10 +161,9 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
             },
         )?;
     }
-    if attach == SELECT {
-        // Cheap insurance: `attach` may hand the terminal over to tmux.
+    if attaching {
         std::io::stdout().flush()?;
-        ctx.tmux().attach(&tmux_session, Some(&window))?;
+        ctx.tmux().select_window(&session.tmux_pane)?;
     }
     Ok(())
 }

@@ -104,7 +104,8 @@ pub enum Command {
         /// Working directory (default: the Quest's)
         #[arg(long, value_name = "PATH")]
         dir: Option<String>,
-        /// Do not move the tmux client to the new window
+        /// Do not select the new window (already the case outside the Quest's
+        /// own tmux session, where there is no client of ours to move)
         #[arg(long)]
         no_attach: bool,
     },
