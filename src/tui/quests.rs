@@ -94,6 +94,11 @@ impl State {
         if self.searching {
             self.searching = false;
             self.query.clear();
+            // `selected` indexes the *visible* rows: dropping the query widens
+            // them under it, so the selection has to be re-anchored on its own
+            // Quest or the next frame settles it onto whichever Quest now
+            // happens to sit at that index.
+            self.resync();
         }
     }
 
@@ -431,7 +436,9 @@ fn sessions_of_selection(app: &mut App) -> Action {
     };
     let (id, slug) = (row.view.quest.id.clone(), row.view.quest.slug.clone());
     app.focus_quest = Some(id);
-    app.tab = Tab::Sessions;
+    // Through `select`, not by assignment: it is what tears a capture down, and
+    // an armed capture behind an inactive tab is invisible.
+    app.select(Tab::Sessions);
     app.say(format!("sessions of {slug}"));
     Action::Refresh
 }
@@ -909,6 +916,8 @@ mod tests {
     use crate::config::Config;
     use crate::db::Db;
     use crate::model::{Quest, QuestState};
+    use crate::tui::app::tab_layout;
+    use crate::tui::keys::MouseInput;
     use crate::tui::render;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1373,6 +1382,59 @@ mod tests {
         assert!(app.quests.query.is_empty());
     }
 
+    /// Leaving the tab drops the half-typed query, which widens `visible()`
+    /// under a `selected` index that was aimed at the narrowed list. Unless the
+    /// selection is re-anchored, the next frame settles the disagreement in
+    /// favour of the index and quietly moves the selection to a different
+    /// Quest — the one `Enter` attaches to from 4.3 on.
+    #[test]
+    fn cancelling_a_capture_on_a_tab_switch_keeps_the_same_quest_selected() {
+        let rows: Vec<QuestRow> = (0..10)
+            .map(|n| {
+                row(
+                    quest(&format!("quest-{n:02}"), QuestState::Active, 100 - n),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let mut app = app_with(rows);
+        // Hit-testing reads the width the header published; the click is only
+        // meaningful after a frame has been drawn at this size.
+        draw(&mut app, 120, 30);
+
+        app.handle(Input::Char('/'));
+        for c in "quest-07".chars() {
+            app.handle(Input::Char(c));
+        }
+        assert_eq!(app.quests.visible().len(), 1);
+        let want = app.quests.selected_row().unwrap().view.quest.clone();
+        assert_eq!(want.slug, "quest-07");
+
+        // Out to Sessions and back, by mouse — the one way out of the box that
+        // is neither Esc nor Enter.
+        let (_, _, sessions, _) = tab_layout()[1];
+        app.handle_mouse(MouseInput::Click {
+            col: sessions,
+            row: 0,
+        });
+        let (_, _, quests, _) = tab_layout()[0];
+        app.handle_mouse(MouseInput::Click {
+            col: quests,
+            row: 0,
+        });
+        assert_eq!(app.tab, Tab::Quests);
+        assert!(!app.quests.capturing());
+        assert_eq!(app.quests.visible().len(), 10, "the query outlived the tab");
+
+        let text = screen(&mut app, 120, 30);
+        assert_eq!(
+            app.quests.selected_row().unwrap().view.quest.slug,
+            "quest-07",
+            "the tab switch relocated the selection\n{text}"
+        );
+        assert_eq!(app.quests.selected_id.as_deref(), Some(want.id.as_str()));
+    }
+
     #[test]
     fn m_cycles_the_machines_present_and_back_to_all() {
         let ws = {
@@ -1402,6 +1464,32 @@ mod tests {
         assert_eq!(handle(&mut app, Input::Char('s')), Action::Refresh);
         assert_eq!(app.tab, Tab::Sessions);
         assert_eq!(app.focus_quest.as_deref(), Some(id.as_str()));
+    }
+
+    /// N14: `s` is unreachable while the box is open today, but the handoff
+    /// must still go through `select` — the invariant is "a capture is only
+    /// ever armed on the active tab", and 4.4/4.5 give other tabs captures.
+    #[test]
+    fn handing_the_selection_to_sessions_tears_down_an_armed_capture() {
+        let mut app = grouped();
+        app.quests.searching = true;
+        app.quests.query = "run".to_string();
+        app.quests.resync();
+        let want = app.quests.selected_row().unwrap().view.quest.id.clone();
+
+        assert_eq!(sessions_of_selection(&mut app), Action::Refresh);
+        assert_eq!(app.tab, Tab::Sessions);
+        assert_eq!(app.focus_quest.as_deref(), Some(want.as_str()));
+        assert!(
+            !app.quests.capturing(),
+            "the box is still holding the keyboard behind an inactive tab"
+        );
+        assert!(
+            app.quests.query.is_empty(),
+            "an uncommitted query outlived the tab: {:?}",
+            app.quests.query
+        );
+        assert!(app.status.contains("sessions of running"), "{}", app.status);
     }
 
     #[test]

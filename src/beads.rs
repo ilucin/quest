@@ -801,6 +801,37 @@ pub fn progress_all(quests: &[&Quest]) -> HashMap<String, Progress> {
 /// tick, and a one-shot `q list` should not inherit an older process's bad luck.
 static LAST_FAILURE: AtomicI64 = AtomicI64::new(0);
 
+/// Test-only exclusive access to [`LAST_FAILURE`]. `cargo test` runs the whole
+/// crate's unit tests in one process, so the static is shared by every test
+/// that reaches `progress_all_with` with a Quest carrying an epic — directly,
+/// or through `refresh`/`fill_progress`. The guard clears the window on the way
+/// in and gives it back clear, so no test can inherit or leak one.
+#[cfg(test)]
+pub(crate) mod backoff {
+    use super::{LAST_FAILURE, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) struct Guard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            LAST_FAILURE.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn acquire() -> Guard {
+        // A test that panicked while holding it poisons the lock; the window
+        // was cleared on the way out regardless, so the poison is not news.
+        let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        LAST_FAILURE.store(0, Ordering::Relaxed);
+        Guard { _lock: lock }
+    }
+}
+
 fn backing_off(now: i64) -> bool {
     let last = LAST_FAILURE.load(Ordering::Relaxed);
     last != 0 && (now - last).abs() < FAILURE_TTL
@@ -1258,7 +1289,7 @@ mod tests {
     /// the tick. The keyboard goes dead while the process looks idle.
     #[test]
     fn a_failing_bd_is_not_respawned_on_every_tick() {
-        LAST_FAILURE.store(0, Ordering::Relaxed);
+        let _guard = backoff::acquire();
         let mut quest = Quest::new("slow", "/tmp/work", "laptop");
         quest.beads_epic = Some("bd-42".to_string());
         let bd = FailingBd::default();
@@ -1274,7 +1305,28 @@ mod tests {
         LAST_FAILURE.store(now() - FAILURE_TTL, Ordering::Relaxed);
         assert!(progress_all_with(&bd, &[&quest]).is_empty());
         assert_eq!(bd.0.get(), 2);
-        LAST_FAILURE.store(0, Ordering::Relaxed);
+    }
+
+    /// The window is process-wide and the unit tests share one process, so the
+    /// guard — not the caller's discipline — is what keeps it from crossing
+    /// test boundaries in either direction.
+    #[test]
+    fn the_backoff_window_does_not_leak_between_tests() {
+        let mut quest = Quest::new("slow", "/tmp/work", "laptop");
+        quest.beads_epic = Some("bd-42".to_string());
+        let bd = FailingBd::default();
+
+        let guard = backoff::acquire();
+        assert!(progress_all_with(&bd, &[&quest]).is_empty());
+        assert!(backing_off(now()), "a failure should arm the window");
+        drop(guard);
+
+        let guard = backoff::acquire();
+        assert!(
+            !backing_off(now()),
+            "the window outlived its guard: the next test inherits a bd q will not call"
+        );
+        drop(guard);
     }
 
     #[test]

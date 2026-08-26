@@ -297,7 +297,7 @@ impl App {
     }
 
     /// Whether the active tab is reading raw text rather than commands.
-    fn capturing(&self) -> bool {
+    pub(super) fn capturing(&self) -> bool {
         match self.tab {
             Tab::Quests => self.quests.capturing(),
             _ => false,
@@ -332,7 +332,9 @@ impl App {
         }
     }
 
-    fn select(&mut self, tab: Tab) {
+    /// The one way to change tabs: every tab switch has to go through the
+    /// capture teardown, not only the ones the tab bar drives.
+    pub(super) fn select(&mut self, tab: Tab) {
         if self.tab != tab {
             // Whatever was being typed is abandoned with the tab: a capture
             // left armed behind an inactive tab is invisible, and the mouse

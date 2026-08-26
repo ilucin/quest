@@ -437,6 +437,15 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     // A reload that failed outranks a keypress's feedback: it is the reason
     // what is on screen may be stale.
     let left = match (app.refresh_error.as_deref(), app.current_status()) {
+        // A capture owns the head of the bar: the bar *is* the box, with its
+        // cursor and match count, and `filters` deliberately keeps the
+        // in-flight query out of the chips. Swapping the box for the error
+        // would leave the keyboard armed and the list filtered with nothing on
+        // screen saying either, so the error is appended instead.
+        (error, Some(status)) if app.capturing() => match error {
+            Some(e) => format!(" {status} · {e}"),
+            None => format!(" {status}"),
+        },
         (Some(e), _) => format!(" {e}"),
         (None, Some(status)) => format!(" {status}"),
         (None, None) => format!(
@@ -809,6 +818,39 @@ mod tests {
         assert!(app.refresh_error.is_none());
         let lines = draw(&mut app, 100, 10);
         assert!(lines.last().unwrap().contains("rows 2"), "{lines:?}");
+    }
+
+    /// N13: while `/` is open the status bar *is* the box — it is the only
+    /// thing on screen saying the keyboard is armed and the list is filtered
+    /// (`filters` keeps an in-flight query out of the chips on purpose). A
+    /// tick that fails mid-word must report itself without evicting it.
+    #[test]
+    fn a_failed_refresh_does_not_evict_the_search_box() {
+        let mut app = app();
+        app.handle(Input::Char('/'));
+        for c in "run".chars() {
+            app.handle(Input::Char(c));
+        }
+        assert!(app.capturing());
+
+        report_refresh(&mut app, Err(anyhow::anyhow!("database is locked")));
+        let lines = draw(&mut app, 100, 10);
+        let bar = lines.last().unwrap();
+        assert!(bar.contains("/run"), "the box was evicted: {bar}");
+        assert!(
+            bar.contains("refresh failed: database is locked"),
+            "the failure went unsaid: {bar}"
+        );
+        assert!(app.capturing(), "the keyboard was handed back");
+
+        // Once the box is closed the failure has the bar to itself again.
+        app.handle(Input::Esc);
+        assert!(!app.capturing());
+        let lines = draw(&mut app, 100, 10);
+        assert!(
+            lines.last().unwrap().contains("refresh failed"),
+            "{lines:?}"
+        );
     }
 
     /// The seam bd-8lz.4.1 left for the tabs that load data: a tick's success
