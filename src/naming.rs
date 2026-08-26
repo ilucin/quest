@@ -14,10 +14,10 @@
 //! `quest.name_input_hash` and, when they differ, spawns
 //! `q name <quest> --auto --apply --detach` in the background. No periodic job.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -147,11 +147,13 @@ struct ClaudeNamer;
 
 impl Namer for ClaudeNamer {
     fn suggest(&self, model: &str, prompt: &str) -> Option<String> {
-        run_capped(
+        let out = crate::proc::run(
             Command::new("claude").args(["-p", "--model", model]),
             prompt.as_bytes(),
             CLAUDE_TIMEOUT,
         )
+        .ok()?;
+        out.success().then(|| out.text())
     }
 }
 
@@ -476,56 +478,6 @@ fn trimmed(raw: Option<&str>) -> Option<String> {
 /// At most `max` chars, on a char boundary.
 fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
-}
-
-/// Runs `cmd` with `input` on stdin and at most `timeout` to answer; `None` on
-/// a spawn failure, a non-zero exit or a timeout. Both pipes are drained on
-/// their own threads so a chatty child cannot deadlock the wait.
-///
-/// TODO: fold into `src/proc.rs` once #19/#20 land it on main.
-fn run_capped(cmd: &mut Command, input: &[u8], timeout: Duration) -> Option<String> {
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let input = input.to_vec();
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(&input);
-        });
-    }
-    let reader = child.stdout.take().map(|mut stdout| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf);
-            buf
-        })
-    });
-
-    let deadline = Instant::now() + timeout;
-    let mut status = None;
-    loop {
-        match child.try_wait() {
-            Ok(Some(s)) => {
-                status = Some(s);
-                break;
-            }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
-            // Timed out, or unwaitable: either way, stop it.
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-        }
-    }
-    if !status.is_some_and(|s| s.success()) {
-        return None;
-    }
-    let out = reader?.join().ok()?;
-    Some(String::from_utf8_lossy(&out).to_string())
 }
 
 #[cfg(test)]
