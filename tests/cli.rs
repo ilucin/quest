@@ -47,7 +47,7 @@ fn help_lists_subcommands() {
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     for sub in [
         "new", "list", "show", "enter", "close", "resume", "rename", "set", "rm", "brief",
-        "events", "doctor", "config", "phase", "note", "link", "links", "artifact",
+        "events", "doctor", "config", "phase", "note", "link", "links", "artifact", "spawn",
     ] {
         assert!(out.contains(sub), "`{sub}` missing from --help:\n{out}");
     }
@@ -527,6 +527,7 @@ impl Env {
             // The attach mode and the confirm refusal depend on them, so
             // neither leaks in from the terminal `cargo test` runs in.
             .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
             .env_remove("Q_QUEST");
         cmd
     }
@@ -595,6 +596,7 @@ fn new_creates_the_quest_the_tmux_session_and_the_master_window() {
     let pane = pane_of(&fixture, "q-foo");
     assert_eq!(pane["window_name"], "master");
     assert_eq!(pane["window_index"], 0);
+    assert_eq!(pane["cwd"], work.to_str().unwrap());
     assert_eq!(pane["env"]["Q_QUEST"], quest_id.as_str());
     assert_eq!(pane["env"]["Q_SESSION"], session_id.as_str());
     assert_eq!(pane["env"]["Q_ROLE"], "master");
@@ -718,11 +720,15 @@ fn new_attaches_to_the_master_window_unless_detached() {
         ])
         .assert()
         .success();
-    assert_eq!(json_of(&assert)["attach"], "exec");
+    let out = json_of(&assert);
+    assert_eq!(out["attach"], "exec");
+    // Attach targets are pane ids: the window name is not an address (SPEC §6).
+    let master_pane = out["session"]["tmux_pane"].as_str().unwrap();
     assert_eq!(
         env.fixture()["attached"],
-        serde_json::json!(["q-foo", "master"])
+        serde_json::json!(["q-foo", master_pane])
     );
+    assert_eq!(env.fixture()["selected"], master_pane);
 }
 
 #[test]
@@ -1613,10 +1619,11 @@ fn the_full_quest_lifecycle() {
     let entered = env.json(&["enter", "foo"]);
     assert_eq!(entered["tmux_session"], "q-foo");
     assert_eq!(entered["window"], "master");
+    assert_eq!(entered["session"]["id"], created["session"]["id"]);
     assert_eq!(entered["attach"], "exec");
     assert_eq!(
         env.fixture()["attached"],
-        serde_json::json!(["q-foo", "master"])
+        serde_json::json!(["q-foo", created["session"]["tmux_pane"].as_str().unwrap()])
     );
     env.cmd()
         .args(["enter", "foo", "--session", "nope"])
@@ -3313,4 +3320,598 @@ fn post_tool_use_is_a_noop_outside_a_quest_and_never_creates_the_database() {
 
     // Garbage on stdin is fine too.
     post_tool_use(&mut pane.cmd(), "not json");
+}
+
+// ------------------------------------------------------------------- q spawn
+
+/// The pane of `<session>:<window>`, from the fixture.
+fn window_of(fixture: &serde_json::Value, session: &str, window: &str) -> serde_json::Value {
+    let panes = fixture["panes"].as_array().unwrap();
+    let mut found = panes
+        .iter()
+        .filter(|p| p["session_name"] == session && p["window_name"] == window);
+    let pane = found
+        .next()
+        .unwrap_or_else(|| panic!("no pane in `{session}:{window}`: {fixture}"));
+    assert!(found.next().is_none(), "more than one `{session}:{window}`");
+    pane.clone()
+}
+
+/// The payload of the newest event of `kind`, for a Quest.
+fn last_payload(env: &Env, quest_id: &str, kind: &str) -> serde_json::Value {
+    let text: String = env
+        .conn()
+        .query_row(
+            "SELECT payload FROM event WHERE quest_id = ?1 AND kind = ?2 ORDER BY id DESC LIMIT 1",
+            [quest_id, kind],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|e| panic!("no `{kind}` event: {e}"));
+    serde_json::from_str(&text).unwrap()
+}
+
+#[test]
+fn spawn_opens_a_worker_window_and_records_the_session() {
+    let env = Env::new();
+    let created = env.new_quest("foo");
+    let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
+    let cwd = created["quest"]["cwd"].as_str().unwrap().to_string();
+
+    let out = env.json(&["spawn", "foo", "write the tests", "--label", "tests"]);
+    assert_eq!(out["quest"]["id"], quest_id.as_str());
+    assert_eq!(out["tmux_session"], "q-foo");
+    assert_eq!(out["window"], "w1-tests");
+    assert_eq!(out["attach"], "none");
+    assert_eq!(out["session"]["role"], "worker");
+    assert_eq!(out["session"]["label"], "tests");
+    assert_eq!(out["session"]["status"], "starting");
+    assert_eq!(out["session"]["first_prompt"], "write the tests");
+    assert_eq!(out["session"]["tmux_session"], "q-foo");
+    let session_id = out["session"]["id"].as_str().unwrap().to_string();
+
+    // The window lives in the Quest's session, next to the master.
+    let fixture = env.fixture();
+    assert_eq!(fixture["attached"], serde_json::Value::Null);
+    let pane = window_of(&fixture, "q-foo", "w1-tests");
+    assert_eq!(pane["window_index"], 1);
+    assert_eq!(window_of(&fixture, "q-foo", "master")["window_index"], 0);
+    assert_eq!(out["session"]["tmux_pane"], pane["pane_id"]);
+    assert_ne!(pane["pane_id"], created["session"]["tmux_pane"]);
+
+    // Same env as the master, but `Q_ROLE=worker` and its own `Q_SESSION`.
+    assert_eq!(pane["env"]["Q_QUEST"], quest_id.as_str());
+    assert_eq!(pane["env"]["Q_SESSION"], session_id.as_str());
+    assert_eq!(pane["env"]["Q_ROLE"], "worker");
+    assert_eq!(
+        pane["env"]["Q_MACHINE"],
+        window_of(&fixture, "q-foo", "master")["env"]["Q_MACHINE"]
+    );
+    assert!(pane["env"]["Q_DB"].is_string());
+    assert!(pane["env"]["Q_CONFIG"].is_string());
+    // Claude is named after the label, not the window.
+    assert_eq!(pane["command"], "claude -n foo/tests -- 'write the tests'");
+    // No `--dir`, so the worker starts in the Quest's own directory.
+    assert_eq!(pane["cwd"], cwd.as_str());
+
+    let conn = env.conn();
+    let (q_id, role, label, status, prompt): (String, String, String, String, String) = conn
+        .query_row(
+            "SELECT quest_id, role, label, status, first_prompt FROM session WHERE id = ?1",
+            [&session_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            q_id.as_str(),
+            role.as_str(),
+            label.as_str(),
+            status.as_str(),
+            prompt.as_str()
+        ),
+        (
+            quest_id.as_str(),
+            "worker",
+            "tests",
+            "starting",
+            "write the tests"
+        )
+    );
+
+    let kinds = event_kinds(&env, &quest_id);
+    assert_eq!(kinds, vec!["quest.created", "session.spawn"]);
+    let payload = last_payload(&env, &quest_id, "session.spawn");
+    assert_eq!(payload["label"], "tests");
+    assert_eq!(payload["window"], "w1-tests");
+    assert_eq!(payload["role"], "worker");
+    assert_eq!(payload["cwd"], cwd.as_str());
+    assert_eq!(payload["prompt"], "write the tests");
+    let session_of_event: String = conn
+        .query_row(
+            "SELECT session_id FROM event WHERE quest_id = ?1 AND kind = 'session.spawn'",
+            [&quest_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(session_of_event, session_id);
+
+    // `q show` lists the worker beside the master.
+    let shown = env.json(&["show", "foo"]);
+    assert_eq!(shown["live_sessions"], 2);
+    let labels: Vec<&str> = shown["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["label"].as_str().unwrap())
+        .collect();
+    assert!(
+        labels.contains(&"master") && labels.contains(&"tests"),
+        "{labels:?}"
+    );
+}
+
+#[test]
+fn spawn_prints_a_human_one_liner() {
+    let env = Env::new();
+    env.new_quest("foo");
+    env.cmd()
+        .args(["spawn", "foo", "go", "--label", "tests"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("spawned s-"))
+        .stdout(predicate::str::contains("tmux q-foo:w1-tests"))
+        .stdout(predicate::str::contains("q enter foo --session tests"));
+    env.cmd()
+        .args(["spawn", "foo", "go", "--label", "other", "-q"])
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
+fn workers_are_numbered_in_order_and_a_number_is_never_reused() {
+    let env = Env::new();
+    env.new_quest("foo");
+    assert_eq!(
+        env.json(&["spawn", "foo", "a", "--label", "tests"])["window"],
+        "w1-tests"
+    );
+    let second = env.json(&["spawn", "foo", "b", "--label", "migration"]);
+    assert_eq!(second["window"], "w2-migration");
+    assert_eq!(
+        window_of(&env.fixture(), "q-foo", "w2-migration")["window_index"],
+        2
+    );
+
+    // The first worker's pane disappears; the sweep ends its session, which
+    // frees the label — but not the number.
+    let mut fixture = env.fixture();
+    let panes: Vec<serde_json::Value> = fixture["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["window_name"] != "w1-tests")
+        .cloned()
+        .collect();
+    fixture["panes"] = serde_json::json!(panes);
+    env.write_fixture(fixture);
+
+    let third = env.json(&["spawn", "foo", "c", "--label", "tests"]);
+    assert_eq!(third["window"], "w3-tests");
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE label = 'tests' AND status = 'ended'"),
+        1
+    );
+}
+
+#[test]
+fn spawn_refuses_a_label_that_is_already_live() {
+    let env = Env::new();
+    env.new_quest("foo");
+    env.json(&["spawn", "foo", "a", "--label", "tests"]);
+    let assert = env
+        .cmd()
+        .args(["spawn", "foo", "b", "--label", "tests", "--json"])
+        .assert()
+        .code(1);
+    let err: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(assert.get_output().stderr.clone()).unwrap())
+            .unwrap();
+    assert_eq!(err["code"], "conflict");
+    assert!(
+        err["error"].as_str().unwrap().contains("already live"),
+        "{err}"
+    );
+    // Nothing was opened and nothing was recorded.
+    assert_eq!(env.count("SELECT count(*) FROM session"), 2);
+    assert_eq!(env.fixture()["panes"].as_array().unwrap().len(), 2);
+
+    // `master` is window 0's label, so it is reserved outright.
+    env.cmd()
+        .args(["spawn", "foo", "b", "--label", "master"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("reserved"));
+}
+
+#[test]
+fn spawn_validates_the_label_and_the_prompt() {
+    let env = Env::new();
+    env.new_quest("foo");
+    for bad in ["Tests", "with space", "under_score", "double--dash"] {
+        env.cmd()
+            .args(["spawn", "foo", "go", "--label", bad])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("invalid label"));
+    }
+    env.cmd()
+        .args(["spawn", "foo", "   ", "--label", "tests"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("needs a prompt"));
+    assert_eq!(env.count("SELECT count(*) FROM session"), 1);
+}
+
+#[test]
+fn spawn_needs_an_active_quest_with_a_live_tmux_session() {
+    let env = Env::new();
+    env.new_quest("foo");
+    env.json(&["close", "foo", "-f"]);
+    env.cmd()
+        .args(["spawn", "foo", "go", "--label", "tests"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("is finished"))
+        .stderr(predicate::str::contains("q resume foo"));
+
+    // Active, but the tmux session is gone: nothing to open a window in.
+    let env = Env::new();
+    env.new_quest("bar");
+    env.write_fixture(serde_json::json!({ "panes": [] }));
+    env.cmd()
+        .args(["spawn", "bar", "go", "--label", "tests"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("no tmux session `q-bar`"))
+        .stderr(predicate::str::contains("q resume bar"));
+
+    env.cmd()
+        .args(["spawn", "nope", "go", "--label", "tests"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not found"));
+}
+
+#[test]
+fn spawn_takes_a_directory_and_a_workflow_of_its_own() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.cmd()
+        .args(["new", "--name", "foo", "--dir", work.to_str().unwrap()])
+        .args(["--workflow", "orchestrator", "-d", "-q"])
+        .assert()
+        .success();
+    let other = env.work("worktree");
+
+    // Both inherited from the Quest unless overridden.
+    let inherited = env.json(&["spawn", "foo", "a", "--label", "tests"]);
+    assert_eq!(inherited["session"]["workflow"], "orchestrator");
+    let quest_id = inherited["quest"]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        last_payload(&env, &quest_id, "session.spawn")["cwd"],
+        work.to_str().unwrap()
+    );
+    assert_eq!(
+        window_of(&env.fixture(), "q-foo", "w1-tests")["cwd"],
+        work.to_str().unwrap()
+    );
+
+    let out = env.json(&[
+        "spawn",
+        "foo",
+        "b",
+        "--label",
+        "migration",
+        "--workflow",
+        "review",
+        "--dir",
+        other.to_str().unwrap(),
+    ]);
+    assert_eq!(out["session"]["workflow"], "review");
+    assert_eq!(
+        last_payload(&env, &quest_id, "session.spawn")["cwd"],
+        other.to_str().unwrap()
+    );
+    assert_eq!(
+        window_of(&env.fixture(), "q-foo", "w2-migration")["cwd"],
+        other.to_str().unwrap()
+    );
+    // The Quest's own cwd is untouched by `--dir`.
+    assert_eq!(env.json(&["show", "foo"])["cwd"], work.to_str().unwrap());
+
+    env.cmd()
+        .args([
+            "spawn",
+            "foo",
+            "c",
+            "--label",
+            "docs",
+            "--dir",
+            "/no/such/dir",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("no such directory"));
+}
+
+#[test]
+fn spawn_selects_the_new_window_only_from_inside_the_quests_session() {
+    let env = Env::new();
+    let created = env.new_quest("foo");
+    let master_pane = created["session"]["tmux_pane"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A second Quest is a second real tmux session to stand in.
+    let elsewhere = env.new_quest("bar");
+    let elsewhere_pane = elsewhere["session"]["tmux_pane"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Outside tmux: the window is opened, but no client is moved.
+    assert_eq!(
+        env.json(&["spawn", "foo", "a", "--label", "outside"])["attach"],
+        "none"
+    );
+    assert_eq!(env.fixture()["selected"], serde_json::Value::Null);
+
+    // Inside another tmux session: still not ours to switch.
+    let mut cmd = env.cmd();
+    let assert = cmd
+        .env("TMUX", "/tmp/tmux-0/default,1,0")
+        .env("TMUX_PANE", &elsewhere_pane)
+        .args(["spawn", "foo", "b", "--label", "elsewhere", "--json"])
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["attach"], "none");
+    assert_eq!(env.fixture()["selected"], serde_json::Value::Null);
+
+    // From the master's own pane: the client follows the worker. `new-window -d`
+    // never moves it on its own, so the selection is this step's alone.
+    let mut cmd = env.cmd();
+    let assert = cmd
+        .env("TMUX", "/tmp/tmux-0/default,1,0")
+        .env("TMUX_PANE", &master_pane)
+        .args(["spawn", "foo", "c", "--label", "inside", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    // `select`, not `switch`: the client stays in the session it is already in
+    // and only the active window changes.
+    assert_eq!(out["attach"], "select");
+    assert_eq!(out["window"], "w3-inside");
+    let worker_pane = out["session"]["tmux_pane"].as_str().unwrap().to_string();
+    assert_eq!(env.fixture()["selected"], worker_pane.as_str());
+    // Selecting a window is not attaching: no client changed sessions.
+    assert_eq!(env.fixture()["attached"], serde_json::Value::Null);
+
+    // ... unless told not to.
+    let mut cmd = env.cmd();
+    let assert = cmd
+        .env("TMUX", "/tmp/tmux-0/default,1,0")
+        .env("TMUX_PANE", &master_pane)
+        .args(["spawn", "foo", "d", "--label", "quiet", "--no-attach"])
+        .arg("--json")
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["attach"], "none");
+    assert_eq!(
+        env.fixture()["selected"],
+        worker_pane.as_str(),
+        "--no-attach moved the client anyway"
+    );
+}
+
+#[test]
+fn spawn_falls_back_to_q_quest_when_the_pane_id_is_missing() {
+    let env = Env::new();
+    let created = env.new_quest("foo");
+    let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
+    let mut cmd = env.cmd();
+    let assert = cmd
+        .env("TMUX", "/tmp/tmux-0/default,1,0")
+        .env("Q_QUEST", &quest_id)
+        .args(["spawn", "foo", "a", "--label", "tests", "--json"])
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["attach"], "select");
+}
+
+#[test]
+fn enter_reaches_a_worker_by_label_through_its_pane() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let spawned = env.json(&["spawn", "foo", "write the tests", "--label", "tests"]);
+    let worker_pane = spawned["session"]["tmux_pane"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The command `q spawn` printed has to work: the worker's window is
+    // `w1-tests`, but it is addressed by pane id, so the label is enough.
+    let entered = env.json(&["enter", "foo", "--session", "tests"]);
+    assert_eq!(entered["tmux_session"], "q-foo");
+    assert_eq!(entered["window"], "w1-tests");
+    assert_eq!(entered["session"]["id"], spawned["session"]["id"]);
+    assert_eq!(entered["attach"], "exec");
+    assert_eq!(
+        env.fixture()["attached"],
+        serde_json::json!(["q-foo", worker_pane.as_str()])
+    );
+    assert_eq!(env.fixture()["selected"], worker_pane.as_str());
+
+    // A rename of the window leaves the label addressable.
+    let mut fixture = env.fixture();
+    for pane in fixture["panes"].as_array_mut().unwrap() {
+        if pane["pane_id"] == worker_pane.as_str() {
+            pane["window_name"] = serde_json::json!("renamed");
+        }
+    }
+    env.write_fixture(fixture);
+    let again = env.json(&["enter", "foo", "--session", "tests"]);
+    assert_eq!(again["window"], "renamed");
+    assert_eq!(
+        env.fixture()["attached"],
+        serde_json::json!(["q-foo", worker_pane.as_str()])
+    );
+
+    // Without `--session` it is still the master.
+    let master = env.json(&["enter", "foo"]);
+    assert_eq!(master["window"], "master");
+}
+
+#[test]
+fn a_spawn_whose_window_never_opens_leaves_no_session_behind() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let mut fixture = env.fixture();
+    fixture["fail_new_window"] = serde_json::json!("no space left for windows");
+    env.write_fixture(fixture);
+
+    env.cmd()
+        .args(["spawn", "foo", "go", "--label", "tests"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("no space left for windows"));
+
+    // The row is inserted before the window (the `SessionStart` hook resolves
+    // `$Q_SESSION` the moment Claude starts), so it has to be taken back.
+    assert_eq!(env.count("SELECT count(*) FROM session"), 1);
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE role = 'worker'"),
+        0
+    );
+    assert_eq!(env.fixture()["panes"].as_array().unwrap().len(), 1);
+    let quest_id = env.json(&["show", "foo"])["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(event_kinds(&env, &quest_id), vec!["quest.created"]);
+
+    // The next spawn works, and the failed one did not consume a number.
+    let mut fixture = env.fixture();
+    fixture.as_object_mut().unwrap().remove("fail_new_window");
+    env.write_fixture(fixture);
+    assert_eq!(
+        env.json(&["spawn", "foo", "go", "--label", "tests"])["window"],
+        "w1-tests"
+    );
+}
+
+/// A worker row inserted but never given a pane — a `q spawn` killed between
+/// the insert and `update_session_pane`. `age` seconds ago.
+fn seed_pending_worker(env: &Env, quest_id: &str, label: &str, age: i64) -> String {
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - age;
+    let id = format!("s-pending-{label}");
+    env.conn()
+        .execute(
+            "INSERT INTO session (id, quest_id, role, label, tmux_session, tmux_pane,
+                                  status, started_at, updated_at)
+             VALUES (?1, ?2, 'worker', ?3, 'q-foo', '', 'starting', ?4, ?4)",
+            rusqlite::params![&id, quest_id, label, started],
+        )
+        .unwrap();
+    id
+}
+
+#[test]
+fn the_sweep_ends_a_row_whose_window_never_opened_once_the_grace_has_passed() {
+    let env = Env::new();
+    let created = env.new_quest("foo");
+    let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
+
+    // Still inside the grace: the window may yet appear, so the row is left be.
+    seed_pending_worker(&env, &quest_id, "fresh", 0);
+    assert_eq!(env.json(&["show", "foo"])["live_sessions"], 2);
+
+    // Past it, nothing is ever going to fill the pane in. Without this the row
+    // holds its label forever: `q enter` sends you to `q resume` and `q resume`
+    // sends you back.
+    let stale = seed_pending_worker(&env, &quest_id, "stale", 60);
+    let shown = env.json(&["show", "foo"]);
+    assert_eq!(shown["live_sessions"], 2);
+    let ended = shown["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == stale.as_str())
+        .unwrap();
+    assert_eq!(ended["status"], "ended");
+    assert!(ended["ended_at"].is_i64());
+
+    let reason: String = env
+        .conn()
+        .query_row(
+            "SELECT json_extract(payload, '$.reason') FROM event
+             WHERE kind = 'session.end' AND session_id = ?1",
+            [&stale],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "never_started");
+
+    // The label is free again, and no window was touched to free it.
+    assert_eq!(env.fixture()["panes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        env.json(&["spawn", "foo", "go", "--label", "stale"])["session"]["label"],
+        "stale"
+    );
+}
+
+#[test]
+fn enter_refuses_a_session_whose_window_never_opened() {
+    let env = Env::new();
+    let created = env.new_quest("foo");
+    let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
+    // Fresh, so the sweep leaves it live and `q enter` is the one answering.
+    seed_pending_worker(&env, &quest_id, "tests", 0);
+
+    let assert = env
+        .cmd()
+        .args(["enter", "foo", "--session", "tests", "--json"])
+        .assert()
+        .code(1)
+        .stdout("");
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    let message = parsed["error"].as_str().unwrap();
+    assert!(message.contains("`tests`"), "{message}");
+    assert!(message.contains("has no pane yet"), "{message}");
+
+    // An empty tmux target means "the active window" — attaching would have
+    // landed on the master while claiming to be the worker.
+    let fixture = env.fixture();
+    assert_eq!(fixture["attached"], serde_json::Value::Null);
+    assert_eq!(fixture["selected"], serde_json::Value::Null);
+
+    // The master is still reachable.
+    assert_eq!(env.json(&["enter", "foo"])["window"], "master");
+}
+
+#[test]
+fn spawn_help_only_lists_the_implemented_flags() {
+    let assert = q().args(["spawn", "--help"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    for flag in ["--label", "--workflow", "--dir", "--no-attach"] {
+        assert!(
+            out.contains(flag),
+            "`{flag}` missing from `q spawn --help`:\n{out}"
+        );
+    }
 }

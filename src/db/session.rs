@@ -60,6 +60,28 @@ impl Db {
         Ok(())
     }
 
+    /// The pane a session was recorded against, once its window exists. Rows
+    /// are inserted before the window (`$Q_SESSION` has to resolve the moment
+    /// Claude starts), so the pane arrives a step later.
+    pub fn update_session_pane(&self, id: &str, tmux_pane: &str) -> anyhow::Result<Session> {
+        self.conn
+            .execute(
+                "UPDATE session SET tmux_pane = ?1, updated_at = ?2 WHERE id = ?3",
+                params![tmux_pane, now(), id],
+            )
+            .map_err(db_err)?;
+        self.require_session(id)
+    }
+
+    /// Undoes an insert whose window never opened. Not a lifecycle operation —
+    /// a session that ran is ended, never deleted.
+    pub fn delete_session(&self, id: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute("DELETE FROM session WHERE id = ?1", [id])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     pub fn get_session(&self, id: &str) -> anyhow::Result<Option<Session>> {
         self.conn
             .query_row(
@@ -489,6 +511,34 @@ mod tests {
         let three = db.record_session_prompt(&s.id, None).unwrap();
         assert_eq!(three.status, SessionStatus::Busy);
         assert_eq!(three.last_prompt.as_deref(), Some("more"));
+    }
+
+    #[test]
+    fn a_pane_is_recorded_after_the_window_opens() {
+        let db = db();
+        let q = quest(&db, "alpha");
+        let mut row = Session::new(&q.id, SessionRole::Worker, "tests", "q-alpha", "");
+        row.id = "s-pending".to_string();
+        db.insert_session(&row).unwrap();
+        assert!(db.find_session_by_pane("%5").unwrap().is_none());
+
+        let stored = db.update_session_pane("s-pending", "%5").unwrap();
+        assert_eq!(stored.tmux_pane, "%5");
+        assert_eq!(
+            db.find_session_by_pane("%5").unwrap().unwrap().id,
+            stored.id
+        );
+        assert!(db.update_session_pane("s-nope", "%6").is_err());
+    }
+
+    #[test]
+    fn deleting_a_session_removes_it_and_tolerates_a_miss() {
+        let db = db();
+        let q = quest(&db, "alpha");
+        let s = session(&db, &q.id, "tests", "%1");
+        db.delete_session(&s.id).unwrap();
+        assert!(db.get_session(&s.id).unwrap().is_none());
+        db.delete_session(&s.id).unwrap();
     }
 
     #[test]

@@ -79,9 +79,13 @@ pub trait Tmux {
     /// Creates a detached session and returns its first pane.
     fn new_session(&self, spec: &NewSession) -> anyhow::Result<Pane>;
     fn new_window(&self, spec: &NewWindow) -> anyhow::Result<Pane>;
+    /// Makes the window holding `pane_id` the active one in its own tmux
+    /// session, without moving any client between sessions.
+    fn select_window(&self, pane_id: &str) -> anyhow::Result<()>;
     /// Inside tmux this switches the client; outside it replaces the process
-    /// with `tmux attach` and therefore does not return on success.
-    fn attach(&self, session: &str, window: Option<&str>) -> anyhow::Result<()>;
+    /// with `tmux attach` and therefore does not return on success. `pane`
+    /// selects its window first.
+    fn attach(&self, session: &str, pane: Option<&str>) -> anyhow::Result<()>;
     fn send_keys(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()>;
     fn capture_pane(&self, pane_id: &str, lines: usize) -> anyhow::Result<String>;
     fn rename_session(&self, old: &str, new: &str) -> anyhow::Result<()>;
@@ -149,9 +153,12 @@ fn args_new_session(spec: &NewSession) -> Vec<String> {
     out
 }
 
+/// `-d` keeps the caller's client where it is: which window becomes active is
+/// the spawning command's decision, made with an explicit `select-window`.
 fn args_new_window(spec: &NewWindow) -> Vec<String> {
     let mut out = args(&[
         "new-window",
+        "-d",
         "-t",
         &exact(&format!("{}:", spec.session)),
         "-P",
@@ -227,12 +234,10 @@ fn args_switch_client(session: &str) -> Vec<String> {
     args(&["switch-client", "-t", &exact(session)])
 }
 
-fn args_select_window(session: &str, window: &str) -> Vec<String> {
-    args(&[
-        "select-window",
-        "-t",
-        &exact(&format!("{session}:{window}")),
-    ])
+/// A pane id addresses its window, and it is the session's identity (SPEC §6):
+/// window names are not persisted and a rename would break a name-based target.
+fn args_select_window(pane_id: &str) -> Vec<String> {
+    args(&["select-window", "-t", pane_id])
 }
 
 fn parse_pane(line: &str) -> Option<Pane> {
@@ -250,14 +255,45 @@ fn parse_pane(line: &str) -> Option<Pane> {
     Some(pane)
 }
 
+/// `%N` out of the first field of a pane line, for the cleanup path where the
+/// rest of the line did not parse.
+fn leading_pane_id(line: &str) -> Option<&str> {
+    let id = line.split('\t').next()?;
+    let n = id.strip_prefix('%')?;
+    (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).then_some(id)
+}
+
 fn parse_panes(stdout: &str) -> Vec<Pane> {
     stdout.lines().filter_map(parse_pane).collect()
+}
+
+/// The pane line of a `-P -F` or `display-message` run. tmux can print a
+/// warning ahead of it, so the format output is the last line, not the whole
+/// of stdout.
+fn last_line(stdout: &str) -> &str {
+    stdout.lines().next_back().unwrap_or("")
 }
 
 /// True when tmux failed only because no server is running — for a liveness
 /// sweep that is indistinguishable from "no panes".
 pub fn is_no_server(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("no server running")
+}
+
+/// True when tmux refused only because the session has no client to move —
+/// the normal state of a Quest started with `-d` or since detached.
+pub fn is_no_client(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("no current client")
+}
+
+/// An empty target is not "the current pane" as far as q is concerned: it means
+/// a session row whose window never opened, and tmux would silently act on
+/// whatever is active instead.
+fn require_pane_id(pane_id: &str) -> anyhow::Result<()> {
+    if pane_id.is_empty() {
+        return Err(QError::Tmux("no pane to select (empty pane id)".to_string()).into());
+    }
+    Ok(())
 }
 
 // --------------------------------------------------------------------- real
@@ -291,8 +327,18 @@ fn run_bool(argv: &[String]) -> anyhow::Result<bool> {
 impl RealTmux {
     fn pane_at(&self, target: &str) -> anyhow::Result<Pane> {
         let out = run(&args_display_pane(target))?;
-        parse_pane(out.trim_end_matches('\n'))
+        parse_pane(last_line(&out))
             .ok_or_else(|| QError::Tmux(format!("cannot read pane of `{target}`")).into())
+    }
+
+    /// The tmux session this process's own pane sits in, when it has one.
+    /// `$TMUX_PANE` is the only thing that survives a shell inside tmux.
+    fn current_session(&self) -> Option<String> {
+        let pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty())?;
+        self.list_panes()
+            .ok()?
+            .into_iter()
+            .find_map(|p| (p.pane_id == pane).then_some(p.session_name))
     }
 }
 
@@ -303,22 +349,54 @@ impl Tmux for RealTmux {
 
     fn new_session(&self, spec: &NewSession) -> anyhow::Result<Pane> {
         let out = run(&args_new_session(spec))?;
-        parse_pane(out.trim_end_matches('\n'))
-            .ok_or_else(|| QError::Tmux("cannot read the new session's pane".to_string()).into())
+        let line = last_line(&out);
+        parse_pane(line).ok_or_else(|| {
+            // The session is up, but without its pane id nothing can address
+            // it; a stray Claude is worse than no session at all.
+            let _ = run(&args_kill_session(&spec.name));
+            QError::Tmux(format!("cannot read the new session's pane: `{line}`")).into()
+        })
     }
 
     fn new_window(&self, spec: &NewWindow) -> anyhow::Result<Pane> {
         let out = run(&args_new_window(spec))?;
-        parse_pane(out.trim_end_matches('\n'))
-            .ok_or_else(|| QError::Tmux("cannot read the new window's pane".to_string()).into())
+        let line = last_line(&out);
+        parse_pane(line).ok_or_else(|| {
+            // Same as above, but only this window is ours to take down. The
+            // leading field is the pane id even when the rest is unreadable.
+            if let Some(id) = leading_pane_id(line) {
+                let _ = run(&args_kill_window(id));
+            }
+            QError::Tmux(format!("cannot read the new window's pane: `{line}`")).into()
+        })
     }
 
-    fn attach(&self, session: &str, window: Option<&str>) -> anyhow::Result<()> {
-        if let Some(w) = window {
-            run(&args_select_window(session, w))?;
+    fn select_window(&self, pane_id: &str) -> anyhow::Result<()> {
+        require_pane_id(pane_id)?;
+        run(&args_select_window(pane_id)).map(|_| ())
+    }
+
+    fn attach(&self, session: &str, pane: Option<&str>) -> anyhow::Result<()> {
+        if let Some(p) = pane {
+            self.select_window(p)?;
         }
         if in_tmux() {
-            run(&args_switch_client(session))?;
+            // Already inside the target session: the window is selected and
+            // there is no client to move. `switch-client` would either be a
+            // no-op or fail on a session nobody is attached to.
+            if self.current_session().as_deref() == Some(session) {
+                return Ok(());
+            }
+            if let Err(e) = run(&args_switch_client(session)) {
+                // A detached session (`q new -d`, or the user let go of it) has
+                // no client to switch. The window is selected, so the next real
+                // attach lands on it — not worth failing the command over.
+                if is_no_client(&e) {
+                    eprintln!("warning: {e:#}");
+                    return Ok(());
+                }
+                return Err(e);
+            }
             return Ok(());
         }
         use std::os::unix::process::CommandExt;
@@ -384,9 +462,17 @@ pub struct FixtureState {
     /// Overrides what `version()` answers, so a test can pose as an old tmux.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// The `(session, window)` of the last `attach`, so tests can assert on it.
+    /// The `(session, pane)` of the last `attach`, so tests can assert on it.
     #[serde(default)]
     pub attached: Option<(String, Option<String>)>,
+    /// The pane whose window was last selected — by `select_window` or by the
+    /// `attach` that precedes it.
+    #[serde(default)]
+    pub selected: Option<String>,
+    /// Makes `new_window` fail with this message until a test clears it, so the
+    /// caller's cleanup path is reachable. Real tmux fails for its own reasons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_new_window: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -400,6 +486,10 @@ pub struct FixturePane {
     pub window_name: String,
     #[serde(default)]
     pub window_index: i32,
+    /// What `-c` asked for; real tmux keeps no such field, but a test has no
+    /// other way to see the directory a window was opened in.
+    #[serde(default)]
+    pub cwd: String,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -427,6 +517,7 @@ impl FixtureState {
         session: &str,
         window: &str,
         index: i32,
+        cwd: &str,
         spec_env: &[(String, String)],
         command: Option<&str>,
     ) -> Pane {
@@ -437,6 +528,7 @@ impl FixtureState {
             session_name: session.to_string(),
             window_name: window.to_string(),
             window_index: index,
+            cwd: cwd.to_string(),
             env: spec_env.iter().cloned().collect(),
             command: command.map(str::to_string),
             buffer: String::new(),
@@ -590,6 +682,7 @@ impl Tmux for FixtureTmux {
                 &spec.name,
                 &spec.window_name,
                 0,
+                &spec.cwd,
                 &spec.env,
                 spec.command.as_deref(),
             ))
@@ -598,6 +691,9 @@ impl Tmux for FixtureTmux {
 
     fn new_window(&self, spec: &NewWindow) -> anyhow::Result<Pane> {
         self.edit(|state| {
+            if let Some(msg) = &state.fail_new_window {
+                return Err(QError::Tmux(msg.clone()).into());
+            }
             let index = state
                 .panes
                 .iter()
@@ -609,28 +705,38 @@ impl Tmux for FixtureTmux {
                 &spec.session,
                 &spec.window_name,
                 index + 1,
+                &spec.cwd,
                 &spec.env,
                 spec.command.as_deref(),
             ))
         })
     }
 
-    fn attach(&self, session: &str, window: Option<&str>) -> anyhow::Result<()> {
+    fn select_window(&self, pane_id: &str) -> anyhow::Result<()> {
+        require_pane_id(pane_id)?;
         self.edit(|state| {
-            let in_session: Vec<&FixturePane> = state
-                .panes
-                .iter()
-                .filter(|p| p.session_name == session)
-                .collect();
-            if in_session.is_empty() {
+            state.pane_mut(pane_id)?;
+            state.selected = Some(pane_id.to_string());
+            Ok(())
+        })
+    }
+
+    fn attach(&self, session: &str, pane: Option<&str>) -> anyhow::Result<()> {
+        self.edit(|state| {
+            if !state.panes.iter().any(|p| p.session_name == session) {
                 return Err(QError::Tmux(format!("can't find session: {session}")).into());
             }
-            if let Some(w) = window
-                && !in_session.iter().any(|p| p.window_name == w)
-            {
-                return Err(QError::Tmux(format!("can't find window: {session}:{w}")).into());
+            if let Some(id) = pane {
+                // Real tmux would switch the client to wherever the pane lives;
+                // asking for one outside `session` is a bug in the caller.
+                if state.pane_mut(id)?.session_name != session {
+                    return Err(
+                        QError::Tmux(format!("pane {id} is not in session {session}")).into(),
+                    );
+                }
+                state.selected = Some(id.to_string());
             }
-            state.attached = Some((session.to_string(), window.map(str::to_string)));
+            state.attached = Some((session.to_string(), pane.map(str::to_string)));
             Ok(())
         })
     }
@@ -793,18 +899,61 @@ pub fn live_panes(tmux: &dyn Tmux) -> anyhow::Result<Vec<Pane>> {
     }
 }
 
-/// The sessions among `sessions` whose pane is gone. Keyed on the
+/// Why a live row is being ended, for the `session.end` payload.
+pub const PANE_GONE: &str = "pane_gone";
+pub const NEVER_STARTED: &str = "never_started";
+
+/// How long a row whose pane is not filled in yet is left alone. A spawn
+/// inserts the row before it opens the window (the `SessionStart` hook has to
+/// find it), so there is always a moment with no pane; if q dies in that
+/// moment nothing will ever fill it, and without the age-out the row stays
+/// live forever — burning its label and bouncing `q enter`/`q resume` off each
+/// other. Longer than tmux needs to open a window, short enough to self-heal.
+pub const START_GRACE_SECS: i64 = 10;
+
+/// An orphaned session row and why it counts as one.
+#[derive(Debug)]
+pub struct Orphan {
+    pub session: Session,
+    pub reason: &'static str,
+}
+
+/// The sessions among `sessions` that no longer have a live pane. Keyed on the
 /// `(tmux_session, pane)` pair: tmux recycles pane ids, so `%1` in another
-/// tmux session is not this session's pane. Shared by `sweep` and `q doctor`.
-pub fn find_orphans(sessions: Vec<Session>, panes: &[Pane]) -> Vec<Session> {
+/// tmux session is not this session's pane. A row with no pane at all is only
+/// an orphan once `START_GRACE_SECS` have passed since it started. Shared by
+/// `sweep` and `q doctor`.
+pub fn find_orphans(sessions: Vec<Session>, panes: &[Pane], now: i64) -> Vec<Orphan> {
     let alive: HashSet<(&str, &str)> = panes
         .iter()
         .map(|p| (p.session_name.as_str(), p.pane_id.as_str()))
         .collect();
     sessions
         .into_iter()
-        .filter(|s| !alive.contains(&(s.tmux_session.as_str(), s.tmux_pane.as_str())))
+        .filter_map(|s| {
+            if s.tmux_pane.is_empty() {
+                let stale = now - s.started_at > START_GRACE_SECS;
+                return stale.then_some(Orphan {
+                    session: s,
+                    reason: NEVER_STARTED,
+                });
+            }
+            let gone = !alive.contains(&(s.tmux_session.as_str(), s.tmux_pane.as_str()));
+            gone.then_some(Orphan {
+                session: s,
+                reason: PANE_GONE,
+            })
+        })
         .collect()
+}
+
+/// The name of the window a pane sits in. Display only — window names are not
+/// an address (SPEC §6), and a vanished pane simply has none.
+pub fn window_of(tmux: &dyn Tmux, pane_id: &str) -> Option<String> {
+    tmux.list_panes()
+        .ok()?
+        .into_iter()
+        .find_map(|p| (p.pane_id == pane_id && !p.window_name.is_empty()).then_some(p.window_name))
 }
 
 /// Liveness (SPEC §6): a live session whose pane is gone has ended. Returns the
@@ -816,14 +965,15 @@ pub fn sweep(db: &Db, tmux: &dyn Tmux) -> anyhow::Result<Vec<Session>> {
     }
     let panes = live_panes(tmux)?;
 
+    let ts = now();
     let mut ended = Vec::new();
-    for session in find_orphans(live, &panes) {
-        let row = db.mark_session_ended(&session.id, now())?;
+    for orphan in find_orphans(live, &panes, ts) {
+        let row = db.mark_session_ended(&orphan.session.id, ts)?;
         db.append_event(
             &row.quest_id,
             Some(&row.id),
             "session.end",
-            &serde_json::json!({ "reason": "pane_gone" }),
+            &serde_json::json!({ "reason": orphan.reason }),
         )?;
         ended.push(row);
     }
@@ -942,6 +1092,7 @@ mod tests {
             args_new_window(&spec),
             [
                 "new-window",
+                "-d",
                 "-t",
                 "=q-alpha:",
                 "-P",
@@ -989,10 +1140,7 @@ mod tests {
         assert_eq!(args_has_session("q-a"), ["has-session", "-t", "=q-a"]);
         assert_eq!(args_attach("q-a"), ["attach", "-t", "=q-a"]);
         assert_eq!(args_switch_client("q-a"), ["switch-client", "-t", "=q-a"]);
-        assert_eq!(
-            args_select_window("q-a", "master"),
-            ["select-window", "-t", "=q-a:master"]
-        );
+        assert_eq!(args_select_window("%42"), ["select-window", "-t", "%42"]);
     }
 
     #[test]
@@ -1188,24 +1336,102 @@ mod tests {
     #[test]
     fn the_fixture_records_the_attach_target() {
         let (_dir, t) = fixture();
-        t.new_session(&NewSession {
-            name: "q-a".to_string(),
-            window_name: "master".to_string(),
-            ..NewSession::default()
-        })
-        .unwrap();
+        let master = t
+            .new_session(&NewSession {
+                name: "q-a".to_string(),
+                window_name: "master".to_string(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        let other = t
+            .new_session(&NewSession {
+                name: "q-b".to_string(),
+                window_name: "master".to_string(),
+                ..NewSession::default()
+            })
+            .unwrap();
 
         assert!(t.attach("q-nope", None).is_err(), "unknown session");
-        assert!(t.attach("q-a", Some("w9")).is_err(), "unknown window");
+        assert!(t.attach("q-a", Some("%404")).is_err(), "unknown pane");
+        let e = t.attach("q-a", Some(&other.pane_id)).unwrap_err();
+        assert!(format!("{e}").contains("not in session q-a"), "{e}");
         assert!(t.load().unwrap().attached.is_none());
 
-        t.attach("q-a", Some("master")).unwrap();
+        t.attach("q-a", Some(&master.pane_id)).unwrap();
+        let state = t.load().unwrap();
         assert_eq!(
-            t.load().unwrap().attached,
-            Some(("q-a".to_string(), Some("master".to_string())))
+            state.attached,
+            Some(("q-a".to_string(), Some(master.pane_id.clone())))
         );
+        // An attach that names a pane selects its window on the way.
+        assert_eq!(state.selected, Some(master.pane_id.clone()));
+
         t.attach("q-a", None).unwrap();
         assert_eq!(t.load().unwrap().attached, Some(("q-a".to_string(), None)));
+    }
+
+    #[test]
+    fn the_fixture_selects_a_window_by_pane_without_attaching() {
+        let (_dir, t) = fixture();
+        let master = t
+            .new_session(&NewSession {
+                name: "q-a".to_string(),
+                window_name: "master".to_string(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        let worker = t
+            .new_window(&NewWindow {
+                session: "q-a".to_string(),
+                window_name: "w1-tests".to_string(),
+                ..NewWindow::default()
+            })
+            .unwrap();
+
+        assert!(t.select_window("%404").is_err(), "unknown pane");
+        t.select_window(&worker.pane_id).unwrap();
+        let state = t.load().unwrap();
+        assert_eq!(state.selected, Some(worker.pane_id));
+        // Selecting is not attaching.
+        assert!(state.attached.is_none());
+        assert_ne!(state.selected, Some(master.pane_id));
+    }
+
+    #[test]
+    fn the_pane_line_is_the_last_line_of_stdout() {
+        // tmux can warn ahead of the `-P -F` output; the format line is last.
+        assert_eq!(last_line("%42\t1\tq-a\tw\t0\n"), "%42\t1\tq-a\tw\t0");
+        assert_eq!(last_line("sessions should be nested\n%42\t1\n"), "%42\t1");
+        assert_eq!(last_line(""), "");
+        assert_eq!(last_line("\n"), "");
+    }
+
+    #[test]
+    fn a_clientless_session_is_told_apart_from_a_real_failure() {
+        let no_client: anyhow::Error =
+            QError::Tmux("`tmux switch-client` failed: no current client".to_string()).into();
+        let other: anyhow::Error =
+            QError::Tmux("`tmux switch-client` failed: can\'t find session".to_string()).into();
+        assert!(is_no_client(&no_client));
+        assert!(!is_no_client(&other));
+    }
+
+    #[test]
+    fn an_empty_pane_id_is_refused_rather_than_read_as_the_active_pane() {
+        // Real tmux takes `-t ''` as "whatever is active" and exits 0.
+        assert!(require_pane_id("").is_err());
+        assert!(require_pane_id("%42").is_ok());
+        let (_dir, t) = fixture();
+        assert!(t.select_window("").is_err());
+    }
+
+    #[test]
+    fn a_leading_pane_id_is_recovered_from_an_unparsable_line() {
+        assert_eq!(leading_pane_id("%42\tnonsense"), Some("%42"));
+        assert_eq!(leading_pane_id("%42"), Some("%42"));
+        assert_eq!(leading_pane_id("no server running"), None);
+        assert_eq!(leading_pane_id("%\t1"), None);
+        assert_eq!(leading_pane_id("%4x\t1"), None);
     }
 
     #[test]
@@ -1364,20 +1590,52 @@ mod tests {
         ];
         let panes = [pane("q-alpha", "%1"), pane("q-other", "%9")];
 
-        let orphans: Vec<String> = find_orphans(sessions.clone(), &panes)
+        let ts = now();
+        let orphans: Vec<(String, &str)> = find_orphans(sessions.clone(), &panes, ts)
             .into_iter()
-            .map(|s| s.label)
+            .map(|o| (o.session.label, o.reason))
             .collect();
-        assert_eq!(orphans, ["gone", "recycled"]);
+        assert_eq!(
+            orphans,
+            [
+                ("gone".to_string(), PANE_GONE),
+                ("recycled".to_string(), PANE_GONE)
+            ]
+        );
 
         // No panes at all (a dead tmux server) orphans everything; every pane
         // present orphans nothing.
-        assert_eq!(find_orphans(sessions.clone(), &[]).len(), 3);
+        assert_eq!(find_orphans(sessions.clone(), &[], ts).len(), 3);
         let all: Vec<Pane> = sessions
             .iter()
             .map(|s| pane(&s.tmux_session, &s.tmux_pane))
             .collect();
-        assert!(find_orphans(sessions, &all).is_empty());
+        assert!(find_orphans(sessions, &all, ts).is_empty());
+    }
+
+    #[test]
+    fn a_row_with_no_pane_is_an_orphan_only_once_the_grace_has_passed() {
+        let ts = now();
+        let mut pending = session_on("starting", "q-alpha", "");
+        pending.started_at = ts;
+        // The window is still being opened: nothing to look for, nothing to end.
+        assert!(find_orphans(vec![pending.clone()], &[], ts).is_empty());
+        assert!(
+            find_orphans(
+                vec![pending.clone()],
+                &[pane("q-alpha", "%1")],
+                ts + START_GRACE_SECS
+            )
+            .is_empty()
+        );
+
+        // Past the grace nobody is going to fill the pane in — the row would
+        // otherwise hold its label forever.
+        pending.started_at = ts - START_GRACE_SECS - 1;
+        let orphans = find_orphans(vec![pending], &[pane("q-alpha", "%1")], ts);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].session.label, "starting");
+        assert_eq!(orphans[0].reason, NEVER_STARTED);
     }
 
     #[test]
@@ -1569,6 +1827,9 @@ mod tests {
             unreachable!()
         }
         fn new_window(&self, _: &NewWindow) -> anyhow::Result<Pane> {
+            unreachable!()
+        }
+        fn select_window(&self, _: &str) -> anyhow::Result<()> {
             unreachable!()
         }
         fn attach(&self, _: &str, _: Option<&str>) -> anyhow::Result<()> {

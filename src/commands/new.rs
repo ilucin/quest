@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::Ctx;
-use crate::commands::{NONE, attach_mode, sweep_quiet};
+use crate::commands::{AttachMode, attach_mode, sweep_quiet};
 use crate::db::{Db, ID_ATTEMPTS};
 use crate::error::QError;
 use crate::model::{NameSource, Quest, Session, SessionRole, SessionStatus, new_id};
@@ -90,10 +90,10 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
             },
         )?;
     }
-    if attach != NONE {
+    if attach != AttachMode::None {
         // An exec attach replaces this process, so nothing buffered survives it.
         std::io::stdout().flush()?;
-        ctx.tmux().attach(&tmux_session, Some(MASTER))?;
+        ctx.tmux().attach(&tmux_session, Some(&session.tmux_pane))?;
     }
     Ok(())
 }
@@ -262,8 +262,18 @@ fn resolve_slug(name: Option<&str>, cwd: &Path) -> anyhow::Result<(String, NameS
 }
 
 pub fn validate_slug(slug: &str) -> anyhow::Result<()> {
-    if slug.len() > SLUG_MAX || !is_slug(slug) {
-        return Err(QError::Invalid(format!("invalid slug `{slug}`: it {SLUG_RULE}")).into());
+    validate_kebab("slug", slug)
+}
+
+/// A session label follows the slug grammar — it becomes part of a tmux window
+/// name and of `claude -n <slug>/<label>` (SPEC §6).
+pub fn validate_label(label: &str) -> anyhow::Result<()> {
+    validate_kebab("label", label)
+}
+
+fn validate_kebab(what: &str, value: &str) -> anyhow::Result<()> {
+    if value.len() > SLUG_MAX || !is_slug(value) {
+        return Err(QError::Invalid(format!("invalid {what} `{value}`: it {SLUG_RULE}")).into());
     }
     Ok(())
 }
@@ -325,7 +335,7 @@ fn git_branch(cwd: &Path) -> Option<String> {
 }
 
 /// `claude -n <slug>/<label> [-- <prompt>]`, run by tmux through a shell.
-fn claude_command(slug: &str, label: &str, prompt: Option<&str>) -> String {
+pub fn claude_command(slug: &str, label: &str, prompt: Option<&str>) -> String {
     let mut cmd = format!("claude -n {}", shell_quote(&format!("{slug}/{label}")));
     if let Some(prompt) = prompt {
         cmd.push_str(" -- ");
@@ -344,7 +354,7 @@ fn shell_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', r"'\''"))
 }
 
-fn fresh_session_id(db: &Db) -> anyhow::Result<String> {
+pub fn fresh_session_id(db: &Db) -> anyhow::Result<String> {
     for _ in 0..ID_ATTEMPTS {
         let id = new_id("s");
         if db.get_session(&id)?.is_none() {

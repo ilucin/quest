@@ -14,6 +14,7 @@ pub mod resume;
 pub mod rm;
 pub mod set;
 pub mod show;
+pub mod spawn;
 
 // Agent self-report (bd-8lz.2.5).
 pub mod link;
@@ -97,17 +98,39 @@ fn in_quest_pane() -> bool {
     std::env::var_os("Q_QUEST").is_some_and(|v| !v.is_empty())
 }
 
-/// The attach mode that leaves the terminal alone (`-d`).
-pub const NONE: &str = "none";
+/// What a command did with the terminal, for the payload and the one-liner.
+/// `Switch` and `Exec` move a client between sessions; `Select` only changes
+/// which window of the caller's own session is active, which is all `q spawn`
+/// ever does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachMode {
+    /// `-d` / `--no-attach`: the terminal is left alone.
+    None,
+    Select,
+    Switch,
+    Exec,
+}
 
-/// What an attach will do, for the payload: inside tmux the client switches,
-/// outside it the process is replaced by `tmux attach`. The one helper every
-/// attaching command reports through.
-pub fn attach_mode(ctx: &Ctx, attaching: bool) -> &'static str {
+impl std::fmt::Display for AttachMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AttachMode::None => "none",
+            AttachMode::Select => "select",
+            AttachMode::Switch => "switch",
+            AttachMode::Exec => "exec",
+        })
+    }
+}
+
+/// What an attach will do: inside tmux the client switches, outside it the
+/// process is replaced by `tmux attach`. The one helper every attaching
+/// command reports through.
+pub fn attach_mode(ctx: &Ctx, attaching: bool) -> AttachMode {
     match (attaching, ctx.tmux().in_tmux()) {
-        (false, _) => NONE,
-        (true, true) => "switch",
-        (true, false) => "exec",
+        (false, _) => AttachMode::None,
+        (true, true) => AttachMode::Switch,
+        (true, false) => AttachMode::Exec,
     }
 }
 
