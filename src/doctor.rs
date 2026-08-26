@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::Ctx;
 use crate::config::Config;
 use crate::db::Db;
-use crate::model::Session;
+use crate::model::{Session, now};
 use crate::output;
 use crate::tmux::{self, Tmux};
 
@@ -310,11 +310,11 @@ fn check_orphans(db: Option<&Db>, tmux: &dyn Tmux, fix: bool, fixed: &mut Vec<St
         Err(e) => return check(NAME, Status::Warn, format!("skipped: {e:#}")),
     };
 
-    let orphans = tmux::find_orphans(live, &panes);
+    let orphans = tmux::find_orphans(live, &panes, now());
     if orphans.is_empty() {
         return check(NAME, Status::Ok, "none");
     }
-    let names: Vec<String> = orphans.iter().map(|s| describe(db, s)).collect();
+    let names: Vec<String> = orphans.iter().map(|o| describe(db, &o.session)).collect();
     with_hint(
         check(
             NAME,

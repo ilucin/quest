@@ -57,6 +57,17 @@ pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
             .into());
         }
     };
+    // A row inserted by a spawn that then died has no pane. tmux reads an
+    // empty target as "whatever is active", so entering it would land on the
+    // master while claiming to be the worker. The sweep ends such a row a few
+    // seconds in; until then, say so.
+    if session.tmux_pane.is_empty() {
+        return Err(QError::Other(format!(
+            "session `{wanted}` of {} has no pane yet; it never finished starting",
+            quest.slug
+        ))
+        .into());
+    }
     // The pane is the session's identity (SPEC §6); the window name is only
     // ever reported, and tmux is the one that knows it.
     let pane = session.tmux_pane.clone();

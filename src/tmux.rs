@@ -273,6 +273,16 @@ pub fn is_no_server(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("no server running")
 }
 
+/// An empty target is not "the current pane" as far as q is concerned: it means
+/// a session row whose window never opened, and tmux would silently act on
+/// whatever is active instead.
+fn require_pane_id(pane_id: &str) -> anyhow::Result<()> {
+    if pane_id.is_empty() {
+        return Err(QError::Tmux("no pane to select (empty pane id)".to_string()).into());
+    }
+    Ok(())
+}
+
 // --------------------------------------------------------------------- real
 
 pub struct RealTmux;
@@ -339,6 +349,7 @@ impl Tmux for RealTmux {
     }
 
     fn select_window(&self, pane_id: &str) -> anyhow::Result<()> {
+        require_pane_id(pane_id)?;
         run(&args_select_window(pane_id)).map(|_| ())
     }
 
@@ -664,6 +675,7 @@ impl Tmux for FixtureTmux {
     }
 
     fn select_window(&self, pane_id: &str) -> anyhow::Result<()> {
+        require_pane_id(pane_id)?;
         self.edit(|state| {
             state.pane_mut(pane_id)?;
             state.selected = Some(pane_id.to_string());
@@ -849,19 +861,51 @@ pub fn live_panes(tmux: &dyn Tmux) -> anyhow::Result<Vec<Pane>> {
     }
 }
 
-/// The sessions among `sessions` whose pane is gone. Keyed on the
+/// Why a live row is being ended, for the `session.end` payload.
+pub const PANE_GONE: &str = "pane_gone";
+pub const NEVER_STARTED: &str = "never_started";
+
+/// How long a row whose pane is not filled in yet is left alone. A spawn
+/// inserts the row before it opens the window (the `SessionStart` hook has to
+/// find it), so there is always a moment with no pane; if q dies in that
+/// moment nothing will ever fill it, and without the age-out the row stays
+/// live forever — burning its label and bouncing `q enter`/`q resume` off each
+/// other. Longer than tmux needs to open a window, short enough to self-heal.
+pub const START_GRACE_SECS: i64 = 10;
+
+/// An orphaned session row and why it counts as one.
+#[derive(Debug)]
+pub struct Orphan {
+    pub session: Session,
+    pub reason: &'static str,
+}
+
+/// The sessions among `sessions` that no longer have a live pane. Keyed on the
 /// `(tmux_session, pane)` pair: tmux recycles pane ids, so `%1` in another
-/// tmux session is not this session's pane. Shared by `sweep` and `q doctor`.
-pub fn find_orphans(sessions: Vec<Session>, panes: &[Pane]) -> Vec<Session> {
+/// tmux session is not this session's pane. A row with no pane at all is only
+/// an orphan once `START_GRACE_SECS` have passed since it started. Shared by
+/// `sweep` and `q doctor`.
+pub fn find_orphans(sessions: Vec<Session>, panes: &[Pane], now: i64) -> Vec<Orphan> {
     let alive: HashSet<(&str, &str)> = panes
         .iter()
         .map(|p| (p.session_name.as_str(), p.pane_id.as_str()))
         .collect();
     sessions
         .into_iter()
-        // A row inserted before its window exists has no pane to look for yet.
-        .filter(|s| !s.tmux_pane.is_empty())
-        .filter(|s| !alive.contains(&(s.tmux_session.as_str(), s.tmux_pane.as_str())))
+        .filter_map(|s| {
+            if s.tmux_pane.is_empty() {
+                let stale = now - s.started_at > START_GRACE_SECS;
+                return stale.then_some(Orphan {
+                    session: s,
+                    reason: NEVER_STARTED,
+                });
+            }
+            let gone = !alive.contains(&(s.tmux_session.as_str(), s.tmux_pane.as_str()));
+            gone.then_some(Orphan {
+                session: s,
+                reason: PANE_GONE,
+            })
+        })
         .collect()
 }
 
@@ -883,14 +927,15 @@ pub fn sweep(db: &Db, tmux: &dyn Tmux) -> anyhow::Result<Vec<Session>> {
     }
     let panes = live_panes(tmux)?;
 
+    let ts = now();
     let mut ended = Vec::new();
-    for session in find_orphans(live, &panes) {
-        let row = db.mark_session_ended(&session.id, now())?;
+    for orphan in find_orphans(live, &panes, ts) {
+        let row = db.mark_session_ended(&orphan.session.id, ts)?;
         db.append_event(
             &row.quest_id,
             Some(&row.id),
             "session.end",
-            &serde_json::json!({ "reason": "pane_gone" }),
+            &serde_json::json!({ "reason": orphan.reason }),
         )?;
         ended.push(row);
     }
@@ -1315,6 +1360,15 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_pane_id_is_refused_rather_than_read_as_the_active_pane() {
+        // Real tmux takes `-t ''` as "whatever is active" and exits 0.
+        assert!(require_pane_id("").is_err());
+        assert!(require_pane_id("%42").is_ok());
+        let (_dir, t) = fixture();
+        assert!(t.select_window("").is_err());
+    }
+
+    #[test]
     fn a_leading_pane_id_is_recovered_from_an_unparsable_line() {
         assert_eq!(leading_pane_id("%42\tnonsense"), Some("%42"));
         assert_eq!(leading_pane_id("%42"), Some("%42"));
@@ -1479,20 +1533,52 @@ mod tests {
         ];
         let panes = [pane("q-alpha", "%1"), pane("q-other", "%9")];
 
-        let orphans: Vec<String> = find_orphans(sessions.clone(), &panes)
+        let ts = now();
+        let orphans: Vec<(String, &str)> = find_orphans(sessions.clone(), &panes, ts)
             .into_iter()
-            .map(|s| s.label)
+            .map(|o| (o.session.label, o.reason))
             .collect();
-        assert_eq!(orphans, ["gone", "recycled"]);
+        assert_eq!(
+            orphans,
+            [
+                ("gone".to_string(), PANE_GONE),
+                ("recycled".to_string(), PANE_GONE)
+            ]
+        );
 
         // No panes at all (a dead tmux server) orphans everything; every pane
         // present orphans nothing.
-        assert_eq!(find_orphans(sessions.clone(), &[]).len(), 3);
+        assert_eq!(find_orphans(sessions.clone(), &[], ts).len(), 3);
         let all: Vec<Pane> = sessions
             .iter()
             .map(|s| pane(&s.tmux_session, &s.tmux_pane))
             .collect();
-        assert!(find_orphans(sessions, &all).is_empty());
+        assert!(find_orphans(sessions, &all, ts).is_empty());
+    }
+
+    #[test]
+    fn a_row_with_no_pane_is_an_orphan_only_once_the_grace_has_passed() {
+        let ts = now();
+        let mut pending = session_on("starting", "q-alpha", "");
+        pending.started_at = ts;
+        // The window is still being opened: nothing to look for, nothing to end.
+        assert!(find_orphans(vec![pending.clone()], &[], ts).is_empty());
+        assert!(
+            find_orphans(
+                vec![pending.clone()],
+                &[pane("q-alpha", "%1")],
+                ts + START_GRACE_SECS
+            )
+            .is_empty()
+        );
+
+        // Past the grace nobody is going to fill the pane in — the row would
+        // otherwise hold its label forever.
+        pending.started_at = ts - START_GRACE_SECS - 1;
+        let orphans = find_orphans(vec![pending], &[pane("q-alpha", "%1")], ts);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].session.label, "starting");
+        assert_eq!(orphans[0].reason, NEVER_STARTED);
     }
 
     #[test]

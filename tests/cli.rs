@@ -3810,6 +3810,100 @@ fn a_spawn_whose_window_never_opens_leaves_no_session_behind() {
     );
 }
 
+/// A worker row inserted but never given a pane — a `q spawn` killed between
+/// the insert and `update_session_pane`. `age` seconds ago.
+fn seed_pending_worker(env: &Env, quest_id: &str, label: &str, age: i64) -> String {
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - age;
+    let id = format!("s-pending-{label}");
+    env.conn()
+        .execute(
+            "INSERT INTO session (id, quest_id, role, label, tmux_session, tmux_pane,
+                                  status, started_at, updated_at)
+             VALUES (?1, ?2, 'worker', ?3, 'q-foo', '', 'starting', ?4, ?4)",
+            rusqlite::params![&id, quest_id, label, started],
+        )
+        .unwrap();
+    id
+}
+
+#[test]
+fn the_sweep_ends_a_row_whose_window_never_opened_once_the_grace_has_passed() {
+    let env = Env::new();
+    let created = env.new_quest("foo");
+    let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
+
+    // Still inside the grace: the window may yet appear, so the row is left be.
+    seed_pending_worker(&env, &quest_id, "fresh", 0);
+    assert_eq!(env.json(&["show", "foo"])["live_sessions"], 2);
+
+    // Past it, nothing is ever going to fill the pane in. Without this the row
+    // holds its label forever: `q enter` sends you to `q resume` and `q resume`
+    // sends you back.
+    let stale = seed_pending_worker(&env, &quest_id, "stale", 60);
+    let shown = env.json(&["show", "foo"]);
+    assert_eq!(shown["live_sessions"], 2);
+    let ended = shown["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == stale.as_str())
+        .unwrap();
+    assert_eq!(ended["status"], "ended");
+    assert!(ended["ended_at"].is_i64());
+
+    let reason: String = env
+        .conn()
+        .query_row(
+            "SELECT json_extract(payload, '$.reason') FROM event
+             WHERE kind = 'session.end' AND session_id = ?1",
+            [&stale],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "never_started");
+
+    // The label is free again, and no window was touched to free it.
+    assert_eq!(env.fixture()["panes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        env.json(&["spawn", "foo", "go", "--label", "stale"])["session"]["label"],
+        "stale"
+    );
+}
+
+#[test]
+fn enter_refuses_a_session_whose_window_never_opened() {
+    let env = Env::new();
+    let created = env.new_quest("foo");
+    let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
+    // Fresh, so the sweep leaves it live and `q enter` is the one answering.
+    seed_pending_worker(&env, &quest_id, "tests", 0);
+
+    let assert = env
+        .cmd()
+        .args(["enter", "foo", "--session", "tests", "--json"])
+        .assert()
+        .code(1)
+        .stdout("");
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    let message = parsed["error"].as_str().unwrap();
+    assert!(message.contains("`tests`"), "{message}");
+    assert!(message.contains("has no pane yet"), "{message}");
+
+    // An empty tmux target means "the active window" — attaching would have
+    // landed on the master while claiming to be the worker.
+    let fixture = env.fixture();
+    assert_eq!(fixture["attached"], serde_json::Value::Null);
+    assert_eq!(fixture["selected"], serde_json::Value::Null);
+
+    // The master is still reachable.
+    assert_eq!(env.json(&["enter", "foo"])["window"], "master");
+}
+
 #[test]
 fn spawn_help_only_lists_the_implemented_flags() {
     let assert = q().args(["spawn", "--help"]).assert().success();
