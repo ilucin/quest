@@ -3041,3 +3041,163 @@ fn ended_session_env_is_rejected_for_writes() {
     // Reads still work.
     pane.cmd().args(["links"]).assert().success();
 }
+
+// ------------------------------------------------ PostToolUse auto-capture
+
+/// A Claude Code `PostToolUse` payload for a Bash call.
+fn bash_payload(cwd: &std::path::Path, command: &str, stdout: &str) -> String {
+    serde_json::json!({
+        "session_id": "claude-1",
+        "cwd": cwd,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": command, "description": "x" },
+        "tool_response": { "stdout": stdout, "stderr": "", "interrupted": false },
+    })
+    .to_string()
+}
+
+fn post_tool_use(cmd: &mut Command, payload: &str) {
+    cmd.args(["hook", "post-tool-use"])
+        .write_stdin(payload.to_string())
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
+fn post_tool_use_captures_a_pr_url_once() {
+    let pane = Pane::new();
+    let cwd = pane.env.work("alpha");
+    let pr = "https://github.com/acme/api/pull/42";
+    let payload = bash_payload(&cwd, "gh pr create", &format!("{pr}/files\n{pr}\n"));
+
+    post_tool_use(&mut pane.cmd(), &payload);
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 1);
+    let (kind, session, event) = pane.last_event();
+    assert_eq!(kind, "link.added");
+    assert_eq!(session.as_deref(), Some(pane.session_id.as_str()));
+    assert_eq!(
+        event,
+        serde_json::json!({ "id": 1, "kind": "pr", "ref": pr, "auto": true })
+    );
+    let links = pane.json(&["links"]);
+    assert_eq!(links[0]["kind"], "pr");
+    assert_eq!(links[0]["ref"], pr);
+    assert_eq!(links[0]["session_id"], pane.session_id.as_str());
+
+    // The same output again: no second row, no second event.
+    post_tool_use(&mut pane.cmd(), &payload);
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 1);
+    assert_eq!(
+        pane.events()
+            .iter()
+            .filter(|(k, _, _)| k == "link.added")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn post_tool_use_captures_worktrees_and_beads() {
+    let pane = Pane::new();
+    let cwd = pane.env.work("alpha");
+    post_tool_use(
+        &mut pane.cmd(),
+        &bash_payload(&cwd, "git worktree add .worktrees/x -b feat/x", ""),
+    );
+    post_tool_use(
+        &mut pane.cmd(),
+        &bash_payload(&cwd, "bd create 'thing' -l repo:x", "Created bd-8lz.9\n"),
+    );
+    let links = pane.json(&["links"]);
+    let refs: Vec<(String, String)> = links
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| {
+            (
+                l["kind"].as_str().unwrap().to_string(),
+                l["ref"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        refs,
+        vec![
+            (
+                "worktree".to_string(),
+                cwd.join(".worktrees/x").to_string_lossy().into_owned()
+            ),
+            ("branch".to_string(), "feat/x".to_string()),
+            ("beads".to_string(), "bd-8lz.9".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn post_tool_use_captures_written_artifacts() {
+    let pane = Pane::new();
+    let cwd = pane.env.work("alpha");
+    let file = cwd.join("output").join("report.html");
+    let payload = serde_json::json!({
+        "session_id": "claude-1",
+        "cwd": cwd,
+        "tool_name": "Write",
+        "tool_input": { "file_path": file, "content": "<h1>hi</h1>" },
+        "tool_response": { "filePath": file, "success": true },
+    })
+    .to_string();
+    post_tool_use(&mut pane.cmd(), &payload);
+
+    let links = pane.json(&["links"]);
+    assert_eq!(links[0]["kind"], "artifact");
+    assert_eq!(links[0]["ref"], file.to_str().unwrap());
+    assert_eq!(links[0]["meta"]["note"], "auto-captured (Write)");
+    let (kind, _, event) = pane.last_event();
+    assert_eq!(kind, "artifact.added");
+    assert_eq!(event["auto"], true);
+    assert_eq!(event["note"], "auto-captured (Write)");
+
+    // Source files are not artifacts.
+    let src = cwd.join("src").join("x.rs");
+    let payload = serde_json::json!({
+        "cwd": cwd,
+        "tool_name": "Write",
+        "tool_input": { "file_path": src, "content": "" },
+        "tool_response": { "filePath": src, "success": true },
+    })
+    .to_string();
+    post_tool_use(&mut pane.cmd(), &payload);
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 1);
+}
+
+#[test]
+fn post_tool_use_is_a_noop_outside_a_quest_and_never_creates_the_database() {
+    // A live database, but no Q_QUEST: untouched.
+    let pane = Pane::new();
+    let cwd = pane.env.work("alpha");
+    let payload = bash_payload(&cwd, "gh", "https://github.com/acme/api/pull/1");
+    let mut cmd = pane.env.cmd();
+    cmd.env("Q_SESSION", &pane.session_id);
+    post_tool_use(&mut cmd, &payload);
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 0);
+
+    // A session from another quest named in the env: nothing captured.
+    let other = pane.env.new_quest("beta");
+    let mut cmd = pane.env.cmd();
+    cmd.env("Q_QUEST", other["quest"]["id"].as_str().unwrap())
+        .env("Q_SESSION", &pane.session_id);
+    post_tool_use(&mut cmd, &payload);
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 0);
+
+    // No database at all: Q_QUEST set, but the file must not appear.
+    let env = Env::new();
+    let mut cmd = env.cmd();
+    cmd.env("Q_QUEST", "q-nope").env("Q_SESSION", "s-nope");
+    post_tool_use(&mut cmd, &payload);
+    assert!(!env.dir.path().join("q.db").exists());
+
+    // Garbage on stdin is fine too.
+    post_tool_use(&mut pane.cmd(), "not json");
+}

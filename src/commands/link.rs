@@ -90,8 +90,21 @@ fn insert(
     if let Some(existing) = db.find_link(&target.quest.id, &link.kind, &link.r#ref)? {
         return report_existing(ctx, existing, title, note);
     }
-
     link.session_id = target.session_id().map(str::to_string);
+    let stored = store(db, link, event_kind, event_note, false)?;
+    emit_link(ctx, &stored, true, "")
+}
+
+/// Inserts `link` (its `quest_id`/`session_id` already set) and appends the
+/// matching event. `auto` marks hook captures (SPEC §12) in the payload.
+/// Callers check `find_link` first; a duplicate here is a real error.
+pub(crate) fn store(
+    db: &crate::db::Db,
+    link: Link,
+    event_kind: &str,
+    event_note: Option<&str>,
+    auto: bool,
+) -> anyhow::Result<Link> {
     let stored = db.insert_link(&link)?;
     let mut payload = serde_json::json!({
         "id": stored.id,
@@ -101,8 +114,16 @@ fn insert(
     if let Some(n) = event_note {
         payload["note"] = serde_json::Value::String(n.to_string());
     }
-    db.append_event(&target.quest.id, target.session_id(), event_kind, &payload)?;
-    emit_link(ctx, &stored, true, "")
+    if auto {
+        payload["auto"] = serde_json::Value::Bool(true);
+    }
+    db.append_event(
+        &stored.quest_id,
+        stored.session_id.as_deref(),
+        event_kind,
+        &payload,
+    )?;
+    Ok(stored)
 }
 
 /// The row already exists: set `title`/`note` where the row has none, keep
@@ -243,7 +264,7 @@ fn expand_tilde(reference: &str) -> String {
 
 /// Absolute path with the deepest existing ancestor canonicalised (so `/tmp/x`
 /// and `/private/tmp/x` are one ref on macOS) and the rest joined verbatim.
-fn absolute(cwd: &Path, path: &str) -> String {
+pub(crate) fn absolute(cwd: &Path, path: &str) -> String {
     let p = Path::new(path);
     let joined: PathBuf = if p.is_absolute() {
         p.to_path_buf()
@@ -303,7 +324,7 @@ fn artifact_path(cwd: &Path, path: &str) -> anyhow::Result<String> {
 
 /// `https://github.com/<org>/<repo>/pull/<n>` — everything after the number
 /// (`/files`, `?diff=`, `#issuecomment`) is dropped, `http`/`www.` unified.
-fn normalize_pr_url(reference: &str) -> String {
+pub(crate) fn normalize_pr_url(reference: &str) -> String {
     let Some(rest) = strip_scheme(reference) else {
         return reference.to_string();
     };
@@ -382,13 +403,13 @@ pub fn detect_kind(reference: &str, probe: &dyn Fn(&str) -> PathKind) -> Option<
     }
 }
 
-fn strip_scheme(r: &str) -> Option<&str> {
+pub(crate) fn strip_scheme(r: &str) -> Option<&str> {
     r.strip_prefix("https://")
         .or_else(|| r.strip_prefix("http://"))
 }
 
 /// `github.com/<org>/<repo>/pull/<n>`
-fn is_github_pr(rest: &str) -> bool {
+pub(crate) fn is_github_pr(rest: &str) -> bool {
     let rest = rest.strip_prefix("www.").unwrap_or(rest);
     let Some(path) = rest.strip_prefix("github.com/") else {
         return false;
@@ -405,7 +426,7 @@ fn is_github_pr(rest: &str) -> bool {
 
 /// `app.productive.io/<org>/.../task/<id>` or `.../tasks/<id>` (also
 /// `?...task/<id>` deep links, SPEC §12).
-fn is_productive_task(rest: &str) -> bool {
+pub(crate) fn is_productive_task(rest: &str) -> bool {
     let Some(path) = rest.strip_prefix("app.productive.io/") else {
         return false;
     };

@@ -6,6 +6,8 @@ pub mod enter;
 pub mod events;
 pub mod fmt;
 pub mod hook;
+// PostToolUse auto-capture (bd-8lz.2.6).
+pub mod hook_capture;
 pub mod list;
 pub mod new;
 pub mod rename;
