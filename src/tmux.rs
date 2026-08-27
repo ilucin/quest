@@ -569,6 +569,11 @@ pub struct FixtureState {
     /// caller's cleanup path is reachable. Real tmux fails for its own reasons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fail_new_window: Option<String>,
+    /// The same for `new_session` — the step `q new` rolls the whole Quest back
+    /// from when it fails (SPEC §5): the row is deleted and the epic closed,
+    /// and there is no other way to reach that path from a test.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_new_session: Option<String>,
     /// The same for `rename_session`, which is how a rename fails once the
     /// slug itself has been checked (SPEC §10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -811,6 +816,9 @@ impl Tmux for FixtureTmux {
 
     fn new_session(&self, spec: &NewSession) -> anyhow::Result<Pane> {
         self.edit(|state| {
+            if let Some(msg) = &state.fail_new_session {
+                return Err(QError::Tmux(msg.clone()).into());
+            }
             if state.panes.iter().any(|p| p.session_name == spec.name) {
                 return Err(QError::Tmux(format!("duplicate session: {}", spec.name)).into());
             }

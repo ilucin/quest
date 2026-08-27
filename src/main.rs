@@ -16,6 +16,7 @@ mod tmux;
 mod tui;
 
 use std::io::IsTerminal;
+use std::sync::Mutex;
 
 use clap::Parser;
 
@@ -36,6 +37,19 @@ pub struct Ctx {
     /// fix — a broken environment.
     db: Option<Db>,
     tmux: Box<dyn Tmux>,
+    /// `bd`, like `tmux`, behind a trait and owned rather than discovered, so
+    /// a test drives the beads paths without the process environment and the
+    /// TUI can hand `bd` a client that does not chatter at the screen.
+    bd: Box<dyn beads::Bd>,
+    /// Diagnostics for the human, buffered instead of written.
+    ///
+    /// A library call reached from `q new` may print to stderr; the same call
+    /// reached from the TUI is running in raw mode on the alternate screen,
+    /// where any write tears the frame up and ratatui's diff renderer never
+    /// repaints it. So nothing below this line writes: warnings land here and
+    /// the caller decides — `run` prints them, the TUI puts them in the status
+    /// bar or in the form's error line.
+    warnings: Mutex<Vec<String>>,
 }
 
 impl Ctx {
@@ -68,6 +82,8 @@ impl Ctx {
             machine_override,
             db,
             tmux: tmux::tmux(),
+            bd: beads::client(),
+            warnings: Mutex::new(Vec::new()),
         })
     }
 
@@ -85,6 +101,16 @@ impl Ctx {
         Ok(ctx)
     }
 
+    /// The same, for the TUI: a `bd` whose "still waiting…" progress notices
+    /// are off. They are stderr writes from inside the call, so nothing the
+    /// caller does afterwards can keep them off the alternate screen — and
+    /// unlike a warning they are worthless once the call has returned.
+    fn for_tui(args: &Cli) -> anyhow::Result<Ctx> {
+        let mut ctx = Ctx::with_db(args)?;
+        ctx.bd = beads::client_quiet();
+        Ok(ctx)
+    }
+
     /// For commands that must work while the file is broken — that is the
     /// state `q config path` and `q config edit` exist to get out of.
     fn lenient(args: &Cli) -> Ctx {
@@ -96,6 +122,8 @@ impl Ctx {
             machine_override: None,
             db: None,
             tmux: tmux::tmux(),
+            bd: beads::client(),
+            warnings: Mutex::new(Vec::new()),
         })
     }
 
@@ -109,9 +137,34 @@ impl Ctx {
         self.tmux.as_ref()
     }
 
+    pub fn bd(&self) -> &dyn beads::Bd {
+        self.bd.as_ref()
+    }
+
+    /// Buffer one diagnostic for whoever owns the output — see
+    /// [`Ctx::warnings`]. Poison is not news: the message is advisory and the
+    /// lock is only ever held for a push.
+    pub fn warn(&self, message: impl Into<String>) {
+        self.warnings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(message.into());
+    }
+
+    /// Everything buffered since the last drain. Every command that can warn
+    /// drains it, so nothing is carried into the next one.
+    pub fn take_warnings(&self) -> Vec<String> {
+        std::mem::take(&mut self.warnings.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// A `Ctx` over an explicit database and tmux, for the in-crate tests.
     /// Both are passed rather than discovered so a test never depends on the
     /// process environment (`Q_DB`, `Q_FIXTURE`) another test may be changing.
+    ///
+    /// `bd` defaults to one that refuses every call: an in-crate test that
+    /// reaches beads without saying so would otherwise shell out to the real
+    /// `bd` against the real tracker. [`Ctx::with_bd`] is how a test that
+    /// means to exercise the beads paths says so.
     #[cfg(test)]
     pub fn for_tests(config: Config, db: Db, tmux: Box<dyn Tmux>) -> Ctx {
         Ctx {
@@ -121,7 +174,15 @@ impl Ctx {
             machine_override: None,
             db: Some(db),
             tmux,
+            bd: Box::new(beads::stub::NoBd),
+            warnings: Mutex::new(Vec::new()),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_bd(mut self, bd: Box<dyn beads::Bd>) -> Ctx {
+        self.bd = bd;
+        self
     }
 }
 
@@ -166,7 +227,7 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
         // draw on. `--json` and a redirected stdout keep the one-line banner,
         // which is what a script reads.
         if !args.json && std::io::stdout().is_terminal() {
-            let ctx = Ctx::with_db(args)?;
+            let ctx = Ctx::for_tui(args)?;
             tui::run(&ctx)?;
             return Ok(0);
         }
@@ -217,6 +278,12 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
                     prompt_file: prompt_file.as_deref(),
                     no_auto_reset: *no_auto_reset,
                     detach: *detach,
+                    // The global `--machine` already decides this; only the
+                    // TUI's form sets it per Quest.
+                    machine: None,
+                    // `q tpl run` (bd-8lz.5) is what will set this from the
+                    // CLI; `q new` has no template.
+                    template: None,
                 },
             )
             .map(|()| 0)

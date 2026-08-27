@@ -16,7 +16,7 @@ pub fn run(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> anyhow::Result<(
     }
     if ctx.json || !ctx.quiet {
         // Not even the one `bd` call when nothing is going to be printed.
-        fill_progress(&mut rows);
+        fill_progress(ctx, &mut rows);
         let views: Vec<&crate::commands::QuestView> = rows.iter().map(|r| &r.view).collect();
         output::emit(ctx.json, &views, || human(&rows))?;
     }

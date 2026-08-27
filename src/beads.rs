@@ -30,6 +30,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Config;
+// Only the real cache root resolves a database path; see `cache_root`.
+#[cfg(not(test))]
 use crate::db::Db;
 use crate::model::{Quest, now};
 use crate::proc;
@@ -324,9 +326,21 @@ pub trait Bd {
 }
 
 pub fn client() -> Box<dyn Bd> {
+    client_with(true)
+}
+
+/// The same client with `bd`'s "still waiting…" progress notices off. They are
+/// stderr writes from inside the call, so only the client can suppress them —
+/// and a caller that owns the screen (the TUI, in raw mode on the alternate
+/// screen) cannot survive one.
+pub fn client_quiet() -> Box<dyn Bd> {
+    client_with(false)
+}
+
+fn client_with(notices: bool) -> Box<dyn Bd> {
     match std::env::var_os("Q_FIXTURE") {
         Some(p) if !p.is_empty() => Box::new(FixtureBd),
-        _ => Box::new(RealBd),
+        _ => Box::new(RealBd { notices }),
     }
 }
 
@@ -364,11 +378,20 @@ fn as_argv(args: &[String]) -> Vec<&str> {
     args.iter().map(String::as_str).collect()
 }
 
-struct RealBd;
+struct RealBd {
+    /// Whether a slow `bd` may say so on stderr while the call is in flight.
+    notices: bool,
+}
+
+impl RealBd {
+    fn notice(&self, text: &'static str) -> Option<(std::time::Duration, &'static str)> {
+        self.notices.then_some((SLOW_WRITE, text))
+    }
+}
 
 impl Bd for RealBd {
     fn create_epic(&self, title: &str, labels: &str, quest_id: &str) -> Result<String, String> {
-        let notice = Some((SLOW_WRITE, "waiting on bd to create the epic…"));
+        let notice = self.notice("waiting on bd to create the epic…");
         match bd(&create_argv(title, labels), WRITE_TIMEOUT, notice) {
             Ok(out) if out.success() => {
                 let stdout = out.text();
@@ -412,7 +435,7 @@ impl Bd for RealBd {
     }
 
     fn close(&self, id: &str, reason: &str) -> Result<(), String> {
-        let notice = Some((SLOW_WRITE, "waiting on bd to close the epic…"));
+        let notice = self.notice("waiting on bd to close the epic…");
         match bd(&close_argv(id, reason), WRITE_TIMEOUT, notice) {
             Ok(out) if out.success() => Ok(()),
             Ok(out) => Err(out.message()),
@@ -425,7 +448,7 @@ impl Bd for RealBd {
     }
 
     fn relabel_repo(&self, epic: &str, old: Option<&str>, new: &str) -> Result<(), String> {
-        let notice = Some((SLOW_WRITE, "waiting on bd to relabel the epic…"));
+        let notice = self.notice("waiting on bd to relabel the epic…");
         let args = relabel_argv(epic, old, new);
         match bd(&as_argv(&args), WRITE_TIMEOUT, notice) {
             Ok(out) if out.success() => Ok(()),
@@ -704,11 +727,67 @@ struct Cached {
 }
 
 fn cache_path(quest_id: &str) -> Option<PathBuf> {
-    Some(
-        cache_dir(&Db::path().ok()?)
-            .join("cache")
-            .join(format!("beads-{quest_id}.json")),
-    )
+    Some(cache_root()?.join(format!("beads-{quest_id}.json")))
+}
+
+/// The directory the per-Quest cache files live in.
+///
+/// `Db::path()` falls back to the real `~/.local/share/q` when `Q_DB` is
+/// unset, and the in-crate tests run in one process that inherits the
+/// developer's home. A hit read out of it short-circuits `progress_all_with`
+/// before `bd` is ever asked, which is a real (if low-rate) flake and a
+/// violation of the repo's "never touch the real `~/.local/share/q`" rule —
+/// so under `cfg(test)` there is no default at all (N-3).
+#[cfg(not(test))]
+fn cache_root() -> Option<PathBuf> {
+    Some(cache_dir(&Db::path().ok()?).join("cache"))
+}
+
+#[cfg(test)]
+fn cache_root() -> Option<PathBuf> {
+    cache_override::root()
+}
+
+/// The in-crate cache directory: none unless a test says otherwise, so no
+/// test can read or write the developer's own cache. See [`cache_root`].
+#[cfg(test)]
+pub(crate) mod cache_override {
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    fn exclusive() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    pub(super) fn root() -> Option<PathBuf> {
+        ROOT.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Points the cache at `dir` until the guard is dropped. `ROOT` is
+    /// process-global, so the guard also serializes the tests that use it.
+    pub(crate) struct Guard(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *ROOT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    pub(crate) fn at(dir: PathBuf) -> Guard {
+        let guard = none();
+        *ROOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir);
+        guard
+    }
+
+    /// The default — no cache anywhere — held against a concurrent [`at`].
+    pub(crate) fn none() -> Guard {
+        let lock = exclusive().lock().unwrap_or_else(|e| e.into_inner());
+        *ROOT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        Guard(lock)
+    }
 }
 
 /// A bare relative `Q_DB` (`q.db`) has an empty parent; its cache belongs in
@@ -768,10 +847,9 @@ fn fresh(cached: &Cached) -> bool {
 
 /// Progress for one Quest: a fresh cache hit, else `bd`, else the stale cache.
 /// `None` when the Quest has no epic, or nothing has ever been read.
-pub fn progress(quest: &Quest) -> Option<Progress> {
-    progress_with(client().as_ref(), quest)
-}
-
+///
+/// The client is the caller's — `Ctx` owns it — so nothing here discovers a
+/// `bd` off the process environment.
 pub fn progress_with(bd: &dyn Bd, quest: &Quest) -> Option<Progress> {
     let epic = epic_of(quest)?;
     let cached = read_cache(&quest.id);
@@ -790,12 +868,6 @@ pub fn progress_with(bd: &dyn Bd, quest: &Quest) -> Option<Progress> {
     }
 }
 
-/// Progress for a whole listing in one `bd` call. Quests without an epic are
-/// absent from the result; a Quest `bd` knows nothing about counts as empty.
-pub fn progress_all(quests: &[&Quest]) -> HashMap<String, Progress> {
-    progress_all_with(client().as_ref(), quests)
-}
-
 /// When the last whole-listing read failed, as a unix timestamp; 0 is never.
 /// Process-local on purpose: it exists to protect a long-lived TUI from its own
 /// tick, and a one-shot `q list` should not inherit an older process's bad luck.
@@ -806,6 +878,133 @@ static LAST_FAILURE: AtomicI64 = AtomicI64::new(0);
 /// that reaches `progress_all_with` with a Quest carrying an epic — directly,
 /// or through `refresh`/`fill_progress`. The guard clears the window on the way
 /// in and gives it back clear, so no test can inherit or leak one.
+/// The in-crate `bd` stand-ins. Handed to a [`crate::Ctx`] with
+/// `Ctx::with_bd`, so a test drives the beads paths — the epic `q new`
+/// creates, the epic `q close --close-epic` closes — without a `bd` binary,
+/// without the process environment, and without the real tracker.
+#[cfg(test)]
+pub(crate) mod stub {
+    use super::Bd;
+    use std::sync::Mutex;
+
+    /// What every `Ctx::for_tests` gets unless it asks for something else:
+    /// a `bd` that refuses, so a test reaching beads by accident fails loudly
+    /// instead of shelling out to the real one.
+    pub(crate) struct NoBd;
+
+    const REFUSED: &str = "this test has no bd (pass one with `Ctx::with_bd`)";
+
+    impl Bd for NoBd {
+        fn create_epic(&self, _: &str, _: &str, _: &str) -> Result<String, String> {
+            Err(REFUSED.to_string())
+        }
+        fn list_quest(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn list_quests(&self, _: &[&str]) -> Option<String> {
+            None
+        }
+        fn close(&self, _: &str, _: &str) -> Result<(), String> {
+            Err(REFUSED.to_string())
+        }
+        fn relabel_repo(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), String> {
+            Err(REFUSED.to_string())
+        }
+    }
+
+    /// A scriptable `bd` that records what it was asked for.
+    pub(crate) struct StubBd {
+        /// `bd create` mints this id, or fails with this message.
+        pub(crate) create: Result<String, String>,
+        /// `bd close` succeeds, or fails with this message.
+        pub(crate) close: Result<(), String>,
+        /// `bd list --json` output, for progress.
+        pub(crate) listing: Option<String>,
+        pub(crate) created: Mutex<Vec<(String, String)>>,
+        pub(crate) closed: Mutex<Vec<(String, String)>>,
+    }
+
+    impl StubBd {
+        /// A `bd` that works: `create` mints `epic`, `close` succeeds.
+        pub(crate) fn working(epic: &str) -> StubBd {
+            StubBd {
+                create: Ok(epic.to_string()),
+                close: Ok(()),
+                listing: None,
+                created: Mutex::new(Vec::new()),
+                closed: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A `bd` that is there but will not do anything — the unreachable
+        /// tracker of B1's failure path.
+        pub(crate) fn failing(why: &str) -> StubBd {
+            StubBd {
+                create: Err(why.to_string()),
+                close: Err(why.to_string()),
+                listing: None,
+                created: Mutex::new(Vec::new()),
+                closed: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub(crate) fn closed_ids(&self) -> Vec<String> {
+            self.closed
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect()
+        }
+    }
+
+    /// So a test can keep a handle on the stub it handed to a `Ctx` and ask
+    /// afterwards what `bd` was told to do.
+    impl Bd for std::sync::Arc<StubBd> {
+        fn create_epic(&self, title: &str, labels: &str, quest: &str) -> Result<String, String> {
+            (**self).create_epic(title, labels, quest)
+        }
+        fn list_quest(&self, quest: &str) -> Option<String> {
+            (**self).list_quest(quest)
+        }
+        fn list_quests(&self, quests: &[&str]) -> Option<String> {
+            (**self).list_quests(quests)
+        }
+        fn close(&self, id: &str, reason: &str) -> Result<(), String> {
+            (**self).close(id, reason)
+        }
+        fn relabel_repo(&self, epic: &str, old: Option<&str>, new: &str) -> Result<(), String> {
+            (**self).relabel_repo(epic, old, new)
+        }
+    }
+
+    impl Bd for StubBd {
+        fn create_epic(&self, title: &str, labels: &str, _: &str) -> Result<String, String> {
+            self.created
+                .lock()
+                .unwrap()
+                .push((title.to_string(), labels.to_string()));
+            self.create.clone()
+        }
+        fn list_quest(&self, _: &str) -> Option<String> {
+            self.listing.clone()
+        }
+        fn list_quests(&self, _: &[&str]) -> Option<String> {
+            self.listing.clone()
+        }
+        fn close(&self, id: &str, reason: &str) -> Result<(), String> {
+            self.closed
+                .lock()
+                .unwrap()
+                .push((id.to_string(), reason.to_string()));
+            self.close.clone()
+        }
+        fn relabel_repo(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod backoff {
     use super::{LAST_FAILURE, Ordering};
@@ -1228,6 +1427,49 @@ mod tests {
         assert_eq!(sanitize("some repo"), "some-repo");
         assert_eq!(sanitize("a,b"), "a-b");
         assert_eq!(sanitize("plain"), "plain");
+    }
+
+    /// N-3. `Db::path()` falls back to the real `~/.local/share/q` when `Q_DB`
+    /// is unset, and every in-crate test runs in one process that inherits the
+    /// developer's home. A *fresh* hit read out of it short-circuits
+    /// `progress_all_with` before `bd` is asked: with a `$HOME` cache seeded
+    /// for all 65536 possible quest ids, `a_failing_bd_is_not_respawned_on_
+    /// every_tick` and `the_backoff_window_does_not_leak_between_tests` both
+    /// fail. A real cache holds a handful of entries, so it is a low-rate
+    /// flake — and a violation of the repo's "never touch the real
+    /// `~/.local/share/q`" rule either way.
+    #[test]
+    fn the_in_crate_cache_never_resolves_to_the_developers_home() {
+        // Against the one test that points the cache somewhere on purpose.
+        let _none = cache_override::none();
+        assert!(
+            cache_path("dead").is_none(),
+            "an in-crate test can read the real cache"
+        );
+        assert!(read_cache("dead").is_none());
+        // And a write is a no-op rather than a file in somebody's home.
+        write_cache("dead", &Progress::default());
+        assert!(read_cache("dead").is_none());
+    }
+
+    /// The cache still works — pointed at a directory the test owns.
+    #[test]
+    fn the_cache_round_trips_through_an_explicit_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let _at = cache_override::at(dir.path().to_path_buf());
+        let progress = Progress {
+            open: 1,
+            in_progress: 2,
+            closed: 3,
+            blocked: 0,
+            total: 6,
+        };
+        write_cache("abcd", &progress);
+        assert_eq!(read_cache("abcd").map(|c| c.progress), Some(progress));
+        assert!(dir.path().join("beads-abcd.json").exists());
+        // And `q rm` drops it.
+        forget("abcd");
+        assert!(read_cache("abcd").is_none());
     }
 
     #[test]
