@@ -2,9 +2,11 @@
 
 use crate::Ctx;
 use crate::cli::QuestState as StateFilter;
+use crate::commands::flush_warnings;
 use crate::commands::{QuestRow, fill_progress, fmt, load_quests};
 use crate::model::DisplayState;
 use crate::output;
+use crate::remote;
 
 pub fn run(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> anyhow::Result<()> {
     let wanted = state.map(display_state_of);
@@ -14,6 +16,13 @@ pub fn run(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> anyhow::Result<(
     if let Some(want) = wanted {
         rows.retain(|r| r.view.display_state == want);
     }
+
+    // The remote fan-out (SPEC §15). bd-8lz.5.2 merges these rows into the
+    // listing and the TUI; until then the round still runs, so a machine that
+    // is down is reported rather than silently missing.
+    remote::warn_unreachable(ctx, &remote::fetch_all(ctx));
+    flush_warnings(ctx);
+
     if ctx.json || !ctx.quiet {
         // Not even the one `bd` call when nothing is going to be printed.
         fill_progress(ctx, &mut rows);

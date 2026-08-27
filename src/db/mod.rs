@@ -8,6 +8,7 @@ pub mod event;
 pub mod link;
 pub mod migrations;
 pub mod quest;
+pub mod remote;
 pub mod session;
 pub mod template;
 
@@ -270,6 +271,7 @@ mod tests {
             "link",
             "template",
             "name_cache",
+            "remote_cache",
         ] {
             let count: i64 = db
                 .conn
