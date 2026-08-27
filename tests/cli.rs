@@ -8037,13 +8037,17 @@ fn a_fresh_remotes_rows_are_filtered_like_local_ones() {
 fn the_machines_array_counts_the_rows_that_claim_each_machine() {
     let env = Env::new();
     env.with_remotes(&[("ws", "ws-host")]);
-    // The bd-8lz.5.3 gap: a *local* Quest filed under a remote's name.
-    let work = env.work("mislabelled");
-    env.cmd()
-        .args(["--machine", "ws", "new", "--name", "mislabelled"])
-        .args(["--no-beads", "-d", "--dir", work.to_str().unwrap()])
-        .assert()
-        .success();
+    // A *local* Quest filed under a remote's name. `q --machine ws new` used
+    // to make one of these (the bd-8lz.5.3 bug — it now creates on `ws`), but
+    // the row is still reachable: a `[[remotes]]` renamed after the fact
+    // leaves exactly this behind, and the envelope has to add up either way.
+    env.new_quest("mislabelled");
+    env.conn()
+        .execute(
+            "UPDATE quest SET machine = 'ws' WHERE slug = 'mislabelled'",
+            [],
+        )
+        .unwrap();
     let payload = remote_listing("ws", "over-there");
 
     let mut cmd = env.cmd();
@@ -8178,10 +8182,12 @@ fn a_remote_that_never_said_its_prefix_gets_the_spec_default() {
     assert_eq!(out["tmux_session"], "q-over-there", "{out}");
 }
 
-/// A window inside a remote Quest needs that machine's session rows, which is
-/// bd-8lz.5.3's proxying; until then it is refused rather than mis-attached.
+/// A window inside a remote Quest needs that machine's session rows, and this
+/// machine has none of them — so the attach runs the far end's own `q enter`
+/// over ssh (SPEC §15's generic rule, applied to an attach), with the
+/// recursion guard on it.
 #[test]
-fn a_session_label_on_a_remote_quest_is_refused_for_now() {
+fn a_session_label_on_a_remote_quest_runs_that_machines_own_enter() {
     let env = Env::new();
     env.with_remotes(&[("ws", "ws-host")]);
     let mut cmd = env.cmd();
@@ -8189,12 +8195,575 @@ fn a_session_label_on_a_remote_quest_is_refused_for_now() {
         &mut cmd,
         serde_json::json!({ "ws-host": { "stdout": remote_listing("ws", "over-there") } }),
     );
-    cmd.args(["enter", "over-there", "--session", "tests"])
-        .assert()
+    let out = json_of(
+        &cmd.args(["enter", "over-there", "--session", "tests", "--json"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(out["machine"], "ws", "{out}");
+    assert_eq!(out["session"], "tests", "{out}");
+    assert_eq!(
+        out["argv"],
+        serde_json::json!([
+            "q",
+            "enter",
+            "over-there",
+            "--session",
+            "tests",
+            "--no-remote"
+        ]),
+        "{out}"
+    );
+    assert_eq!(
+        attach_calls(&env),
+        ["attach\tws-host\tq\tenter\tover-there\t--session\ttests\t--no-remote"]
+    );
+}
+
+// ------------------------------------------------------- q remote dispatch
+//
+// SPEC §15's generic rule: every command that resolves a Quest on a remote
+// machine is proxied over ssh with the same arguments, and `--no-remote`
+// breaks the recursion (bd-8lz.5.3).
+
+impl Env {
+    /// A host that answers the listing fan-out with a real far-end listing and
+    /// every proxied command with `proxied`.
+    fn two_faced(&self, slug: &str, proxied: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "ws-host": { "stdout": remote_listing("ws", slug), "proxied": proxied },
+        })
+    }
+
+    /// Run `args` with the scripted ssh armed.
+    fn over_ssh(&self, hosts: serde_json::Value, args: &[&str]) -> assert_cmd::assert::Assert {
+        let mut cmd = self.cmd();
+        self.with_ssh(&mut cmd, hosts);
+        cmd.args(args).assert()
+    }
+
+    /// Every ssh call that was not the listing fan-out — the proxied ones.
+    fn proxy_calls(&self) -> Vec<String> {
+        self.ssh_calls()
+            .into_iter()
+            .filter(|line| !line.contains("\tlist\t") && !line.starts_with("attach"))
+            .collect()
+    }
+}
+
+/// A remote answer that succeeds and says so.
+fn ok_reply() -> serde_json::Value {
+    serde_json::json!({ "stdout": "done over there\n" })
+}
+
+/// Every command SPEC §16 gives a `<quest>` (or a `<quest>/<label>`) reaches
+/// the machine that runs it, with its own arguments and the recursion guard.
+#[test]
+fn every_command_that_resolves_a_remote_quest_is_proxied_with_the_guard() {
+    for (args, sent) in [
+        (vec!["show", "over-there"], "q\tshow\tover-there"),
+        (vec!["brief", "over-there"], "q\tbrief\tover-there"),
+        (vec!["links", "over-there"], "q\tlinks\tover-there"),
+        (vec!["events", "over-there"], "q\tevents\tover-there"),
+        (vec!["sessions", "over-there"], "q\tsessions\tover-there"),
+        (vec!["name", "over-there"], "q\tname\tover-there"),
+        (
+            vec!["rename", "over-there", "renamed"],
+            "q\trename\tover-there\trenamed",
+        ),
+        (
+            vec!["set", "over-there", "goal", "ship it"],
+            "q\tset\tover-there\tgoal\t'ship it'",
+        ),
+        (
+            vec!["spawn", "over-there", "--label", "tests", "run the suite"],
+            "q\tspawn\tover-there\t--label\ttests\t'run the suite'",
+        ),
+        (
+            vec!["close", "over-there", "-f"],
+            "q\tclose\tover-there\t-f",
+        ),
+        (vec!["rm", "over-there", "-f"], "q\trm\tover-there\t-f"),
+        (
+            vec!["resume", "over-there", "-d"],
+            "q\tresume\tover-there\t-d",
+        ),
+        (
+            vec!["peek", "over-there/master"],
+            "q\tpeek\tover-there/master",
+        ),
+        (
+            vec!["send", "over-there/master", "carry on"],
+            "q\tsend\tover-there/master\t'carry on'",
+        ),
+        (
+            vec!["reset", "over-there/master"],
+            "q\treset\tover-there/master",
+        ),
+        (
+            vec!["kill", "over-there/tests", "-f"],
+            "q\tkill\tover-there/tests\t-f",
+        ),
+        (
+            vec!["note", "a note", "--quest", "over-there"],
+            "q\tnote\t'a note'\t--quest\tover-there",
+        ),
+        (
+            vec!["link", "add", "https://x/1", "--quest", "over-there"],
+            "q\tlink\tadd\t'https://x/1'\t--quest\tover-there",
+        ),
+    ] {
+        let env = Env::new();
+        env.with_remotes(&[("ws", "ws-host")]);
+        env.over_ssh(env.two_faced("over-there", ok_reply()), &args)
+            .success();
+        assert_eq!(
+            env.proxy_calls(),
+            [format!("ws-host\t{sent}\t--no-remote")],
+            "{args:?}"
+        );
+    }
+}
+
+/// The far end's streams are this command's streams, and its exit code is this
+/// process's (CLAUDE.md: human output to stdout, errors to stderr).
+#[test]
+fn a_proxied_command_relays_both_streams_and_its_exit_code() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let reply = serde_json::json!({
+        "stdout": "the pane, verbatim\n",
+        "stderr": "error: not idle\n",
+        "exit": 1,
+    });
+    env.over_ssh(
+        env.two_faced("over-there", reply),
+        &["peek", "over-there/master"],
+    )
+    .code(1)
+    .stdout("the pane, verbatim\n")
+    .stderr(predicate::str::contains("error: not idle"));
+}
+
+/// `--json` still means one JSON document on stdout: the far end already wrote
+/// one and it is relayed rather than rebuilt.
+#[test]
+fn a_proxied_json_command_is_still_valid_json_on_stdout() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let reply = serde_json::json!({ "stdout": "{\"quest\":{\"slug\":\"over-there\"}}\n" });
+    let assert = env
+        .over_ssh(
+            env.two_faced("over-there", reply),
+            &["show", "over-there", "--json"],
+        )
+        .success();
+    let out = json_of(&assert);
+    assert_eq!(out["quest"]["slug"], "over-there", "{out}");
+    // `--json` travelled: the far end has to know to answer in kind.
+    assert_eq!(
+        env.proxy_calls(),
+        ["ws-host\tq\tshow\tover-there\t--json\t--no-remote"]
+    );
+}
+
+/// A far end that exits non-zero under `--json` sends a `{"error": …}` on
+/// stderr, and that is what a `--json` caller here gets — unchanged.
+#[test]
+fn a_proxied_json_failure_keeps_the_far_ends_error_object() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let reply = serde_json::json!({
+        "stderr": "{\"error\":\"not found: session `nope`\",\"code\":\"not_found\"}\n",
+        "exit": 1,
+    });
+    let assert = env
+        .over_ssh(
+            env.two_faced("over-there", reply),
+            &["peek", "over-there/nope", "--json"],
+        )
         .code(1)
-        .stderr(predicate::str::contains("not supported on ws"))
-        // One sentence, not a wrapped source line: the format string used to
-        // bake fourteen spaces into the middle of it.
-        .stderr(predicate::str::contains("  ").not());
+        .stdout("");
+    assert_eq!(error_json(&assert)["code"], "not_found");
+}
+
+/// The recursion guard. A `q` running with `--no-remote` has no remote to ask,
+/// so it can neither resolve a Quest elsewhere nor dial one — which is exactly
+/// what every proxied invocation carries.
+#[test]
+fn no_remote_stops_the_proxy_dead() {
+    for args in [
+        vec!["show", "over-there"],
+        vec!["peek", "over-there/master"],
+        vec!["close", "over-there", "-f"],
+        vec!["spawn", "over-there", "--label", "t", "p"],
+        vec!["new", "--name", "here", "--no-beads", "-d"],
+    ] {
+        let env = Env::new();
+        env.with_remotes(&[("ws", "ws-host")]);
+        let mut full = vec!["--no-remote"];
+        full.extend(args.iter().copied());
+        env.over_ssh(env.two_faced("over-there", ok_reply()), &full);
+        assert!(
+            env.ssh_calls().is_empty(),
+            "{args:?}: {:?}",
+            env.ssh_calls()
+        );
+    }
+}
+
+/// A session id or a bare `<label>` is unique only per machine (SPEC §16), so
+/// neither can name a session elsewhere: they stay here, and never cost an ssh.
+#[test]
+fn a_bare_label_or_a_session_id_never_leaves_this_machine() {
+    for target in ["master", "s-0001"] {
+        let env = Env::new();
+        env.with_remotes(&[("ws", "ws-host")]);
+        env.over_ssh(env.two_faced("over-there", ok_reply()), &["peek", target])
+            .code(1)
+            .stderr(predicate::str::contains("not found"));
+        assert!(
+            env.ssh_calls().is_empty(),
+            "{target}: {:?}",
+            env.ssh_calls()
+        );
+    }
+}
+
+/// The commands that cannot honestly travel are refused with a reason and a
+/// way forward, not proxied into something that would be wrong over there.
+#[test]
+fn a_command_that_cannot_travel_is_refused_with_a_reason() {
+    for (args, said) in [
+        (vec!["events", "over-there", "--follow"], "--follow"),
+        (
+            vec![
+                "artifact",
+                "add",
+                "/tmp/report.html",
+                "--quest",
+                "over-there",
+            ],
+            "absolute path",
+        ),
+        (
+            vec!["phase", "building", "--quest", "over-there"],
+            "$Q_SESSION",
+        ),
+    ] {
+        let env = Env::new();
+        env.with_remotes(&[("ws", "ws-host")]);
+        env.over_ssh(env.two_faced("over-there", ok_reply()), &args)
+            .code(1)
+            .stderr(predicate::str::contains(said))
+            .stderr(predicate::str::contains("ws"));
+        assert!(env.proxy_calls().is_empty(), "{args:?}");
+    }
+    // The snapshot, which is what `--follow` is refused in favour of, travels.
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.over_ssh(
+        env.two_faced("over-there", ok_reply()),
+        &["events", "over-there"],
+    )
+    .success();
+    assert_eq!(
+        env.proxy_calls(),
+        ["ws-host\tq\tevents\tover-there\t--no-remote"]
+    );
+}
+
+/// The confirmation belongs to the machine with the human. The far end's stdin
+/// is `/dev/null`, so its own prompt could only abort — so it is asked here and
+/// the command travels with `-f`.
+#[test]
+fn a_destructive_command_is_confirmed_here_and_forced_over_there() {
+    // No terminal under a test, so the local prompt refuses and nothing is
+    // sent to run.
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.over_ssh(
+        env.two_faced("over-there", ok_reply()),
+        &["close", "over-there"],
+    )
+    .code(1)
+    .stderr(predicate::str::contains("aborted"));
+    assert!(env.proxy_calls().is_empty(), "{:?}", env.proxy_calls());
+
+    // Answered with `-f`, it travels — once, with `-f` still on it.
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.over_ssh(
+        env.two_faced("over-there", ok_reply()),
+        &["close", "over-there", "-f"],
+    )
+    .success();
+    assert_eq!(
+        env.proxy_calls(),
+        ["ws-host\tq\tclose\tover-there\t-f\t--no-remote"]
+    );
+}
+
+/// SPEC §15: `q new --machine ws …` → `ssh <alias> q new … -d`. The Quest is
+/// created **on that machine** — before bd-8lz.5.3 this made a local Quest
+/// merely labelled `ws`, indistinguishable from a real remote row.
+#[test]
+fn new_on_a_remote_creates_it_there_and_not_here() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let payload = serde_json::json!({
+        "quest": { "id": "q-1234", "slug": "over-there", "machine": "ws" },
+        "session": { "id": "s-0001" },
+        "tmux_session": "q-over-there",
+        "attach": "none",
+    });
+    let hosts = serde_json::json!({
+        "ws-host": { "stdout": serde_json::to_string(&payload).unwrap() },
+    });
+    let assert = env
+        .over_ssh(
+            hosts,
+            &[
+                "--machine",
+                "ws",
+                "new",
+                "--name",
+                "over-there",
+                "--goal",
+                "make it idempotent",
+                "--no-beads",
+                "-d",
+                "--json",
+            ],
+        )
+        .success();
+
+    // `-d` and `--json` are added; `--machine` does not travel (over there it
+    // would name a machine that `q` has never heard of).
+    assert_eq!(
+        env.ssh_calls(),
+        [
+            "ws-host\tq\tnew\t--name\tover-there\t--goal\t'make it idempotent'\
+             \t--no-beads\t-d\t--json\t--no-remote"
+        ]
+    );
+    let out = json_of(&assert);
+    assert_eq!(out["machine"], "ws", "{out}");
+    assert_eq!(out["remote"], true, "{out}");
+    assert_eq!(out["quest"]["slug"], "over-there", "{out}");
+    assert_eq!(out["attach"], "none", "{out}");
+
+    // Nothing was written here. The old bug's row would be right there.
+    assert_eq!(env.count("SELECT COUNT(*) FROM quest"), 0);
+}
+
+/// …and then enter (SPEC §15), unless `-d` said not to. The session name comes
+/// from the machine that created it, so nothing here guesses a tmux prefix.
+#[test]
+fn new_on_a_remote_attaches_to_the_machine_that_created_it() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let payload = serde_json::json!({
+        "quest": { "id": "q-1234", "slug": "over-there", "machine": "ws" },
+        "tmux_session": "work_over-there",
+    });
+    let hosts = serde_json::json!({
+        "ws-host": { "stdout": serde_json::to_string(&payload).unwrap() },
+    });
+    env.over_ssh(
+        hosts,
+        &[
+            "--machine",
+            "ws",
+            "new",
+            "--name",
+            "over-there",
+            "--no-beads",
+        ],
+    )
+    .success()
+    .stdout(predicate::str::contains("created quest over-there on ws"));
+    assert_eq!(
+        attach_calls(&env),
+        ["attach\tws-host\ttmux\tattach\t-t\t'=work_over-there'"]
+    );
+}
+
+/// A `q new` that fails over there fails here, with what it said.
+#[test]
+fn a_remote_creation_that_fails_says_what_the_far_end_said() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let hosts = serde_json::json!({
+        "ws-host": {
+            "stderr": "{\"error\":\"slug `over-there` is taken\",\"code\":\"conflict\"}\n",
+            "exit": 1,
+        },
+    });
+    env.over_ssh(
+        hosts,
+        &["--machine", "ws", "new", "--name", "over-there", "-d"],
+    )
+    .code(1)
+    .stderr(predicate::str::contains("slug `over-there` is taken"))
+    .stderr(predicate::str::contains("on ws"));
+    assert_eq!(env.count("SELECT COUNT(*) FROM quest"), 0);
+}
+
+/// `q resume` has no terminal at the far end to attach to, so it travels with
+/// `-d` and the attach is made from here afterwards.
+#[test]
+fn resume_on_a_remote_runs_detached_there_and_attaches_from_here() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.over_ssh(
+        env.two_faced("over-there", ok_reply()),
+        &["resume", "over-there"],
+    )
+    .success();
+    assert_eq!(
+        env.proxy_calls(),
+        ["ws-host\tq\tresume\tover-there\t-d\t--no-remote"]
+    );
+    assert_eq!(
+        attach_calls(&env),
+        ["attach\tws-host\ttmux\tattach\t-t\t'=q-over-there'"]
+    );
+}
+
+/// A resume that failed over there is not followed by an attach to a tmux
+/// session that does not exist.
+#[test]
+fn a_remote_resume_that_failed_does_not_attach() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let reply = serde_json::json!({ "stderr": "error: still running\n", "exit": 1 });
+    env.over_ssh(
+        env.two_faced("over-there", reply),
+        &["resume", "over-there"],
+    )
+    .code(1);
     assert!(attach_calls(&env).is_empty());
+}
+
+/// The ladder is the same one `q enter` walks (SPEC §16), across machines: a
+/// target that matches on two of them is listed, not guessed at.
+///
+/// …and the cache-first shortcut is the same one too, gap included: until a
+/// listing has taught this machine that `ws` holds a Quest by that name, the
+/// exact local hit is taken with no ssh at all.
+#[test]
+fn a_target_that_matches_on_two_machines_is_ambiguous_for_every_command() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.new_quest("over-there");
+    let hosts = env.two_faced("over-there", ok_reply());
+
+    // The accepted gap (bd-8lz.5.2): a cold cache is not a suspicion.
+    env.over_ssh(hosts.clone(), &["show", "over-there", "--json"])
+        .success();
+    assert!(env.proxy_calls().is_empty());
+
+    // One listing is enough to teach it, and then the collision is reported.
+    env.over_ssh(hosts.clone(), &["list", "--json"]).success();
+    let assert = env
+        .over_ssh(hosts, &["show", "over-there", "--json"])
+        .code(1);
+    let err = error_json(&assert);
+    assert_eq!(err["code"], "ambiguous", "{err}");
+    let said = err["error"].as_str().unwrap();
+    assert!(
+        said.contains("on laptop") && said.contains("on ws"),
+        "{said}"
+    );
+    assert!(env.proxy_calls().is_empty());
+}
+
+/// The user-visible lie this bead closes: a Quest `q list` happily shows used
+/// to answer `not found` to everything but `q enter`.
+#[test]
+fn a_quest_the_listing_shows_is_no_longer_not_found() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let hosts = env.two_faced("over-there", ok_reply());
+    let listing = json_of(&env.over_ssh(hosts.clone(), &["list", "--json"]).success());
+    assert_eq!(slugs_of(&listing), ["over-there"], "{listing}");
+    env.over_ssh(hosts, &["show", "over-there"]).success();
+
+    // A target that is on no machine still is not found, and says where it
+    // looked when `--machine` narrowed that.
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let assert = env
+        .over_ssh(
+            env.two_faced("over-there", ok_reply()),
+            &["--machine", "ws", "show", "nowhere", "--json"],
+        )
+        .code(1);
+    let err = error_json(&assert);
+    assert_eq!(err["code"], "not_found", "{err}");
+    assert!(err["error"].as_str().unwrap().contains("on ws"), "{err}");
+}
+
+/// A remote that cannot be reached at the moment of the proxy is an error
+/// about that machine, not a relayed exit code — ssh's own 255 says nothing
+/// about a command that never ran.
+#[test]
+fn a_remote_that_drops_the_connection_is_reported_as_unreachable() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let reply = serde_json::json!({
+        "stderr": "ssh: connect to host ws-host port 22: Connection refused\n",
+        "exit": 255,
+    });
+    env.over_ssh(env.two_faced("over-there", reply), &["show", "over-there"])
+        .code(1)
+        .stderr(predicate::str::contains("cannot reach ws"))
+        .stderr(predicate::str::contains("Connection refused"));
+}
+
+/// Free text carrying spaces, quotes, `$` and `=` is one argv word here and
+/// one shell word over there. Quoting happens at the single ssh boundary, so
+/// the far end's login shell cannot expand or split it.
+#[test]
+fn free_text_reaches_the_far_end_as_one_shell_word() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let text = "run `make test` for $USER 'now' FOO=1 ~x";
+    env.over_ssh(
+        env.two_faced("over-there", ok_reply()),
+        &["send", "over-there/master", text],
+    )
+    .success();
+    assert_eq!(
+        env.proxy_calls(),
+        ["ws-host\tq\tsend\tover-there/master\t\
+          'run `make test` for $USER '\\''now'\\'' FOO=1 ~x'\t--no-remote"]
+    );
+}
+
+/// `q resume <remote> --json` is one document, not two: the far end's answer
+/// with the attach folded into it.
+#[test]
+fn a_remote_resume_reports_both_halves_as_one_json_document() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let reply = serde_json::json!({
+        "stdout": "{\"quest\":{\"slug\":\"over-there\"},\"tmux_session\":\"q-over-there\"}\n",
+    });
+    let assert = env
+        .over_ssh(
+            env.two_faced("over-there", reply),
+            &["resume", "over-there", "--json"],
+        )
+        .success();
+    let out = json_of(&assert);
+    assert_eq!(out["quest"]["slug"], "over-there", "{out}");
+    assert_eq!(out["machine"], "ws", "{out}");
+    assert_eq!(out["remote"], true, "{out}");
+    assert_eq!(
+        out["argv"],
+        serde_json::json!(["tmux", "attach", "-t", "=q-over-there"]),
+        "{out}"
+    );
 }

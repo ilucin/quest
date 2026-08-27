@@ -171,6 +171,52 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
     })
 }
 
+/// `q new … -d --json`, as the far end must receive it (SPEC §15's
+/// `ssh <alias> q new … -d`).
+///
+/// **Built, not forwarded** — unlike every other proxied command
+/// ([`crate::commands::proxy`]). It has to be: the TUI's new-Quest form reaches
+/// the same path with no argv behind it, and one builder is the only way the
+/// CLI and the form cannot drift apart.
+///
+/// * `-d` because there is no terminal at the far end; the attach is this
+///   machine's, afterwards.
+/// * `--json` because the answer has to be read — the slug and the tmux session
+///   name are how that attach finds the Quest.
+/// * `--dir` travels only when it was given. This machine's cwd is not a path
+///   over there, so without it the far end's `q new` uses its own default (the
+///   ssh login directory) rather than a directory that happens to share a name.
+/// * `--prompt-file` never travels: it names a file on *this* machine, and
+///   [`resolve_prompt`] has already turned it into text.
+///
+/// Nothing here is quoted: quoting is [`crate::remote`]'s, at the single ssh
+/// boundary.
+pub fn remote_argv(args: &Args) -> Vec<String> {
+    let mut argv = vec!["q".to_string(), "new".to_string()];
+    let mut flag = |name: &str, value: Option<&str>| {
+        if let Some(value) = value {
+            argv.push(name.to_string());
+            argv.push(value.to_string());
+        }
+    };
+    flag("--name", args.name);
+    flag("--goal", args.goal);
+    flag("--dir", args.dir);
+    flag("--workflow", args.workflow);
+    flag("--repo", args.repo);
+    flag("--prompt", args.prompt);
+    if args.no_beads {
+        argv.push("--no-beads".to_string());
+    }
+    if args.no_auto_reset {
+        argv.push("--no-auto-reset".to_string());
+    }
+    argv.push("-d".to_string());
+    argv.push("--json".to_string());
+    argv.push(crate::commands::proxy::NO_REMOTE.to_string());
+    argv
+}
+
 /// The Quest row is about to be deleted, so its epic loses its only pointer:
 /// close it rather than leave a stray open epic in a shared tracker. A `bd`
 /// that will not cooperate is named, so the id is not simply lost.
@@ -454,7 +500,7 @@ pub fn resolve_dir(dir: Option<&str>) -> anyhow::Result<PathBuf> {
 }
 
 /// `--prompt`, or `--prompt-file <path>`; `-` reads stdin. Blank is no prompt.
-fn resolve_prompt(prompt: Option<&str>, file: Option<&str>) -> anyhow::Result<Option<String>> {
+pub fn resolve_prompt(prompt: Option<&str>, file: Option<&str>) -> anyhow::Result<Option<String>> {
     let text = match (prompt, file) {
         (Some(text), _) => text.to_string(),
         (None, Some("-")) => std::io::read_to_string(std::io::stdin())

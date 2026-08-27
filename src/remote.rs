@@ -33,6 +33,20 @@ use crate::output;
 /// not a listing.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The deadline on a **proxied** command (SPEC §15, bd-8lz.5.3). Far longer
+/// than [`TIMEOUT`]: a listing that blocks is a broken listing, but a
+/// `q spawn` over there starts tmux and Claude, and a user who typed the
+/// command is willing to wait for it. Still bounded — a `q` that never returns
+/// must not leave a terminal wedged with no way back but Ctrl-C.
+///
+/// The far end is *not* killed when this passes (bd-8lz.5.7): the ssh client
+/// is, and what that leaves behind on the remote is that bead's problem.
+pub const PROXY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The cap on ssh's own `ConnectTimeout`; see [`ssh_argv`]. A host that has not
+/// completed a handshake in this long is down, whatever the command's deadline.
+pub const CONNECT_MAX: Duration = Duration::from_secs(5);
+
 /// What a remote is always asked for. `--no-remote` is the recursion guard:
 /// without it the remote would fan out to *its* remotes, us included; `--all`
 /// is why the cache works — see [`list_argv`].
@@ -134,13 +148,19 @@ pub fn ssh() -> Box<dyn Ssh> {
 /// or a passphrase must fail fast rather than hold the listing until the
 /// deadline. `ConnectTimeout` is ssh's own budget for the TCP handshake, set to
 /// *half* the deadline so the common failure (host down, unroutable) gives up
-/// well inside the round rather than burning the whole budget.
+/// well inside the round rather than burning the whole budget — and capped at
+/// [`CONNECT_MAX`], because a proxied command's deadline ([`PROXY_TIMEOUT`]) is
+/// generous about how long the far end may *work* and says nothing about how
+/// long a dead host may take to answer the phone.
 fn ssh_argv(alias: &str, argv: &[&str], timeout: Duration) -> Vec<String> {
     let mut out = vec![
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         "-o".to_string(),
-        format!("ConnectTimeout={}", (timeout.as_secs() / 2).max(1)),
+        format!(
+            "ConnectTimeout={}",
+            (timeout.as_secs() / 2).clamp(1, CONNECT_MAX.as_secs())
+        ),
         alias.to_string(),
     ];
     out.extend(remote_command(argv.iter().map(|a| (*a).to_string())));
@@ -407,6 +427,17 @@ pub struct SshHost {
     /// the deadline times out, exactly as the real backend would.
     #[serde(default)]
     pub delay_ms: u64,
+    /// The answer to a call that is **not** the listing fan-out — a command
+    /// proxied to this host (SPEC §15, bd-8lz.5.3).
+    ///
+    /// One host plays two roles in a single proxied invocation: it is asked for
+    /// its listing (so the target can be resolved to it at all) and then asked
+    /// to run the command. Without this a test could only script one of them,
+    /// and a proxied command that must fail would have to fail the listing
+    /// first — at which point the Quest is never found and the proxy never
+    /// happens. Absent, both roles get the same canned answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxied: Option<Box<SshHost>>,
 }
 
 impl Ssh for FixtureSsh {
@@ -415,6 +446,12 @@ impl Ssh for FixtureSsh {
         let mut script = script();
         let Some(host) = script.hosts.remove(alias) else {
             return SshOutcome::Failed(format!("no fixture host `{alias}`"));
+        };
+        // The listing fan-out and a proxied command are two different questions
+        // to the same host; see [`SshHost::proxied`].
+        let host = match host.proxied {
+            Some(proxied) if argv != LIST_ARGV => *proxied,
+            _ => host,
         };
         let delay = Duration::from_millis(host.delay_ms);
         if delay > timeout {

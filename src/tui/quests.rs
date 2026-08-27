@@ -14,7 +14,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::Ctx;
-use crate::commands::{QuestRow, close, fill_progress, fmt, load_quests, new, rename, resume};
+use crate::commands::{
+    QuestRow, close, fill_progress, fmt, load_quests, new, proxy, rename, resume,
+};
 use crate::error::QError;
 use crate::model::{
     DisplayState, Event, Link, NameSource, Quest, QuestState, Session, SessionRole, SessionStatus,
@@ -981,27 +983,41 @@ fn create(ctx: &Ctx, app: &mut App, form: &Form) -> anyhow::Result<()> {
         .filter(|_| !no_beads);
     let prompt = template.as_ref().and_then(|t| t.master_prompt.clone());
 
-    let created = new::create(
-        ctx,
-        &new::Args {
-            // SPEC §11: the Quest records which template made it.
-            template: template.as_ref().map(|t| t.id.as_str()),
-            name: form.optional(F_NAME),
-            goal: goal.as_deref(),
-            dir: dir.as_deref(),
-            workflow: workflow.as_deref(),
-            repo: repo.as_deref(),
-            no_beads,
-            prompt: prompt.as_deref(),
-            prompt_file: None,
-            no_auto_reset: false,
-            // The TUI never attaches on its own: `q new` ends at a tmux pane,
-            // but the TUI is the fleet view and blanking it the instant a
-            // Quest exists is not what `n` asks for. `o` is one key away.
-            detach: true,
-            machine: Some(&machine),
-        },
-    )?;
+    let args = new::Args {
+        // SPEC §11: the Quest records which template made it.
+        template: template.as_ref().map(|t| t.id.as_str()),
+        name: form.optional(F_NAME),
+        goal: goal.as_deref(),
+        dir: dir.as_deref(),
+        workflow: workflow.as_deref(),
+        repo: repo.as_deref(),
+        no_beads,
+        prompt: prompt.as_deref(),
+        prompt_file: None,
+        no_auto_reset: false,
+        // The TUI never attaches on its own: `q new` ends at a tmux pane,
+        // but the TUI is the fleet view and blanking it the instant a
+        // Quest exists is not what `n` asks for. `o` is one key away.
+        detach: true,
+        machine: Some(&machine),
+    };
+
+    // SPEC §15: the machine select is not a label. A remote here means the
+    // Quest is created *on that machine*, over ssh — the same builder `q new
+    // --machine` uses. Before bd-8lz.5.3 this field only stamped a local row
+    // with a remote's name, which made it indistinguishable from a real one.
+    if let Some(remote) = ctx.config.remotes.iter().find(|r| r.name == machine) {
+        let created = proxy::create_remote(ctx, remote, &args)?;
+        // No anchor: the row lives in that machine's database and arrives with
+        // the next remote tick (SPEC §17's `[ui] tick_remote`).
+        app.say(format!(
+            "created {} on {} · it appears at the next remote tick",
+            created.slug, created.machine
+        ));
+        return Ok(());
+    }
+
+    let created = new::create(ctx, &args)?;
     app.quests.focus_on(Anchor::local(&created.quest));
     app.say(format!("created {} · o enters it", created.quest.slug));
     Ok(())
@@ -3060,6 +3076,81 @@ mod form_tests {
         // And the listing the TUI is drawing agrees.
         refresh(&rig.ctx, &mut app).unwrap();
         assert!(app.quests.rows.is_empty());
+    }
+
+    /// SPEC §15/§17: the form's machine select is not a label. Choosing a
+    /// remote creates the Quest **on that machine**, over ssh, with the same
+    /// `q new … -d --json --no-remote` the CLI sends — and writes nothing here.
+    ///
+    /// The bug this pins: before bd-8lz.5.3 this field only stamped a local row
+    /// with a remote's name, and the listing then showed a Quest on `ws` that
+    /// `ws` had never heard of.
+    #[test]
+    fn choosing_a_remote_in_the_new_form_creates_the_quest_on_that_machine() {
+        let mut config = Config::default();
+        config.machine.name = "laptop".to_string();
+        config.remotes = vec![crate::config::Remote {
+            name: "ws".to_string(),
+            ssh: "ws-host".to_string(),
+        }];
+        // No tmux fixture file: a Quest created over there must never reach
+        // this machine's tmux.
+        let ctx = Ctx::for_tests(
+            config,
+            Db::open_in_memory().unwrap(),
+            Box::new(crate::tmux::FixtureTmux::new(std::path::PathBuf::from(
+                "/nonexistent/tmux.json",
+            ))),
+        );
+        let ssh = std::sync::Arc::new(crate::remote::stub::StubSsh::new(&[(
+            "ws-host",
+            crate::remote::SshOutcome::Done {
+                code: Some(0),
+                stdout: serde_json::json!({
+                    "quest": { "id": "q-1234", "slug": "over-there", "machine": "ws" },
+                    "tmux_session": "q-over-there",
+                })
+                .to_string(),
+                stderr: String::new(),
+            },
+        )]));
+        let ctx = ctx.with_ssh(ssh.clone());
+
+        let mut app = App::new(&ctx.config, "laptop");
+        app.set_size(120, 40);
+        refresh(&ctx, &mut app).unwrap();
+        app.handle(Input::Char('n'));
+        set(&mut app, F_NAME, "over-there");
+        no_beads(&mut app);
+        focus(&mut app, F_MACHINE);
+        app.handle(Input::Right);
+        assert_eq!(app.modal.as_ref().unwrap().form.choice(F_MACHINE), "ws");
+        choose_action(&mut app);
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+        crate::tui::submit(&ctx, &mut app);
+
+        assert!(app.modal.is_none(), "the form is still up: {}", app.status);
+        assert!(app.status.contains("over-there"), "{}", app.status);
+        assert!(app.status.contains("on ws"), "{}", app.status);
+        // Nothing here: the row lives in that machine's database.
+        assert!(ctx.db().unwrap().list_quests(true).unwrap().is_empty());
+
+        let calls = ssh.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].0, "ws-host");
+        assert_eq!(
+            calls[0].1,
+            [
+                "q",
+                "new",
+                "--name",
+                "over-there",
+                "--no-beads",
+                "-d",
+                "--json",
+                "--no-remote"
+            ]
+        );
     }
 
     #[test]
