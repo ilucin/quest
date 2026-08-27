@@ -47,7 +47,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::Ctx;
 use crate::brief;
-use crate::commands::enter;
+use crate::commands::{enter, peek};
 
 use app::{Action, App, Tab};
 
@@ -317,11 +317,63 @@ where
     Ok(out)
 }
 
-/// `o` on the Quests tab (SPEC §17): hand the terminal to tmux.
+/// What an attach would land in: the Quest, the window inside it, and what to
+/// call the pair in a message.
+///
+/// `o` on the Quests tab means the Quest's master; `⏎`/`o` on the Sessions tab
+/// means *exactly that row's window* (SPEC §17), which is the same thing
+/// `q enter --session <label>` means.
+struct AttachWant {
+    quest: crate::model::Quest,
+    label: Option<String>,
+    name: String,
+    /// The exact `q` session row the attach must land in, when the caller had
+    /// one in hand. `enter::resolve` finds a label among the Quest's *live*
+    /// sessions, and labels are reused once a worker is gone — so with `a` on,
+    /// selecting an ended `alpha/tests` and pressing `⏎` would attach to its
+    /// live replacement, under a name identical to the one the row showed.
+    /// `None` on the Quests tab, where the master is whichever row holds it.
+    session: Option<String>,
+}
+
+/// Nothing selected is `None`; a selection whose Quest has since been deleted
+/// is an `Err`, which the caller puts in the status bar.
+fn attach_want(ctx: &Ctx, app: &App) -> anyhow::Result<Option<AttachWant>> {
+    match app.tab {
+        Tab::Quests => Ok(quests::selected_quest(app).map(|quest| AttachWant {
+            name: quest.slug.clone(),
+            quest,
+            label: None,
+            session: None,
+        })),
+        Tab::Sessions => {
+            let Some(selection) = sessions::selected(app) else {
+                return Ok(None);
+            };
+            // By id, now: the row is as old as the last tick, and the Quest
+            // the window belongs to is what `enter::resolve` is about to be
+            // asked about.
+            let quest = ctx.db()?.get_quest(&selection.quest)?.ok_or_else(|| {
+                crate::error::QError::NotFound(format!("quest of {}", selection.name))
+            })?;
+            Ok(Some(AttachWant {
+                quest,
+                label: Some(selection.label),
+                name: selection.name,
+                session: Some(selection.session),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `o` on the Quests tab and `⏎` on the Sessions tab (SPEC §17): hand the
+/// terminal to tmux.
 ///
 /// Resolved through [`enter::resolve`] — the same check `q enter` makes — so a
-/// finished Quest, a tmux session that is gone and a master window that ended
-/// all say the same thing here as they do on the command line.
+/// finished Quest, a tmux session that is gone, a master window that ended and
+/// a worker label that is not live all say the same thing here as they do on
+/// the command line.
 fn attach<B, T>(
     ctx: &Ctx,
     io: &mut T,
@@ -333,21 +385,38 @@ where
     B::Error: std::error::Error + Send + Sync + 'static,
     T: TermIo,
 {
-    let Some(quest) = quests::selected_quest(app) else {
-        return Ok(());
+    let want = match attach_want(ctx, app) {
+        Ok(Some(want)) => want,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            app.say(format!("cannot enter: {e:#}"));
+            return Ok(());
+        }
     };
-    // The listing is as old as the last tick, and a master that died in the
+    // The listing is as old as the last tick, and a window that died in the
     // meantime would otherwise be attached to as if it were live — `q enter`
     // sweeps first for the same reason. A sweep that fails is not reported
     // here: `resolve` is about to consult the same tmux and will say so.
     let _ = crate::commands::sweep_quiet(ctx);
-    let target = match enter::resolve(ctx, &quest, None) {
+    let target = match enter::resolve(ctx, &want.quest, want.label.as_deref()) {
         Ok(target) => target,
         Err(e) => {
-            app.say(format!("cannot enter {}: {e:#}", quest.slug));
+            app.say(format!("cannot enter {}: {e:#}", want.name));
             return Ok(());
         }
     };
+    // SPEC §17 is "attach to exactly that window". `enter::resolve` answers a
+    // narrower question — which LIVE session of this Quest carries that label —
+    // and a reused label makes the two different rows.
+    if let Some(wanted) = &want.session
+        && &target.session.id != wanted
+    {
+        app.say(format!(
+            "{} is not that session any more (the label was reused); x to reload",
+            want.name
+        ));
+        return Ok(());
+    }
     if !ctx.config.ui.return_after_detach {
         // Hand the terminal back for good: outside tmux the attach replaces
         // this process and never returns, and inside it the client moves to
@@ -366,10 +435,56 @@ where
         // Inside tmux the attach is a `switch-client`: the client moves to the
         // Quest and this process never lost anything, so "back from" would be
         // reporting a round trip that did not happen.
-        Ok(()) if ctx.tmux().in_tmux() => format!("switched to {}", quest.slug),
-        Ok(()) => format!("back from {}", quest.slug),
-        Err(e) => format!("cannot enter {}: {e:#}", quest.slug),
+        Ok(()) if ctx.tmux().in_tmux() => format!("switched to {}", want.name),
+        Ok(()) => format!("back from {}", want.name),
+        Err(e) => format!("cannot enter {}: {e:#}", want.name),
     });
+    Ok(())
+}
+
+/// Lines of pane a `p` captures. Far more than `q peek`'s default screenful:
+/// the pager can scroll, so the useful bound is the transcript rather than the
+/// terminal.
+const PEEK_LINES: usize = 200;
+
+/// `p` on the Sessions tab (SPEC §17): the pane, in the pager.
+///
+/// The same [`handoff`] the attach and the brief use, and the same
+/// [`peek::capture`] `q peek` uses — captured *before* the handoff, so a
+/// session that cannot be peeked at is a status message rather than a blank
+/// screen with a pager on nothing.
+fn peek_in_pager<B, T>(
+    ctx: &Ctx,
+    io: &mut T,
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> anyhow::Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+    T: TermIo,
+{
+    let Some(selection) = sessions::selected(app) else {
+        return Ok(());
+    };
+    let _ = crate::commands::sweep_quiet(ctx);
+    let text = match crate::commands::target::resolve(ctx, &selection.session).and_then(|found| {
+        Ok((
+            found.name(),
+            found.session.tmux_pane.clone(),
+            peek::capture(ctx, &found, PEEK_LINES)?,
+        ))
+    }) {
+        Ok((name, pane, text)) => format!("# {name} · pane {pane}\n\n{text}\n"),
+        Err(e) => {
+            app.say(format!("cannot peek at {}: {e:#}", selection.name));
+            return Ok(());
+        }
+    };
+    let paged = handoff(io, terminal, app.mouse, || pager::show(&text))?;
+    if let Err(e) = paged {
+        app.say(format!("cannot page the peek: {e:#}"));
+    }
     Ok(())
 }
 
@@ -498,6 +613,10 @@ fn event_loop(
                     brief_in_pager(ctx, &mut Stdio, terminal, app)?;
                     dirty = true;
                 }
+                Action::Peek => {
+                    peek_in_pager(ctx, &mut Stdio, terminal, app)?;
+                    dirty = true;
+                }
                 // Creating, renaming, closing or resuming all change the
                 // listing, so the reload is part of the action.
                 Action::Submit => {
@@ -546,7 +665,12 @@ fn submit(ctx: &Ctx, app: &mut App) {
     let Some(mut modal) = app.modal.take() else {
         return;
     };
-    let outcome = quests::submit(ctx, app, &modal.prompt, &modal.form);
+    let outcome = match &modal.prompt {
+        app::Prompt::Send(_) | app::Prompt::Kill(_) | app::Prompt::Reset(_) => {
+            sessions::submit(ctx, app, &modal.prompt, &modal.form)
+        }
+        _ => quests::submit(ctx, app, &modal.prompt, &modal.form),
+    };
     let warnings = ctx.take_warnings();
     match outcome {
         Ok(()) => {
@@ -722,6 +846,9 @@ fn hint(app: &App) -> &'static str {
     }
     match app.tab {
         Tab::Quests => " ? help · o attach · b brief · q quit ",
+        // The two that take over the terminal lead here too: `⏎` lands in the
+        // agent's own window, `p` opens its pane in a pager.
+        Tab::Sessions => " ? help · ⏎ enter · p peek · q quit ",
         _ => " ? help · x refresh · q quit ",
     }
 }
@@ -1620,11 +1747,18 @@ mod tests {
         let quests = on(Tab::Quests);
         assert!(quests.contains("o attach"), "{quests:?}");
         assert!(quests.contains("b brief"), "{quests:?}");
-        // The stub tabs have neither, and advertise the reload instead.
-        for tab in [Tab::Sessions, Tab::Templates, Tab::Events] {
+        // Sessions has its own pair that take over the terminal: `⏎` lands in
+        // the agent's window, `p` opens its pane in a pager.
+        let fleet = on(Tab::Sessions);
+        assert!(fleet.contains("\u{23ce} enter"), "{fleet:?}");
+        assert!(fleet.contains("p peek"), "{fleet:?}");
+        assert!(!fleet.contains("brief"), "{fleet:?}");
+        // The stub tabs have none of them, and advertise the reload instead.
+        for tab in [Tab::Templates, Tab::Events] {
             let other = on(tab);
             assert!(!other.contains("attach"), "{tab:?}: {other:?}");
             assert!(!other.contains("brief"), "{tab:?}: {other:?}");
+            assert!(!other.contains("peek"), "{tab:?}: {other:?}");
             assert!(other.contains("x refresh"), "{tab:?}: {other:?}");
         }
         // `?` and `q` are on every tab: one opens the list of everything the
@@ -2101,6 +2235,438 @@ mod tests {
         attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
         assert!(app.status.contains("is finished"), "{}", app.status);
         assert!(fixture(&_dir).attached.is_none());
+    }
+
+    // ------------------------------------------ the Sessions tab's two keys
+
+    /// A Quest with a master and one worker, each in its own pane, plus the
+    /// `Ctx` over both. The Sessions tab is what these exercise, so both
+    /// windows have to exist and be distinguishable.
+    fn fleet_ctx() -> (Ctx, tempfile::TempDir) {
+        use crate::model::{Quest, Session, SessionRole, SessionStatus};
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let quest = db
+            .insert_quest(&Quest::new("alpha", "/tmp/work", "laptop"))
+            .unwrap();
+        for (label, role, pane) in [
+            ("master", SessionRole::Master, "%1"),
+            ("tests", SessionRole::Worker, "%2"),
+        ] {
+            let mut row = Session::new(&quest.id, role, label, "q-alpha", pane);
+            row.status = SessionStatus::Idle;
+            db.insert_session(&row).unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tmux.json");
+        let state = crate::tmux::FixtureState {
+            next_pane: 9,
+            panes: [("master", "%1"), ("tests", "%2")]
+                .iter()
+                .map(|(window, pane)| crate::tmux::FixturePane {
+                    pane_id: (*pane).to_string(),
+                    pane_pid: 1234,
+                    session_name: "q-alpha".to_string(),
+                    window_name: (*window).to_string(),
+                    buffer: format!("last line of {window}\n"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
+        (
+            Ctx::for_tests(
+                Config::default(),
+                db,
+                Box::new(crate::tmux::FixtureTmux::new(path)),
+            ),
+            dir,
+        )
+    }
+
+    /// Puts the Sessions tab up, loaded, with the selection on `label`.
+    fn on_session(ctx: &Ctx, label: &str) -> App {
+        let mut app = loaded(ctx);
+        // Through the shell's own key, so the tab switch goes through
+        // `App::select` exactly as it does for a user.
+        assert_eq!(app.handle(Input::Char('2')), Action::None);
+        assert_eq!(app.tab, Tab::Sessions);
+        refresh_now(ctx, &mut app);
+        for _ in 0..6 {
+            if sessions::selected(&app).map(|s| s.label) == Some(label.to_string()) {
+                return app;
+            }
+            app.handle(Input::Down);
+        }
+        panic!("no session labelled {label} in the fleet");
+    }
+
+    /// SPEC §17: "`⏎` attach na točno taj window" — the worker's pane, not the
+    /// Quest's master. This is the half `q enter --session <label>` already
+    /// does, reached through the same `enter::resolve`.
+    #[test]
+    fn enter_on_the_sessions_tab_attaches_to_exactly_that_window() {
+        let (ctx, _dir) = fleet_ctx();
+        let mut app = on_session(&ctx, "tests");
+        assert_eq!(app.handle(Input::Enter), Action::Attach);
+
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        let mut terminal = test_terminal();
+        attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
+
+        let state = fixture(&_dir);
+        assert_eq!(
+            state.attached,
+            Some(("q-alpha".to_string(), Some("%2".to_string()))),
+            "it attached to the master instead of the worker"
+        );
+        assert!(
+            app.status.contains("back from alpha/tests"),
+            "{}",
+            app.status
+        );
+        restore_with(&mut term);
+    }
+
+    /// And the master row still lands in window 0, so the two rows are not the
+    /// same attach with a different label on it.
+    #[test]
+    fn the_master_row_attaches_to_window_zero() {
+        let (ctx, _dir) = fleet_ctx();
+        let mut app = on_session(&ctx, "master");
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        let mut terminal = test_terminal();
+        attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
+        assert_eq!(
+            fixture(&_dir).attached,
+            Some(("q-alpha".to_string(), Some("%1".to_string())))
+        );
+        restore_with(&mut term);
+    }
+
+    /// A worker whose window ended says what `q enter --session` says, and
+    /// nothing is handed over.
+    #[test]
+    fn attaching_to_a_session_whose_window_is_gone_is_refused() {
+        let (ctx, _dir) = fleet_ctx();
+        let mut app = on_session(&ctx, "tests");
+        // The worker's pane disappears; the sweep inside `attach` notices.
+        let path = fixture_path(&_dir);
+        let tmux = crate::tmux::FixtureTmux::new(&path);
+        let mut state = tmux.load().unwrap();
+        state.panes.retain(|p| p.pane_id != "%2");
+        tmux.save(&state).unwrap();
+
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let mut terminal = test_terminal();
+        attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
+        assert!(
+            app.status.contains("cannot enter alpha/tests"),
+            "{}",
+            app.status
+        );
+        assert!(fixture(&_dir).attached.is_none());
+    }
+
+    /// SPEC §17 `p`: the pane, through the same `handoff` the attach and the
+    /// brief use, and the same `peek::capture` `q peek` uses.
+    #[test]
+    fn p_pages_the_selected_pane_through_the_one_handoff() {
+        let (ctx, _dir) = fleet_ctx();
+        let mut app = on_session(&ctx, "tests");
+        assert_eq!(app.handle(Input::Char('p')), Action::Peek);
+
+        let out = _dir.path().join("paged");
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        term.calls.clear();
+        let mut terminal = test_terminal();
+        pager::with_pager(Some(&format!("tee {}", out.display())), || {
+            peek_in_pager(&ctx, &mut term, &mut terminal, &mut app).expect("peek");
+        });
+
+        let paged = std::fs::read_to_string(&out).unwrap();
+        assert!(paged.contains("last line of tests"), "{paged}");
+        assert!(!paged.contains("last line of master"), "{paged}");
+        assert!(paged.contains("alpha/tests"), "{paged}");
+        assert!(paged.contains("%2"), "{paged}");
+        // Same one mechanism as the attach and the brief, in the same order.
+        assert_eq!(
+            term.calls,
+            [
+                "cursor show",
+                "mouse off",
+                "paste off",
+                "alt off",
+                "raw off",
+                "flush",
+                "raw on",
+                "alt on",
+                "paste on",
+                "mouse on",
+            ]
+        );
+        restore_with(&mut term);
+    }
+
+    /// A pane that is gone is a status message, not a blank screen with a
+    /// pager sitting on nothing.
+    #[test]
+    fn peeking_at_a_dead_pane_never_reaches_the_pager() {
+        let (ctx, _dir) = fleet_ctx();
+        let mut app = on_session(&ctx, "tests");
+        let path = fixture_path(&_dir);
+        let tmux = crate::tmux::FixtureTmux::new(&path);
+        let mut state = tmux.load().unwrap();
+        state.panes.retain(|p| p.pane_id != "%2");
+        tmux.save(&state).unwrap();
+
+        let out = _dir.path().join("never");
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let mut terminal = test_terminal();
+        pager::with_pager(Some(&format!("tee {}", out.display())), || {
+            peek_in_pager(&ctx, &mut term, &mut terminal, &mut app).expect("peek");
+        });
+        assert!(!out.exists(), "the pager ran on a dead pane");
+        assert!(
+            app.status.contains("cannot peek at alpha/tests"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            term.calls,
+            Vec::<&str>::new(),
+            "the terminal was handed over"
+        );
+    }
+
+    /// B1. A row a `q spawn` inserted before its window opened has no pane,
+    /// and `capture-pane -t ''` reads whatever pane is current — q's own.
+    #[test]
+    fn peeking_at_a_row_whose_window_never_opened_never_reaches_the_pager() {
+        let (ctx, _dir) = fleet_ctx();
+        // The worker loses its pane the way a half-finished spawn leaves it:
+        // the row is live, the pane column is empty.
+        ctx.db()
+            .unwrap()
+            .update_session_pane(&session_id(&ctx, "tests"), "")
+            .unwrap();
+        let mut app = on_session(&ctx, "tests");
+
+        let out = _dir.path().join("never");
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let mut terminal = test_terminal();
+        pager::with_pager(Some(&format!("tee {}", out.display())), || {
+            peek_in_pager(&ctx, &mut term, &mut terminal, &mut app).expect("peek");
+        });
+        assert!(!out.exists(), "the pager ran on q's own pane");
+        assert!(app.status.contains("has no pane"), "{}", app.status);
+        assert_eq!(term.calls, Vec::<&str>::new());
+        // Both windows are still there.
+        assert_eq!(fixture(&_dir).panes.len(), 2);
+    }
+
+    // ------------------------------- the event loop's own prompt dispatcher
+
+    /// N-3. Every earlier test of these three prompts called `sessions::submit`
+    /// directly. `tui::submit` is what the event loop actually calls, and if
+    /// its match arm sent session prompts to `quests::submit` they would land
+    /// on that function's `Prompt::Send(_) | Kill(_) | Reset(_) => Ok(())` arm:
+    /// the form would close, the status would say nothing was wrong, and
+    /// nothing would happen. These drive the real dispatcher.
+    fn focus_field(app: &mut App, label: &str) {
+        for _ in 0..24 {
+            let at = app
+                .modal
+                .as_ref()
+                .expect("no form is open")
+                .form
+                .focused()
+                .map(crate::tui::form::Field::label);
+            if at == Some(label) {
+                return;
+            }
+            app.handle(Input::Tab);
+        }
+        panic!("no field labelled {label}");
+    }
+
+    /// Move the action row off `cancel`, the way the user has to.
+    fn arm_action(app: &mut App) {
+        focus_field(app, crate::tui::form::ACTION);
+        for _ in 0..3 {
+            if app.modal.as_ref().unwrap().form.confirmed() {
+                return;
+            }
+            app.handle(Input::Right);
+        }
+        panic!("the action row never left `{}`", crate::tui::form::CANCEL);
+    }
+
+    fn session_id(ctx: &Ctx, label: &str) -> String {
+        ctx.db()
+            .unwrap()
+            .list_live_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.label == label)
+            .unwrap_or_else(|| panic!("no session labelled {label}"))
+            .id
+    }
+
+    #[test]
+    fn the_loops_dispatcher_runs_a_kill_prompt_and_not_a_quest_one() {
+        let (ctx, _dir) = fleet_ctx();
+        let mut app = on_session(&ctx, "tests");
+        assert_eq!(app.handle(Input::Char('k')), Action::None);
+        arm_action(&mut app);
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+
+        submit(&ctx, &mut app);
+        assert!(app.modal.is_none(), "{}", app.status);
+        assert!(app.status.contains("killed alpha/tests"), "{}", app.status);
+        // The proof the prompt was really run: the window is gone.
+        let panes = fixture(&_dir).panes;
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].window_name, "master");
+    }
+
+    #[test]
+    fn the_loops_dispatcher_runs_a_send_prompt_and_not_a_quest_one() {
+        let (ctx, _dir) = fleet_ctx();
+        let mut app = on_session(&ctx, "tests");
+        assert_eq!(app.handle(Input::Char('t')), Action::None);
+        focus_field(&mut app, "text");
+        for c in "carry on".chars() {
+            app.handle(Input::Char(c));
+        }
+        arm_action(&mut app);
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+
+        submit(&ctx, &mut app);
+        assert!(app.modal.is_none(), "{}", app.status);
+        assert!(app.status.contains("sent to alpha/tests"), "{}", app.status);
+        let panes = fixture(&_dir).panes;
+        let worker = panes.iter().find(|p| p.pane_id == "%2").unwrap();
+        assert!(worker.buffer.contains("carry on"), "{:?}", worker.buffer);
+        // And only into that pane.
+        let master = panes.iter().find(|p| p.pane_id == "%1").unwrap();
+        assert!(!master.buffer.contains("carry on"), "{:?}", master.buffer);
+    }
+
+    #[test]
+    fn the_loops_dispatcher_runs_a_reset_prompt_and_not_a_quest_one() {
+        let (ctx, _dir) = fleet_ctx();
+        let mut app = on_session(&ctx, "tests");
+        assert_eq!(app.handle(Input::Char('Z')), Action::None);
+        arm_action(&mut app);
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+
+        submit(&ctx, &mut app);
+        assert!(app.modal.is_none(), "{}", app.status);
+        assert!(
+            app.status.contains("resetting alpha/tests"),
+            "{}",
+            app.status
+        );
+        let id = session_id(&ctx, "tests");
+        let events = ctx
+            .db()
+            .unwrap()
+            .list_events_by_kinds(&quest_id(&ctx), &["session.reset_scheduled"], 10)
+            .unwrap();
+        assert_eq!(events.len(), 1, "nothing was scheduled");
+        assert_eq!(events[0].session_id.as_deref(), Some(id.as_str()));
+    }
+
+    /// A failing session prompt must come back into the form the way a Quest
+    /// prompt does, rather than closing as if it had worked.
+    #[test]
+    fn a_session_prompt_that_fails_keeps_the_form_up_with_the_reason() {
+        let (ctx, _dir) = fleet_ctx();
+        let mut app = on_session(&ctx, "tests");
+        app.handle(Input::Char('k'));
+        // The window dies while the box is up.
+        let tmux = crate::tmux::FixtureTmux::new(fixture_path(&_dir));
+        let mut state = tmux.load().unwrap();
+        state.panes.retain(|p| p.pane_id != "%2");
+        tmux.save(&state).unwrap();
+        arm_action(&mut app);
+        app.handle(Input::Enter);
+
+        submit(&ctx, &mut app);
+        let error = app
+            .modal
+            .as_ref()
+            .expect("the form closed on a failure")
+            .form
+            .error()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("Esc and try again"), "{error}");
+    }
+
+    fn quest_id(ctx: &Ctx) -> String {
+        ctx.db().unwrap().list_quests(true).unwrap()[0].id.clone()
+    }
+
+    /// N-1. SPEC §17's `⏎` is "attach to exactly that window". `enter::resolve`
+    /// answers a narrower question — which *live* session carries this label —
+    /// and a label is reused once its worker is gone, so with `a` on, an ended
+    /// `alpha/tests` would have attached to its live replacement under a name
+    /// identical to the row's.
+    #[test]
+    fn enter_refuses_a_row_whose_label_now_belongs_to_another_session() {
+        use crate::model::{Session, SessionRole, SessionStatus};
+        let (ctx, _dir) = fleet_ctx();
+        // The worker ends and a replacement takes its label and a new pane.
+        let old = session_id(&ctx, "tests");
+        ctx.db()
+            .unwrap()
+            .mark_session_ended(&old, crate::model::now())
+            .unwrap();
+        let quest = quest_id(&ctx);
+        let mut row = Session::new(&quest, SessionRole::Worker, "tests", "q-alpha", "%2");
+        row.status = SessionStatus::Idle;
+        let fresh = ctx.db().unwrap().insert_session(&row).unwrap();
+        assert_ne!(fresh.id, old);
+
+        let mut app = loaded(&ctx);
+        assert_eq!(app.handle(Input::Char('2')), Action::None);
+        // `a` shows the ended rows, and the reload it asks for is what puts
+        // them in the listing.
+        assert_eq!(app.handle(Input::Char('a')), Action::Refresh);
+        refresh_now(&ctx, &mut app);
+        for _ in 0..8 {
+            if sessions::selected(&app).map(|s| s.session) == Some(old.clone()) {
+                break;
+            }
+            app.handle(Input::Down);
+        }
+        assert_eq!(sessions::selected(&app).map(|s| s.session), Some(old));
+
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let mut terminal = test_terminal();
+        attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
+        assert!(
+            app.status.contains("not that session any more"),
+            "it attached to the replacement: {}",
+            app.status
+        );
+        assert!(fixture(&_dir).attached.is_none());
+        assert!(term.calls.is_empty(), "{:?}", term.calls);
     }
 
     /// With nothing selected there is nothing to attach to, and the loop must

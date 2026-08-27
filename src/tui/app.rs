@@ -72,6 +72,8 @@ pub enum Action {
     Attach,
     /// Leave TUI mode and page the selection's brief (SPEC §17 `b`).
     Brief,
+    /// Leave TUI mode and page the selected session's pane (SPEC §17 `p`).
+    Peek,
     /// Run the open modal's [`Prompt`] (SPEC §17 `n` / `r` / `c` / `R`).
     /// Carries nothing: the loop reads the form — and the Quest id the prompt
     /// was opened against — out of `App::modal`.
@@ -107,6 +109,34 @@ pub struct Target {
     pub epic: Option<String>,
 }
 
+/// The session a Sessions-tab prompt was opened against, and enough of what
+/// the box said about it to notice if it stopped being true.
+///
+/// SPEC §6 makes the **tmux pane** the session's identity — stable across a
+/// rename, a `/clear`, a Claude restart in the same pane — and the pane is
+/// what `kill`, `send` and `reset` all actually act on. It is not sufficient
+/// on its own: pane ids restart from `%0` with the tmux server, so the row is
+/// carried too, with `started_at` as the column nothing can change (session
+/// ids are 16 bits and can be minted twice).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTarget {
+    /// The `q` session row.
+    pub session: String,
+    /// The Quest it belongs to, so a refetch cannot cross Quests.
+    pub quest: String,
+    /// The pane the box promised to act on (SPEC §6).
+    pub pane: String,
+    /// The one column nothing can change; `session` alone is reusable.
+    pub started_at: i64,
+    /// `<slug>/<label>` — what the box called it. A rename underneath (of the
+    /// Quest or of the window) makes the box a lie about which agent this is.
+    pub name: String,
+    /// Whether it had ended when the box was drawn. A session that ends while
+    /// a prompt is up must not be killed, or have text typed into a pane that
+    /// by now belongs to something else.
+    pub ended: bool,
+}
+
 /// What an open form will do when it is submitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Prompt {
@@ -114,18 +144,28 @@ pub enum Prompt {
     Rename(Target),
     Close(Target),
     Resume(Target),
+    /// SPEC §17 `t` — type into a live Claude session.
+    Send(SessionTarget),
+    /// SPEC §17 `k` — end one worker.
+    Kill(SessionTarget),
+    /// SPEC §17 `Z` — hand a session a fresh context window (SPEC §8).
+    Reset(SessionTarget),
 }
 
 impl Prompt {
     /// The Quest the prompt was opened against, if any.
     pub fn quest(&self) -> Option<&str> {
-        self.target().map(|t| t.quest.as_str())
+        match self {
+            Prompt::NewQuest => None,
+            Prompt::Rename(t) | Prompt::Close(t) | Prompt::Resume(t) => Some(t.quest.as_str()),
+            Prompt::Send(t) | Prompt::Kill(t) | Prompt::Reset(t) => Some(t.quest.as_str()),
+        }
     }
 
     pub fn target(&self) -> Option<&Target> {
         match self {
-            Prompt::NewQuest => None,
             Prompt::Rename(t) | Prompt::Close(t) | Prompt::Resume(t) => Some(t),
+            _ => None,
         }
     }
 }
@@ -162,6 +202,7 @@ pub fn help_rows(tab: Tab) -> Vec<(&'static str, &'static str)> {
     let mut rows: Vec<(&str, &str)> = HELP.to_vec();
     let own: &[(&str, &str)] = match tab {
         Tab::Quests => quests::HELP,
+        Tab::Sessions => sessions::HELP,
         _ => &[],
     };
     if !own.is_empty() {
@@ -288,7 +329,7 @@ impl App {
             machines: machines(config, machine),
             tmux_prefix: config.tmux.session_prefix.clone(),
             quests: quests::State::default(),
-            sessions: sessions::State::default(),
+            sessions: sessions::State::new(config),
             templates: templates::State::default(),
             events: events::State::default(),
         }
@@ -478,6 +519,7 @@ impl App {
     pub fn filters(&self) -> String {
         match self.tab {
             Tab::Quests => self.quests.filters(),
+            Tab::Sessions => self.sessions.filters(),
             _ => String::new(),
         }
     }

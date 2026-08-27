@@ -83,7 +83,7 @@ impl Strategy {
 
     /// `[context] reset_strategy`. Validated on load, so an unknown spelling
     /// can only come from a config `q` itself rejected — fall back to `clear`.
-    fn from_config(config: &Config) -> Strategy {
+    pub fn from_config(config: &Config) -> Strategy {
         match config.context.reset_strategy.as_str() {
             "compact" => Strategy::Compact,
             _ => Strategy::Clear,
@@ -145,6 +145,22 @@ fn attempt(ctx: &Ctx, args: &Args, scheduled: bool) -> anyhow::Result<u8> {
         .unwrap_or_else(|| Strategy::from_config(&ctx.config));
     let session = &found.session;
     let db = ctx.db()?;
+    // A row whose window never opened has an empty pane, and every `send_keys`
+    // below would then land on whatever window is current — `/clear` typed into
+    // the caller's own terminal. The gate cannot catch it: a `starting` row that
+    // a hook marked idle passes.
+    found.require_pane()?;
+    // The same cooldown `Z` takes, for the same reason: a `q reset` typed by
+    // hand on top of a reset the `Stop` hook has just scheduled runs two
+    // children, and the second clears the context window the first just made
+    // (SPEC §8). The scheduled path is exempt — it *is* that reset.
+    if !scheduled && recently_scheduled(db, &found.quest.id, &session.id) {
+        return Err(QError::Conflict(format!(
+            "{} already has a reset scheduled; wait for it",
+            found.name()
+        ))
+        .into());
+    }
 
     let (verdict, refusal) = found.idle_gate(ctx);
     if let Some(reason) = refusal {
@@ -280,7 +296,7 @@ fn schedule(
     }
 
     let strategy = Strategy::from_config(config);
-    let argv = argv(&row.id, strategy)?;
+    let argv = argv(&row.id, strategy, SCHEDULED_DELAY)?;
     let mut payload = serde_json::json!({
         "ctx_pct": ctx_pct,
         "threshold": threshold,
@@ -350,18 +366,105 @@ fn recently_scheduled(db: &Db, quest_id: &str, session_id: &str) -> bool {
 
 /// The detached command line, or `None` when this binary's own path is
 /// unknowable (nothing to re-invoke).
-fn argv(session_id: &str, strategy: Strategy) -> Option<Vec<String>> {
+fn argv(session_id: &str, strategy: Strategy, delay: u64) -> Option<Vec<String>> {
     let exe = std::env::current_exe().ok()?;
     Some(vec![
         exe.to_string_lossy().into_owned(),
         "reset".to_string(),
         session_id.to_string(),
         "--delay".to_string(),
-        SCHEDULED_DELAY.to_string(),
+        delay.to_string(),
         "--strategy".to_string(),
         strategy.as_str().to_string(),
         "--quiet".to_string(),
     ])
+}
+
+/// A reset asked for by hand — the TUI's `Z` (SPEC §17) — handed to the same
+/// detached `q reset` the `Stop` hook uses.
+///
+/// Detached for the same reason the hook detaches: [`attempt`] waits for the
+/// fresh brief (up to [`COMPACT_TIMEOUT`]), and a caller that must not block
+/// cannot afford that. The TUI's event loop is exactly such a caller — a
+/// synchronous `Z` would freeze the whole UI for the length of the wait.
+///
+/// The idle gate is taken *here* as well as in the child, so a session that is
+/// mid-turn is refused in front of the user rather than silently in a process
+/// nobody is watching. `--delay 0` marks the child as the scheduled path, so
+/// what it cannot do lands as a `session.reset_skipped` / `session.reset_failed`
+/// event instead of an exit code nobody reads.
+///
+/// Returns the command line that was scheduled.
+pub fn spawn_detached(
+    ctx: &Ctx,
+    found: &target::Target,
+    strategy: Strategy,
+) -> anyhow::Result<Vec<String>> {
+    spawn_detached_with(ctx, found, strategy, &detach)
+}
+
+/// [`spawn_detached`] with its one impure edge injected, the way [`schedule`]
+/// takes it — so a test can prove what was decided without forking anything.
+/// Without this, `current_exe()` inside a unit test is the *test binary*, and
+/// every `Z` test really did spawn a copy of it.
+fn spawn_detached_with(
+    ctx: &Ctx,
+    found: &target::Target,
+    strategy: Strategy,
+    launch: &dyn Fn(&[String]) -> Launch,
+) -> anyhow::Result<Vec<String>> {
+    // `require_live` covers both halves: an ended row, and a row whose window
+    // never opened (an empty pane is "the current window" to tmux, so a reset
+    // would type `/clear` into whatever the caller is looking at).
+    found.require_live()?;
+    let (_, refusal) = found.idle_gate(ctx);
+    if let Some(reason) = refusal {
+        return Err(QError::Conflict(format!("{} is not idle: {reason}", found.name())).into());
+    }
+    // The same cooldown the AUTO path takes. Without it, a `Z` landing on a
+    // session the `Stop` hook has just scheduled a `--delay 2` reset for runs
+    // two children: this one clears now, the other wakes two seconds later,
+    // re-takes an idle gate the fresh `SessionStart` has just satisfied, and
+    // clears the new context window plus its follow-up (SPEC §8).
+    if recently_scheduled(ctx.db()?, &found.quest.id, &found.session.id) {
+        return Err(QError::Conflict(format!(
+            "{} already has a reset scheduled; wait for it",
+            found.name()
+        ))
+        .into());
+    }
+
+    let argv = argv(&found.session.id, strategy, 0)
+        .ok_or_else(|| QError::Other("cannot find this q binary to re-invoke".to_string()))?;
+    let mut payload = serde_json::json!({
+        "ctx_pct": found.session.ctx_pct,
+        "strategy": strategy.as_str(),
+        "delay": 0,
+        "manual": true,
+        "argv": argv,
+    });
+    let outcome = launch(&argv);
+    if outcome == Launch::Failed {
+        let mut failed = payload.clone();
+        failed["stage"] = serde_json::json!("spawn");
+        let _ = ctx.db()?.append_event(
+            &found.quest.id,
+            Some(&found.session.id),
+            "session.reset_failed",
+            &failed,
+        );
+        return Err(QError::Other(format!("cannot start `q reset {}`", found.name())).into());
+    }
+    // Same key the auto path records: under `$Q_NO_DETACH`/`$Q_FIXTURE` nothing
+    // was handed to the OS, and the event must not claim otherwise.
+    payload["spawned"] = serde_json::json!(outcome == Launch::Spawned);
+    ctx.db()?.append_event(
+        &found.quest.id,
+        Some(&found.session.id),
+        "session.reset_scheduled",
+        &payload,
+    )?;
+    Ok(argv)
 }
 
 /// What became of the detached child. `Suppressed` is a decision, not a
@@ -402,7 +505,11 @@ fn detach(argv: &[String]) -> Launch {
 }
 
 fn suppressed() -> bool {
-    env_set("Q_FIXTURE") || env_set("Q_NO_DETACH")
+    // No in-crate test may fork. `current_exe()` there is the *test binary*,
+    // so a real launch spawns a copy of the whole suite with `reset …` on its
+    // command line — which is exactly what the `Z` tests were doing. The
+    // integration tests reach the same branch through `$Q_FIXTURE`.
+    cfg!(test) || env_set("Q_FIXTURE") || env_set("Q_NO_DETACH")
 }
 
 fn env_set(key: &str) -> bool {
@@ -553,6 +660,187 @@ mod tests {
         assert!(schedule(&db, &session, &config, &launcher.as_fn()).is_none());
         assert_eq!(launcher.calls(), 1);
         assert_eq!(scheduled_events(&db, &quest.id).len(), 1);
+    }
+
+    /// A `Ctx` over the same in-memory fleet, with a tmux fixture holding the
+    /// master's pane. Nothing here touches the process environment or a real
+    /// tmux server.
+    fn manual_fleet(
+        status: SessionStatus,
+        pane: &str,
+    ) -> (Ctx, tempfile::TempDir, Quest, target::Target) {
+        let (db, quest, mut session) = fleet(Some(40), status);
+        if session.tmux_pane != pane {
+            db.update_session_pane(&session.id, pane).unwrap();
+            session = db.get_session(&session.id).unwrap().unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tmux.json");
+        std::fs::write(&path, "{}").unwrap();
+        let ctx = Ctx::for_tests(
+            Config::default(),
+            db,
+            Box::new(crate::tmux::FixtureTmux::new(path)),
+        );
+        let found = target::Target {
+            quest: quest.clone(),
+            session,
+        };
+        (ctx, dir, quest, found)
+    }
+
+    /// N-2: `Z` racing the `Stop` hook's own `--delay 2` schedule ran two
+    /// children. The manual one clears now; the auto one wakes two seconds
+    /// later, re-takes an idle gate the fresh `SessionStart` has just
+    /// satisfied, and clears the *new* context window plus its follow-up
+    /// (SPEC §8). The manual path takes the same cooldown the auto path does.
+    #[test]
+    fn a_manual_reset_will_not_double_fire_on_top_of_a_scheduled_one() {
+        let (ctx, _dir, quest, found) = manual_fleet(SessionStatus::Idle, "%1");
+        let launcher = Launcher::new();
+        // The `Stop` hook gets there first.
+        assert!(
+            schedule(
+                ctx.db().unwrap(),
+                &found.session,
+                &ctx.config,
+                &launcher.as_fn()
+            )
+            .is_some()
+        );
+        assert_eq!(launcher.calls(), 1);
+
+        let error = spawn_detached_with(&ctx, &found, Strategy::Clear, &launcher.as_fn())
+            .expect_err("the manual reset was let through on top of the scheduled one");
+        assert!(
+            format!("{error:#}").contains("already has a reset scheduled"),
+            "{error:#}"
+        );
+        assert_eq!(launcher.calls(), 1, "a second child was launched");
+        assert_eq!(scheduled_events(ctx.db().unwrap(), &quest.id).len(), 1);
+    }
+
+    /// And two `Z` presses in a row are the same race with the same answer.
+    #[test]
+    fn a_second_manual_reset_inside_the_cooldown_is_refused() {
+        let (ctx, _dir, quest, found) = manual_fleet(SessionStatus::Idle, "%1");
+        let launcher = Launcher::new();
+        spawn_detached_with(&ctx, &found, Strategy::Clear, &launcher.as_fn()).expect("first Z");
+        assert!(spawn_detached_with(&ctx, &found, Strategy::Clear, &launcher.as_fn()).is_err());
+        assert_eq!(launcher.calls(), 1);
+        assert_eq!(scheduled_events(ctx.db().unwrap(), &quest.id).len(), 1);
+    }
+
+    /// R2-4: the same race one keystroke removed. `Z` took the cooldown but a
+    /// `q reset` typed by hand in another terminal did not, so it fired a
+    /// second child on top of the one the `Stop` hook had just scheduled.
+    #[test]
+    fn a_hand_typed_reset_will_not_double_fire_on_a_scheduled_one() {
+        let (ctx, _dir, quest, found) = manual_fleet(SessionStatus::Idle, "%1");
+        let launcher = Launcher::new();
+        // The `Stop` hook gets there first.
+        assert!(
+            schedule(
+                ctx.db().unwrap(),
+                &found.session,
+                &ctx.config,
+                &launcher.as_fn()
+            )
+            .is_some()
+        );
+
+        let args = Args {
+            session: &found.session.id,
+            delay: None,
+            strategy: Some(Strategy::Clear),
+        };
+        let error = run(&ctx, &args).expect_err("the hand-typed reset was let through");
+        assert!(
+            format!("{error:#}").contains("already has a reset scheduled"),
+            "{error:#}"
+        );
+        // Refused before anything was typed at the master, and without a
+        // second `session.reset_scheduled` of its own.
+        let db = ctx.db().unwrap();
+        assert!(
+            db.list_events_by_kinds(&quest.id, &["session.reset"], 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(scheduled_events(db, &quest.id).len(), 1);
+    }
+
+    /// And the cooldown must not refuse the child that event is *about*: the
+    /// scheduled path is the reset the hook asked for.
+    #[test]
+    fn the_scheduled_child_is_not_refused_by_the_event_that_scheduled_it() {
+        let (ctx, _dir, quest, found) = manual_fleet(SessionStatus::Busy, "%1");
+        let db = ctx.db().unwrap();
+        db.append_event(
+            &quest.id,
+            Some(&found.session.id),
+            "session.reset_scheduled",
+            &serde_json::json!({ "delay": SCHEDULED_DELAY }),
+        )
+        .unwrap();
+
+        let args = Args {
+            session: &found.session.id,
+            delay: Some(0),
+            strategy: Some(Strategy::Clear),
+        };
+        // `busy` stops it at the idle gate — the point is that it got that far
+        // instead of being turned away by its own cooldown.
+        assert_eq!(run(&ctx, &args).unwrap(), 0);
+        assert_eq!(
+            db.list_events_by_kinds(&quest.id, &["session.reset_skipped"], 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// N-6: the manual payload records whether the OS was actually involved,
+    /// exactly as the auto path does. Under a suppressed launch it must not
+    /// claim a child that never ran.
+    #[test]
+    fn a_manual_schedule_records_whether_it_was_really_spawned() {
+        for (outcome, want) in [(Launch::Spawned, true), (Launch::Suppressed, false)] {
+            let (ctx, _dir, quest, found) = manual_fleet(SessionStatus::Idle, "%1");
+            spawn_detached_with(&ctx, &found, Strategy::Clear, &|_| outcome).expect("Z");
+            let events = scheduled_events(ctx.db().unwrap(), &quest.id);
+            let payload = events[0].payload.as_ref().unwrap();
+            assert_eq!(payload["manual"], serde_json::json!(true));
+            assert_eq!(payload["spawned"], serde_json::json!(want), "{outcome:?}");
+        }
+    }
+
+    /// B1: a row whose window never opened has an empty pane, and tmux reads an
+    /// empty `-t` target as "whatever is current". `spawn_detached` used to
+    /// refuse this for a *master* only — the `role ==` conjunct was a slip, and
+    /// every worker `Z` went straight past it.
+    #[test]
+    fn a_reset_of_a_row_with_no_pane_is_refused_whatever_its_role() {
+        for role in [SessionRole::Master, SessionRole::Worker] {
+            let (ctx, _dir, quest, mut found) = manual_fleet(SessionStatus::Idle, "");
+            found.session.role = role;
+            let launcher = Launcher::new();
+            let error = spawn_detached_with(&ctx, &found, Strategy::Clear, &launcher.as_fn())
+                .expect_err("a pane-less row was reset");
+            assert!(format!("{error:#}").contains("has no pane"), "{error:#}");
+            assert_eq!(launcher.calls(), 0);
+            assert!(scheduled_events(ctx.db().unwrap(), &quest.id).is_empty());
+
+            // And the synchronous `q reset` path refuses it too, rather than
+            // typing `/clear` into whatever window is current.
+            let args = Args {
+                session: &found.session.id,
+                delay: None,
+                strategy: Some(Strategy::Clear),
+            };
+            let error = run(&ctx, &args).expect_err("a pane-less row was reset");
+            assert!(format!("{error:#}").contains("has no pane"), "{error:#}");
+        }
     }
 
     #[test]
@@ -739,7 +1027,7 @@ mod tests {
 
     #[test]
     fn the_scheduled_argv_re_invokes_this_binary() {
-        let argv = argv("s-0001", Strategy::Compact).unwrap();
+        let argv = argv("s-0001", Strategy::Compact, SCHEDULED_DELAY).unwrap();
         assert_eq!(
             argv[1..],
             [

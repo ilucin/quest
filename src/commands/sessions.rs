@@ -34,6 +34,19 @@ pub struct SessionView {
 }
 
 pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
+    let views = load(ctx, args)?;
+    if ctx.json || !ctx.quiet {
+        let across_quests = args.quest.is_none();
+        output::emit(ctx.json, &views, || human(&views, across_quests))?;
+    }
+    Ok(())
+}
+
+/// The one definition of "the session listing": swept, machine-filtered and
+/// annotated with the registry's second opinion. `q sessions` renders it as a
+/// table and the TUI's Sessions tab (SPEC §17) as rows, so the two can never
+/// disagree about which sessions exist or what state they are in.
+pub fn load(ctx: &Ctx, args: &Args) -> anyhow::Result<Vec<SessionView>> {
     sweep_quiet(ctx)?;
     let db = ctx.db()?;
 
@@ -62,12 +75,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     };
 
     annotate(&mut views);
-
-    if ctx.json || !ctx.quiet {
-        let across_quests = args.quest.is_none();
-        output::emit(ctx.json, &views, || human(&views, across_quests))?;
-    }
-    Ok(())
+    Ok(views)
 }
 
 /// Fills in `registry` for the live rows Claude has a pid for: one file read
@@ -183,7 +191,7 @@ fn coarse(cell: &str) -> &str {
 }
 
 /// `waiting` alone says nothing about what for; the hook records it, so show it.
-fn status_cell(session: &Session) -> String {
+pub fn status_cell(session: &Session) -> String {
     match (&session.status, session.waiting_for.as_deref()) {
         (SessionStatus::Waiting, Some(what)) => format!("waiting: {what}"),
         (status, _) => status.to_string(),

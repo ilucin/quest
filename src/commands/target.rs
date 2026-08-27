@@ -51,11 +51,33 @@ impl Target {
         consult(session, pane, Some(&self.name()))
     }
 
-    /// For the commands that can only act on a live pane (`q peek`, `q send`).
+    /// For the commands that can only act on a live pane (`q peek`, `q send`,
+    /// `q reset`).
+    ///
+    /// "Live" means two things, and the second is the one that bites: a row
+    /// inserted by a `q spawn` that then died carries **no pane at all**, and
+    /// tmux reads an empty `-t` target as "whatever is current" — so a
+    /// `capture-pane`/`send-keys`/`kill-window` against it acts on the
+    /// caller's own window. `q enter` has refused this since M1; every other
+    /// pane-taking command refuses it here.
     pub fn require_live(&self) -> anyhow::Result<()> {
         if self.ended() {
             return Err(QError::Other(format!(
                 "session {} ({}) has ended",
+                self.name(),
+                self.session.id
+            ))
+            .into());
+        }
+        self.require_pane()
+    }
+
+    /// The session has a pane to act on. See [`Target::require_live`] for why
+    /// an empty one is never "the current pane".
+    pub fn require_pane(&self) -> anyhow::Result<()> {
+        if self.session.tmux_pane.is_empty() {
+            return Err(QError::Other(format!(
+                "session {} ({}) has no pane; it never finished starting",
                 self.name(),
                 self.session.id
             ))

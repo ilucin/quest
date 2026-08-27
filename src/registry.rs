@@ -23,10 +23,50 @@ use serde::{Deserialize, Serialize};
 
 /// `$Q_CLAUDE_SESSIONS_DIR`, else `~/.claude/sessions`. `None` only when
 /// neither is knowable, which makes every lookup `Unknown`.
+///
+/// Under `cfg(test)` there is no default at all — only what a test points it
+/// at ([`dir_override`]), so no in-crate test can read the developer's own
+/// registry. The same rule `beads::cache_root` follows, for the same reason.
 pub fn dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    return dir_override::get();
+    #[cfg(not(test))]
     match std::env::var_os("Q_CLAUDE_SESSIONS_DIR") {
         Some(raw) if !raw.is_empty() => Some(PathBuf::from(raw)),
         _ => Some(dirs::home_dir()?.join(".claude").join("sessions")),
+    }
+}
+
+/// The in-crate registry directory: none unless a test says otherwise.
+#[cfg(test)]
+pub(crate) mod dir_override {
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    fn exclusive() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    pub(super) fn get() -> Option<PathBuf> {
+        DIR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// `DIR` is process-global, so the guard also serializes the tests using it.
+    pub(crate) struct Guard(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    pub(crate) fn at(dir: PathBuf) -> Guard {
+        let guard = Guard(exclusive().lock().unwrap_or_else(|e| e.into_inner()));
+        *DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir);
+        guard
     }
 }
 
