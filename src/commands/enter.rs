@@ -183,6 +183,22 @@ struct Scope<'a> {
     pinned: Option<&'a str>,
 }
 
+/// SPEC §16's rungs, in order: exact id, exact slug, unique prefix, unique
+/// substring. A single array because [`resolve_target`] and
+/// [`uncontested_local`] must ask the same question — the cheap check decides
+/// whether the expensive one is worth running, so a rung the two disagreed
+/// about would be a rung where `q enter` guesses.
+const LADDER: [fn(&Quest, &str) -> bool; 4] = [
+    |q, t| q.id == t,
+    |q, t| q.slug == t,
+    |q, t| q.id.starts_with(t) || q.slug.starts_with(t),
+    |q, t| q.id.contains(t) || q.slug.contains(t),
+];
+
+/// How many of [`LADDER`]'s rungs are *exact* — the ones a Quest can only
+/// match by being the thing that was typed.
+const EXACT: usize = 2;
+
 /// SPEC §16 target resolution across **every** machine in the listing: exact
 /// id, exact slug, then unique prefix, then unique substring, with more than
 /// one match at a rung an error rather than a guess.
@@ -194,12 +210,11 @@ struct Scope<'a> {
 /// with nothing said. Ambiguity across machines is reported the same way
 /// ambiguity on one is: as a list of what matched, with where.
 ///
-/// That applies to the *exact* rungs too, and it is why there is no
-/// "exact locally, so skip the ssh" shortcut: a Quest id is 16 bits and unique
-/// only per machine, so an id that is exact on two machines is a genuine
-/// ambiguity, and short-circuiting on the local one would silently pick a
-/// Quest the user may not have meant. The fast path is the one case where the
-/// question cannot arise — no remotes to ask (see [`run`]).
+/// That applies to the *exact* rungs too: a Quest id is 16 bits and unique only
+/// per machine, so an id that is exact on two machines is a genuine ambiguity
+/// rather than a reason to prefer the local one. Which candidates this is
+/// handed is [`run`]'s decision, and it is where the cost of asking the other
+/// machines is weighed — see [`uncontested_local`].
 fn resolve_target<'a>(
     local: &'a [Quest],
     results: &'a [RemoteResult],
@@ -227,13 +242,7 @@ fn resolve_target<'a>(
         })
     }));
 
-    let ladder: [fn(&Quest, &str) -> bool; 4] = [
-        |q, t| q.id == t,
-        |q, t| q.slug == t,
-        |q, t| q.id.starts_with(t) || q.slug.starts_with(t),
-        |q, t| q.id.contains(t) || q.slug.contains(t),
-    ];
-    for rule in ladder {
+    for rule in LADDER {
         let matches: Vec<Candidate<'a>> = all
             .iter()
             .copied()
@@ -252,6 +261,49 @@ fn resolve_target<'a>(
         }
     }
     Err(not_found(target, scope).into())
+}
+
+/// The local Quest `target` names exactly — but only when the last round's
+/// cache says no remote could be naming the same thing.
+///
+/// `q enter` is the most-used command there is, and the cross-machine ladder
+/// makes every invocation pay a fan-out round to rule out a collision that
+/// almost never exists: ~150 ms against a healthy remote, the full 5 s deadline
+/// against a dead one, where a local attach used to be a single database read.
+/// So the `remote_cache` is asked first. It already holds every remote's last
+/// listing, and reading it costs no ssh.
+///
+/// Suspicion is exactly "a cached remote row that would match at this rung or
+/// an earlier one". A remote row further down the ladder cannot beat an exact
+/// hit, so it is no reason to dial out; one at the same rung — or, against an
+/// exact *slug*, one whose *id* is the target — is the collision that must be
+/// reported, and that case takes the live round, so the ambiguity error is
+/// built from fresh rows rather than from a cache that may have moved on.
+/// A local target that is ambiguous *here* also declines: the full ladder is
+/// what says so.
+///
+/// **The accepted gap.** A cold cache means no suspicion, so a genuine
+/// collision with a remote Quest this machine has never listed enters the local
+/// Quest silently. Closing it means an ssh on every `q enter`, which is the
+/// cost this exists to avoid; a single `q list` (or any TUI tick) is enough to
+/// teach the cache about the other machine.
+fn uncontested_local<'a>(ctx: &Ctx, local: &'a [Quest], target: &str) -> Option<&'a Quest> {
+    if target.is_empty() {
+        return None;
+    }
+    let (rung, rule) = LADDER[..EXACT]
+        .iter()
+        .enumerate()
+        .find(|(_, rule)| local.iter().any(|q| rule(q, target)))?;
+    let mut hits = local.iter().filter(|q| rule(q, target));
+    let quest = hits.next()?;
+    if hits.next().is_some() {
+        return None;
+    }
+    let contested = remote::cached_quests(ctx)
+        .iter()
+        .any(|q| LADDER[..=rung].iter().any(|r| r(&q.view.quest, target)));
+    (!contested).then_some(quest)
 }
 
 /// `not found: quest `alpha`` — and, under `--machine`, which machine it was
@@ -361,6 +413,13 @@ pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
         };
         let found = resolve_target(&local, &[], target, scope)?;
         return enter_local(ctx, found.quest, label);
+    }
+
+    // Cache-first: the everyday `q enter <a quest that runs here>` stays a
+    // database read even with remotes configured, and only a cached row that
+    // could mean the same thing buys the round-trip (see `uncontested_local`).
+    if let Some(quest) = uncontested_local(ctx, &local, target) {
+        return enter_local(ctx, quest, label);
     }
 
     // `--all`: a Quest that is finished over there has to be *found* before it
@@ -675,6 +734,124 @@ mod tests {
                 .quest
                 .slug,
             "local-alpha"
+        );
+    }
+
+    /// A remote's listing in `remote_cache`, as the last fan-out left it.
+    fn cache(ctx: &Ctx, name: &str, quests: &[Quest]) {
+        let views: Vec<QuestView> = quests
+            .iter()
+            .map(|q| QuestView::new(q.clone(), &[]))
+            .collect();
+        ctx.db()
+            .unwrap()
+            .put_remote_cache(name, &serde_json::to_string(&views).unwrap(), 1)
+            .unwrap();
+    }
+
+    /// The everyday `q enter <a quest that runs here>`: the cache already holds
+    /// the other machine's listing and nothing in it could mean this Quest, so
+    /// there is nothing an ssh could add.
+    #[test]
+    fn an_exact_local_match_with_an_uncontested_cache_needs_no_round() {
+        let (ctx, _dir) = with_tmux(false, false);
+        let local = [Quest::new("here", "/tmp", "laptop")];
+        cache(&ctx, "ws", &[Quest::new("over-there", "/tmp", "ws")]);
+
+        assert_eq!(
+            uncontested_local(&ctx, &local, "here").unwrap().slug,
+            "here"
+        );
+        assert_eq!(
+            uncontested_local(&ctx, &local, &local[0].id).unwrap().slug,
+            "here"
+        );
+        // Only the *exact* rungs qualify: a fragment can be beaten by an exact
+        // hit on another machine (S1), so it still has to ask.
+        assert!(uncontested_local(&ctx, &local, "her").is_none());
+        assert!(uncontested_local(&ctx, &local, "").is_none());
+        assert!(uncontested_local(&ctx, &local, "nowhere").is_none());
+    }
+
+    /// A cache that has never heard of the other machine reports no suspicion —
+    /// the accepted gap. `q enter` takes the local Quest rather than paying an
+    /// ssh to discover there was nothing to find.
+    #[test]
+    fn a_cold_cache_is_not_a_suspicion() {
+        let (ctx, _dir) = with_tmux(false, false);
+        let local = [Quest::new("here", "/tmp", "laptop")];
+        assert_eq!(
+            uncontested_local(&ctx, &local, "here").unwrap().slug,
+            "here"
+        );
+    }
+
+    /// D3, from the cache: a cached remote row that would match at the same
+    /// rung is the collision, and it buys the live round that reports it.
+    #[test]
+    fn a_cached_row_that_could_mean_the_same_quest_forces_the_round() {
+        // An exact slug on both machines.
+        let (ctx, _dir) = with_tmux(false, false);
+        let local = [Quest::new("here", "/tmp", "laptop")];
+        cache(&ctx, "ws", &[Quest::new("here", "/tmp", "ws")]);
+        assert!(uncontested_local(&ctx, &local, "here").is_none());
+
+        // An exact id on both machines.
+        let (ctx, _dir) = with_tmux(false, false);
+        let local = [Quest::new("here", "/tmp", "laptop")];
+        let mut collides = Quest::new("over-there", "/tmp", "ws");
+        collides.id = local[0].id.clone();
+        cache(&ctx, "ws", &[collides]);
+        assert!(uncontested_local(&ctx, &local, &local[0].id).is_none());
+
+        // And an *earlier* rung: the local hit is an exact slug, but a remote
+        // Quest's id is that same string — the id rung is walked first, so the
+        // remote one would win outright.
+        let (ctx, _dir) = with_tmux(false, false);
+        let local = [Quest::new("here", "/tmp", "laptop")];
+        let mut named = Quest::new("over-there", "/tmp", "ws");
+        named.id = "here".to_string();
+        cache(&ctx, "ws", &[named]);
+        assert!(uncontested_local(&ctx, &local, "here").is_none());
+    }
+
+    /// A cached remote row that only matches further down the ladder cannot
+    /// beat an exact hit, so it is not worth an ssh.
+    #[test]
+    fn a_cached_row_further_down_the_ladder_is_not_a_collision() {
+        let (ctx, _dir) = with_tmux(false, false);
+        let local = [Quest::new("here", "/tmp", "laptop")];
+        cache(&ctx, "ws", &[Quest::new("here-too", "/tmp", "ws")]);
+        assert_eq!(
+            uncontested_local(&ctx, &local, "here").unwrap().slug,
+            "here"
+        );
+    }
+
+    /// Ambiguous *here* is the full ladder's story to tell — it is the thing
+    /// that lists candidates — so the shortcut declines.
+    #[test]
+    fn a_target_that_is_ambiguous_locally_still_takes_the_long_way() {
+        let (ctx, _dir) = with_tmux(false, false);
+        let mut twin = Quest::new("elsewhere", "/tmp", "laptop");
+        let first = Quest::new("here", "/tmp", "laptop");
+        twin.id = first.id.clone();
+        let id = first.id.clone();
+        let local = [first, twin];
+        assert!(uncontested_local(&ctx, &local, &id).is_none());
+    }
+
+    /// `--no-remote` and a `--machine` naming this machine leave no targets, so
+    /// there is no cache to consult and nothing to be suspicious of.
+    #[test]
+    fn with_nothing_to_ask_the_cache_is_not_even_read() {
+        let (ctx, _dir) = with_tmux(false, false);
+        let local = [Quest::new("here", "/tmp", "laptop")];
+        cache(&ctx, "ws", &[Quest::new("here", "/tmp", "ws")]);
+        let ctx = ctx.with_no_remote(true);
+        assert_eq!(
+            uncontested_local(&ctx, &local, "here").unwrap().slug,
+            "here"
         );
     }
 

@@ -7708,10 +7708,12 @@ fn iterm_control_mode_is_used_only_outside_tmux() {
 /// A local Quest is entered locally, and a name that is on neither machine is
 /// still a plain "not found" rather than a story about ssh.
 ///
-/// The other machine *is* asked first: an id or a slug is unique only per
-/// machine, so "exact here, so skip the ssh" is a guess (see
-/// `an_id_that_is_exact_on_both_machines_is_ambiguous`). What must not happen
-/// is an attach over ssh for a Quest that lives here.
+/// A target that is *exact* here and uncontested in the cache is entered
+/// without dialling out at all (see
+/// `an_uncontested_cache_enters_a_local_quest_with_no_ssh`); anything else —
+/// a fragment, a typo — is resolved across machines, because an id or a slug is
+/// unique only per machine. What must not happen either way is an attach over
+/// ssh for a Quest that lives here.
 #[test]
 fn entering_looks_across_machines_and_reports_a_typo_as_a_typo() {
     let env = Env::new();
@@ -7726,7 +7728,8 @@ fn entering_looks_across_machines_and_reports_a_typo_as_a_typo() {
     let entered = json_of(&cmd.args(["enter", "here", "--json"]).assert().success());
     assert_eq!(entered["tmux_session"], "q-here");
     assert_eq!(entered["attach"], "exec");
-    assert!(attach_calls(&env).is_empty(), "{:?}", env.ssh_calls());
+    // Cold cache, exact local hit: nothing to be suspicious of, so no ssh runs.
+    assert!(env.ssh_calls().is_empty(), "{:?}", env.ssh_calls());
 
     let mut cmd = env.cmd();
     env.with_ssh(
@@ -7737,7 +7740,41 @@ fn entering_looks_across_machines_and_reports_a_typo_as_a_typo() {
     let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
     assert!(err.contains("not_found"), "{err}");
     assert!(err.contains("nowhere"), "{err}");
+    // A target that is not exact here *is* asked across machines before it is
+    // refused: an exact slug on `ws` would have beaten a local fragment (S1).
+    assert_eq!(
+        env.ssh_calls(),
+        ["ws-host\tq\tlist\t--json\t--no-remote\t--all"]
+    );
     assert!(attach_calls(&env).is_empty());
+}
+
+/// `q enter` is the most-used command, and with `[[remotes]]` configured the
+/// cross-machine ladder made every one of them pay a fan-out round. The cache
+/// is consulted instead: it already holds the other machine's listing, and when
+/// nothing in it could mean this target, the local attach costs no ssh at all.
+#[test]
+fn an_uncontested_cache_enters_a_local_quest_with_no_ssh() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.new_quest("here");
+    let payload = remote_listing("ws", "over-there");
+
+    // One `q list` fills the cache — the round every enter used to repeat.
+    env.list(serde_json::json!({ "ws-host": { "stdout": payload.clone() } }))
+        .success();
+    assert_eq!(env.ssh_calls().len(), 1);
+    std::fs::remove_file(env.ssh_log()).unwrap();
+
+    // The remote is still scripted and healthy; it is simply not asked.
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": payload } }),
+    );
+    let entered = json_of(&cmd.args(["enter", "here", "--json"]).assert().success());
+    assert_eq!(entered["tmux_session"], "q-here");
+    assert!(env.ssh_calls().is_empty(), "{:?}", env.ssh_calls());
 }
 
 /// With no `[[remotes]]` at all there is nothing to ask, so the ladder stays
@@ -7759,6 +7796,11 @@ fn entering_without_remotes_never_leaves_this_machine() {
 /// a different Quest on each. Entering the local one without a word is the
 /// guess SPEC §16 refuses everywhere else — and the candidates say which
 /// machine each is on, so `on ws` cannot be read as covering both.
+///
+/// The cache is what raises the suspicion, and the error is then built from a
+/// **live** round rather than from the cached rows: it is a refusal to act, so
+/// it is made on fresh data. The accepted cost of not asking on every enter is
+/// pinned first, in `a_collision_the_cache_has_never_seen_is_entered_locally`.
 #[test]
 fn an_id_that_is_exact_on_both_machines_is_ambiguous() {
     let env = Env::new();
@@ -7774,6 +7816,11 @@ fn an_id_that_is_exact_on_both_machines_is_ambiguous() {
     far["quests"][0]["id"] = serde_json::json!(id);
     let payload = far.to_string();
 
+    // The cache learns about `ws` — one `q list`, or any TUI tick.
+    env.list(serde_json::json!({ "ws-host": { "stdout": payload.clone() } }))
+        .success();
+    std::fs::remove_file(env.ssh_log()).unwrap();
+
     let mut cmd = env.cmd();
     env.with_ssh(
         &mut cmd,
@@ -7784,7 +7831,52 @@ fn an_id_that_is_exact_on_both_machines_is_ambiguous() {
     assert!(err.contains("ambiguous"), "{err}");
     assert!(err.contains("(here) on laptop"), "{err}");
     assert!(err.contains("(over-there) on ws"), "{err}");
+    // Fresh rows, not the cached ones the suspicion came from.
+    assert_eq!(
+        env.ssh_calls(),
+        ["ws-host\tq\tlist\t--json\t--no-remote\t--all"]
+    );
     assert!(attach_calls(&env).is_empty());
+}
+
+/// The trade-off, stated as a test so nobody discovers it in the field: with a
+/// cache that has never seen the colliding remote Quest, `q enter <id>` takes
+/// the local one and says nothing. Closing that means an ssh on **every**
+/// `q enter`, which is the cost cache-first exists to avoid — and one `q list`
+/// is enough to turn the same command into the ambiguity error above.
+#[test]
+fn a_collision_the_cache_has_never_seen_is_entered_locally() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let id = env.new_quest("here")["quest"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let payload = remote_listing("ws", "over-there");
+    let mut far: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    far["quests"][0]["id"] = serde_json::json!(id);
+    let payload = far.to_string();
+
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": payload.clone() } }),
+    );
+    let entered = json_of(&cmd.args(["enter", &id, "--json"]).assert().success());
+    assert_eq!(entered["tmux_session"], "q-here");
+    assert!(env.ssh_calls().is_empty(), "{:?}", env.ssh_calls());
+
+    // …and the very next round teaches the cache, after which it is ambiguous.
+    env.list(serde_json::json!({ "ws-host": { "stdout": payload.clone() } }))
+        .success();
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": payload } }),
+    );
+    let assert = cmd.args(["enter", &id, "--json"]).assert().code(1);
+    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("ambiguous"), "{err}");
 }
 
 /// `--machine` scopes `q enter` as it scopes `q list`: pinned to a remote, a

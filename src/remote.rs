@@ -631,6 +631,31 @@ pub fn fetch_all(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> Vec<Remote
     results
 }
 
+/// Every remote's **last cached** listing, read straight out of `remote_cache`
+/// with no ssh at all — what a command consults when it needs to know whether a
+/// remote could be in play before deciding to pay for a fan-out (see
+/// [`crate::commands::enter`]).
+///
+/// Respects `--no-remote` and `--machine` exactly as [`fetch_all`] does, and
+/// carries no status: a remote that has never answered, or whose cached payload
+/// no longer parses, simply contributes nothing. The rows are unfiltered — the
+/// far end is always asked for the whole listing — so what comes back here is
+/// what a `--all` round would have returned last time.
+pub fn cached_quests(ctx: &Ctx) -> Vec<RemoteQuest> {
+    let targets = targets(ctx);
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let Ok(db) = ctx.db() else {
+        return Vec::new();
+    };
+    targets
+        .iter()
+        .filter_map(|remote| load(Some(db), &remote.name))
+        .flat_map(|(listing, _)| listing.quests)
+        .collect()
+}
+
 /// Apply this invocation's `--all`/`--state` to rows a remote sent, fresh or
 /// cached alike. See [`list_argv`]: the far end always sends everything, so
 /// this is where SPEC §16's filters are applied to a remote's rows — by the
