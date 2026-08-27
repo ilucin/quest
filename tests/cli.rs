@@ -147,6 +147,13 @@ fn config_path(cmd: &TestCmd) -> std::path::PathBuf {
     cmd.dir.path().join("config.toml")
 }
 
+/// The `quests` array of a `q list --json` envelope. The listing is the one
+/// command whose `--json` is an object rather than an array: it also has to
+/// report the machines it asked (see `commands::list` for the contract).
+fn quests_of(assert: &assert_cmd::assert::Assert) -> serde_json::Value {
+    json_of(assert)["quests"].clone()
+}
+
 fn json_of(assert: &assert_cmd::assert::Assert) -> serde_json::Value {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("not JSON ({e}): {stdout}"))
@@ -384,7 +391,7 @@ fn machine_flag_accepts_this_machines_own_name() {
         .args(["--machine", "laptop", "list", "--json"])
         .assert()
         .success();
-    assert!(json_of(&assert).as_array().unwrap().is_empty());
+    assert!(json_of(&assert)["quests"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -2005,7 +2012,7 @@ fn two_quests_get_distinct_panes_and_both_stay_alive() {
     );
 
     // The second `q new` must not have swept the first quest's session.
-    let list = env.json(&["list"]);
+    let list = env.quests(&["list"]);
     for row in list.as_array().unwrap() {
         assert_eq!(row["display_state"], "active", "{row}");
         assert_eq!(row["live_sessions"], 1, "{row}");
@@ -2057,7 +2064,7 @@ fn the_full_quest_lifecycle() {
     let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
 
     // list: the fresh master counts as an active session.
-    let list = env.json(&["list"]);
+    let list = env.quests(&["list"]);
     assert_eq!(list.as_array().unwrap().len(), 1);
     assert_eq!(list[0]["slug"], "foo");
     assert_eq!(list[0]["display_state"], "active");
@@ -2107,8 +2114,8 @@ fn the_full_quest_lifecycle() {
     assert!(event_kinds(&env, &quest_id).contains(&"quest.closed".to_string()));
 
     // a finished Quest is hidden unless asked for
-    assert!(env.json(&["list"]).as_array().unwrap().is_empty());
-    let all = env.json(&["list", "--all"]);
+    assert!(env.quests(&["list"]).as_array().unwrap().is_empty());
+    let all = env.quests(&["list", "--all"]);
     assert_eq!(all.as_array().unwrap().len(), 1);
     assert_eq!(all[0]["display_state"], "finished");
     assert_eq!(all[0]["live_sessions"], 0);
@@ -2126,7 +2133,7 @@ fn the_full_quest_lifecycle() {
     assert_ne!(resumed["session"]["id"], created["session"]["id"]);
     assert_eq!(env.count("SELECT count(*) FROM session"), 2);
     assert_eq!(pane_of(&env.fixture(), "q-foo")["window_name"], "master");
-    assert_eq!(env.json(&["list"])[0]["display_state"], "active");
+    assert_eq!(env.quests(&["list"])[0]["display_state"], "active");
     assert!(event_kinds(&env, &quest_id).contains(&"quest.resumed".to_string()));
 
     // rename
@@ -2135,7 +2142,7 @@ fn the_full_quest_lifecycle() {
     assert_eq!(renamed["quest"]["name_source"], "manual");
     assert_eq!(renamed["tmux_session"], "q-bar");
     assert_eq!(pane_of(&env.fixture(), "q-bar")["window_name"], "master");
-    assert_eq!(env.json(&["list"])[0]["slug"], "bar");
+    assert_eq!(env.quests(&["list"])[0]["slug"], "bar");
     // Only the live session follows the rename; the closed one is history.
     assert_eq!(
         env.count("SELECT count(*) FROM session WHERE tmux_session = 'q-bar'"),
@@ -2159,7 +2166,12 @@ fn the_full_quest_lifecycle() {
         .success()
         .stdout(predicate::str::contains("removed q-"))
         .stdout(predicate::str::contains("(bar)"));
-    assert!(env.json(&["list", "--all"]).as_array().unwrap().is_empty());
+    assert!(
+        env.quests(&["list", "--all"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(env.count("SELECT count(*) FROM quest"), 0);
     assert_eq!(env.count("SELECT count(*) FROM session"), 0);
     assert_eq!(env.count("SELECT count(*) FROM event"), 0);
@@ -2190,21 +2202,21 @@ fn list_filters_by_derived_state() {
     env.json(&["close", "foo", "-f"]);
     env.new_quest("bar");
     assert_eq!(
-        env.json(&["list", "--state", "active"])
+        env.quests(&["list", "--state", "active"])
             .as_array()
             .unwrap()
             .len(),
         1
     );
-    assert_eq!(env.json(&["list", "--state", "active"])[0]["slug"], "bar");
+    assert_eq!(env.quests(&["list", "--state", "active"])[0]["slug"], "bar");
     assert!(
-        env.json(&["list", "--state", "idle"])
+        env.quests(&["list", "--state", "idle"])
             .as_array()
             .unwrap()
             .is_empty()
     );
     // `--state finished` implies `--all`.
-    let finished = env.json(&["list", "--state", "finished"]);
+    let finished = env.quests(&["list", "--state", "finished"]);
     assert_eq!(finished.as_array().unwrap().len(), 1);
     assert_eq!(finished[0]["slug"], "foo");
 }
@@ -2213,12 +2225,12 @@ fn list_filters_by_derived_state() {
 fn list_filters_by_machine_only_when_asked() {
     let env = Env::new();
     env.new_quest("foo");
-    assert_eq!(env.json(&["list"]).as_array().unwrap().len(), 1);
+    assert_eq!(env.quests(&["list"]).as_array().unwrap().len(), 1);
     // `elsewhere` has to be a machine this `q` knows: a configured remote,
     // asked for nothing here because `--no-remote` keeps the round local.
     env.with_remotes(&[("elsewhere", "elsewhere-host")]);
     assert!(
-        env.json(&["--machine", "elsewhere", "--no-remote", "list"])
+        env.quests(&["--machine", "elsewhere", "--no-remote", "list"])
             .as_array()
             .unwrap()
             .is_empty()
@@ -2234,7 +2246,7 @@ fn close_without_force_and_without_a_tty_aborts() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("aborted (use -f)"));
-    assert_eq!(env.json(&["list"])[0]["display_state"], "active");
+    assert_eq!(env.quests(&["list"])[0]["display_state"], "active");
     assert_eq!(
         env.count("SELECT count(*) FROM quest WHERE state = 'active'"),
         1
@@ -2388,7 +2400,7 @@ fn a_listing_sweeps_a_pane_that_is_gone() {
     // The pane died without a hook ever reporting it.
     env.write_fixture(serde_json::json!({ "next_pane": 1, "panes": [] }));
 
-    let list = env.json(&["list"]);
+    let list = env.quests(&["list"]);
     assert_eq!(list[0]["display_state"], "idle");
     assert_eq!(list[0]["live_sessions"], 0);
 
@@ -2451,7 +2463,7 @@ fn resume_revives_an_active_quest_that_lost_its_sessions() {
     assert_eq!(resumed["attach"], "none");
     assert_ne!(resumed["session"]["id"], created["session"]["id"]);
     assert_eq!(pane_of(&env.fixture(), "q-foo")["window_name"], "master");
-    assert_eq!(env.json(&["list"])[0]["live_sessions"], 1);
+    assert_eq!(env.quests(&["list"])[0]["live_sessions"], 1);
 }
 
 #[test]
@@ -2484,7 +2496,7 @@ fn rename_works_without_a_tmux_session() {
     assert_eq!(renamed["quest"]["slug"], "bar");
     assert_eq!(renamed["tmux_session"], "q-bar");
     assert_eq!(renamed["changed"], true);
-    assert_eq!(env.json(&["list"])[0]["slug"], "bar");
+    assert_eq!(env.quests(&["list"])[0]["slug"], "bar");
     // The swept session ended under the old name and keeps it.
     assert_eq!(
         env.count("SELECT count(*) FROM session WHERE tmux_session = 'q-foo'"),
@@ -5543,7 +5555,7 @@ fn show_and_list_report_beads_progress() {
 
     let mut cmd = env.cmd();
     env.with_bd_list(&mut cmd, &issues);
-    let out = json_of(&cmd.args(["list", "--json"]).assert().success());
+    let out = quests_of(&cmd.args(["list", "--json"]).assert().success());
     assert_eq!(out[0]["progress"]["total"], 4);
 }
 
@@ -5582,7 +5594,7 @@ fn progress_falls_back_to_the_cache_when_bd_stops_answering() {
     assert_eq!(out["progress"]["total"], 2);
 
     // `bd` is gone; the last reading is still what a listing shows.
-    let out = json_of(&env.cmd().args(["list", "--json"]).assert().success());
+    let out = quests_of(&env.cmd().args(["list", "--json"]).assert().success());
     assert_eq!(out[0]["progress"]["total"], 2);
     assert_eq!(out[0]["progress"]["closed"], 1);
 
@@ -5799,7 +5811,7 @@ fn the_repo_flag_is_validated() {
         .failure()
         .stderr(predicate::str::contains("invalid beads repo label"));
     // Nothing was created by either.
-    let out = json_of(&env.cmd().args(["list", "--json"]).assert().success());
+    let out = quests_of(&env.cmd().args(["list", "--json"]).assert().success());
     assert_eq!(out.as_array().unwrap().len(), 0, "{out}");
 }
 
@@ -7072,6 +7084,11 @@ impl Env {
             .env("Q_FIXTURE_SSH_LOG", self.ssh_log());
     }
 
+    /// The rows of `q list --json`, whatever else the envelope carries.
+    fn quests(&self, args: &[&str]) -> serde_json::Value {
+        self.json(args)["quests"].clone()
+    }
+
     /// `q list --json` with the scripted ssh in place.
     fn list(&self, hosts: serde_json::Value) -> assert_cmd::assert::Assert {
         let mut cmd = self.cmd();
@@ -7095,8 +7112,8 @@ fn remote_listing(machine: &str, slug: &str) -> String {
     let assert = far.cmd().args(["list", "--json"]).assert().success();
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
-    assert_eq!(parsed.as_array().unwrap().len(), 1, "{parsed}");
-    assert_eq!(parsed[0]["machine"], machine);
+    assert_eq!(parsed["quests"].as_array().unwrap().len(), 1, "{parsed}");
+    assert_eq!(parsed["quests"][0]["machine"], machine);
     out.trim().to_string()
 }
 
@@ -7187,7 +7204,7 @@ fn a_remote_that_times_out_is_marked_unreachable_and_the_listing_still_succeeds(
     assert!(stderr.contains("⚠ unreachable"), "{stderr}");
     assert!(stderr.contains("ws"), "{stderr}");
     // The local listing is untouched by the remote being down.
-    let listed = json_of(&assert);
+    let listed = quests_of(&assert);
     assert_eq!(listed[0]["slug"], "local-one");
 }
 
@@ -7308,4 +7325,379 @@ fn a_remote_the_script_does_not_know_never_reaches_a_real_host() {
     env.with_remotes(&[("ws", "ws-host")]);
     let assert = env.list(serde_json::json!({})).success();
     assert!(stderr_of(&assert).contains("⚠ unreachable"));
+}
+
+// ------------------------------------------- q list: the merged listing (5.2)
+
+/// The rows of `q list --json`, and the machines it asked, with the scripted
+/// ssh in place.
+impl Env {
+    fn listing(&self, hosts: serde_json::Value) -> serde_json::Value {
+        json_of(&self.list(hosts).success())
+    }
+
+    /// The row of `slug` in a listing envelope.
+    fn row_of<'a>(listing: &'a serde_json::Value, slug: &str) -> &'a serde_json::Value {
+        listing["quests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["slug"] == slug)
+            .unwrap_or_else(|| panic!("no row `{slug}` in {listing}"))
+    }
+
+    /// The machine entry called `name`.
+    fn machine_of<'a>(listing: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        listing["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == name)
+            .unwrap_or_else(|| panic!("no machine `{name}` in {listing}"))
+    }
+}
+
+/// SPEC §15: one listing, both machines, with a machine column.
+#[test]
+fn a_remote_machines_quests_join_the_listing() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.new_quest("here");
+    let payload = remote_listing("ws", "over-there");
+
+    let listing = env.listing(serde_json::json!({ "ws-host": { "stdout": payload } }));
+    let slugs: Vec<&str> = listing["quests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["slug"].as_str().unwrap())
+        .collect();
+    assert!(slugs.contains(&"here"), "{listing}");
+    assert!(slugs.contains(&"over-there"), "{listing}");
+
+    // Local and remote rows are told apart by `source`, not by guesswork.
+    assert_eq!(
+        Env::row_of(&listing, "here")["source"],
+        serde_json::json!({ "kind": "local" })
+    );
+    assert_eq!(
+        Env::row_of(&listing, "over-there")["source"],
+        serde_json::json!({ "kind": "remote", "stale": false })
+    );
+    assert_eq!(Env::row_of(&listing, "over-there")["machine"], "ws");
+
+    // The same listing for a human, with the machine column of SPEC §15.
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": remote_listing("ws", "over-there") } }),
+    );
+    let assert = cmd.arg("list").assert().success();
+    let human = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(human.contains("MACHINE"), "{human}");
+    assert!(human.contains("over-there"), "{human}");
+    assert!(human.contains("ws"), "{human}");
+}
+
+/// The rows a remote sent are re-emitted exactly as they arrived: a field a
+/// newer `q` over there knows and this one does not must survive.
+#[test]
+fn a_remote_row_is_re_emitted_verbatim() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&remote_listing("workstation", "over-there")).unwrap();
+    payload["quests"][0]["something_from_the_future"] = serde_json::json!({ "a": 1 });
+    let payload = payload.to_string();
+
+    let listing = env.listing(serde_json::json!({ "ws-host": { "stdout": payload } }));
+    let row = Env::row_of(&listing, "over-there");
+    assert_eq!(
+        row["something_from_the_future"],
+        serde_json::json!({ "a": 1 })
+    );
+    // …except `machine`, which is `remotes[].name` rather than what the far
+    // end calls itself, and `source`, which only this side can know.
+    assert_eq!(row["machine"], "ws");
+    assert_eq!(row["source"]["kind"], "remote");
+}
+
+/// A machine that is down keeps its rows, marked — in the column and in the
+/// row's `source` — and says so on stderr (SPEC §15).
+#[test]
+fn an_unreachable_remotes_cached_rows_are_shown_and_marked_stale() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let payload = remote_listing("ws", "over-there");
+    env.list(serde_json::json!({ "ws-host": { "stdout": payload } }))
+        .success();
+
+    let listing = env.listing(serde_json::json!({ "ws-host": { "timeout": true } }));
+    assert_eq!(
+        Env::row_of(&listing, "over-there")["source"],
+        serde_json::json!({ "kind": "remote", "stale": true })
+    );
+    let machine = Env::machine_of(&listing, "ws");
+    assert_eq!(machine["status"], "unreachable");
+    assert!(
+        machine["reason"].as_str().unwrap().contains("5s"),
+        "{machine}"
+    );
+    assert_eq!(machine["stale"], true);
+    assert_eq!(machine["quests"], 1);
+    assert!(machine["fetched_at"].is_i64(), "{machine}");
+
+    // And in the table, where a stale row sits next to live ones.
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "timeout": true } }),
+    );
+    let assert = cmd.arg("list").assert().success();
+    let human = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(human.contains("ws \u{26a0} stale"), "{human}");
+    assert!(stderr_of(&assert).contains("⚠ unreachable"), "{assert:?}");
+}
+
+/// The one thing rows cannot say: a machine that is down and has nothing
+/// cached contributes none, and "no answer" must not read as "no Quests".
+#[test]
+fn a_machine_that_is_down_with_no_cache_is_still_in_the_machines_array() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let listing = env.listing(serde_json::json!({ "ws-host": { "timeout": true } }));
+    assert!(
+        listing["quests"].as_array().unwrap().is_empty(),
+        "{listing}"
+    );
+
+    let machine = Env::machine_of(&listing, "ws");
+    assert_eq!(machine["status"], "unreachable");
+    assert_eq!(machine["stale"], false);
+    assert_eq!(machine["fetched_at"], serde_json::Value::Null);
+    assert_eq!(machine["quests"], 0);
+    // Flattened: bd-8lz.5.1 nested this as `{"status": {"status": …}}`.
+    assert!(machine["status"].is_string(), "{machine}");
+}
+
+#[test]
+fn a_remote_on_an_unreadable_version_is_incompatible_in_the_machines_array() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let listing = env.listing(serde_json::json!({ "ws-host": { "stdout": "not json" } }));
+    let machine = Env::machine_of(&listing, "ws");
+    assert_eq!(machine["status"], "incompatible");
+    assert!(machine["reason"].as_str().unwrap().contains("cannot read"));
+}
+
+/// `--machine` narrows the rows *and* the roster, to a remote and to this one.
+#[test]
+fn a_machine_filter_narrows_the_merged_listing_both_ways() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.new_quest("here");
+    let payload = remote_listing("ws", "over-there");
+
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": payload.clone() } }),
+    );
+    let listing = json_of(
+        &cmd.args(["list", "--json", "--machine", "ws"])
+            .assert()
+            .success(),
+    );
+    let rows = listing["quests"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{listing}");
+    assert_eq!(rows[0]["slug"], "over-there");
+    assert_eq!(listing["machines"].as_array().unwrap().len(), 1);
+    assert_eq!(listing["machines"][0]["name"], "ws");
+
+    // Pinned to this machine: no ssh at all, and only local rows.
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": payload } }),
+    );
+    let listing = json_of(
+        &cmd.args(["list", "--json", "--machine", "laptop"])
+            .assert()
+            .success(),
+    );
+    let rows = listing["quests"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{listing}");
+    assert_eq!(rows[0]["slug"], "here");
+    assert_eq!(listing["machines"].as_array().unwrap().len(), 1);
+    assert_eq!(listing["machines"][0]["kind"], "local");
+}
+
+/// The recursion guard is also what makes the far end's answer a *local*
+/// listing: no rows but its own, and one machine entry.
+#[test]
+fn no_remote_yields_only_local_rows() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.new_quest("here");
+    let payload = remote_listing("ws", "over-there");
+    // Cache a good answer first, so `--no-remote` could show it if it tried.
+    env.list(serde_json::json!({ "ws-host": { "stdout": payload } }))
+        .success();
+
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": "[]" } }),
+    );
+    let listing = json_of(
+        &cmd.args(["list", "--json", "--no-remote"])
+            .assert()
+            .success(),
+    );
+    let rows = listing["quests"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{listing}");
+    assert_eq!(rows[0]["slug"], "here");
+    assert_eq!(rows[0]["source"], serde_json::json!({ "kind": "local" }));
+    assert_eq!(listing["machines"].as_array().unwrap().len(), 1);
+    assert_eq!(listing["machines"][0]["kind"], "local");
+}
+
+// -------------------------------------------------- q enter over ssh (5.2)
+
+/// The ssh log line an attach writes: `attach`, the alias, then the argv.
+fn attach_calls(env: &Env) -> Vec<String> {
+    env.ssh_calls()
+        .into_iter()
+        .filter(|line| line.starts_with("attach"))
+        .collect()
+}
+
+/// SPEC §15: `q enter` on a Quest that runs elsewhere is
+/// `ssh -t <alias> tmux attach -t q-<slug>`.
+#[test]
+fn entering_a_remote_quest_attaches_over_ssh() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let payload = remote_listing("ws", "over-there");
+
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": payload } }),
+    );
+    let assert = cmd
+        .args(["enter", "over-there", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    assert_eq!(out["machine"], "ws");
+    assert_eq!(out["remote"], true);
+    assert_eq!(out["tmux_session"], "q-over-there");
+    assert_eq!(out["quest"]["slug"], "over-there");
+
+    assert_eq!(
+        attach_calls(&env),
+        ["attach\tws-host\ttmux\tattach\t-t\t=q-over-there"]
+    );
+}
+
+/// `[tmux] iterm_cc` (SPEC §15 / §20), and only outside tmux.
+#[test]
+fn iterm_control_mode_is_used_only_outside_tmux() {
+    let env = Env::new();
+    env.write_config(
+        "[machine]\nname = \"laptop\"\n\n[tmux]\niterm_cc = true\n\n\
+         [[remotes]]\nname = \"ws\"\nssh = \"ws-host\"\n",
+    );
+    let payload = remote_listing("ws", "over-there");
+
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": payload.clone() } }),
+    );
+    cmd.args(["enter", "over-there"]).assert().success();
+    assert_eq!(
+        attach_calls(&env),
+        ["attach\tws-host\ttmux\t-CC\tattach\t-t\t=q-over-there"]
+    );
+
+    // Inside tmux a control-mode client would be a nested one, which iTerm2
+    // cannot host: the plain attach is the only thing that works.
+    std::fs::remove_file(env.ssh_log()).unwrap();
+    env.write_fixture(serde_json::json!({ "next_pane": 1, "panes": [], "in_tmux": true }));
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": payload } }),
+    );
+    cmd.args(["enter", "over-there"]).assert().success();
+    assert_eq!(
+        attach_calls(&env),
+        ["attach\tws-host\ttmux\tattach\t-t\t=q-over-there"]
+    );
+}
+
+/// A local Quest is entered without ever dialling out, and a name that is on
+/// neither machine is still a plain "not found".
+#[test]
+fn entering_looks_locally_first_and_reports_a_typo_as_a_typo() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.new_quest("here");
+
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": remote_listing("ws", "over-there") } }),
+    );
+    cmd.args(["enter", "here"]).assert().success();
+    assert!(env.ssh_calls().is_empty(), "{:?}", env.ssh_calls());
+
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": remote_listing("ws", "over-there") } }),
+    );
+    let assert = cmd.args(["enter", "nowhere", "--json"]).assert().code(1);
+    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("not_found"), "{err}");
+    assert!(err.contains("nowhere"), "{err}");
+    assert!(attach_calls(&env).is_empty());
+}
+
+/// `--no-remote` breaks the recursion, so it also stops `q enter` from
+/// looking anywhere but here.
+#[test]
+fn entering_under_no_remote_never_asks_another_machine() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": remote_listing("ws", "over-there") } }),
+    );
+    cmd.args(["enter", "over-there", "--no-remote"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("over-there"));
+    assert!(env.ssh_calls().is_empty(), "{:?}", env.ssh_calls());
+}
+
+/// A window inside a remote Quest needs that machine's session rows, which is
+/// bd-8lz.5.3's proxying; until then it is refused rather than mis-attached.
+#[test]
+fn a_session_label_on_a_remote_quest_is_refused_for_now() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": remote_listing("ws", "over-there") } }),
+    );
+    cmd.args(["enter", "over-there", "--session", "tests"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not supported on ws"));
+    assert!(attach_calls(&env).is_empty());
 }

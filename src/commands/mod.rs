@@ -48,7 +48,7 @@ use crate::tmux;
 /// `q list --json` is read straight back into these (SPEC §15), so local and
 /// remote rows need no translation. The optional fields default so a remote on
 /// an older `q` that never learned to report one still parses.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestView {
     #[serde(flatten)]
     pub quest: Quest,
@@ -103,33 +103,133 @@ pub fn live(sessions: &[Session]) -> impl Iterator<Item = &Session> {
     sessions.iter().filter(|s| s.status != SessionStatus::Ended)
 }
 
+/// Where a listing row came from (SPEC §15), and the `source` object of
+/// `q list --json`.
+///
+/// Not derivable from the row itself: a remote's rows carry `remotes[].name`
+/// in their `machine` column, but nothing in a row says whether it was read
+/// out of this machine's database, fetched over ssh a moment ago, or replayed
+/// from the cache of a machine that is down.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Origin {
+    /// This machine's database.
+    Local,
+    /// A remote's `q list --json`. `stale` is the cache standing in for a
+    /// machine that did not answer this round.
+    Remote { stale: bool },
+}
+
+impl Origin {
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Origin::Remote { .. })
+    }
+
+    pub fn is_stale(&self) -> bool {
+        matches!(self, Origin::Remote { stale: true })
+    }
+}
+
 /// A Quest's derived view together with the sessions it was derived from.
 /// `q list` only needs the view; the TUI's Quests tab also renders the
 /// sessions, so the one loader hands back both rather than querying twice.
+#[derive(Debug, Clone)]
 pub struct QuestRow {
     pub view: QuestView,
     pub sessions: Vec<Session>,
+    pub origin: Origin,
+    /// The row exactly as a remote sent it, for `--json` to re-emit; `None`
+    /// for a local row, which is serialized from `view`. See
+    /// [`crate::remote::RemoteQuest`].
+    pub raw: Option<serde_json::Value>,
 }
 
-/// Every Quest this `q` speaks for, swept, machine-filtered and ranked.
+impl QuestRow {
+    pub fn local(view: QuestView, sessions: Vec<Session>) -> QuestRow {
+        QuestRow {
+            view,
+            sessions,
+            origin: Origin::Local,
+            raw: None,
+        }
+    }
+
+    /// A row a remote sent. It has no sessions here: sessions live in the
+    /// database of the machine that runs them (SPEC §15, "no sync"), and
+    /// reaching for them is bd-8lz.5.3's proxying.
+    pub fn remote(quest: crate::remote::RemoteQuest, stale: bool) -> QuestRow {
+        QuestRow {
+            view: quest.view,
+            sessions: Vec::new(),
+            origin: Origin::Remote { stale },
+            raw: Some(quest.raw),
+        }
+    }
+
+    /// The machine column of `q list`: the machine's name, marked when the row
+    /// is the cache standing in for a machine that did not answer (SPEC §15).
+    ///
+    /// The TUI marks the same thing with the glyph alone
+    /// ([`crate::tui::quests`]): its rows are a fixed width and it carries a
+    /// standing chip naming the machine, while a table column has room to say
+    /// it outright.
+    pub fn machine_cell(&self) -> String {
+        if self.origin.is_stale() {
+            format!("{} \u{26a0} stale", self.view.quest.machine)
+        } else {
+            self.view.quest.machine.clone()
+        }
+    }
+}
+
+/// Fold every remote's rows into the local listing and rank the whole thing as
+/// one list (SPEC §15), draining `results` of the rows it moves.
+///
+/// One ranking, not one section per machine: the grouping SPEC §17 asks for is
+/// needs-you / active / idle / finished, and a Quest that needs you needs you
+/// wherever it runs. Ties keep the order the rows arrived in — local first,
+/// then the remotes in config order — because [`sort_quests`] sorts stably.
+pub fn merge_remote(rows: &mut Vec<QuestRow>, results: &mut [crate::remote::RemoteResult]) {
+    rows.extend(remote_rows(results));
+    sort_quests(rows);
+}
+
+/// One round's remote rows, drained out of `results`.
+///
+/// Split from [`merge_remote`] for the TUI, which builds these once when a
+/// round lands and then re-merges the same rows into every 2 s local reload —
+/// its remote tick is 10 s (SPEC §17), so most reloads have no new answer to
+/// fold in.
+pub fn remote_rows(results: &mut [crate::remote::RemoteResult]) -> Vec<QuestRow> {
+    let mut out = Vec::new();
+    for result in results.iter_mut() {
+        let stale = result.stale;
+        let quests = std::mem::take(&mut result.quests);
+        out.extend(quests.into_iter().map(|q| QuestRow::remote(q, stale)));
+    }
+    out
+}
+
+/// Every **local** Quest, swept, machine-filtered and ranked.
 ///
 /// The single definition of "the Quest listing": `q list` and the TUI's Quests
 /// tab both come through here, so they can never disagree about which Quests
-/// exist, what state they are in, or what order they belong in.
+/// exist, what state they are in, or what order they belong in. Remote rows
+/// join them through [`merge_remote`], on each caller's own schedule — the CLI
+/// once per invocation, the TUI on `[ui] tick_remote` rather than on its 2 s
+/// local tick.
 pub fn load_quests(ctx: &Ctx, include_finished: bool) -> anyhow::Result<Vec<QuestRow>> {
     sweep_quiet(ctx)?;
     let db = ctx.db()?;
     let mut rows: Vec<QuestRow> = Vec::new();
     for quest in db.list_quests(include_finished)? {
-        // TODO(M4): a remote machine's Quests come over ssh, not out of this db.
+        // Only this machine's Quests are in here; a remote's come over ssh and
+        // are folded in by [`merge_remote`].
         if ctx.machine_filter().is_some_and(|m| m != quest.machine) {
             continue;
         }
         let sessions = db.list_sessions_by_quest(&quest.id)?;
-        rows.push(QuestRow {
-            view: QuestView::new(quest, &sessions),
-            sessions,
-        });
+        rows.push(QuestRow::local(QuestView::new(quest, &sessions), sessions));
     }
     sort_quests(&mut rows);
     Ok(rows)

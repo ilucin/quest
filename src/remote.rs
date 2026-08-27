@@ -61,6 +61,16 @@ fn state_flag(state: StateFilter) -> &'static str {
     }
 }
 
+/// The envelope keys of `q list --json` (SPEC §15 / §16), named here because
+/// both the emitter and this parser have to agree on them.
+pub const QUESTS: &str = "quests";
+pub const MACHINES: &str = "machines";
+/// The key holding a row's machine — `remotes[].name`, stamped by whoever
+/// merged the row rather than trusted from the far end.
+pub const MACHINE: &str = "machine";
+/// The key holding a row's provenance; see [`crate::commands::Origin`].
+pub const SOURCE: &str = "source";
+
 /// SPEC §15's marker for a machine that did not answer.
 pub const UNREACHABLE: &str = "⚠ unreachable";
 /// The same, for a machine that answered with something this `q` cannot read.
@@ -83,10 +93,21 @@ pub enum SshOutcome {
     Failed(String),
 }
 
-/// `Send + Sync` because the fan-out shares one client across threads.
+/// `Send + Sync` because the fan-out shares one client across threads — and
+/// because the TUI's [`Poller`] holds the same client from its own thread.
 pub trait Ssh: Send + Sync {
     /// `ssh <alias> <argv…>`, given up on after `timeout`.
     fn run(&self, alias: &str, argv: &[&str], timeout: Duration) -> SshOutcome;
+
+    /// `ssh -t <alias> <argv…>`, interactively: SPEC §15's remote `q enter`.
+    /// Replaces this process, exactly as a local `tmux attach` does, so on
+    /// success it does not return.
+    fn attach(&self, alias: &str, argv: &[String]) -> anyhow::Result<()>;
+
+    /// [`Ssh::attach`] for a caller that needs its process back — the TUI's
+    /// `[ui] return_after_detach`. Runs as a child and returns when the far
+    /// end's tmux client detaches.
+    fn attach_child(&self, alias: &str, argv: &[String]) -> anyhow::Result<()>;
 }
 
 /// `FixtureSsh` whenever `$Q_FIXTURE` is set, else the real thing — the same
@@ -119,6 +140,38 @@ fn ssh_argv(alias: &str, argv: &[&str], timeout: Duration) -> Vec<String> {
     out
 }
 
+/// The argv of an interactive `ssh`. No `BatchMode` and no `ConnectTimeout`,
+/// unlike [`ssh_argv`]: there *is* someone at the keyboard here, a passphrase
+/// prompt is the point rather than a hang, and an attach has no deadline.
+/// `-t` forces a tty, without which the far end's `tmux attach` refuses.
+pub fn attach_argv(alias: &str, argv: &[String]) -> Vec<String> {
+    let mut out = vec!["-t".to_string(), alias.to_string()];
+    out.extend(argv.iter().cloned());
+    out
+}
+
+/// ssh hands the remote command to a shell, so an argument that is more than
+/// one shell word has to arrive as one. Everything `q` sends is a slug or a
+/// flag, but `[tmux] session_prefix` is free-form config and ends up inside
+/// the tmux target.
+pub fn sh_quote(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "=_-./:@%+,".contains(c));
+    if plain {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+fn attach_failed(alias: &str, e: &std::io::Error) -> QError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => QError::Other("ssh not found on PATH".to_string()),
+        _ => QError::Other(format!("cannot ssh to `{alias}`: {e}")),
+    }
+}
+
 pub struct RealSsh;
 
 /// How often the deadline is checked while the child runs.
@@ -134,6 +187,25 @@ impl Ssh for RealSsh {
         let mut cmd = Command::new("ssh");
         cmd.args(ssh_argv(alias, argv, timeout));
         run_with_deadline(cmd, timeout)
+    }
+
+    fn attach(&self, alias: &str, argv: &[String]) -> anyhow::Result<()> {
+        use std::os::unix::process::CommandExt;
+        let e = Command::new("ssh").args(attach_argv(alias, argv)).exec();
+        Err(attach_failed(alias, &e).into())
+    }
+
+    fn attach_child(&self, alias: &str, argv: &[String]) -> anyhow::Result<()> {
+        // Inherited stdio on purpose: the ssh *is* the terminal until the far
+        // end detaches, and this call blocks for exactly that long.
+        let status = Command::new("ssh")
+            .args(attach_argv(alias, argv))
+            .status()
+            .map_err(|e| attach_failed(alias, &e))?;
+        if !status.success() {
+            return Err(QError::Other(format!("`ssh {alias}` exited with {status}")).into());
+        }
+        Ok(())
     }
 }
 
@@ -324,6 +396,17 @@ impl Ssh for FixtureSsh {
             stderr: host.stderr,
         }
     }
+
+    /// Recorded, never run: a fixture that `exec`ed would replace the test.
+    fn attach(&self, alias: &str, argv: &[String]) -> anyhow::Result<()> {
+        log_attach("attach", alias, argv);
+        Ok(())
+    }
+
+    fn attach_child(&self, alias: &str, argv: &[String]) -> anyhow::Result<()> {
+        log_attach("attach-child", alias, argv);
+        Ok(())
+    }
 }
 
 /// A missing or unreadable script is an empty one — every alias then fails.
@@ -332,6 +415,17 @@ fn script() -> SshScript {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
+}
+
+/// An attach, in the same log: `attach`, the alias, then the remote argv.
+/// Marked rather than shaped like a `run` line so a test can tell the two
+/// apart, and so exec-vs-child — the `[ui] return_after_detach` split — is on
+/// the record.
+fn log_attach(kind: &str, alias: &str, argv: &[String]) {
+    let mut parts = vec![alias.to_string()];
+    parts.extend(argv.iter().cloned());
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+    log(kind, &parts);
 }
 
 /// Appended, never rewritten: the fan-out logs from several threads at once,
@@ -354,50 +448,80 @@ fn log(alias: &str, argv: &[&str]) {
 // ------------------------------------------------------------------ results
 
 /// How a remote answered this round.
+///
+/// Internally tagged, so it flattens into whatever carries it:
+/// `{"status": "ok"}` / `{"status": "unreachable", "reason": "…"}` rather than
+/// bd-8lz.5.1's nested `{"status": {"status": …}}` (bd-8lz.5.2 owns the
+/// `--json` contract).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "status", content = "reason")]
+#[serde(rename_all = "snake_case", tag = "status")]
 pub enum RemoteStatus {
     Ok,
     /// No answer: down, unroutable, no `q` there, or slower than [`TIMEOUT`].
-    Unreachable(String),
+    Unreachable {
+        reason: String,
+    },
     /// An answer this `q` cannot read — a `q` too old or too new at the far end.
-    Incompatible(String),
+    Incompatible {
+        reason: String,
+    },
 }
 
 impl RemoteStatus {
-    /// For the merge in bd-8lz.5.2, which shows fresh rows differently.
-    #[allow(dead_code)]
-    pub fn is_ok(&self) -> bool {
-        matches!(self, RemoteStatus::Ok)
+    pub fn unreachable(reason: impl Into<String>) -> RemoteStatus {
+        RemoteStatus::Unreachable {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn incompatible(reason: impl Into<String>) -> RemoteStatus {
+        RemoteStatus::Incompatible {
+            reason: reason.into(),
+        }
     }
 
     /// The listing marker (SPEC §15), or `None` when all is well.
     pub fn marker(&self) -> Option<&'static str> {
         match self {
             RemoteStatus::Ok => None,
-            RemoteStatus::Unreachable(_) => Some(UNREACHABLE),
-            RemoteStatus::Incompatible(_) => Some(INCOMPATIBLE),
+            RemoteStatus::Unreachable { .. } => Some(UNREACHABLE),
+            RemoteStatus::Incompatible { .. } => Some(INCOMPATIBLE),
         }
     }
 
     pub fn reason(&self) -> Option<&str> {
         match self {
             RemoteStatus::Ok => None,
-            RemoteStatus::Unreachable(r) | RemoteStatus::Incompatible(r) => Some(r),
+            RemoteStatus::Unreachable { reason } | RemoteStatus::Incompatible { reason } => {
+                Some(reason)
+            }
         }
     }
 }
 
+/// One Quest as a remote sent it: the parsed view this `q` renders and sorts
+/// by, next to the object it arrived in.
+///
+/// Both, because they answer different questions. `view` is what a listing is
+/// built from; `raw` is what `--json` re-emits, so a field a newer `q` at the
+/// far end knows and this one does not survives the trip (it would be dropped
+/// by re-serializing `view`).
+#[derive(Debug)]
+pub struct RemoteQuest {
+    pub view: QuestView,
+    pub raw: serde_json::Value,
+}
+
 /// One remote's Quests and how they were come by. Never an error: a machine
 /// that is down contributes a row saying so, not a failed command.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct RemoteResult {
     /// `remotes[].name` — the value of a Quest's `machine` column over there.
     pub name: String,
     pub ssh: String,
     pub status: RemoteStatus,
     /// This round's answer, or the last cached one when the round failed.
-    pub quests: Vec<QuestView>,
+    pub quests: Vec<RemoteQuest>,
     /// True when `quests` came out of the cache rather than off the wire.
     pub stale: bool,
     /// When `quests` were fetched. `None` when there is nothing to show at all.
@@ -451,6 +575,112 @@ pub fn fetch_all(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> Vec<Remote
     let argv = list_argv(all, state);
     let answers = fan_out(ctx.ssh(), &targets, &argv, TIMEOUT);
     resolve(ctx.db().ok(), &targets, answers, now())
+}
+
+// ----------------------------------------------------------------- polling
+
+/// One completed fan-out round on its way from the poller thread to the UI
+/// thread. Opaque on purpose: turning it into [`RemoteResult`]s needs the
+/// cache, and the database belongs to the thread that owns the `Ctx`.
+pub struct Round {
+    targets: Vec<Remote>,
+    answers: Vec<Result<Answer, RemoteStatus>>,
+}
+
+/// The TUI's remote tick (SPEC §17: `[ui] tick_remote`, 10 s, against 2 s
+/// locally).
+///
+/// One worker thread running one round at a time. The UI thread never waits on
+/// ssh — it looks in between frames with [`Poller::take`] and picks up whatever
+/// has finished — so a remote that is slow or dead costs a round, never a
+/// frame and never the local tick.
+///
+/// Single-threaded by design rather than by convenience: an ssh whose pipe is
+/// held open past the deadline leaves an abandoned drain holding its buffer
+/// until the far fd closes, which under `ControlPersist` is tens of seconds
+/// later. Rounds that could overlap would pile those up without bound; here a
+/// round cannot start until the last one has returned.
+pub struct Poller {
+    rounds: mpsc::Receiver<Round>,
+    /// Also the shutdown signal: dropping the `Poller` closes it, and the
+    /// worker exits at the end of the round it is in.
+    nudges: mpsc::SyncSender<()>,
+}
+
+impl Poller {
+    /// Start polling, or `None` when there is nothing to poll — no remotes,
+    /// `--no-remote`, or a `--machine` that is not one of them.
+    ///
+    /// The round is asked for the *whole* listing (`--all`), unlike the CLI's,
+    /// because the TUI's `f` toggle filters rows it already has rather than
+    /// re-fetching: a keypress must not have to wait for a fan-out.
+    pub fn spawn(ctx: &Ctx, every: Duration) -> Option<Poller> {
+        let targets: Vec<Remote> = targets(ctx).into_iter().cloned().collect();
+        if targets.is_empty() {
+            return None;
+        }
+        let ssh = ctx.ssh_shared();
+        let argv = list_argv(true, None);
+        let (send_round, rounds) = mpsc::channel();
+        let (nudges, wake) = mpsc::sync_channel(1);
+        // Detached: a round holds for at most `TIMEOUT`, and joining it would
+        // put that on the TUI's exit path for nothing.
+        std::thread::spawn(move || {
+            poll_loop(ssh.as_ref(), &targets, &argv, every, &send_round, &wake)
+        });
+        Some(Poller { rounds, nudges })
+    }
+
+    /// The newest round that has finished since the last look, if any. Never
+    /// blocks; older rounds are dropped rather than replayed.
+    pub fn take(&self) -> Option<Round> {
+        let mut latest = None;
+        while let Ok(round) = self.rounds.try_recv() {
+            latest = Some(round);
+        }
+        latest
+    }
+
+    /// Ask for a round now (the TUI's `x`). Coalesced: a nudge that arrives
+    /// while one is queued or running is dropped, so holding `x` down cannot
+    /// queue a fan-out per keypress.
+    pub fn nudge(&self) {
+        let _ = self.nudges.try_send(());
+    }
+}
+
+fn poll_loop(
+    ssh: &dyn Ssh,
+    targets: &[Remote],
+    argv: &[String],
+    every: Duration,
+    send_round: &mpsc::Sender<Round>,
+    wake: &mpsc::Receiver<()>,
+) {
+    loop {
+        let borrowed: Vec<&Remote> = targets.iter().collect();
+        let answers = fan_out(ssh, &borrowed, argv, TIMEOUT);
+        let round = Round {
+            targets: targets.to_vec(),
+            answers,
+        };
+        // The receiver is gone: the TUI has exited and this thread with it.
+        if send_round.send(round).is_err() {
+            return;
+        }
+        match wake.recv_timeout(every) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// A polled round, folded through the cache exactly as [`fetch_all`] folds a
+/// synchronous one.
+pub fn resolve_round(ctx: &Ctx, round: Round) -> Vec<RemoteResult> {
+    let targets: Vec<&Remote> = round.targets.iter().collect();
+    resolve(ctx.db().ok(), &targets, round.answers, now())
 }
 
 /// Every machine name `--machine` may name: this one, plus the remotes. Used to
@@ -509,7 +739,7 @@ fn fan_out(
             .into_iter()
             .map(|h| {
                 h.join().unwrap_or_else(|_| {
-                    Err(RemoteStatus::Unreachable(
+                    Err(RemoteStatus::unreachable(
                         "the ssh call panicked".to_string(),
                     ))
                 })
@@ -521,9 +751,12 @@ fn fan_out(
 /// One remote's answer: the Quests it sent and the bytes they arrived in. The
 /// bytes are what the cache keeps — re-serializing the parsed views would drop
 /// every field a newer `q` at the far end knows and this one does not.
+///
+/// `pub` because the TUI's [`Poller`] carries a whole round back from its own
+/// thread before the database on the UI thread turns it into [`RemoteResult`]s.
 #[derive(Debug)]
-struct Answer {
-    quests: Vec<QuestView>,
+pub struct Answer {
+    quests: Vec<RemoteQuest>,
     raw: String,
 }
 
@@ -532,20 +765,20 @@ struct Answer {
 /// another version of `q` all land on a status.
 fn interpret(outcome: SshOutcome, timeout: Duration) -> Result<Answer, RemoteStatus> {
     match outcome {
-        SshOutcome::TimedOut => Err(RemoteStatus::Unreachable(format!(
+        SshOutcome::TimedOut => Err(RemoteStatus::unreachable(format!(
             "no answer within {}s",
             timeout.as_secs()
         ))),
-        SshOutcome::Failed(e) => Err(RemoteStatus::Unreachable(e)),
+        SshOutcome::Failed(e) => Err(RemoteStatus::unreachable(e)),
         SshOutcome::Done {
             code,
             stdout,
             stderr,
         } => {
             if code != Some(0) {
-                return Err(RemoteStatus::Unreachable(exit_reason(code, &stderr)));
+                return Err(RemoteStatus::unreachable(exit_reason(code, &stderr)));
             }
-            let quests = parse(&stdout).map_err(RemoteStatus::Incompatible)?;
+            let quests = parse(&stdout).map_err(RemoteStatus::incompatible)?;
             Ok(Answer {
                 quests,
                 raw: stdout.trim().to_string(),
@@ -566,14 +799,42 @@ fn exit_reason(code: Option<i32>, stderr: &str) -> String {
     }
 }
 
-/// `q list --json` is an array of [`QuestView`]. Unknown fields are ignored, so
-/// a newer `q` at the far end still parses; a missing required one does not.
-pub fn parse(stdout: &str) -> Result<Vec<QuestView>, String> {
+/// The far end's `q list --json`, row by row.
+///
+/// The document is the envelope `q list --json` emits — `{"quests": [...],
+/// "machines": [...]}` — and a bare array is accepted as well, which is what a
+/// `q` from before the envelope sends and what its cache rows still hold. Only
+/// `quests` is read: a remote's own `machines` describes *its* fan-out, and
+/// under `--no-remote` it never has one.
+///
+/// Each row is kept twice (see [`RemoteQuest`]): parsed, and verbatim. Unknown
+/// fields are ignored by the parse and survive in the verbatim copy, so a newer
+/// `q` at the far end still lists; a missing required field does not parse.
+pub fn parse(stdout: &str) -> Result<Vec<RemoteQuest>, String> {
     let text = stdout.trim();
     if text.is_empty() {
         return Err("empty response".to_string());
     }
-    serde_json::from_str(text).map_err(|e| format!("cannot read `q list --json`: {e}"))
+    let document: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("cannot read `q list --json`: {e}"))?;
+    let rows = match &document {
+        serde_json::Value::Array(rows) => rows,
+        serde_json::Value::Object(map) => match map.get(QUESTS).and_then(|q| q.as_array()) {
+            Some(rows) => rows,
+            None => return Err("`q list --json` has no `quests` array".to_string()),
+        },
+        _ => return Err("`q list --json` is neither an array nor an object".to_string()),
+    };
+    rows.iter()
+        .map(|raw| {
+            serde_json::from_value(raw.clone())
+                .map(|view| RemoteQuest {
+                    view,
+                    raw: raw.clone(),
+                })
+                .map_err(|e| format!("cannot read a quest in `q list --json`: {e}"))
+        })
+        .collect()
 }
 
 /// Pairs each answer with its remote, writing the good ones to the cache and
@@ -621,10 +882,18 @@ fn resolve(
 /// remote called `ws`. The config name is the one the user types into
 /// `--machine` and the one this `q` shows in the machine column, so every row
 /// is stamped with it; the remote's own idea of its name is not carried over.
-fn attribute(quests: &mut [QuestView], name: &str) {
+fn attribute(quests: &mut [RemoteQuest], name: &str) {
     for quest in quests {
-        if quest.quest.machine != name {
-            quest.quest.machine = name.to_string();
+        if quest.view.quest.machine != name {
+            quest.view.quest.machine = name.to_string();
+        }
+        // The verbatim row is what `--json` re-emits, so it is stamped too:
+        // a consumer must never see two names for one machine.
+        if let Some(row) = quest.raw.as_object_mut() {
+            row.insert(
+                MACHINE.to_string(),
+                serde_json::Value::String(name.to_string()),
+            );
         }
     }
 }
@@ -637,16 +906,14 @@ fn store(db: Option<&Db>, name: &str, payload: &str, ts: i64) {
     let _ = db.put_remote_cache(name, payload, ts);
 }
 
-fn load(db: Option<&Db>, name: &str) -> Option<(Vec<QuestView>, i64)> {
+fn load(db: Option<&Db>, name: &str) -> Option<(Vec<RemoteQuest>, i64)> {
     let cached = db?.get_remote_cache(name).ok().flatten()?;
     let mut quests = parse(&cached.payload).ok()?;
     attribute(&mut quests, name);
     Some((quests, cached.fetched_at))
 }
 
-/// The configured remote called `name`, for the commands that dispatch to one
-/// (bd-8lz.5.3).
-#[allow(dead_code)]
+/// The configured remote called `name`, for the commands that dispatch to one.
 pub fn find<'a>(remotes: &'a [Remote], name: &str) -> anyhow::Result<&'a Remote> {
     remotes.iter().find(|r| r.name == name).ok_or_else(|| {
         QError::NotFound(format!("remote `{name}` (see `[[remotes]]` in the config)")).into()
@@ -669,6 +936,21 @@ pub(crate) mod stub {
         fn run(&self, _: &str, _: &[&str], _: Duration) -> SshOutcome {
             SshOutcome::Failed("this test has no ssh (pass one with `Ctx::with_ssh`)".to_string())
         }
+
+        fn attach(&self, alias: &str, _: &[String]) -> anyhow::Result<()> {
+            Err(no_ssh(alias))
+        }
+
+        fn attach_child(&self, alias: &str, _: &[String]) -> anyhow::Result<()> {
+            Err(no_ssh(alias))
+        }
+    }
+
+    fn no_ssh(alias: &str) -> anyhow::Error {
+        crate::error::QError::Other(format!(
+            "this test has no ssh (pass one with `Ctx::with_ssh`): {alias}"
+        ))
+        .into()
     }
 
     /// A scriptable ssh that records what it was asked, and how many calls
@@ -683,6 +965,7 @@ pub(crate) mod stub {
     #[derive(Default)]
     struct StubState {
         calls: Vec<(String, Vec<String>)>,
+        attaches: Vec<(String, String, Vec<String>)>,
         running: usize,
         peak: usize,
     }
@@ -713,6 +996,20 @@ pub(crate) mod stub {
         pub(crate) fn peak(&self) -> usize {
             self.state.lock().unwrap().peak
         }
+
+        /// Every attach, as `(kind, alias, argv)` — `kind` is `exec` or
+        /// `child`, the `[ui] return_after_detach` split.
+        pub(crate) fn attaches(&self) -> Vec<(String, String, Vec<String>)> {
+            self.state.lock().unwrap().attaches.clone()
+        }
+
+        fn record_attach(&self, kind: &str, alias: &str, argv: &[String]) {
+            self.state.lock().unwrap().attaches.push((
+                kind.to_string(),
+                alias.to_string(),
+                argv.to_vec(),
+            ));
+        }
     }
 
     impl Ssh for StubSsh {
@@ -734,6 +1031,17 @@ pub(crate) mod stub {
                 .get(alias)
                 .cloned()
                 .unwrap_or_else(|| SshOutcome::Failed(format!("no stub host `{alias}`")))
+        }
+
+        /// Recorded, never run: a stub that `exec`ed would replace the test.
+        fn attach(&self, alias: &str, argv: &[String]) -> anyhow::Result<()> {
+            self.record_attach("exec", alias, argv);
+            Ok(())
+        }
+
+        fn attach_child(&self, alias: &str, argv: &[String]) -> anyhow::Result<()> {
+            self.record_attach("child", alias, argv);
+            Ok(())
         }
     }
 }
@@ -852,7 +1160,7 @@ mod tests {
         // The answers keep config order whatever order they arrived in.
         let slugs: Vec<&str> = answers
             .iter()
-            .map(|a| a.as_ref().unwrap().quests[0].quest.slug.as_str())
+            .map(|a| a.as_ref().unwrap().quests[0].view.quest.slug.as_str())
             .collect();
         assert_eq!(slugs, ["one", "two", "three"]);
         assert_eq!(ssh.calls()[0].1, LIST_ARGV);
@@ -896,14 +1204,32 @@ mod tests {
     fn garbage_and_foreign_json_are_incompatible_not_a_panic() {
         for stdout in [
             "not json at all",
-            "{\"quests\": []}",
+            // An object without the envelope key.
+            "{\"rows\": []}",
+            // A row that is not a Quest.
             "[{\"id\": \"q-1\"}]",
+            "{\"quests\": [{\"id\": \"q-1\"}]}",
+            "42",
             "",
             "   \n",
         ] {
             let status = interpret(ok(stdout.to_string()), TIMEOUT).unwrap_err();
             assert_eq!(status.marker(), Some(INCOMPATIBLE), "accepted `{stdout}`");
         }
+    }
+
+    /// Both shapes of the wire format: the envelope `q list --json` emits now,
+    /// and the bare array a `q` from before it sends — which is also what its
+    /// cache rows still hold.
+    #[test]
+    fn the_envelope_and_the_bare_array_both_parse() {
+        let array = payload("one");
+        let enveloped = format!("{{\"quests\": {array}, \"machines\": []}}");
+        for text in [array.as_str(), enveloped.as_str(), "{\"quests\": []}"] {
+            let quests = parse(text).unwrap_or_else(|e| panic!("{text} → {e}"));
+            assert!(quests.len() <= 1);
+        }
+        assert_eq!(parse(&enveloped).unwrap()[0].view.quest.slug, "one");
     }
 
     #[test]
@@ -913,8 +1239,8 @@ mod tests {
         // And a field this q knows but an older one never sent.
         value[0].as_object_mut().unwrap().remove("progress");
         let quests = parse(&value.to_string()).unwrap();
-        assert_eq!(quests[0].quest.slug, "one");
-        assert_eq!(quests[0].progress, None);
+        assert_eq!(quests[0].view.quest.slug, "one");
+        assert_eq!(quests[0].view.progress, None);
     }
 
     #[test]
@@ -927,13 +1253,13 @@ mod tests {
         assert_eq!(fresh[0].status, RemoteStatus::Ok);
         assert!(!fresh[0].stale);
         assert_eq!(fresh[0].fetched_at, Some(1000));
-        assert_eq!(fresh[0].quests[0].quest.slug, "one");
+        assert_eq!(fresh[0].quests[0].view.quest.slug, "one");
         assert_eq!(fresh[0].note(), None);
 
         let down = resolve(
             Some(&db),
             &targets,
-            vec![Err(RemoteStatus::Unreachable("host is down".to_string()))],
+            vec![Err(RemoteStatus::unreachable("host is down".to_string()))],
             2000,
         );
         assert!(down[0].stale, "the cache was not used");
@@ -942,7 +1268,7 @@ mod tests {
             Some(1000),
             "the stale timestamp is kept"
         );
-        assert_eq!(down[0].quests[0].quest.slug, "one");
+        assert_eq!(down[0].quests[0].view.quest.slug, "one");
         let note = down[0].note().unwrap();
         assert!(
             note.contains(UNREACHABLE) && note.contains("host is down"),
@@ -958,7 +1284,7 @@ mod tests {
         let out = resolve(
             Some(&db),
             &targets,
-            vec![Err(RemoteStatus::Unreachable("nope".to_string()))],
+            vec![Err(RemoteStatus::unreachable("nope".to_string()))],
             10,
         );
         assert!(out[0].quests.is_empty());
@@ -975,13 +1301,13 @@ mod tests {
         let out = resolve(
             None,
             &targets,
-            vec![Err(RemoteStatus::Unreachable("x".to_string()))],
+            vec![Err(RemoteStatus::unreachable("x".to_string()))],
             1,
         );
         assert!(out[0].quests.is_empty());
     }
 
-    fn ctx_with(remotes: &[Remote], ssh: Box<dyn Ssh>) -> Ctx {
+    fn ctx_with(remotes: &[Remote], ssh: std::sync::Arc<dyn Ssh>) -> Ctx {
         let mut config = crate::config::Config::default();
         config.machine.name = "laptop".to_string();
         config.remotes = remotes.to_vec();
@@ -1000,7 +1326,7 @@ mod tests {
     fn no_remotes_configured_means_no_ssh_at_all() {
         // `NoSsh` fails every call, so a single invocation would show up as an
         // unreachable row rather than as nothing.
-        let ctx = ctx_with(&[], Box::new(stub::NoSsh));
+        let ctx = ctx_with(&[], Arc::new(stub::NoSsh));
         assert!(targets(&ctx).is_empty());
         assert!(fetch_all(&ctx, false, None).is_empty());
     }
@@ -1008,12 +1334,12 @@ mod tests {
     #[test]
     fn no_remote_skips_the_fan_out() {
         let remotes = [remote("ws")];
-        let ctx = ctx_with(&remotes, Box::new(stub::NoSsh)).with_no_remote(true);
+        let ctx = ctx_with(&remotes, Arc::new(stub::NoSsh)).with_no_remote(true);
         assert!(targets(&ctx).is_empty());
         assert!(fetch_all(&ctx, false, None).is_empty());
 
         // The same config without the guard does reach for the remote.
-        let ctx = ctx_with(&remotes, Box::new(stub::NoSsh));
+        let ctx = ctx_with(&remotes, Arc::new(stub::NoSsh));
         assert_eq!(names(&fetch_all(&ctx, false, None)), ["ws"]);
     }
 
@@ -1021,10 +1347,10 @@ mod tests {
     fn a_machine_filter_narrows_the_fan_out_to_that_one_remote() {
         let remotes = [remote("ws"), remote("box")];
         let ssh = || {
-            Box::new(StubSsh::new(&[
+            Arc::new(StubSsh::new(&[
                 ("ws-host", ok(payload("one"))),
                 ("box-host", ok(payload("two"))),
-            ])) as Box<dyn Ssh>
+            ])) as Arc<dyn Ssh>
         };
         assert_eq!(
             names(&fetch_all(&ctx_with(&remotes, ssh()), false, None)),
@@ -1039,7 +1365,7 @@ mod tests {
             ["box"]
         );
         // The local machine is not a remote: nothing to ask.
-        let ctx = ctx_with(&remotes, Box::new(stub::NoSsh)).with_machine(Some("laptop"));
+        let ctx = ctx_with(&remotes, Arc::new(stub::NoSsh)).with_machine(Some("laptop"));
         assert!(fetch_all(&ctx, false, None).is_empty());
     }
 
@@ -1050,9 +1376,9 @@ mod tests {
             ("up-host", ok(payload("one"))),
             ("down-host", SshOutcome::TimedOut),
         ]);
-        let results = fetch_all(&ctx_with(&remotes, Box::new(ssh)), false, None);
+        let results = fetch_all(&ctx_with(&remotes, Arc::new(ssh)), false, None);
         assert_eq!(results[0].status, RemoteStatus::Ok);
-        assert_eq!(results[0].quests[0].quest.slug, "one");
+        assert_eq!(results[0].quests[0].view.quest.slug, "one");
         assert_eq!(results[1].status.marker(), Some(UNREACHABLE));
         assert!(results[1].quests.is_empty());
     }
@@ -1193,16 +1519,16 @@ mod tests {
 
         let raw = payload_from("workstation", "over-there");
         let fresh = resolve(Some(&db), &targets, vec![Ok(answer(&raw))], 1000);
-        assert_eq!(fresh[0].quests[0].quest.machine, "ws");
+        assert_eq!(fresh[0].quests[0].view.quest.machine, "ws");
 
         let down = resolve(
             Some(&db),
             &targets,
-            vec![Err(RemoteStatus::Unreachable("down".to_string()))],
+            vec![Err(RemoteStatus::unreachable("down".to_string()))],
             2000,
         );
         assert!(down[0].stale);
-        assert_eq!(down[0].quests[0].quest.machine, "ws");
+        assert_eq!(down[0].quests[0].view.quest.machine, "ws");
     }
 
     #[test]
@@ -1220,6 +1546,123 @@ mod tests {
         assert_eq!(cached.payload, raw, "the payload was re-serialized");
         let back: serde_json::Value = serde_json::from_str(&cached.payload).unwrap();
         assert_eq!(back[0]["something_from_the_future"], "hello");
+    }
+
+    // ------------------------------------------------------- attach & polling
+
+    #[test]
+    fn an_interactive_ssh_asks_for_a_tty_and_nothing_else() {
+        // No `BatchMode`, no `ConnectTimeout`: there is someone at the
+        // keyboard, and an attach has no deadline.
+        assert_eq!(
+            attach_argv("ws-host", &["tmux".to_string(), "attach".to_string()]),
+            ["-t", "ws-host", "tmux", "attach"]
+        );
+    }
+
+    #[test]
+    fn an_argument_that_is_more_than_one_shell_word_is_quoted() {
+        assert_eq!(sh_quote("=q-alpha"), "=q-alpha");
+        assert_eq!(sh_quote("tmux"), "tmux");
+        assert_eq!(sh_quote("=q alpha"), "'=q alpha'");
+        assert_eq!(sh_quote("a'b"), r"'a'\''b'");
+        assert_eq!(sh_quote(""), "''");
+        assert_eq!(sh_quote("; rm -rf /"), "'; rm -rf /'");
+    }
+
+    #[test]
+    fn an_attach_is_recorded_rather_than_run_by_the_stub() {
+        let ssh = StubSsh::new(&[]);
+        let argv = vec!["tmux".to_string(), "attach".to_string()];
+        ssh.attach("ws-host", &argv).unwrap();
+        ssh.attach_child("ws-host", &argv).unwrap();
+        assert_eq!(
+            ssh.attaches(),
+            [
+                ("exec".to_string(), "ws-host".to_string(), argv.clone()),
+                ("child".to_string(), "ws-host".to_string(), argv),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_poller_has_nothing_to_poll_without_remotes() {
+        let ctx = ctx_with(&[], Arc::new(stub::NoSsh));
+        assert!(Poller::spawn(&ctx, Duration::from_millis(1)).is_none());
+
+        let remotes = [remote("ws")];
+        let ctx = ctx_with(&remotes, Arc::new(stub::NoSsh)).with_no_remote(true);
+        assert!(Poller::spawn(&ctx, Duration::from_millis(1)).is_none());
+
+        // Pinned to the local machine: there is no remote in the listing.
+        let ctx = ctx_with(&remotes, Arc::new(stub::NoSsh)).with_machine(Some("laptop"));
+        assert!(Poller::spawn(&ctx, Duration::from_millis(1)).is_none());
+    }
+
+    /// The property the TUI depends on: rounds arrive without the caller ever
+    /// waiting on ssh, and two of them are never in flight at once — an
+    /// abandoned pipe drain outlives its round, so overlapping rounds would
+    /// pile them up (SPEC §23 #6).
+    #[test]
+    fn the_poller_delivers_rounds_and_never_overlaps_two() {
+        let stub = Arc::new(
+            StubSsh::new(&[
+                ("ws-host", ok(payload("one"))),
+                ("box-host", ok(payload("two"))),
+            ])
+            .with_delay(Duration::from_millis(20)),
+        );
+        let remotes = [remote("ws"), remote("box")];
+        let ctx = ctx_with(&remotes, stub.clone() as Arc<dyn Ssh>);
+        let poller = Poller::spawn(&ctx, Duration::from_millis(1)).expect("two remotes to poll");
+
+        let deadline = Instant::now() + PATIENCE;
+        let mut rounds = 0;
+        while rounds < 3 && Instant::now() < deadline {
+            if let Some(round) = poller.take() {
+                let results = resolve_round(&ctx, round);
+                assert_eq!(names(&results), ["ws", "box"]);
+                assert_eq!(results[0].quests[0].view.quest.slug, "one");
+                rounds += 1;
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert_eq!(rounds, 3, "the poller stopped delivering");
+        // Two remotes are asked at once; two *rounds* never are.
+        assert_eq!(stub.peak(), 2, "rounds overlapped");
+        drop(poller);
+    }
+
+    /// `x` in the TUI nudges the poller. Coalesced: a nudge that arrives while
+    /// one is already queued is dropped, so holding the key down cannot queue
+    /// a fan-out per keypress.
+    #[test]
+    fn nudges_are_coalesced_rather_than_queued() {
+        let stub = Arc::new(StubSsh::new(&[("ws-host", ok(payload("one")))]));
+        let remotes = [remote("ws")];
+        let ctx = ctx_with(&remotes, stub.clone() as Arc<dyn Ssh>);
+        // Long enough that nothing here is the periodic tick.
+        let poller = Poller::spawn(&ctx, Duration::from_secs(600)).expect("a remote to poll");
+
+        // The round every poller opens with.
+        let deadline = Instant::now() + PATIENCE;
+        while poller.take().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for _ in 0..20 {
+            poller.nudge();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let mut extra = 0;
+        while poller.take().is_some() {
+            extra += 1;
+        }
+        // At least the nudge was honoured, and nowhere near twenty of them:
+        // the queue holds one, plus at most the round already running.
+        assert!((1..=2).contains(&extra), "{extra} rounds for twenty nudges");
+        assert!(stub.calls().len() <= 3, "{:?}", stub.calls());
+        drop(poller);
     }
 
     #[test]

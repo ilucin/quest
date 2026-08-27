@@ -126,8 +126,9 @@ fn args(parts: &[&str]) -> Vec<String> {
 }
 
 /// tmux matches `-t` targets by prefix unless they start with `=`; without it
-/// `q-a` would happily resolve to `q-alpha`.
-fn exact(target: &str) -> String {
+/// `q-a` would happily resolve to `q-alpha`. `pub` because the remote attach
+/// (SPEC §15) builds the same target for a tmux on another machine.
+pub fn exact(target: &str) -> String {
     format!("={target}")
 }
 
