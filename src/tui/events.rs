@@ -646,15 +646,16 @@ fn cells_of(row: &EventRow) -> Cells {
 }
 
 /// The widest cell in each column, so the columns line up across the tail
-/// rather than per screenful.
-fn widths_of(cells: &[Cells], across: bool) -> [usize; 4] {
-    let mut w = [0usize; 4];
+/// rather than per screenful. The kind is not among them: it is last on the
+/// meta line in two-line mode and alone on its own line in three, so nothing
+/// follows it that padding would line up.
+fn widths_of(cells: &[Cells], across: bool) -> [usize; 3] {
+    let mut w = [0usize; 3];
     for c in cells {
         let each = [
             layout::width(&c.age),
             if across { layout::width(&c.quest) } else { 0 },
             layout::width(&c.session),
-            layout::width(&c.kind),
         ];
         for (at, value) in each.into_iter().enumerate() {
             w[at] = w[at].max(value);
@@ -663,11 +664,13 @@ fn widths_of(cells: &[Cells], across: bool) -> [usize; 4] {
     w
 }
 
-/// One event, on one line when the terminal is wide enough for it and on two
-/// when SPEC §17's narrow band puts the payload underneath.
+/// One event: when, where and what kind, with the payload on a line of its
+/// own underneath. SPEC §17's narrow band gets a third line, and spends it the
+/// way the Quests tab spends its own — moving the fixed-width fact (here the
+/// kind) off the meta line so the variable-width one keeps the full terminal.
 fn row_lines<'a>(
     c: &Cells,
-    w: &[usize; 4],
+    w: &[usize; 3],
     across: bool,
     selected: bool,
     width: usize,
@@ -686,24 +689,36 @@ fn row_lines<'a>(
         head.push(' ');
     }
     head.push_str(&pad(&c.session, w[2]));
-    head.push(' ');
-    if per_row > 1 {
+    let three = per_row >= 3;
+    if !three {
+        head.push(' ');
         head.push_str(&c.kind);
-        return vec![
-            Line::from(Span::styled(layout::truncate(&head, width), style)),
-            Line::from(Span::styled(
-                layout::truncate(&format!("{INDENT}{}", c.payload), width),
-                style,
-            )),
-        ];
     }
-    head.push_str(&pad(&c.kind, w[3]));
-    head.push(' ');
-    head.push_str(&c.payload);
-    vec![Line::from(Span::styled(
-        layout::truncate(&head, width),
-        style,
-    ))]
+    let mut out = vec![
+        Line::from(Span::styled(
+            layout::truncate(head.trim_end(), width),
+            style,
+        )),
+        Line::from(Span::styled(
+            layout::truncate(&format!("{INDENT}{}", c.payload), width),
+            style,
+        )),
+    ];
+    if three {
+        // Dim only when the row is not the selected one: the cursor's
+        // reversed block is what says which event is which, and dimming
+        // inside it would break the block up.
+        let kind = if selected {
+            style
+        } else {
+            style.add_modifier(Modifier::DIM)
+        };
+        out.push(Line::from(Span::styled(
+            layout::truncate(&format!("{INDENT}{}", c.kind), width),
+            kind,
+        )));
+    }
+    out
 }
 
 /// Right-pad to `want` display columns. `format!("{:w$}")` counts `char`s, and
@@ -1507,6 +1522,63 @@ mod tests {
             assert!(
                 lines.iter().any(|l| l.contains("note")),
                 "the long row swallowed the next one at {w}: {lines:?}"
+            );
+            // Where the kind sits is the difference between the two bands, and
+            // the narrow one only earns its third line by drawing it.
+            let own_line = lines
+                .iter()
+                .any(|l| l.trim_end() == format!("{INDENT}session.prompt"));
+            assert_eq!(
+                own_line,
+                mode == layout::RowMode::Three,
+                "the kind is on the wrong line at {w}: {lines:?}"
+            );
+        }
+    }
+
+    /// N1: SPEC §17's narrow band is three lines per event, and `viewport` —
+    /// which is what `PageDown` steps by — counts on it. A band that budgets
+    /// three and draws two leaves every third body line permanently blank and
+    /// puts paging out of step with what is on screen.
+    #[test]
+    fn the_narrow_band_draws_every_line_it_budgets_for() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        let session = rig.session(&quest, "worker");
+        for n in 0..6 {
+            rig.event_with(
+                &quest,
+                Some(&session),
+                &format!("kind.{n}"),
+                serde_json::json!({ "text": format!("payload {n}") }),
+            );
+        }
+        let mut app = rig.app();
+
+        for (w, per_row) in [(120u16, 2usize), (60, 3)] {
+            app.set_size(w, 14);
+            app.handle(Input::Char('G'));
+            assert_eq!(app.row_mode().lines() as usize, per_row);
+            let lines = draw(&mut app, w, 14);
+            let body: Vec<&String> = lines[1..lines.len() - 1].iter().collect();
+            let heads = body
+                .iter()
+                .filter(|l| !l.is_empty() && !l.starts_with(INDENT))
+                .count();
+            let drawn = body.iter().filter(|l| !l.is_empty()).count();
+            assert_eq!(
+                drawn,
+                heads * per_row,
+                "{w}: {heads} rows drew {drawn} lines: {body:?}"
+            );
+            // `viewport` is how many rows the body holds, so it is also how
+            // many the loop drew.
+            assert_eq!(viewport(&app), heads, "{w}: {body:?}");
+            // Every line of the selected row is on screen, kind included.
+            let row = app.events.selected_row().unwrap();
+            assert!(
+                body.iter().any(|l| l.contains(&row.event.kind)),
+                "{w}: the selected row lost its kind: {body:?}"
             );
         }
     }
