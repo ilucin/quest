@@ -706,13 +706,23 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         let view = &state.rows[*i];
         let at = rank(view);
-        // The header only goes in when its row fits under it. Pushing the pair
-        // and truncating afterwards left a header with nothing beneath it —
-        // and at a one-line body that swallowed the selected row entirely.
-        if group != Some(at) && left >= 2 {
-            lines.push(Line::from(
-                Span::raw(layout::truncate(group_title(at), width)).dim(),
-            ));
+        // A heading and its first row go on screen together or not at all:
+        // pushing the pair and truncating afterwards left a header with
+        // nothing beneath it, and dropping only the header put the row under
+        // the PREVIOUS group's heading. With one line left the whole group is
+        // held over — `settle` has already fitted the selected row above here.
+        // The exception is a one-line body, where the row is all there is room
+        // for and no heading is above it to mislabel it.
+        if group != Some(at) {
+            if left < 2 {
+                if !lines.is_empty() {
+                    break;
+                }
+            } else {
+                lines.push(Line::from(
+                    Span::raw(layout::truncate(group_title(at), width)).dim(),
+                ));
+            }
         }
         group = Some(at);
         lines.push(row_line(
@@ -873,7 +883,7 @@ mod tests {
 
     /// How a session is described to [`Rig::session`].
     struct Spec {
-        label: &'static str,
+        label: String,
         role: SessionRole,
         status: SessionStatus,
         phase: Option<&'static str>,
@@ -882,9 +892,9 @@ mod tests {
         updated_at: i64,
     }
 
-    fn spec(label: &'static str, status: SessionStatus) -> Spec {
+    fn spec(label: &str, status: SessionStatus) -> Spec {
         Spec {
-            label,
+            label: label.to_string(),
             role: SessionRole::Worker,
             status,
             phase: None,
@@ -933,7 +943,7 @@ mod tests {
             let mut row = Session::new(
                 quest.id.as_str(),
                 spec.role,
-                spec.label,
+                &spec.label,
                 &tmux_session,
                 pane,
             );
@@ -952,7 +962,7 @@ mod tests {
             }
             let row = self.db().insert_session(&row).unwrap();
             if !pane.is_empty() && spec.status != SessionStatus::Ended {
-                self.add_pane(&tmux_session, spec.label, pane);
+                self.add_pane(&tmux_session, &spec.label, pane);
             }
             row
         }
@@ -1235,8 +1245,10 @@ mod tests {
     fn the_viewport_only_pays_for_the_groups_the_listing_actually_has() {
         let rig = Rig::new();
         let quest = rig.quest("alpha");
-        for (n, label) in ["w1", "w2", "w3", "w4", "w5", "w6"].into_iter().enumerate() {
-            let mut row = spec(label, SessionStatus::Idle);
+        // More rows than either page, so the clamp cannot stand in for the
+        // step and the PageDown assertion tells the two page sizes apart.
+        for n in 0..12u8 {
+            let mut row = spec(&format!("w{n}"), SessionStatus::Idle);
             row.updated_at = 1_000 + n as i64;
             rig.session(&quest, &format!("%{}", n + 1), row);
         }
@@ -1248,7 +1260,9 @@ mod tests {
         // PageDown moves by that page rather than by a constant.
         assert_eq!(app.sessions.selected, 0);
         handle(&mut app, Input::PageDown);
-        assert_eq!(app.sessions.selected, 5, "PageDown paged by the wrong step");
+        assert_eq!(app.sessions.selected, 9, "PageDown paged by the wrong step");
+        handle(&mut app, Input::PageUp);
+        assert_eq!(app.sessions.selected, 0, "PageUp paged by the wrong step");
     }
 
     /// The same off-by-one at the bottom of the loop: the header and its row
@@ -1283,6 +1297,114 @@ mod tests {
                 lines.join("\n")
             );
         }
+    }
+
+    /// R2-1. The round-2 review's exhaustive probe, kept as a test: every fleet
+    /// shape x every body height x every selection, asserting all three
+    /// viewport properties at once. Suppressing the header on the last line
+    /// without also dropping its row traded orphan headers for rows drawn
+    /// under the PREVIOUS group's heading.
+    #[test]
+    fn no_row_ever_renders_under_another_group_s_header() {
+        const SHAPES: [[usize; GROUPS]; 9] = [
+            [1, 1, 1, 9, 0],
+            [1, 1, 1, 1, 1],
+            [3, 0, 0, 3, 0],
+            [0, 1, 0, 1, 0],
+            [2, 2, 2, 2, 2],
+            [1, 0, 1, 0, 1],
+            [0, 0, 0, 5, 0],
+            [4, 1, 0, 0, 1],
+            [1, 2, 3, 4, 1],
+        ];
+        const STATUSES: [SessionStatus; GROUPS] = [
+            SessionStatus::Waiting,
+            SessionStatus::Busy,
+            SessionStatus::Starting,
+            SessionStatus::Idle,
+            SessionStatus::Ended,
+        ];
+        const HEADERS: [&str; GROUPS] = ["waiting", "busy", "starting", "idle", "ended"];
+
+        // The label carries its own group, so a row can be checked against the
+        // heading it actually ended up under.
+        fn group_of(line: &str) -> Option<usize> {
+            line.split_whitespace().find_map(|token| {
+                HEADERS.iter().position(|h| {
+                    token.strip_prefix(h).is_some_and(|rest| {
+                        !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+                    })
+                })
+            })
+        }
+
+        let mut orphans = 0;
+        let mut mislabelled = 0;
+        let mut invisible = 0;
+        let mut first = String::new();
+        for shape in SHAPES {
+            let rig = Rig::new();
+            let quest = rig.quest("alpha");
+            let mut pane = 0i64;
+            for (at, count) in shape.iter().enumerate() {
+                for n in 0..*count {
+                    pane += 1;
+                    let mut row = spec(&format!("{}{n}", HEADERS[at]), STATUSES[at]);
+                    row.updated_at = 9_000 - pane;
+                    rig.session(&quest, &format!("%{pane}"), row);
+                }
+            }
+            let mut app = rig.app();
+            app.sessions.show_ended = true;
+            refresh(&rig.ctx, &mut app).unwrap();
+            let len = app.sessions.visible().len();
+            assert_eq!(len, shape.iter().sum::<usize>(), "{shape:?}");
+
+            for body_h in 1..=20u16 {
+                for sel in 0..len {
+                    app.sessions.selected = sel;
+                    app.sessions.offset = 0;
+                    let lines = draw(&mut app, 120, body_h + 2);
+                    let body: Vec<&str> =
+                        lines[1..lines.len() - 1].iter().map(|l| l.trim()).collect();
+                    let mut blame = |what: &str| {
+                        if first.is_empty() {
+                            first = format!(
+                                "{what} \u{b7} {shape:?} h={body_h} sel={sel}\n{}",
+                                lines.join("\n")
+                            );
+                        }
+                    };
+                    let mut under: Option<usize> = None;
+                    for (n, line) in body.iter().enumerate() {
+                        if let Some(at) = HEADERS.iter().position(|h| h == line) {
+                            let next = body.get(n + 1).copied().unwrap_or("");
+                            if next.is_empty() || HEADERS.contains(&next) {
+                                orphans += 1;
+                                blame(&format!("orphan header `{line}`"));
+                            }
+                            under = Some(at);
+                            continue;
+                        }
+                        let Some(at) = group_of(line) else { continue };
+                        if let Some(seen) = under.filter(|seen| *seen != at) {
+                            mislabelled += 1;
+                            blame(&format!("`{line}` under `{}`", HEADERS[seen]));
+                        }
+                        under = Some(at);
+                    }
+                    if !body.iter().any(|l| l.starts_with('\u{25b8}')) {
+                        invisible += 1;
+                        blame("the selection is invisible");
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            (orphans, mislabelled, invisible),
+            (0, 0, 0),
+            "orphan headers / mislabelled rows / invisible selections\n{first}"
+        );
     }
 
     // ------------------------------------------------- the Quests hand-off

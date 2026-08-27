@@ -150,6 +150,17 @@ fn attempt(ctx: &Ctx, args: &Args, scheduled: bool) -> anyhow::Result<u8> {
     // the caller's own terminal. The gate cannot catch it: a `starting` row that
     // a hook marked idle passes.
     found.require_pane()?;
+    // The same cooldown `Z` takes, for the same reason: a `q reset` typed by
+    // hand on top of a reset the `Stop` hook has just scheduled runs two
+    // children, and the second clears the context window the first just made
+    // (SPEC §8). The scheduled path is exempt — it *is* that reset.
+    if !scheduled && recently_scheduled(db, &found.quest.id, &session.id) {
+        return Err(QError::Conflict(format!(
+            "{} already has a reset scheduled; wait for it",
+            found.name()
+        ))
+        .into());
+    }
 
     let (verdict, refusal) = found.idle_gate(ctx);
     if let Some(reason) = refusal {
@@ -718,6 +729,75 @@ mod tests {
         assert!(spawn_detached_with(&ctx, &found, Strategy::Clear, &launcher.as_fn()).is_err());
         assert_eq!(launcher.calls(), 1);
         assert_eq!(scheduled_events(ctx.db().unwrap(), &quest.id).len(), 1);
+    }
+
+    /// R2-4: the same race one keystroke removed. `Z` took the cooldown but a
+    /// `q reset` typed by hand in another terminal did not, so it fired a
+    /// second child on top of the one the `Stop` hook had just scheduled.
+    #[test]
+    fn a_hand_typed_reset_will_not_double_fire_on_a_scheduled_one() {
+        let (ctx, _dir, quest, found) = manual_fleet(SessionStatus::Idle, "%1");
+        let launcher = Launcher::new();
+        // The `Stop` hook gets there first.
+        assert!(
+            schedule(
+                ctx.db().unwrap(),
+                &found.session,
+                &ctx.config,
+                &launcher.as_fn()
+            )
+            .is_some()
+        );
+
+        let args = Args {
+            session: &found.session.id,
+            delay: None,
+            strategy: Some(Strategy::Clear),
+        };
+        let error = run(&ctx, &args).expect_err("the hand-typed reset was let through");
+        assert!(
+            format!("{error:#}").contains("already has a reset scheduled"),
+            "{error:#}"
+        );
+        // Refused before anything was typed at the master, and without a
+        // second `session.reset_scheduled` of its own.
+        let db = ctx.db().unwrap();
+        assert!(
+            db.list_events_by_kinds(&quest.id, &["session.reset"], 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(scheduled_events(db, &quest.id).len(), 1);
+    }
+
+    /// And the cooldown must not refuse the child that event is *about*: the
+    /// scheduled path is the reset the hook asked for.
+    #[test]
+    fn the_scheduled_child_is_not_refused_by_the_event_that_scheduled_it() {
+        let (ctx, _dir, quest, found) = manual_fleet(SessionStatus::Busy, "%1");
+        let db = ctx.db().unwrap();
+        db.append_event(
+            &quest.id,
+            Some(&found.session.id),
+            "session.reset_scheduled",
+            &serde_json::json!({ "delay": SCHEDULED_DELAY }),
+        )
+        .unwrap();
+
+        let args = Args {
+            session: &found.session.id,
+            delay: Some(0),
+            strategy: Some(Strategy::Clear),
+        };
+        // `busy` stops it at the idle gate — the point is that it got that far
+        // instead of being turned away by its own cooldown.
+        assert_eq!(run(&ctx, &args).unwrap(), 0);
+        assert_eq!(
+            db.list_events_by_kinds(&quest.id, &["session.reset_skipped"], 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// N-6: the manual payload records whether the OS was actually involved,

@@ -107,6 +107,10 @@ pub fn run(ctx: &Ctx, session_target: &str, force: bool) -> anyhow::Result<()> {
     // An already-ended session has nothing to confirm: `apply` reports the
     // no-op, and the question would be about work that is not going to happen.
     if !found.ended() && !force {
+        // Before the question, not after the answer: a row whose window never
+        // opened has no pane to name, and the prompt read "tmux window of
+        // pane )". `apply` refuses it either way — this just refuses first.
+        found.require_pane()?;
         confirm(
             ctx,
             &format!(

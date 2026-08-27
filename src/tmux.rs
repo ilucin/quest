@@ -331,7 +331,9 @@ pub fn is_no_client(e: &anyhow::Error) -> bool {
 /// in both implementations, so the hazard cannot be reintroduced by a new
 /// caller forgetting to check.
 fn require_pane_id(pane_id: &str) -> anyhow::Result<()> {
-    if pane_id.is_empty() {
+    // Whitespace is no more of a target than "" is: tmux trims the `-t`
+    // argument and lands on the current pane just the same.
+    if pane_id.trim().is_empty() {
         return Err(QError::Tmux("no pane to select (empty pane id)".to_string()).into());
     }
     Ok(())
@@ -1583,9 +1585,14 @@ mod tests {
     fn an_empty_pane_id_is_refused_rather_than_read_as_the_active_pane() {
         // Real tmux takes `-t ''` as "whatever is active" and exits 0.
         assert!(require_pane_id("").is_err());
+        // R2-5: and it trims, so a blank target is the same active pane.
+        for blank in [" ", "\t", "\n", "  \t "] {
+            assert!(require_pane_id(blank).is_err(), "{blank:?} got through");
+        }
         assert!(require_pane_id("%42").is_ok());
         let (_dir, t) = fixture();
         assert!(t.select_window("").is_err());
+        assert!(t.select_window(" ").is_err());
     }
 
     /// Every call that hands tmux a pane as its `-t` target. An empty one is

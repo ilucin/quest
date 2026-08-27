@@ -4392,6 +4392,27 @@ fn kill_peek_send_and_reset_refuse_a_session_whose_window_never_opened() {
     assert_eq!(env.status_of(&pending), "idle");
 }
 
+/// R2-3: the confirmation names the pane it is about to kill, so for a row
+/// whose window never opened it asked about "tmux window of pane )" and only
+/// refused once the answer was in. The refusal belongs in front of the
+/// question, the way the TUI's openers do it.
+#[test]
+fn kill_refuses_a_pane_less_session_before_it_asks_to_confirm() {
+    let env = Env::new();
+    let created = env.new_quest("foo");
+    let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
+    let pending = seed_pending_worker(&env, &quest_id, "tests", 0);
+    env.set_status(&pending, "idle", None);
+
+    // No `-f`: the confirmation is the next thing that would happen.
+    let message = env.json_err(&["kill", "foo/tests"])["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("has no pane"), "{message}");
+    assert_eq!(env.status_of(&pending), "idle");
+}
+
 /// N-4: an argument that can never be valid is rejected before the target is
 /// resolved — and therefore before the liveness sweep writes anything.
 #[test]
