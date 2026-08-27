@@ -112,18 +112,31 @@ pub struct RemoteTarget {
 /// one, which iTerm2 cannot host — so inside tmux the plain attach is not a
 /// fallback but the only thing that works.
 ///
-/// The session name is built from *this* machine's `[tmux] session_prefix`.
-/// The far end's prefix is not knowable from a listing row, and SPEC §15 names
-/// the target literally as `q-<slug>`.
-pub fn remote_target(ctx: &Ctx, remote: &Remote, slug: &str) -> RemoteTarget {
-    let tmux_session = session_name(&ctx.config, slug);
+/// `tmux_prefix` is the **far end's** `[tmux] session_prefix`, off its own
+/// `machines` entry (see [`crate::remote::Listing`]). This machine's prefix is
+/// not it: the two are independent config files, and a laptop set to `quest-`
+/// would otherwise attach to a session name that does not exist on a
+/// workstation still using `q-`. SPEC §15's literal `q-<slug>` is the fallback
+/// for a remote whose `q` is too old to report one.
+///
+/// The argv is the command as `q` means it, unquoted: quoting is what
+/// [`crate::remote::attach_argv`] does on the way into ssh, so what `--json`
+/// shows here is an argv a consumer can read.
+pub fn remote_target(
+    ctx: &Ctx,
+    remote: &Remote,
+    slug: &str,
+    tmux_prefix: Option<&str>,
+) -> RemoteTarget {
+    let prefix = tmux_prefix.unwrap_or(remote::DEFAULT_TMUX_PREFIX);
+    let tmux_session = format!("{prefix}{slug}");
     let mut argv = vec!["tmux".to_string()];
     if ctx.config.tmux.iterm_cc && !ctx.tmux().in_tmux() {
         argv.push("-CC".to_string());
     }
     argv.push("attach".to_string());
     argv.push("-t".to_string());
-    argv.push(remote::sh_quote(&crate::tmux::exact(&tmux_session)));
+    argv.push(crate::tmux::exact(&tmux_session));
     RemoteTarget {
         machine: remote.name.clone(),
         alias: remote.ssh.clone(),
@@ -132,36 +145,87 @@ pub fn remote_target(ctx: &Ctx, remote: &Remote, slug: &str) -> RemoteTarget {
     }
 }
 
-/// The Quest `target` names among the rows the remotes sent, by the same rule
-/// [`crate::db::Db::resolve_quest`] uses locally: exact id, exact slug, then
-/// prefix, then substring, with more than one match an error rather than a
-/// guess.
-fn resolve_remote<'a>(
+/// A Quest a `q enter` target could mean, and the machine it runs on.
+#[derive(Debug, Clone, Copy)]
+struct Candidate<'a> {
+    quest: &'a Quest,
+    /// `None` for this machine.
+    machine: Option<&'a str>,
+    /// That machine's tmux prefix; see [`remote_target`].
+    tmux_prefix: Option<&'a str>,
+}
+
+impl Candidate<'_> {
+    /// How the Quest is named when more than one matched.
+    fn label(&self) -> String {
+        let head = format!("{} ({})", self.quest.id, self.quest.slug);
+        match self.machine {
+            Some(machine) => format!("{head} on {machine}"),
+            None => head,
+        }
+    }
+}
+
+/// The exact rungs of SPEC §16 against this machine's Quests: the one lookup
+/// worth doing before any ssh.
+///
+/// A Quest whose id or slug is *exactly* what was typed is not a guess, so it
+/// is entered without dialling out. Everything below exact is a guess, which is
+/// why the fuzzy rungs wait for the remotes (see [`resolve_target`]).
+fn exact_local<'a>(local: &'a [Quest], target: &str) -> Option<&'a Quest> {
+    local
+        .iter()
+        .find(|q| q.id == target)
+        .or_else(|| local.iter().find(|q| q.slug == target))
+}
+
+/// SPEC §16 target resolution across **every** machine in the listing: exact
+/// id, exact slug, then unique prefix, then unique substring, with more than
+/// one match at a rung an error rather than a guess.
+///
+/// The rungs are walked across the whole candidate set rather than machine by
+/// machine. Running the local ladder to exhaustion first would let a local
+/// *prefix* hit shadow a remote *exact slug* hit — the user types the name of a
+/// Quest that exists and lands in a different Quest on a different machine,
+/// with nothing said. Ambiguity across machines is reported the same way
+/// ambiguity on one is: as a list of what matched, with where.
+fn resolve_target<'a>(
+    local: &'a [Quest],
     results: &'a [RemoteResult],
     target: &str,
-) -> anyhow::Result<(&'a str, &'a Quest)> {
-    let all: Vec<(&str, &Quest)> = results
+) -> anyhow::Result<Candidate<'a>> {
+    if target.is_empty() {
+        return Err(QError::NotFound("quest ``".to_string()).into());
+    }
+    // Local first, so the order candidates are listed in is this machine's
+    // Quests then the remotes in config order.
+    let mut all: Vec<Candidate<'a>> = local
         .iter()
-        .flat_map(|r| {
-            r.quests
-                .iter()
-                .map(move |q| (r.name.as_str(), &q.view.quest))
+        .map(|quest| Candidate {
+            quest,
+            machine: None,
+            tmux_prefix: None,
         })
         .collect();
-    if let Some(hit) = all.iter().find(|(_, q)| q.id == target) {
-        return Ok(*hit);
-    }
-    if let Some(hit) = all.iter().find(|(_, q)| q.slug == target) {
-        return Ok(*hit);
-    }
-    for rule in [
-        |q: &Quest, t: &str| q.id.starts_with(t) || q.slug.starts_with(t),
-        |q: &Quest, t: &str| q.id.contains(t) || q.slug.contains(t),
-    ] {
-        let matches: Vec<(&str, &Quest)> = all
+    all.extend(results.iter().flat_map(|r| {
+        r.quests.iter().map(move |q| Candidate {
+            quest: &q.view.quest,
+            machine: Some(r.name.as_str()),
+            tmux_prefix: r.tmux_prefix.as_deref(),
+        })
+    }));
+
+    let ladder: [fn(&Quest, &str) -> bool; 4] = [
+        |q, t| q.id == t,
+        |q, t| q.slug == t,
+        |q, t| q.id.starts_with(t) || q.slug.starts_with(t),
+        |q, t| q.id.contains(t) || q.slug.contains(t),
+    ];
+    for rule in ladder {
+        let matches: Vec<Candidate<'a>> = all
             .iter()
             .copied()
-            .filter(|(_, q)| rule(q, target))
+            .filter(|c| rule(c.quest, target))
             .collect();
         match matches.len() {
             0 => continue,
@@ -169,10 +233,7 @@ fn resolve_remote<'a>(
             _ => {
                 return Err(QError::Ambiguous {
                     target: target.to_string(),
-                    candidates: matches
-                        .into_iter()
-                        .map(|(machine, q)| format!("{} ({}) on {machine}", q.id, q.slug))
-                        .collect(),
+                    candidates: matches.iter().map(Candidate::label).collect(),
                 }
                 .into());
             }
@@ -181,39 +242,14 @@ fn resolve_remote<'a>(
     Err(QError::NotFound(format!("quest `{target}`")).into())
 }
 
-/// Whether an error is "no such Quest here" — the one local failure that is
-/// worth asking the other machines about.
-fn is_not_found(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<QError>().map(QError::code) == Some("not_found")
-}
-
-/// `q enter` on a Quest that is not in this database: ask the remotes, and
-/// hand the terminal to the one that has it (SPEC §15).
-///
-/// `local` is the error the local lookup gave, returned unchanged when there
-/// are no remotes to ask or none of them has it — a `q enter typo` must read
-/// as a typo, not as a report about ssh.
+/// Hand the terminal to the machine `found` runs on (SPEC §15).
 fn enter_remote(
     ctx: &Ctx,
-    target: &str,
+    found: Candidate<'_>,
+    machine: &str,
     label: Option<&str>,
-    local: anyhow::Error,
 ) -> anyhow::Result<()> {
-    if !ctx.remote_enabled() || remote::targets(ctx).is_empty() {
-        return Err(local);
-    }
-    // `--all`: a Quest that is finished over there has to be *found* before it
-    // can be refused, exactly as a local one is.
-    let results = remote::fetch_all(ctx, true, None);
-    remote::warn_unreachable(ctx, &results);
-    flush_warnings(ctx);
-
-    let (machine, quest) = match resolve_remote(&results, target) {
-        Ok(found) => found,
-        // Nothing matched anywhere: the local error is still the true one.
-        Err(e) if is_not_found(&e) => return Err(local),
-        Err(e) => return Err(e),
-    };
+    let quest = found.quest;
     if quest.state == QuestState::Finished {
         return Err(QError::Other(format!(
             "quest {} is finished on {machine}; run `q resume {}` there",
@@ -226,50 +262,41 @@ fn enter_remote(
     // proxying bd-8lz.5.3 adds.
     if let Some(label) = label {
         return Err(QError::Other(format!(
-            "--session {label} is not supported on {machine} yet;              `q enter {}` lands in its master",
+            "--session {label} is not supported on {machine} yet; `q enter {}` lands in its master",
             quest.slug
         ))
         .into());
     }
     let remote = remote::find(&ctx.config.remotes, machine)?;
-    let found = remote_target(ctx, remote, &quest.slug);
+    let target = remote_target(ctx, remote, &quest.slug, found.tmux_prefix);
 
     if ctx.json || !ctx.quiet {
         output::emit(
             ctx.json,
             &serde_json::json!({
                 "quest": quest,
-                "machine": found.machine,
-                "ssh": found.alias,
-                "tmux_session": found.tmux_session,
+                "machine": target.machine,
+                "ssh": target.alias,
+                "tmux_session": target.tmux_session,
                 "remote": true,
-                "argv": found.argv,
+                "argv": target.argv,
             }),
             || {
                 format!(
                     "attaching to {}:{} over ssh",
-                    found.machine, found.tmux_session
+                    target.machine, target.tmux_session
                 )
             },
         )?;
     }
     // The attach replaces this process, so nothing buffered survives it.
     std::io::stdout().flush()?;
-    ctx.ssh().attach(&found.alias, &found.argv)
+    ctx.ssh().attach(&target.alias, &target.argv)
 }
 
-pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
-    sweep_quiet(ctx)?;
-    let db = ctx.db()?;
-    // Local first: a Quest this machine runs is entered without ever dialling
-    // out, and a name that is ambiguous *here* is a mistake to report rather
-    // than a reason to widen the search.
-    let quest = match db.resolve_quest(target) {
-        Ok(quest) => quest,
-        Err(e) if is_not_found(&e) => return enter_remote(ctx, target, label, e),
-        Err(e) => return Err(e),
-    };
-    let found = resolve(ctx, &quest, label)?;
+/// Attach to a Quest in this machine's own tmux.
+fn enter_local(ctx: &Ctx, quest: &Quest, label: Option<&str>) -> anyhow::Result<()> {
+    let found = resolve(ctx, quest, label)?;
 
     if ctx.json || !ctx.quiet {
         output::emit(
@@ -287,6 +314,34 @@ pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
     // A real attach replaces this process, so nothing buffered survives it.
     std::io::stdout().flush()?;
     ctx.tmux().attach(&found.tmux_session, Some(&found.pane))
+}
+
+pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
+    sweep_quiet(ctx)?;
+    let local = ctx.db()?.list_quests(true)?;
+    // An exact hit here is entered without ever dialling out.
+    if let Some(quest) = exact_local(&local, target) {
+        return enter_local(ctx, quest, label);
+    }
+    // Anything less than exact has to be held against the other machines
+    // before it is acted on: a local *fragment* match must not shadow a Quest
+    // whose name is exactly what was typed, wherever that Quest runs.
+    let results = if ctx.remote_enabled() && !remote::targets(ctx).is_empty() {
+        // `--all`: a Quest that is finished over there has to be *found*
+        // before it can be refused, exactly as a local one is.
+        let results = remote::fetch_all(ctx, true, None);
+        remote::warn_unreachable(ctx, &results);
+        flush_warnings(ctx);
+        results
+    } else {
+        Vec::new()
+    };
+
+    let found = resolve_target(&local, &results, target)?;
+    match found.machine {
+        Some(machine) => enter_remote(ctx, found, machine, label),
+        None => enter_local(ctx, found.quest, label),
+    }
 }
 
 #[cfg(test)]
@@ -332,17 +387,35 @@ mod tests {
     #[test]
     fn the_remote_attach_is_the_spec_command() {
         let (ctx, _dir) = with_tmux(false, false);
-        let target = remote_target(&ctx, &ws(), "alpha");
+        let target = remote_target(&ctx, &ws(), "alpha", None);
         assert_eq!(target.machine, "ws");
         assert_eq!(target.alias, "ws-host");
         assert_eq!(target.tmux_session, "q-alpha");
         // `=` for the same reason the local attach uses it: without it tmux
         // matches `-t` by prefix and `q-a` would resolve to `q-alpha`.
         assert_eq!(target.argv, ["tmux", "attach", "-t", "=q-alpha"]);
+        // …and it is quoted on the way into ssh, because the far end's login
+        // shell sees the words before tmux does: zsh reads a bare `=q-alpha`
+        // as an equals expansion and never runs tmux at all.
         assert_eq!(
             crate::remote::attach_argv(&target.alias, &target.argv),
-            ["-t", "ws-host", "tmux", "attach", "-t", "=q-alpha"]
+            ["-t", "ws-host", "tmux", "attach", "-t", "'=q-alpha'"]
         );
+    }
+
+    /// The session name belongs to the machine that runs the Quest: SPEC §15's
+    /// `q-` only until that machine says otherwise.
+    #[test]
+    fn the_tmux_prefix_is_the_far_ends_not_this_machines() {
+        let (mut ctx, _dir) = with_tmux(false, false);
+        ctx.config.tmux.session_prefix = "quest-".to_string();
+        // This machine's prefix does not reach across the wire.
+        let target = remote_target(&ctx, &ws(), "alpha", None);
+        assert_eq!(target.tmux_session, "q-alpha");
+        // What the far end reported does.
+        let target = remote_target(&ctx, &ws(), "alpha", Some("work_"));
+        assert_eq!(target.tmux_session, "work_alpha");
+        assert_eq!(target.argv.last().unwrap(), "=work_alpha");
     }
 
     /// `[tmux] iterm_cc` — and only outside tmux, because a control-mode
@@ -351,25 +424,30 @@ mod tests {
     fn iterm_control_mode_is_asked_for_only_outside_tmux() {
         let (ctx, _dir) = with_tmux(true, false);
         assert_eq!(
-            remote_target(&ctx, &ws(), "alpha").argv,
+            remote_target(&ctx, &ws(), "alpha", None).argv,
             ["tmux", "-CC", "attach", "-t", "=q-alpha"]
         );
 
         let (ctx, _dir) = with_tmux(true, true);
         assert_eq!(
-            remote_target(&ctx, &ws(), "alpha").argv,
+            remote_target(&ctx, &ws(), "alpha", None).argv,
             ["tmux", "attach", "-t", "=q-alpha"]
         );
     }
 
-    /// The tmux target is one shell word on the far end, whatever
-    /// `[tmux] session_prefix` is.
+    /// A far-end prefix with a space is still one shell word when ssh sends it
+    /// — and the argv `--json` shows is the unquoted one.
     #[test]
     fn a_session_prefix_with_a_space_still_arrives_as_one_argument() {
-        let (mut ctx, _dir) = with_tmux(false, false);
-        ctx.config.tmux.session_prefix = "my quests/".to_string();
-        let target = remote_target(&ctx, &ws(), "alpha");
-        assert_eq!(target.argv.last().unwrap(), "'=my quests/alpha'");
+        let (ctx, _dir) = with_tmux(false, false);
+        let target = remote_target(&ctx, &ws(), "alpha", Some("my quests/"));
+        assert_eq!(target.argv.last().unwrap(), "=my quests/alpha");
+        assert_eq!(
+            crate::remote::attach_argv(&target.alias, &target.argv)
+                .last()
+                .unwrap(),
+            "'=my quests/alpha'"
+        );
     }
 
     fn result(name: &str, slugs: &[&str]) -> RemoteResult {
@@ -387,7 +465,12 @@ mod tests {
                 .collect(),
             stale: false,
             fetched_at: Some(1),
+            tmux_prefix: Some("q-".to_string()),
         }
+    }
+
+    fn machine_of<'a>(found: &Candidate<'a>) -> &'a str {
+        found.machine.unwrap_or("<local>")
     }
 
     #[test]
@@ -395,24 +478,39 @@ mod tests {
         let results = [result("ws", &["cdc-backfill"]), result("box", &["other"])];
         let id = results[0].quests[0].view.quest.id.clone();
 
-        assert_eq!(resolve_remote(&results, "cdc-backfill").unwrap().0, "ws");
-        assert_eq!(resolve_remote(&results, &id).unwrap().0, "ws");
+        assert_eq!(
+            machine_of(&resolve_target(&[], &results, "cdc-backfill").unwrap()),
+            "ws"
+        );
+        assert_eq!(
+            machine_of(&resolve_target(&[], &results, &id).unwrap()),
+            "ws"
+        );
         // Prefix, then substring.
         assert_eq!(
-            resolve_remote(&results, "cdc").unwrap().1.slug,
+            resolve_target(&[], &results, "cdc").unwrap().quest.slug,
             "cdc-backfill"
         );
         assert_eq!(
-            resolve_remote(&results, "backfill").unwrap().1.slug,
+            resolve_target(&[], &results, "backfill")
+                .unwrap()
+                .quest
+                .slug,
             "cdc-backfill"
         );
-        assert_eq!(resolve_remote(&results, "oth").unwrap().0, "box");
+        assert_eq!(
+            machine_of(&resolve_target(&[], &results, "oth").unwrap()),
+            "box"
+        );
 
-        let e = resolve_remote(&results, "nope").unwrap_err();
-        assert_eq!(
-            e.downcast_ref::<QError>().map(QError::code),
-            Some("not_found")
-        );
+        for empty in ["", "nope"] {
+            let e = resolve_target(&[], &results, empty).unwrap_err();
+            assert_eq!(
+                e.downcast_ref::<QError>().map(QError::code),
+                Some("not_found"),
+                "{empty}"
+            );
+        }
     }
 
     /// Two machines can hold Quests whose names both match; guessing between
@@ -420,12 +518,73 @@ mod tests {
     #[test]
     fn a_fragment_that_matches_on_two_machines_names_both() {
         let results = [result("ws", &["cdc-one"]), result("box", &["cdc-two"])];
-        let e = resolve_remote(&results, "cdc").unwrap_err();
+        let e = resolve_target(&[], &results, "cdc").unwrap_err();
         assert_eq!(
             e.downcast_ref::<QError>().map(QError::code),
             Some("ambiguous")
         );
         let said = e.to_string();
         assert!(said.contains("on ws") && said.contains("on box"), "{said}");
+    }
+
+    /// The ladder is walked across machines, not machine by machine: a local
+    /// *prefix* hit must not shadow a remote Quest whose slug is exactly what
+    /// was typed.
+    #[test]
+    fn an_exact_slug_anywhere_beats_a_local_fragment() {
+        let local = [Quest::new("cdc-backfill-v2", "/tmp", "laptop")];
+        let results = [result("ws", &["cdc-backfill"])];
+
+        // `exact_local` is what `run` checks before any ssh: the local Quest
+        // is only a prefix match, so it does not qualify.
+        assert!(exact_local(&local, "cdc-backfill").is_none());
+        assert_eq!(
+            exact_local(&local, "cdc-backfill-v2").map(|q| q.slug.as_str()),
+            Some("cdc-backfill-v2")
+        );
+
+        let found = resolve_target(&local, &results, "cdc-backfill").unwrap();
+        assert_eq!(found.quest.slug, "cdc-backfill");
+        assert_eq!(machine_of(&found), "ws");
+
+        // A fragment that matches on both is ambiguous rather than local-wins.
+        let e = resolve_target(&local, &results, "cdc-back").unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<QError>().map(QError::code),
+            Some("ambiguous")
+        );
+        let said = e.to_string();
+        assert!(said.contains("on ws"), "{said}");
+        // The local candidate is named without a machine suffix, exactly as
+        // `db.resolve_quest` names it.
+        assert!(said.contains("(cdc-backfill-v2)"), "{said}");
+    }
+
+    /// With no remotes in the picture the ladder is the local one, unchanged.
+    #[test]
+    fn without_remotes_the_ladder_is_purely_local() {
+        let local = [
+            Quest::new("alpha", "/tmp", "laptop"),
+            Quest::new("alpine", "/tmp", "laptop"),
+        ];
+        assert_eq!(
+            resolve_target(&local, &[], "alpha").unwrap().quest.slug,
+            "alpha"
+        );
+        assert!(
+            resolve_target(&local, &[], "alpha")
+                .unwrap()
+                .machine
+                .is_none()
+        );
+        assert_eq!(
+            resolve_target(&local, &[], "alpi").unwrap().quest.slug,
+            "alpine"
+        );
+        let e = resolve_target(&local, &[], "alp").unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<QError>().map(QError::code),
+            Some("ambiguous")
+        );
     }
 }

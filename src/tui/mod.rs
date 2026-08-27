@@ -499,7 +499,14 @@ where
         ));
         return Ok(());
     }
-    let target = enter::remote_target(ctx, remote, &want.quest.slug);
+    // The prefix is the far end's, off the last round it answered; SPEC §15's
+    // `q-` stands in until then.
+    let target = enter::remote_target(
+        ctx,
+        remote,
+        &want.quest.slug,
+        app.remote_tmux.get(machine).map(String::as_str),
+    );
     if !ctx.config.ui.return_after_detach {
         restore_with(io);
         ctx.ssh().attach(&target.alias, &target.argv)?;
@@ -646,6 +653,34 @@ fn apply_event(app: &mut App, ev: Event) -> (Action, bool) {
     }
 }
 
+/// The remote clock, stopped while the UI thread has given the terminal away.
+///
+/// A handoff blocks this thread for as long as the child runs — four hours in
+/// a tmux session is ordinary — and a poller left running would spend that
+/// opening an ssh connection per machine every `[ui] tick_remote` for a screen
+/// nobody is looking at. Held as a guard so every exit path out of the
+/// handoff, `?` included, starts it again.
+struct Away<'a>(Option<&'a remote::Poller>);
+
+impl<'a> Away<'a> {
+    fn new(poller: Option<&'a remote::Poller>) -> Away<'a> {
+        if let Some(poller) = poller {
+            poller.pause();
+        }
+        Away(poller)
+    }
+}
+
+impl Drop for Away<'_> {
+    fn drop(&mut self) {
+        if let Some(poller) = self.0 {
+            // Resuming asks for a round straight away: whatever the user was
+            // doing, what is on screen is older than it looks.
+            poller.resume();
+        }
+    }
+}
+
 /// Fold a finished remote round into the state the renderer reads (SPEC §15).
 /// Runs on the UI thread because the cache is a database write and the `Ctx`
 /// owns the only connection; the ssh it is the answer to ran elsewhere.
@@ -656,6 +691,14 @@ fn absorb(ctx: &Ctx, app: &mut App, round: remote::Round) {
         .filter_map(remote::RemoteResult::note)
         .collect();
     app.remote_note = (!notes.is_empty()).then(|| notes.join(" \u{b7} "));
+    // Kept rather than replaced: a machine that did not answer this round
+    // still has the prefix it reported when it did, which is the same age as
+    // the cached rows shown under it.
+    for result in &results {
+        if let Some(prefix) = &result.tmux_prefix {
+            app.remote_tmux.insert(result.name.clone(), prefix.clone());
+        }
+    }
     app.quests.remote = crate::commands::remote_rows(&mut results);
 }
 
@@ -669,6 +712,8 @@ fn event_loop(
     refresh_now(ctx, app);
     let mut last_tick = Instant::now();
     let mut dirty = true;
+    // Whether the poller's death has already been reported.
+    let mut stopped = false;
 
     loop {
         // Mouse capture is ANY-MOTION tracking (CSI ?1003h), so without this
@@ -701,17 +746,28 @@ fn event_loop(
                 }
                 // Both take the terminal away and give it back, so both need
                 // the screen rebuilt — and after an attach the Quest has very
-                // likely moved on, so the listing is reloaded too.
+                // likely moved on, so the listing is reloaded too. The remote
+                // clock stops for the duration: nobody is looking, and an
+                // attach can last hours (see [`Away`]).
                 Action::Attach => {
-                    attach(ctx, &mut Stdio, terminal, app)?;
+                    let away = Away::new(poller);
+                    let out = attach(ctx, &mut Stdio, terminal, app);
+                    drop(away);
+                    out?;
                     refresh_due = true;
                 }
                 Action::Brief => {
-                    brief_in_pager(ctx, &mut Stdio, terminal, app)?;
+                    let away = Away::new(poller);
+                    let out = brief_in_pager(ctx, &mut Stdio, terminal, app);
+                    drop(away);
+                    out?;
                     dirty = true;
                 }
                 Action::Peek => {
-                    peek_in_pager(ctx, &mut Stdio, terminal, app)?;
+                    let away = Away::new(poller);
+                    let out = peek_in_pager(ctx, &mut Stdio, terminal, app);
+                    drop(away);
+                    out?;
                     dirty = true;
                 }
                 // Creating, renaming, closing or resuming all change the
@@ -730,6 +786,14 @@ fn event_loop(
         if let Some(round) = poller.and_then(remote::Poller::take) {
             absorb(ctx, app, round);
             refresh_due = true;
+        }
+        // A poller that has stopped would otherwise leave the last chip
+        // standing for ever, which reads as a fact about the machines rather
+        // than about `q`. Said once.
+        if poller.is_some_and(|p| !p.alive()) && !stopped {
+            stopped = true;
+            app.remote_note = Some("remote polling stopped".to_string());
+            dirty = true;
         }
 
         let now = Instant::now();
@@ -2389,34 +2453,57 @@ mod tests {
 
     /// A round that lands turns into rows and, when a machine did not answer,
     /// into the standing chip that says the listing is partly the cache.
+    ///
+    /// Through `absorb` itself — it is the whole of the TUI's remote data
+    /// path, cache write included, and a test that re-implemented its body
+    /// would prove nothing about it.
     #[test]
     fn a_finished_round_becomes_rows_and_a_chip() {
         let (ctx, _ssh, mut app) = remote_rig(crate::model::QuestState::Active);
+        app.quests.remote.clear();
 
-        let mut results = vec![
-            crate::remote::RemoteResult {
-                name: "ws".to_string(),
-                ssh: "ws-host".to_string(),
-                status: crate::remote::RemoteStatus::Ok,
-                quests: Vec::new(),
-                stale: false,
-                fetched_at: Some(1),
-            },
-            crate::remote::RemoteResult {
-                name: "box".to_string(),
-                ssh: "box-host".to_string(),
-                status: crate::remote::RemoteStatus::unreachable("host is down"),
-                quests: Vec::new(),
-                stale: false,
-                fetched_at: None,
-            },
-        ];
-        let notes: Vec<String> = results
-            .iter()
-            .filter_map(crate::remote::RemoteResult::note)
-            .collect();
-        app.remote_note = (!notes.is_empty()).then(|| notes.join(" \u{b7} "));
-        app.quests.remote = crate::commands::remote_rows(&mut results);
+        let view = crate::commands::QuestView::new(
+            crate::model::Quest::new("over-there", "/tmp/work", "workstation"),
+            &[],
+        );
+        // The envelope a real `q list --json --no-remote` sends, prefix and all.
+        let payload = serde_json::json!({
+            "quests": [view],
+            "machines": [{
+                "name": "workstation", "kind": "local", "status": "ok",
+                "quests": 1, "tmux_prefix": "work_"
+            }],
+        })
+        .to_string();
+        let round = crate::remote::Round::for_tests(vec![
+            (
+                crate::config::Remote {
+                    name: "ws".to_string(),
+                    ssh: "ws-host".to_string(),
+                },
+                crate::remote::SshOutcome::Done {
+                    code: Some(0),
+                    stdout: payload.clone(),
+                    stderr: String::new(),
+                },
+            ),
+            (
+                crate::config::Remote {
+                    name: "box".to_string(),
+                    ssh: "box-host".to_string(),
+                },
+                crate::remote::SshOutcome::Failed("host is down".to_string()),
+            ),
+        ]);
+
+        absorb(&ctx, &mut app, round);
+
+        // The rows the round brought back, stamped with the *config* name.
+        assert_eq!(app.quests.remote.len(), 1);
+        let row = &app.quests.remote[0];
+        assert_eq!(row.view.quest.slug, "over-there");
+        assert_eq!(row.view.quest.machine, "ws");
+        assert!(row.origin.is_remote() && !row.origin.is_stale());
 
         let note = app.remote_note.clone().expect("a machine is down");
         assert!(note.contains("box \u{26a0} unreachable"), "{note}");
@@ -2425,7 +2512,24 @@ mod tests {
         assert!(app.chips().contains("box"), "{}", app.chips());
         app.say("something else");
         assert!(app.chips().contains("box"));
-        let _ = ctx;
+
+        // The far end's tmux prefix, which is what `o` on that row attaches to.
+        assert_eq!(app.remote_tmux.get("ws").map(String::as_str), Some("work_"));
+
+        // And the cache write really happened, on this thread.
+        let cached = ctx.db().unwrap().get_remote_cache("ws").unwrap();
+        assert_eq!(cached.map(|c| c.payload), Some(payload));
+
+        // A local reload folds the round's rows back into the listing.
+        refresh_now(&ctx, &mut app);
+        assert!(
+            app.quests
+                .loaded()
+                .iter()
+                .any(|r| r.view.quest.slug == "over-there"),
+            "the remote row did not survive a reload: {:?}",
+            app.refresh_error
+        );
     }
 
     /// Inside tmux there is no process to replace and nothing to wait for:

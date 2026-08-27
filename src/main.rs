@@ -85,6 +85,18 @@ impl Ctx {
         let machine_override = match &args.machine {
             Some(m) => {
                 remote::validate_target(&config, m)?;
+                // `--machine <remote>` says "that machine only"; `--no-remote`
+                // says "no machine but this one". Together they can only
+                // produce an empty answer, and an empty answer about a machine
+                // reads as a fact about that machine — so it is refused rather
+                // than silently returned.
+                if args.no_remote && *m != config.machine.name {
+                    return Err(QError::Other(format!(
+                        "--machine {m} with --no-remote: `{m}` is a remote machine, \
+                         and --no-remote suppresses every remote"
+                    ))
+                    .into());
+                }
                 Some(m.clone())
             }
             None => None,

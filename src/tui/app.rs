@@ -289,6 +289,10 @@ pub struct App {
     /// about what is on screen — the rows of a machine that is down are the
     /// cache, or missing — and the next keypress must not erase it.
     pub remote_note: Option<String>,
+    /// Each remote's `[tmux] session_prefix`, as it reported it in the last
+    /// round it answered. `o` on a remote row needs it to name the session to
+    /// attach to, and only that machine can know it (SPEC §15).
+    pub remote_tmux: std::collections::BTreeMap<String, String>,
     /// The Quest a tab handed to another tab — `s` on the Quests tab means
     /// "the Sessions tab, filtered to this one" (SPEC §17).
     pub focus_quest: Option<String>,
@@ -330,6 +334,7 @@ impl App {
             status_at: 0,
             refresh_error: None,
             remote_note: None,
+            remote_tmux: std::collections::BTreeMap::new(),
             focus_quest: None,
             detail: false,
             modal: None,

@@ -210,6 +210,31 @@ pub fn remote_rows(results: &mut [crate::remote::RemoteResult]) -> Vec<QuestRow>
     out
 }
 
+/// SPEC §16's listing filters, as one predicate.
+///
+/// The single definition of "is this row in this listing": `q list` runs local
+/// rows through it and [`crate::remote::retain_listed`] runs every remote row —
+/// fresh and cached alike — through the same one. bd-8lz.5.1's constraint is
+/// that the merge must not filter remote rows differently from local ones, and
+/// one shared function is the only way to keep that true.
+pub fn listed(view: &QuestView, all: bool, state: Option<crate::cli::QuestState>) -> bool {
+    match state {
+        // `--state` is exact, `--all` or not: asking for finished Quests is how
+        // you see them, and asking for active ones must never return others.
+        Some(want) => view.display_state == display_state_of(want),
+        None => all || view.display_state != DisplayState::Finished,
+    }
+}
+
+/// The `DisplayState` a `--state` value names.
+pub fn display_state_of(state: crate::cli::QuestState) -> DisplayState {
+    match state {
+        crate::cli::QuestState::Active => DisplayState::Active,
+        crate::cli::QuestState::Idle => DisplayState::Idle,
+        crate::cli::QuestState::Finished => DisplayState::Finished,
+    }
+}
+
 /// Every **local** Quest, swept, machine-filtered and ranked.
 ///
 /// The single definition of "the Quest listing": `q list` and the TUI's Quests

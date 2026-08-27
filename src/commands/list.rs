@@ -31,42 +31,56 @@
 //! with no Quests.
 //!
 //! ```json
-//! {"name": "laptop", "kind": "local",  "status": "ok", "quests": 3}
+//! {"name": "laptop", "kind": "local",  "status": "ok", "tmux_prefix": "q-",
+//!  "quests": 3}
 //! {"name": "ws", "kind": "remote", "ssh": "ws", "status": "ok",
-//!  "stale": false, "fetched_at": 1756300000, "quests": 2}
+//!  "stale": false, "fetched_at": 1756300000, "tmux_prefix": "q-", "quests": 2}
 //! {"name": "ws", "kind": "remote", "ssh": "ws", "status": "unreachable",
 //!  "reason": "no answer within 5s", "stale": true, "fetched_at": 1756299000,
-//!  "quests": 2}
+//!  "tmux_prefix": "q-", "quests": 2}
 //! {"name": "box", "kind": "remote", "ssh": "box", "status": "incompatible",
 //!  "reason": "cannot read `q list --json`: …", "stale": false,
-//!  "fetched_at": null, "quests": 0}
+//!  "fetched_at": null, "tmux_prefix": null, "quests": 0}
 //! ```
 //!
 //! `status` is `ok` | `unreachable` | `incompatible`, with `reason` present on
-//! the last two. `--machine <name>` narrows both arrays to that machine, and
-//! `--no-remote` leaves only the local entry.
+//! the last two. `quests` counts the rows that claim that machine, so the two
+//! arrays always agree. `tmux_prefix` is that machine's `[tmux]
+//! session_prefix` — this one's from the config, a remote's as it reported it
+//! (`null` from a `q` too old to say) — and it is the only thing on the wire
+//! that can name a session on another machine, which is what `q enter` on a
+//! remote Quest attaches to. `--machine <name>` narrows both arrays to that
+//! machine; `--no-remote` leaves only the local entry, and is refused
+//! alongside a `--machine` naming a remote.
+//!
+//! Every row, local or remote, is filtered by the one predicate
+//! ([`crate::commands::listed`]) — `--all`/`--state` applied here rather than
+//! at the far end, because one cache row per remote has to serve every
+//! invocation (see [`crate::remote::list_argv`]).
 //!
 //! This envelope is also the wire format between machines: the fan-out asks a
-//! remote for `q list --json --no-remote` and reads `quests` out of the answer
-//! (a bare array is still accepted, which is what a `q` from before the
-//! envelope sends — see [`crate::remote::parse`]).
+//! remote for `q list --json --no-remote --all` and reads `quests` and its own
+//! `machines` entry out of the answer (a bare array is still accepted, which is
+//! what a `q` from before the envelope sends — see [`crate::remote::parse`]).
 
 use crate::Ctx;
 use crate::cli::QuestState as StateFilter;
 use crate::commands::flush_warnings;
-use crate::commands::{QuestRow, fill_progress, fmt, load_quests, merge_remote};
+use crate::commands::{
+    QuestRow, display_state_of, fill_progress, fmt, listed, load_quests, merge_remote,
+};
 use crate::model::DisplayState;
 use crate::output;
 use crate::remote::{self, RemoteResult};
 
 pub fn run(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> anyhow::Result<()> {
-    let wanted = state.map(display_state_of);
-    let include_finished = all || wanted == Some(DisplayState::Finished);
+    let include_finished = all || state.map(display_state_of) == Some(DisplayState::Finished);
 
+    // Loading is narrowed by `include_finished` — the database can do that much
+    // — and then the one predicate decides, so local and remote rows are
+    // filtered by literally the same code (see [`crate::commands::listed`]).
     let mut rows = load_quests(ctx, include_finished)?;
-    if let Some(want) = wanted {
-        rows.retain(|r| r.view.display_state == want);
-    }
+    rows.retain(|r| listed(&r.view, all, state));
 
     // Nothing below this line runs when nothing is going to be printed: not the
     // one `bd` call, and not a fan-out that can cost the full remote deadline.
@@ -86,8 +100,9 @@ pub fn run(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> anyhow::Result<(
     flush_warnings(ctx);
 
     fill_progress(ctx, &mut rows);
-    let machines = machines_json(ctx, &remotes, rows.len());
+    let roster = roster(ctx, &remotes);
     merge_remote(&mut rows, &mut remotes);
+    let machines = machines_json(&roster, &rows);
 
     let mut payload = serde_json::Map::new();
     payload.insert(
@@ -119,12 +134,12 @@ fn row_json(row: &QuestRow) -> serde_json::Value {
     value
 }
 
-/// The `machines` array: this machine when the listing covers it, then every
-/// remote it asked, in config order.
+/// The `machines` array before the counts: this machine when the listing covers
+/// it, then every remote it asked, in config order.
 ///
-/// Counts come from before the merge, so `quests` is per machine rather than a
-/// share of one ranked list.
-fn machines_json(ctx: &Ctx, remotes: &[RemoteResult], local_rows: usize) -> Vec<serde_json::Value> {
+/// Built *before* the merge because [`merge_remote`] drains the results, and
+/// counted after it — see [`machines_json`].
+fn roster(ctx: &Ctx, remotes: &[RemoteResult]) -> Vec<serde_json::Value> {
     let mut out = Vec::with_capacity(remotes.len() + 1);
     let local = ctx.config.machine.name.as_str();
     if ctx.machine_filter().is_none_or(|m| m == local) {
@@ -132,7 +147,7 @@ fn machines_json(ctx: &Ctx, remotes: &[RemoteResult], local_rows: usize) -> Vec<
             "name": local,
             "kind": "local",
             "status": "ok",
-            "quests": local_rows,
+            "tmux_prefix": ctx.config.tmux.session_prefix,
         }));
     }
     for result in remotes {
@@ -142,7 +157,9 @@ fn machines_json(ctx: &Ctx, remotes: &[RemoteResult], local_rows: usize) -> Vec<
             "ssh": result.ssh,
             "stale": result.stale,
             "fetched_at": result.fetched_at,
-            "quests": result.quests.len(),
+            // What that machine calls its tmux sessions, as it reported them;
+            // `null` from a `q` too old to say (see `remote::Answer`).
+            "tmux_prefix": result.tmux_prefix,
         });
         // Flattened in: `{"status": "unreachable", "reason": …}` rather than
         // bd-8lz.5.1's nested `{"status": {"status": …}}`.
@@ -159,12 +176,28 @@ fn machines_json(ctx: &Ctx, remotes: &[RemoteResult], local_rows: usize) -> Vec<
     out
 }
 
-fn display_state_of(state: StateFilter) -> DisplayState {
-    match state {
-        StateFilter::Active => DisplayState::Active,
-        StateFilter::Idle => DisplayState::Idle,
-        StateFilter::Finished => DisplayState::Finished,
-    }
+/// The roster with each machine's row count filled in.
+///
+/// Counted from the rows themselves, by the `machine` each one claims, rather
+/// than from the bucket it arrived in: the two can disagree (a local Quest
+/// created with `--machine ws`), and an envelope whose counts contradict its
+/// own rows is worse than either answer.
+fn machines_json(roster: &[serde_json::Value], rows: &[QuestRow]) -> Vec<serde_json::Value> {
+    roster
+        .iter()
+        .map(|entry| {
+            let mut entry = entry.clone();
+            let quests = entry
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(|name| rows.iter().filter(|r| r.view.quest.machine == name).count())
+                .unwrap_or(0);
+            if let Some(object) = entry.as_object_mut() {
+                object.insert("quests".to_string(), serde_json::json!(quests));
+            }
+            entry
+        })
+        .collect()
 }
 
 fn human(rows: &[QuestRow]) -> String {
@@ -227,6 +260,7 @@ mod tests {
             quests,
             stale,
             fetched_at: Some(1000),
+            tmux_prefix: Some("q-".to_string()),
         }
     }
 
@@ -427,18 +461,26 @@ mod tests {
                 vec![],
             ),
         ];
-        let entries = machines_json(&ctx(None), &remotes, 2);
+        // Two local rows and the one `ws` sent — counted by the machine each
+        // row claims, not by the bucket it arrived in.
+        let rows = vec![
+            row("here", QuestState::Active, 3, &[]),
+            row("also-here", QuestState::Active, 2, &[]),
+            QuestRow::remote(remote_quest("ws", "a", QuestState::Active, 1), false),
+        ];
+        let entries = machines_json(&roster(&ctx(None), &remotes), &rows);
         assert_eq!(
             entries[0],
             serde_json::json!({
-                "name": "laptop", "kind": "local", "status": "ok", "quests": 2
+                "name": "laptop", "kind": "local", "status": "ok",
+                "tmux_prefix": "q-", "quests": 2
             })
         );
         assert_eq!(
             entries[1],
             serde_json::json!({
                 "name": "ws", "kind": "remote", "ssh": "ws-host", "status": "ok",
-                "stale": false, "fetched_at": 1000, "quests": 1
+                "stale": false, "fetched_at": 1000, "tmux_prefix": "q-", "quests": 1
             })
         );
         // Flattened, not nested: `{"status": …, "reason": …}`.
@@ -453,14 +495,16 @@ mod tests {
     #[test]
     fn a_machine_filter_narrows_the_machines_array_too() {
         let remotes = vec![result("ws", RemoteStatus::Ok, false, vec![])];
-        let entries = machines_json(&ctx(Some("ws")), &remotes, 0);
+        let entries = machines_json(&roster(&ctx(Some("ws")), &remotes), &[]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["name"], "ws");
 
         // Pinned to this machine, the fan-out found nothing to ask.
-        let entries = machines_json(&ctx(Some("laptop")), &[], 3);
+        let rows = vec![row("here", QuestState::Active, 3, &[])];
+        let entries = machines_json(&roster(&ctx(Some("laptop")), &[]), &rows);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["kind"], "local");
+        assert_eq!(entries[0]["quests"], 1);
     }
 
     #[test]

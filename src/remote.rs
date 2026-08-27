@@ -34,31 +34,27 @@ use crate::output;
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a remote is always asked for. `--no-remote` is the recursion guard:
-/// without it the remote would fan out to *its* remotes, us included.
-pub const LIST_ARGV: [&str; 4] = ["q", "list", "--json", "--no-remote"];
+/// without it the remote would fan out to *its* remotes, us included; `--all`
+/// is why the cache works — see [`list_argv`].
+pub const LIST_ARGV: [&str; 5] = ["q", "list", "--json", "--no-remote", "--all"];
 
-/// The remote's `q list`, filtered the same way this one is. The flags have to
-/// travel: a remote answering its own default listing would silently contradict
-/// a `--all` or `--state` the user actually asked for.
-pub fn list_argv(all: bool, state: Option<StateFilter>) -> Vec<String> {
-    let mut argv: Vec<String> = LIST_ARGV.iter().map(|a| (*a).to_string()).collect();
-    if all {
-        argv.push("--all".to_string());
-    }
-    if let Some(state) = state {
-        argv.push("--state".to_string());
-        argv.push(state_flag(state).to_string());
-    }
-    argv
-}
-
-/// The `--state` value clap would have parsed, spelled back out.
-fn state_flag(state: StateFilter) -> &'static str {
-    match state {
-        StateFilter::Active => "active",
-        StateFilter::Idle => "idle",
-        StateFilter::Finished => "finished",
-    }
+/// The remote's `q list` — always the **whole** listing, never this
+/// invocation's `--all`/`--state`.
+///
+/// The filters deliberately do not travel. There is one cache row per remote
+/// and it has to serve every invocation: a payload fetched under `--all` (which
+/// `q enter` and the TUI poller always ask for) replayed under a plain `q list`
+/// would leak finished Quests, and a payload fetched under `--state active`
+/// replayed under `--all` would hide live ones. Stamping the cache with its
+/// flags only turns that into a cache that is almost never usable.
+///
+/// So the wire request is unconditional and the filtering happens on arrival,
+/// through the very same predicate local rows go through
+/// ([`crate::commands::listed`]) — which is also the only way fresh and stale
+/// remote rows can be filtered identically, and the only way remote rows can be
+/// filtered identically to local ones (bd-8lz.5.1's standing constraint).
+pub fn list_argv() -> Vec<String> {
+    LIST_ARGV.iter().map(|a| (*a).to_string()).collect()
 }
 
 /// The envelope keys of `q list --json` (SPEC §15 / §16), named here because
@@ -70,6 +66,13 @@ pub const MACHINES: &str = "machines";
 pub const MACHINE: &str = "machine";
 /// The key holding a row's provenance; see [`crate::commands::Origin`].
 pub const SOURCE: &str = "source";
+/// The key on a `machines` entry holding that machine's `[tmux]
+/// session_prefix` — the only place the far end's tmux session names are
+/// knowable from here (SPEC §15).
+pub const TMUX_PREFIX: &str = "tmux_prefix";
+/// SPEC §15's tmux session prefix, and the fallback for a remote whose `q` is
+/// too old to report its own.
+pub const DEFAULT_TMUX_PREFIX: &str = "q-";
 
 /// SPEC §15's marker for a machine that did not answer.
 pub const UNREACHABLE: &str = "⚠ unreachable";
@@ -136,7 +139,7 @@ fn ssh_argv(alias: &str, argv: &[&str], timeout: Duration) -> Vec<String> {
         format!("ConnectTimeout={}", (timeout.as_secs() / 2).max(1)),
         alias.to_string(),
     ];
-    out.extend(argv.iter().map(|a| (*a).to_string()));
+    out.extend(remote_command(argv.iter().map(|a| (*a).to_string())));
     out
 }
 
@@ -146,19 +149,38 @@ fn ssh_argv(alias: &str, argv: &[&str], timeout: Duration) -> Vec<String> {
 /// `-t` forces a tty, without which the far end's `tmux attach` refuses.
 pub fn attach_argv(alias: &str, argv: &[String]) -> Vec<String> {
     let mut out = vec!["-t".to_string(), alias.to_string()];
-    out.extend(argv.iter().cloned());
+    out.extend(remote_command(argv.iter().cloned()));
     out
 }
 
-/// ssh hands the remote command to a shell, so an argument that is more than
-/// one shell word has to arrive as one. Everything `q` sends is a slug or a
-/// flag, but `[tmux] session_prefix` is free-form config and ends up inside
-/// the tmux target.
+/// The remote command as the far end's shell must receive it — every word
+/// quoted at this one boundary rather than by each caller.
+///
+/// ssh does not take an argv: it joins everything after the alias with spaces
+/// and hands the string to the remote user's **login shell**. So quoting is a
+/// property of *sending* a command, not of building one, and it is applied
+/// here so no caller can forget it. Only the words after the alias go through
+/// this — ssh's own options (`-t`, `-o …`, the alias) are exec'd by us.
+fn remote_command(argv: impl Iterator<Item = String>) -> Vec<String> {
+    argv.map(|a| sh_quote(&a)).collect()
+}
+
+/// One shell word, safe in **any** remote login shell.
+///
+/// Conservative on purpose: only strictly alphanumerics and `-_./` pass
+/// through unquoted, and everything else is single-quoted. The plain set is
+/// not "what bash leaves alone" — the far end's shell is whatever that user
+/// runs, and zsh (the macOS default) expands things bash does not. `=q-alpha`,
+/// the tmux exact-match target of SPEC §15, is the case that proves it: zsh's
+/// *equals expansion* rewrites a word starting with `=` to the path of that
+/// command and aborts the line when there is none, so an unquoted target never
+/// reaches tmux at all. `~` is the same story. A word this errs on costs two
+/// quote characters; a word it lets through costs the command.
 pub fn sh_quote(arg: &str) -> String {
     let plain = !arg.is_empty()
         && arg
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "=_-./:@%+,".contains(c));
+            .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c));
     if plain {
         return arg.to_string();
     }
@@ -307,7 +329,7 @@ fn drain(pipe: Option<impl Read + Send + 'static>, done: mpsc::Sender<()>) -> Bu
             loop {
                 match pipe.read(&mut chunk) {
                     Ok(0) => break,
-                    Ok(n) => lock(&into).extend_from_slice(&chunk[..n]),
+                    Ok(n) => lock(into.as_ref()).extend_from_slice(&chunk[..n]),
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
@@ -319,13 +341,15 @@ fn drain(pipe: Option<impl Read + Send + 'static>, done: mpsc::Sender<()>) -> Bu
 }
 
 fn taken(buf: &Buffer) -> String {
-    String::from_utf8_lossy(&lock(buf)).into_owned()
+    String::from_utf8_lossy(&lock(buf.as_ref())).into_owned()
 }
 
-/// Poison is not news here: the reader only ever appends, so the bytes that did
-/// arrive are still exactly the bytes that arrived.
-fn lock(buf: &Buffer) -> std::sync::MutexGuard<'_, Vec<u8>> {
-    buf.lock().unwrap_or_else(|e| e.into_inner())
+/// Poison is not news behind any of this module's locks: a drain only ever
+/// appends (so the bytes that did arrive are still exactly the bytes that
+/// arrived), and the poller's slot holds one round the UI can do without. A
+/// panicking helper thread must never also freeze the caller.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ----------------------------------------------------------------- fixture
@@ -371,7 +395,7 @@ pub struct SshHost {
 
 impl Ssh for FixtureSsh {
     fn run(&self, alias: &str, argv: &[&str], timeout: Duration) -> SshOutcome {
-        log(alias, argv);
+        log_run(alias, argv);
         let mut script = script();
         let Some(host) = script.hosts.remove(alias) else {
             return SshOutcome::Failed(format!("no fixture host `{alias}`"));
@@ -417,13 +441,22 @@ fn script() -> SshScript {
         .unwrap_or_default()
 }
 
-/// An attach, in the same log: `attach`, the alias, then the remote argv.
-/// Marked rather than shaped like a `run` line so a test can tell the two
-/// apart, and so exec-vs-child — the `[ui] return_after_detach` split — is on
-/// the record.
+/// A fan-out call, logged as the far end's shell would receive it — quoting
+/// included, so a test pins the *sent* command rather than the argv on its way
+/// to [`remote_command`].
+fn log_run(alias: &str, argv: &[&str]) {
+    let sent = remote_command(argv.iter().map(|a| (*a).to_string()));
+    let sent: Vec<&str> = sent.iter().map(String::as_str).collect();
+    log(alias, &sent);
+}
+
+/// An attach, in the same log: `attach`, the alias, then the remote argv as
+/// sent. Marked rather than shaped like a `run` line so a test can tell the
+/// two apart, and so exec-vs-child — the `[ui] return_after_detach` split — is
+/// on the record.
 fn log_attach(kind: &str, alias: &str, argv: &[String]) {
     let mut parts = vec![alias.to_string()];
-    parts.extend(argv.iter().cloned());
+    parts.extend(remote_command(argv.iter().cloned()));
     let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
     log(kind, &parts);
 }
@@ -526,6 +559,10 @@ pub struct RemoteResult {
     pub stale: bool,
     /// When `quests` were fetched. `None` when there is nothing to show at all.
     pub fetched_at: Option<i64>,
+    /// That machine's `[tmux] session_prefix`, as it reported it. `None` when
+    /// it has not answered yet or its `q` is too old to say; SPEC §15's
+    /// [`DEFAULT_TMUX_PREFIX`] is the fallback.
+    pub tmux_prefix: Option<String>,
 }
 
 impl RemoteResult {
@@ -572,9 +609,25 @@ pub fn fetch_all(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> Vec<Remote
     if targets.is_empty() {
         return Vec::new();
     }
-    let argv = list_argv(all, state);
-    let answers = fan_out(ctx.ssh(), &targets, &argv, TIMEOUT);
-    resolve(ctx.db().ok(), &targets, answers, now())
+    let answers = fan_out(ctx.ssh(), &targets, &list_argv(), TIMEOUT);
+    let mut results = resolve(ctx.db().ok(), &targets, answers, now());
+    retain_listed(&mut results, all, state);
+    results
+}
+
+/// Apply this invocation's `--all`/`--state` to rows a remote sent, fresh or
+/// cached alike. See [`list_argv`]: the far end always sends everything, so
+/// this is where SPEC §16's filters are applied to a remote's rows — by the
+/// same predicate that filtered the local ones.
+pub fn retain_listed(results: &mut [RemoteResult], all: bool, state: Option<StateFilter>) {
+    if all && state.is_none() {
+        return;
+    }
+    for result in results {
+        result
+            .quests
+            .retain(|q| crate::commands::listed(&q.view, all, state));
+    }
 }
 
 // ----------------------------------------------------------------- polling
@@ -601,7 +654,18 @@ pub struct Round {
 /// later. Rounds that could overlap would pile those up without bound; here a
 /// round cannot start until the last one has returned.
 pub struct Poller {
-    rounds: mpsc::Receiver<Round>,
+    /// The last finished round, waiting to be picked up. A *slot*, not a
+    /// queue: the UI wants the newest answer and nothing else, and a queue
+    /// nobody drains is unbounded memory — the UI thread can be away for hours
+    /// inside a [`crate::tui`] handoff.
+    latest: Arc<Mutex<Option<Round>>>,
+    /// Set while the UI thread has given the terminal away. The worker starts
+    /// no round while it is on, so an attach that lasts four hours does not
+    /// cost 1440 ssh connections to machines nobody is looking at.
+    paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Dropped by the worker on its way out, so [`Poller::alive`] can tell a
+    /// stopped clock from a quiet one.
+    beacon: Arc<()>,
     /// Also the shutdown signal: dropping the `Poller` closes it, and the
     /// worker exits at the end of the round it is in.
     nudges: mpsc::SyncSender<()>,
@@ -611,34 +675,40 @@ impl Poller {
     /// Start polling, or `None` when there is nothing to poll — no remotes,
     /// `--no-remote`, or a `--machine` that is not one of them.
     ///
-    /// The round is asked for the *whole* listing (`--all`), unlike the CLI's,
-    /// because the TUI's `f` toggle filters rows it already has rather than
-    /// re-fetching: a keypress must not have to wait for a fan-out.
+    /// The round asks for the whole listing (see [`list_argv`]); the TUI's `f`
+    /// toggle filters rows it already has rather than re-fetching, so a
+    /// keypress never waits for a fan-out.
     pub fn spawn(ctx: &Ctx, every: Duration) -> Option<Poller> {
         let targets: Vec<Remote> = targets(ctx).into_iter().cloned().collect();
         if targets.is_empty() {
             return None;
         }
         let ssh = ctx.ssh_shared();
-        let argv = list_argv(true, None);
-        let (send_round, rounds) = mpsc::channel();
+        let argv = list_argv();
+        let latest = Arc::new(Mutex::new(None));
+        let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let beacon = Arc::new(());
         let (nudges, wake) = mpsc::sync_channel(1);
+        let worker = Worker {
+            latest: latest.clone(),
+            paused: paused.clone(),
+            beacon: beacon.clone(),
+        };
         // Detached: a round holds for at most `TIMEOUT`, and joining it would
         // put that on the TUI's exit path for nothing.
-        std::thread::spawn(move || {
-            poll_loop(ssh.as_ref(), &targets, &argv, every, &send_round, &wake)
-        });
-        Some(Poller { rounds, nudges })
+        std::thread::spawn(move || poll_loop(ssh.as_ref(), &targets, &argv, every, &worker, &wake));
+        Some(Poller {
+            latest,
+            paused,
+            beacon,
+            nudges,
+        })
     }
 
     /// The newest round that has finished since the last look, if any. Never
-    /// blocks; older rounds are dropped rather than replayed.
+    /// blocks; older rounds were overwritten rather than queued.
     pub fn take(&self) -> Option<Round> {
-        let mut latest = None;
-        while let Ok(round) = self.rounds.try_recv() {
-            latest = Some(round);
-        }
-        latest
+        lock(&self.latest).take()
     }
 
     /// Ask for a round now (the TUI's `x`). Coalesced: a nudge that arrives
@@ -647,6 +717,36 @@ impl Poller {
     pub fn nudge(&self) {
         let _ = self.nudges.try_send(());
     }
+
+    /// Stop starting rounds. The one already in flight, if any, finishes.
+    pub fn pause(&self) {
+        self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Start again, and ask for a round straight away: whatever the UI was
+    /// away doing, the listing it comes back to is older than it looks.
+    pub fn resume(&self) {
+        self.paused
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.nudge();
+    }
+
+    /// Whether the worker is still there. False once it has returned or
+    /// panicked — the remote clock has stopped, and a TUI that kept showing
+    /// the last chip would say nothing about it.
+    pub fn alive(&self) -> bool {
+        Arc::strong_count(&self.beacon) > 1
+    }
+}
+
+/// The poller's half of the shared state.
+struct Worker {
+    latest: Arc<Mutex<Option<Round>>>,
+    paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Held for exactly as long as the worker runs, and read only through the
+    /// `Arc`'s strong count; see [`Poller::alive`].
+    #[allow(dead_code)]
+    beacon: Arc<()>,
 }
 
 fn poll_loop(
@@ -654,24 +754,42 @@ fn poll_loop(
     targets: &[Remote],
     argv: &[String],
     every: Duration,
-    send_round: &mpsc::Sender<Round>,
+    worker: &Worker,
     wake: &mpsc::Receiver<()>,
 ) {
     loop {
-        let borrowed: Vec<&Remote> = targets.iter().collect();
-        let answers = fan_out(ssh, &borrowed, argv, TIMEOUT);
-        let round = Round {
-            targets: targets.to_vec(),
-            answers,
-        };
-        // The receiver is gone: the TUI has exited and this thread with it.
-        if send_round.send(round).is_err() {
-            return;
+        if !worker.paused.load(std::sync::atomic::Ordering::SeqCst) {
+            let borrowed: Vec<&Remote> = targets.iter().collect();
+            let answers = fan_out(ssh, &borrowed, argv, TIMEOUT);
+            // Overwrites whatever the UI has not picked up: one round of
+            // memory, and always the newest one.
+            *lock(&worker.latest) = Some(Round {
+                targets: targets.to_vec(),
+                answers,
+            });
         }
         match wake.recv_timeout(every) {
             Ok(()) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // The `Poller` is gone: the TUI has exited and this thread with it.
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Round {
+    /// A round as the poller would have delivered it, from what each remote
+    /// would have printed. Built through [`interpret`], so a test drives the
+    /// real parse — and, through [`resolve_round`], the real cache write.
+    pub(crate) fn for_tests(answers: Vec<(Remote, SshOutcome)>) -> Round {
+        let (targets, outcomes): (Vec<Remote>, Vec<SshOutcome>) = answers.into_iter().unzip();
+        Round {
+            answers: outcomes
+                .into_iter()
+                .map(|o| interpret(o, TIMEOUT))
+                .collect(),
+            targets,
         }
     }
 }
@@ -756,8 +874,17 @@ fn fan_out(
 /// thread before the database on the UI thread turns it into [`RemoteResult`]s.
 #[derive(Debug)]
 pub struct Answer {
-    quests: Vec<RemoteQuest>,
+    listing: Listing,
     raw: String,
+}
+
+/// A `q list --json` document, read.
+#[derive(Debug, Default)]
+pub struct Listing {
+    pub quests: Vec<RemoteQuest>,
+    /// The sender's `[tmux] session_prefix`, out of its own `machines` entry.
+    /// `None` from a bare array or a `q` too old to report it.
+    pub tmux_prefix: Option<String>,
 }
 
 /// What the far end said, turned into either an [`Answer`] or a reason it is
@@ -778,9 +905,9 @@ fn interpret(outcome: SshOutcome, timeout: Duration) -> Result<Answer, RemoteSta
             if code != Some(0) {
                 return Err(RemoteStatus::unreachable(exit_reason(code, &stderr)));
             }
-            let quests = parse(&stdout).map_err(RemoteStatus::incompatible)?;
+            let listing = parse(&stdout).map_err(RemoteStatus::incompatible)?;
             Ok(Answer {
-                quests,
+                listing,
                 raw: stdout.trim().to_string(),
             })
         }
@@ -810,7 +937,7 @@ fn exit_reason(code: Option<i32>, stderr: &str) -> String {
 /// Each row is kept twice (see [`RemoteQuest`]): parsed, and verbatim. Unknown
 /// fields are ignored by the parse and survive in the verbatim copy, so a newer
 /// `q` at the far end still lists; a missing required field does not parse.
-pub fn parse(stdout: &str) -> Result<Vec<RemoteQuest>, String> {
+pub fn parse(stdout: &str) -> Result<Listing, String> {
     let text = stdout.trim();
     if text.is_empty() {
         return Err("empty response".to_string());
@@ -825,7 +952,8 @@ pub fn parse(stdout: &str) -> Result<Vec<RemoteQuest>, String> {
         },
         _ => return Err("`q list --json` is neither an array nor an object".to_string()),
     };
-    rows.iter()
+    let quests: Vec<RemoteQuest> = rows
+        .iter()
         .map(|raw| {
             serde_json::from_value(raw.clone())
                 .map(|view| RemoteQuest {
@@ -834,7 +962,27 @@ pub fn parse(stdout: &str) -> Result<Vec<RemoteQuest>, String> {
                 })
                 .map_err(|e| format!("cannot read a quest in `q list --json`: {e}"))
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok(Listing {
+        tmux_prefix: local_tmux_prefix(&document),
+        quests,
+    })
+}
+
+/// The sender's own tmux prefix: the `machines` entry it filed itself under.
+/// A remote is asked with `--no-remote`, so its roster is exactly one entry —
+/// but it is matched on `kind` rather than on position, because a future `q`
+/// may put more there.
+fn local_tmux_prefix(document: &serde_json::Value) -> Option<String> {
+    document
+        .get(MACHINES)?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("kind").and_then(|k| k.as_str()) == Some("local"))?
+        .get(TMUX_PREFIX)?
+        .as_str()
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
 }
 
 /// Pairs each answer with its remote, writing the good ones to the cache and
@@ -851,14 +999,15 @@ fn resolve(
         .map(|(remote, answer)| match answer {
             Ok(mut answer) => {
                 store(db, &remote.name, &answer.raw, ts);
-                attribute(&mut answer.quests, &remote.name);
+                attribute(&mut answer.listing.quests, &remote.name);
                 RemoteResult {
                     name: remote.name.clone(),
                     ssh: remote.ssh.clone(),
                     status: RemoteStatus::Ok,
-                    quests: answer.quests,
+                    quests: answer.listing.quests,
                     stale: false,
                     fetched_at: Some(ts),
+                    tmux_prefix: answer.listing.tmux_prefix,
                 }
             }
             Err(status) => {
@@ -869,7 +1018,8 @@ fn resolve(
                     status,
                     stale: cached.is_some(),
                     fetched_at: cached.as_ref().map(|(_, at)| *at),
-                    quests: cached.map(|(q, _)| q).unwrap_or_default(),
+                    tmux_prefix: cached.as_ref().and_then(|(l, _)| l.tmux_prefix.clone()),
+                    quests: cached.map(|(l, _)| l.quests).unwrap_or_default(),
                 }
             }
         })
@@ -906,11 +1056,11 @@ fn store(db: Option<&Db>, name: &str, payload: &str, ts: i64) {
     let _ = db.put_remote_cache(name, payload, ts);
 }
 
-fn load(db: Option<&Db>, name: &str) -> Option<(Vec<RemoteQuest>, i64)> {
+fn load(db: Option<&Db>, name: &str) -> Option<(Listing, i64)> {
     let cached = db?.get_remote_cache(name).ok().flatten()?;
-    let mut quests = parse(&cached.payload).ok()?;
-    attribute(&mut quests, name);
-    Some((quests, cached.fetched_at))
+    let mut listing = parse(&cached.payload).ok()?;
+    attribute(&mut listing.quests, name);
+    Some((listing, cached.fetched_at))
 }
 
 /// The configured remote called `name`, for the commands that dispatch to one.
@@ -1073,7 +1223,7 @@ mod tests {
     /// A remote's answer, the way `interpret` would have built it.
     fn answer(raw: &str) -> Answer {
         Answer {
-            quests: parse(raw).unwrap(),
+            listing: parse(raw).unwrap(),
             raw: raw.to_string(),
         }
     }
@@ -1101,7 +1251,8 @@ mod tests {
                 "q",
                 "list",
                 "--json",
-                "--no-remote"
+                "--no-remote",
+                "--all"
             ]
         );
         // However short the deadline, ssh is never told to wait zero seconds.
@@ -1111,31 +1262,78 @@ mod tests {
         );
     }
 
+    /// The filters do NOT travel — see [`list_argv`]. One cache row per remote
+    /// has to serve every invocation, so the wire request is always the whole
+    /// listing and SPEC §16's filters are applied on arrival.
     #[test]
-    fn the_listing_filters_travel_to_the_remote() {
-        assert_eq!(list_argv(false, None), LIST_ARGV);
+    fn the_remote_is_always_asked_for_the_whole_listing() {
+        assert_eq!(list_argv(), LIST_ARGV);
+        assert!(list_argv().contains(&"--all".to_string()));
+        assert!(!list_argv().iter().any(|a| a == "--state"));
+    }
+
+    /// …and the filters are applied to what comes back, by the same predicate
+    /// that filtered the local rows.
+    #[test]
+    fn a_remotes_rows_are_filtered_on_arrival_fresh_or_cached() {
+        let mixed = {
+            let mut live = Quest::new("live-there", "/tmp", "ws");
+            live.state = crate::model::QuestState::Active;
+            let mut done = Quest::new("done-there", "/tmp", "ws");
+            done.state = crate::model::QuestState::Finished;
+            let views = [QuestView::new(live, &[]), QuestView::new(done, &[])];
+            serde_json::to_string(&views).unwrap()
+        };
+        let slugs = |results: &[RemoteResult]| -> Vec<String> {
+            results[0]
+                .quests
+                .iter()
+                .map(|q| q.view.quest.slug.clone())
+                .collect()
+        };
+        let remotes = [remote("ws")];
+        let ssh = || Arc::new(StubSsh::new(&[("ws-host", ok(mixed.clone()))])) as Arc<dyn Ssh>;
+
+        // Fresh.
         assert_eq!(
-            list_argv(true, Some(StateFilter::Idle)),
-            [
-                "q",
-                "list",
-                "--json",
-                "--no-remote",
-                "--all",
-                "--state",
-                "idle"
-            ]
+            slugs(&fetch_all(&ctx_with(&remotes, ssh()), false, None)),
+            ["live-there"],
+            "a finished remote Quest is not in the default listing"
         );
-        // Every filter this `q` accepts has a spelling the far end accepts.
-        for state in [
-            StateFilter::Active,
-            StateFilter::Idle,
-            StateFilter::Finished,
-        ] {
-            let argv = list_argv(false, Some(state));
-            assert_eq!(argv[..4], LIST_ARGV);
-            assert_eq!(argv[4], "--state");
-        }
+        assert_eq!(
+            slugs(&fetch_all(&ctx_with(&remotes, ssh()), true, None)).len(),
+            2
+        );
+        assert_eq!(
+            slugs(&fetch_all(
+                &ctx_with(&remotes, ssh()),
+                false,
+                Some(StateFilter::Finished)
+            )),
+            ["done-there"]
+        );
+
+        // …and cached, which is the case the cache row cannot answer on its
+        // own: one `--all` round fills it, then the machine goes down and a
+        // plain `q list` replays it. Same database, dead ssh.
+        let ctx = ctx_with(&remotes, ssh());
+        assert_eq!(slugs(&fetch_all(&ctx, true, None)).len(), 2);
+        let ctx = ctx.with_ssh(Arc::new(stub::NoSsh));
+        let cached = fetch_all(&ctx, false, None);
+        assert!(cached[0].stale, "the cache was not used");
+        assert_eq!(
+            slugs(&cached),
+            ["live-there"],
+            "a cached row is filtered by THIS invocation's flags"
+        );
+        assert_eq!(slugs(&fetch_all(&ctx, true, None)).len(), 2);
+        // No live session over there, so the unfinished one reads as idle —
+        // exactly as the far end's own `q list --state idle` would report it.
+        assert_eq!(
+            slugs(&fetch_all(&ctx, false, Some(StateFilter::Idle))),
+            ["live-there"]
+        );
+        assert!(slugs(&fetch_all(&ctx, false, Some(StateFilter::Active))).is_empty());
     }
 
     #[test]
@@ -1149,7 +1347,7 @@ mod tests {
         ])
         .with_delay(Duration::from_millis(50));
 
-        let answers = fan_out(&ssh, &targets, &list_argv(false, None), TIMEOUT);
+        let answers = fan_out(&ssh, &targets, &list_argv(), TIMEOUT);
 
         assert_eq!(answers.len(), 3);
         assert!(answers.iter().all(|a| a.is_ok()));
@@ -1160,7 +1358,13 @@ mod tests {
         // The answers keep config order whatever order they arrived in.
         let slugs: Vec<&str> = answers
             .iter()
-            .map(|a| a.as_ref().unwrap().quests[0].view.quest.slug.as_str())
+            .map(|a| {
+                a.as_ref().unwrap().listing.quests[0]
+                    .view
+                    .quest
+                    .slug
+                    .as_str()
+            })
             .collect();
         assert_eq!(slugs, ["one", "two", "three"]);
         assert_eq!(ssh.calls()[0].1, LIST_ARGV);
@@ -1226,10 +1430,22 @@ mod tests {
         let array = payload("one");
         let enveloped = format!("{{\"quests\": {array}, \"machines\": []}}");
         for text in [array.as_str(), enveloped.as_str(), "{\"quests\": []}"] {
-            let quests = parse(text).unwrap_or_else(|e| panic!("{text} → {e}"));
-            assert!(quests.len() <= 1);
+            let listing = parse(text).unwrap_or_else(|e| panic!("{text} → {e}"));
+            assert!(listing.quests.len() <= 1);
+            // Nothing said its prefix, so nothing is assumed.
+            assert_eq!(listing.tmux_prefix, None);
         }
-        assert_eq!(parse(&enveloped).unwrap()[0].view.quest.slug, "one");
+        assert_eq!(parse(&enveloped).unwrap().quests[0].view.quest.slug, "one");
+
+        // The sender's own `machines` entry is where its tmux prefix comes
+        // from — the only thing on the wire that can name a remote session.
+        let with_prefix = format!(
+            "{{\"quests\": {array}, \"machines\": [{{\"name\": \"ws\", \"kind\": \"local\", \"tmux_prefix\": \"work_\"}}]}}"
+        );
+        assert_eq!(
+            parse(&with_prefix).unwrap().tmux_prefix,
+            Some("work_".to_string())
+        );
     }
 
     #[test]
@@ -1238,9 +1454,9 @@ mod tests {
         value[0]["something_from_the_future"] = serde_json::json!("hello");
         // And a field this q knows but an older one never sent.
         value[0].as_object_mut().unwrap().remove("progress");
-        let quests = parse(&value.to_string()).unwrap();
-        assert_eq!(quests[0].view.quest.slug, "one");
-        assert_eq!(quests[0].view.progress, None);
+        let listing = parse(&value.to_string()).unwrap();
+        assert_eq!(listing.quests[0].view.quest.slug, "one");
+        assert_eq!(listing.quests[0].view.progress, None);
     }
 
     #[test]
@@ -1560,14 +1776,43 @@ mod tests {
         );
     }
 
+    /// The far end's login shell sees these words before any program does,
+    /// and it is not necessarily bash.
     #[test]
     fn an_argument_that_is_more_than_one_shell_word_is_quoted() {
-        assert_eq!(sh_quote("=q-alpha"), "=q-alpha");
+        // SPEC §15's tmux target. zsh — the macOS default, and what `ws` runs
+        // — applies *equals expansion* to a leading `=`: unquoted, the line
+        // dies with `zsh:1: q-alpha not found` and tmux never runs at all.
+        assert_eq!(sh_quote("=q-alpha"), "'=q-alpha'");
+        // …and `~` is the same story, in every shell.
+        assert_eq!(sh_quote("~/x"), "'~/x'");
+        // A plain word stays plain: alphanumerics and `-_./`, nothing else.
         assert_eq!(sh_quote("tmux"), "tmux");
+        assert_eq!(sh_quote("--no-remote"), "--no-remote");
+        assert_eq!(sh_quote("q-alpha"), "q-alpha");
+        assert_eq!(sh_quote("/usr/local/bin/q"), "/usr/local/bin/q");
         assert_eq!(sh_quote("=q alpha"), "'=q alpha'");
         assert_eq!(sh_quote("a'b"), r"'a'\''b'");
         assert_eq!(sh_quote(""), "''");
         assert_eq!(sh_quote("; rm -rf /"), "'; rm -rf /'");
+        // Everything the old plain set let through, now quoted.
+        for arg in ["=x", "a=b", "~x", "a%b", "a,b", "a+b", "a:b", "a@b"] {
+            assert_eq!(sh_quote(arg), format!("'{arg}'"), "{arg}");
+        }
+    }
+
+    /// Quoting happens once, at the ssh boundary, so no caller can forget it —
+    /// and the fan-out's own flags are unaffected by it.
+    #[test]
+    fn the_remote_command_is_quoted_on_its_way_into_ssh() {
+        assert_eq!(
+            attach_argv("ws-host", &["tmux".to_string(), "=q-alpha".to_string()]),
+            ["-t", "ws-host", "tmux", "'=q-alpha'"]
+        );
+        // ssh's own options are ours to exec, never the far end's to read.
+        let argv = ssh_argv("ws", &LIST_ARGV, TIMEOUT);
+        assert_eq!(argv[1], "BatchMode=yes");
+        assert_eq!(&argv[5..], LIST_ARGV);
     }
 
     #[test]
@@ -1662,6 +1907,55 @@ mod tests {
         // the queue holds one, plus at most the round already running.
         assert!((1..=2).contains(&extra), "{extra} rounds for twenty nudges");
         assert!(stub.calls().len() <= 3, "{:?}", stub.calls());
+        drop(poller);
+    }
+
+    /// SPEC §17's handoff: the UI thread can be inside a tmux attach for
+    /// hours, and a poller left running would open an ssh connection per
+    /// machine per tick for a screen nobody is looking at — retaining a round
+    /// each time, because nothing is draining them.
+    #[test]
+    fn a_paused_poller_starts_no_rounds_and_keeps_only_the_newest() {
+        let stub = Arc::new(StubSsh::new(&[("ws-host", ok(payload("one")))]));
+        let remotes = [remote("ws")];
+        let ctx = ctx_with(&remotes, stub.clone() as Arc<dyn Ssh>);
+        let poller = Poller::spawn(&ctx, Duration::from_millis(1)).expect("a remote to poll");
+
+        // Let it get going, then hand the terminal away.
+        let deadline = Instant::now() + PATIENCE;
+        while stub.calls().len() < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(stub.calls().len() >= 3, "the poller never started");
+        poller.pause();
+
+        // The round in flight finishes; after that, nothing starts.
+        let settled = loop {
+            let before = stub.calls().len();
+            std::thread::sleep(Duration::from_millis(50));
+            if stub.calls().len() == before {
+                break before;
+            }
+            assert!(Instant::now() < deadline, "the poller never stopped");
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(stub.calls().len(), settled, "a paused poller kept dialling");
+
+        // However many rounds ran, at most one was ever retained.
+        assert!(poller.take().is_some(), "no round to pick up");
+        assert!(
+            poller.take().is_none(),
+            "rounds were queued rather than kept"
+        );
+
+        // Coming back asks for one straight away.
+        poller.resume();
+        let deadline = Instant::now() + PATIENCE;
+        while poller.take().is_none() {
+            assert!(Instant::now() < deadline, "the poller did not resume");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(poller.alive());
         drop(poller);
     }
 
