@@ -45,7 +45,10 @@ pub fn run(ctx: &Ctx, target: &str, force: bool, close_epic: bool) -> anyhow::Re
     if !force && let Some(question) = confirmation(ctx, &quest, close_epic)? {
         confirm(ctx, &question)?;
     }
-    let out = apply(ctx, &quest, close_epic)?;
+    let out = apply(ctx, &quest, close_epic);
+    // Before the payload, exactly where the `eprintln!`s used to land.
+    crate::commands::flush_warnings(ctx);
+    let out = out?;
 
     if ctx.json || !ctx.quiet {
         output::emit(
@@ -73,12 +76,9 @@ pub fn confirmation(ctx: &Ctx, quest: &Quest, close_epic: bool) -> anyhow::Resul
         if !close_epic {
             return Ok(None);
         }
-        let Some(epic) = beads::epic_of(quest) else {
+        let Some(epic) = epic_pending(ctx, quest)? else {
             return Ok(None);
         };
-        if epic_already_closed(ctx, quest)? {
-            return Ok(None);
-        }
         return Ok(Some(format!("close beads epic {epic}?")));
     }
     let epic = match beads::epic_of(quest).filter(|_| close_epic) {
@@ -160,38 +160,51 @@ fn epic_note(quest: &Quest, epic_closed: bool) -> String {
 /// already done.
 fn close_epic_again(ctx: &Ctx, quest: &Quest) -> anyhow::Result<bool> {
     let Some(epic) = beads::epic_of(quest) else {
-        eprintln!(
+        ctx.warn(format!(
             "warning: --close-epic: quest {} has no beads epic",
             quest.slug
-        );
+        ));
         return Ok(false);
     };
-    if epic_already_closed(ctx, quest)? {
-        eprintln!("note: beads epic {epic} was already closed by an earlier `q close`");
+    // Deliberately asked again rather than reusing what `confirmation` found:
+    // between the two lies a `[y/N]` blocked on stdin, which can be minutes,
+    // and closing an epic somebody else closed in that window is the write
+    // this check exists to prevent.
+    if epic_pending(ctx, quest)?.is_none() {
+        ctx.warn(format!(
+            "note: beads epic {epic} was already closed by an earlier `q close`"
+        ));
         return Ok(false);
     }
     Ok(close_the_epic(ctx, quest))
 }
 
-/// Whether an earlier `q close --close-epic` already closed this epic.
-fn epic_already_closed(ctx: &Ctx, quest: &Quest) -> anyhow::Result<bool> {
-    let db = ctx.db()?;
-    Ok(!db
+/// The epic a `--close-epic` still has to close: `None` when the Quest has no
+/// epic, or an earlier `q close --close-epic` already closed it — the recorded
+/// event is the proof.
+fn epic_pending<'a>(ctx: &Ctx, quest: &'a Quest) -> anyhow::Result<Option<&'a str>> {
+    let Some(epic) = beads::epic_of(quest) else {
+        return Ok(None);
+    };
+    let done = !ctx
+        .db()?
         .list_events_by_kinds(&quest.id, &["beads.epic_closed"], 1)?
-        .is_empty())
+        .is_empty();
+    Ok((!done).then_some(epic))
 }
 
 /// `--close-epic`: closes the Quest's beads epic (SPEC §13). A missing epic or
-/// an unreachable `bd` is a warning — the Quest still closes.
+/// an unreachable `bd` is a warning on the `Ctx` — the Quest still closes, and
+/// nothing is written to a screen the caller may own.
 fn close_the_epic(ctx: &Ctx, quest: &Quest) -> bool {
     let Some(epic) = beads::epic_of(quest) else {
-        eprintln!(
+        ctx.warn(format!(
             "warning: --close-epic: quest {} has no beads epic",
             quest.slug
-        );
+        ));
         return false;
     };
-    match beads::client().close(epic, "quest closed") {
+    match ctx.bd().close(epic, "quest closed") {
         Ok(()) => {
             let _ = ctx.db().and_then(|db| {
                 db.append_event(
@@ -204,7 +217,7 @@ fn close_the_epic(ctx: &Ctx, quest: &Quest) -> bool {
             true
         }
         Err(e) => {
-            eprintln!("warning: `bd close {epic}` failed: {e}");
+            ctx.warn(format!("warning: `bd close {epic}` failed: {e}"));
             false
         }
     }

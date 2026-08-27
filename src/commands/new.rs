@@ -43,6 +43,10 @@ pub struct Args<'a> {
     /// which is what the global `--machine` already decides for the CLI; the
     /// TUI's new-Quest form picks it per Quest instead (SPEC §17).
     pub machine: Option<&'a str>,
+    /// The **id** of the template this Quest was instantiated from (SPEC §11's
+    /// `template_id` column). No CLI flag reaches it yet: `q tpl run` is
+    /// bd-8lz.5's, and the TUI's template select is the one caller today.
+    pub template: Option<&'a str>,
 }
 
 /// Everything `q new` creates, before anything is printed or attached to.
@@ -58,11 +62,17 @@ pub struct Created {
 }
 
 pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
+    let created = create(ctx, args);
+    // Before the payload and before `main` renders a failure: a warning about
+    // the epic explains what the line after it says (or does not say), and on
+    // the rollback path it is the only record of an epic that outlived its
+    // Quest.
+    crate::commands::flush_warnings(ctx);
     let Created {
         quest,
         session,
         tmux_session,
-    } = create(ctx, args)?;
+    } = created?;
 
     let attach = attach_mode(ctx, !args.detach);
     if ctx.json || !ctx.quiet {
@@ -118,6 +128,7 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
     row.goal = args.goal.map(str::to_string);
     // TODO(M5): validate `--workflow` against the workflow registry.
     row.workflow = args.workflow.map(str::to_string);
+    row.template_id = args.template.map(str::to_string);
     // Only the opt-out is stored; NULL keeps following `[context] auto_reset`.
     row.auto_reset = args.no_auto_reset.then_some(false);
     let quest = db.insert_quest(&row)?;
@@ -131,6 +142,7 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
             "cwd": quest.cwd,
             "machine": quest.machine,
             "workflow": quest.workflow,
+            "template_id": quest.template_id,
             "name_source": quest.name_source,
             "auto_reset": quest.auto_reset,
         }),
@@ -147,7 +159,7 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
         // so would the epic, which lives in a tracker this row was the only
         // pointer to.
         Err(e) => {
-            abandon_epic(beads::client().as_ref(), &quest);
+            abandon_epic(ctx, &quest);
             let _ = db.delete_quest(&quest.id);
             return Err(e);
         }
@@ -162,15 +174,15 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
 /// The Quest row is about to be deleted, so its epic loses its only pointer:
 /// close it rather than leave a stray open epic in a shared tracker. A `bd`
 /// that will not cooperate is named, so the id is not simply lost.
-fn abandon_epic(bd: &dyn beads::Bd, quest: &Quest) {
+fn abandon_epic(ctx: &Ctx, quest: &Quest) {
     let Some(epic) = beads::epic_of(quest) else {
         return;
     };
-    if let Err(err) = bd.close(epic, "quest creation failed") {
-        eprintln!(
+    if let Err(err) = ctx.bd().close(epic, "quest creation failed") {
+        ctx.warn(format!(
             "warning: quest creation failed and beads epic {epic} could not be closed \
              ({err}); close it with `bd close {epic}`"
-        );
+        ));
     }
 }
 
@@ -192,7 +204,8 @@ fn repo_flag(args: &Args) -> anyhow::Result<Option<String>> {
 
 /// Creates the Quest's beads epic and stores it on the row. Returns the Quest
 /// unchanged when `--no-beads` was given or `bd` could not be reached — the
-/// warning goes to stderr so `--json` stdout stays a single payload.
+/// warning is buffered on the `Ctx` (never written), so `--json` stdout stays a
+/// single payload and a TUI caller can put it in the status bar instead.
 fn create_epic(ctx: &Ctx, quest: Quest, args: &Args, repo: Option<&str>) -> Quest {
     if args.no_beads {
         return quest;
@@ -208,14 +221,14 @@ fn create_epic(ctx: &Ctx, quest: Quest, args: &Args, repo: Option<&str>) -> Ques
         Some(goal) => format!("{}: {goal}", quest.slug),
         None => quest.slug.clone(),
     };
-    match beads::client().create_epic(&title, &labels, &quest.id) {
+    match ctx.bd().create_epic(&title, &labels, &quest.id) {
         Ok(epic) => store_epic(ctx, quest, &epic, &repo),
         Err(e) => {
-            eprintln!(
+            ctx.warn(format!(
                 "warning: no beads epic for {} ({e}); link one later with \
                  `q set {} beads_epic <id>`, or pass --no-beads to skip this",
                 quest.slug, quest.slug
-            );
+            ));
             quest
         }
     }
@@ -242,7 +255,9 @@ fn store_epic(ctx: &Ctx, quest: Quest, epic: &str, repo: &str) -> Quest {
     match stored {
         Ok(stored) => stored,
         Err(e) => {
-            eprintln!("warning: beads epic {epic} could not be stored: {e:#}");
+            ctx.warn(format!(
+                "warning: beads epic {epic} could not be stored: {e:#}"
+            ));
             quest
         }
     }
@@ -691,69 +706,59 @@ mod tests {
         assert_eq!(resolve_prompt(Some("   "), None).unwrap(), None);
     }
 
-    /// Records the `bd close` calls a rollback makes.
-    #[derive(Default)]
-    struct SpyBd {
-        closed: std::cell::RefCell<Vec<(String, String)>>,
-        refuse: bool,
-    }
-
-    impl beads::Bd for SpyBd {
-        fn create_epic(&self, _: &str, _: &str, _: &str) -> Result<String, String> {
-            unreachable!("a rollback never creates")
-        }
-        fn list_quest(&self, _: &str) -> Option<String> {
-            None
-        }
-        fn list_quests(&self, _: &[&str]) -> Option<String> {
-            None
-        }
-        fn close(&self, id: &str, reason: &str) -> Result<(), String> {
-            self.closed
-                .borrow_mut()
-                .push((id.to_string(), reason.to_string()));
-            if self.refuse {
-                Err("bd is wedged".to_string())
-            } else {
-                Ok(())
-            }
-        }
-        fn relabel_repo(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), String> {
-            unreachable!("a rollback never relabels")
-        }
-    }
-
     fn quest_with_epic(epic: Option<&str>) -> Quest {
         let mut quest = Quest::new("slug", "/tmp", "machine");
         quest.beads_epic = epic.map(str::to_string);
         quest
     }
 
+    /// A `Ctx` whose `bd` is the given stub, so the rollback runs against the
+    /// same seam the TUI and the CLI use.
+    fn ctx_with(bd: &std::sync::Arc<beads::stub::StubBd>) -> Ctx {
+        Ctx::for_tests(
+            crate::config::Config::default(),
+            crate::db::Db::open_in_memory().unwrap(),
+            Box::new(crate::tmux::FixtureTmux::new(std::path::PathBuf::from(
+                "/nonexistent/tmux.json",
+            ))),
+        )
+        .with_bd(Box::new(bd.clone()))
+    }
+
     #[test]
     fn a_rolled_back_quest_closes_the_epic_it_had_already_minted() {
-        let bd = SpyBd::default();
-        abandon_epic(&bd, &quest_with_epic(Some("bd-7fx")));
+        let bd = std::sync::Arc::new(beads::stub::StubBd::working("bd-7fx"));
+        let ctx = ctx_with(&bd);
+        abandon_epic(&ctx, &quest_with_epic(Some("bd-7fx")));
         assert_eq!(
-            bd.closed.borrow().as_slice(),
+            bd.closed.lock().unwrap().as_slice(),
             [("bd-7fx".to_string(), "quest creation failed".to_string())]
         );
+        assert!(ctx.take_warnings().is_empty());
     }
 
     #[test]
     fn a_rollback_with_no_epic_asks_bd_for_nothing() {
-        let bd = SpyBd::default();
-        abandon_epic(&bd, &quest_with_epic(None));
-        assert!(bd.closed.borrow().is_empty());
+        let bd = std::sync::Arc::new(beads::stub::StubBd::working("bd-7fx"));
+        let ctx = ctx_with(&bd);
+        abandon_epic(&ctx, &quest_with_epic(None));
+        assert!(bd.closed.lock().unwrap().is_empty());
     }
 
+    /// The rollback's own warning is buffered on the `Ctx`, never written: the
+    /// TUI reaches this path with the alternate screen up, and a stray stderr
+    /// write there tears the frame and is never repainted (B1).
     #[test]
-    fn a_bd_that_refuses_the_rollback_is_survivable() {
-        let bd = SpyBd {
-            refuse: true,
-            ..SpyBd::default()
-        };
-        abandon_epic(&bd, &quest_with_epic(Some("bd-7fx")));
-        assert_eq!(bd.closed.borrow().len(), 1);
+    fn a_bd_that_refuses_the_rollback_is_survivable_and_says_so_in_data() {
+        let bd = std::sync::Arc::new(beads::stub::StubBd::failing("bd is wedged"));
+        let ctx = ctx_with(&bd);
+        abandon_epic(&ctx, &quest_with_epic(Some("bd-7fx")));
+        assert_eq!(bd.closed.lock().unwrap().len(), 1);
+        let warnings = ctx.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("bd close bd-7fx"), "{warnings:?}");
+        // Drained: nothing is carried into the next command.
+        assert!(ctx.take_warnings().is_empty());
     }
 
     #[test]

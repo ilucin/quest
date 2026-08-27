@@ -9,13 +9,13 @@
 //!
 //! Pure, like the rest of the state machine: [`Form::handle`] only edits the
 //! form and says what happened, and [`render`] only draws it.
-#![allow(dead_code)]
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::keys::Input;
 use super::layout;
@@ -27,6 +27,12 @@ const CARET: char = '\u{2588}';
 const FOCUS: &str = "\u{25b8} ";
 /// Two borders plus one column of padding on each side.
 const BOX_CHROME: u16 = 4;
+/// The label of the row that decides whether a submit means anything.
+pub const ACTION: &str = "action";
+/// Its non-committal option, and the one it starts on.
+pub const CANCEL: &str = "cancel";
+/// Marks a cut in a value too wide for the box.
+const CUT: char = '\u{2026}';
 
 /// What a keypress did to a form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +62,11 @@ pub enum Field {
         label: String,
         options: Vec<String>,
         at: usize,
+        /// Whether Space is refused as a way to cycle it. The affirmative on a
+        /// destructive prompt is `guarded`: bracketed paste is off, so a paste
+        /// arrives as ordinary keys, and a space in pasted text must not be
+        /// able to arm the very option the prompt is guarding.
+        guarded: bool,
     },
     /// Flipped with `←`/`→`/space.
     Toggle { label: String, on: bool },
@@ -79,7 +90,12 @@ impl Field {
     }
 
     /// The value as the box shows it, with the caret when this row has focus.
-    fn shown(&self, focused: bool) -> String {
+    ///
+    /// `budget` is the columns the value may occupy, when the caller knows it.
+    /// A focused text field longer than that is *scrolled* rather than cut at
+    /// the end: cutting keeps the start and loses the caret, which is exactly
+    /// the state where the user is typing and nothing on screen moves.
+    fn shown(&self, focused: bool, budget: Option<usize>) -> String {
         match self {
             Field::Text {
                 value,
@@ -88,10 +104,10 @@ impl Field {
                 ..
             } => {
                 if !focused {
-                    return if value.is_empty() {
-                        blank.clone()
-                    } else {
-                        value.clone()
+                    let text = if value.is_empty() { blank } else { value };
+                    return match budget {
+                        Some(budget) => layout::truncate(text, budget),
+                        None => text.clone(),
                     };
                 }
                 let (head, tail) = value.split_at(*cursor);
@@ -99,7 +115,10 @@ impl Field {
                 if value.is_empty() {
                     out.push_str(blank);
                 }
-                out
+                match budget {
+                    Some(budget) => window(&out, layout::width(head), budget),
+                    None => out,
+                }
             }
             Field::Select { options, at, .. } => match options.get(*at) {
                 Some(option) => format!("\u{2039} {option} \u{203a}"),
@@ -165,7 +184,43 @@ impl Form {
             label: label.to_string(),
             options,
             at,
+            guarded: false,
         })
+    }
+
+    /// The affirmative of a prompt that destroys something or starts a
+    /// process, as a row that begins on `cancel`.
+    ///
+    /// `q close` asks `[y/N]` and reads a bare Enter as *abort*; a box whose
+    /// Enter is unconditionally affirmative is a safety regression against
+    /// that, and one the user cannot see coming — the keys buffered during a
+    /// stall (a hanging `bd`, write-lock contention) arrive as if they had
+    /// been typed at the box. So the affirmative is never the default, and
+    /// never reachable by a key a paste can carry.
+    pub fn action(self, verb: &str) -> Form {
+        self.push(Field::Select {
+            label: ACTION.to_string(),
+            options: vec![CANCEL.to_string(), verb.to_string()],
+            at: 0,
+            guarded: true,
+        })
+    }
+
+    /// The verb an [`action`](Form::action) row offers.
+    fn verb(&self) -> Option<&str> {
+        match self.find(ACTION) {
+            Some(Field::Select { options, .. }) => options.last().map(String::as_str),
+            _ => None,
+        }
+    }
+
+    /// Whether a submit means anything: true for a form with no action row at
+    /// all, and for one whose action row has been moved off `cancel`.
+    pub fn confirmed(&self) -> bool {
+        match self.find(ACTION) {
+            Some(_) => self.choice(ACTION) != CANCEL,
+            None => true,
+        }
     }
 
     pub fn toggle(self, label: &str, on: bool) -> Form {
@@ -195,10 +250,6 @@ impl Form {
 
     fn find(&self, label: &str) -> Option<&Field> {
         self.fields.iter().find(|f| f.label() == label)
-    }
-
-    fn find_mut(&mut self, label: &str) -> Option<&mut Field> {
-        self.fields.iter_mut().find(|f| f.label() == label)
     }
 
     /// A text field's value, trimmed. Missing labels read as empty rather than
@@ -231,17 +282,6 @@ impl Form {
         matches!(self.find(label), Some(Field::Toggle { on: true, .. }))
     }
 
-    /// Fill a text field only when it is still empty: a template's defaults
-    /// must never overwrite something already typed.
-    pub fn fill_blank(&mut self, label: &str, with: &str) {
-        if let Some(Field::Text { value, cursor, .. }) = self.find_mut(label)
-            && value.trim().is_empty()
-        {
-            *value = with.to_string();
-            *cursor = value.len();
-        }
-    }
-
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -262,7 +302,22 @@ impl Form {
     pub fn handle(&mut self, input: Input) -> Outcome {
         match input {
             Input::Esc => Outcome::Cancel,
-            Input::Enter => Outcome::Submit,
+            // Not a submit while the action row still reads `cancel`, and not
+            // a dismissal either: the box stays up, saying what is missing.
+            // Dismissing would throw away everything typed and would look, to
+            // someone whose Enter arrived from a buffer, exactly like the
+            // action having run.
+            Input::Enter => {
+                if self.confirmed() {
+                    Outcome::Submit
+                } else {
+                    let verb = self.verb().unwrap_or("go ahead").to_string();
+                    self.set_error(format!(
+                        "nothing done \u{b7} choose \u{2039} {verb} \u{203a} on the {ACTION} row (\u{2190}\u{2192}), or Esc"
+                    ));
+                    Outcome::Editing
+                }
+            }
             Input::Tab | Input::Down => {
                 self.step_focus(1);
                 Outcome::Editing
@@ -362,14 +417,25 @@ impl Form {
                 }
                 _ => false,
             },
-            Field::Select { options, at, .. } => {
+            Field::Select {
+                options,
+                at,
+                guarded,
+                ..
+            } => {
                 let n = options.len();
                 match input {
                     Input::Left => {
                         *at = (*at + n - 1) % n;
                         true
                     }
-                    Input::Right | Input::Char(' ') => {
+                    Input::Right => {
+                        *at = (*at + 1) % n;
+                        true
+                    }
+                    // Space is a character a paste can carry; a guarded row
+                    // moves only on the arrows.
+                    Input::Char(' ') if !*guarded => {
                         *at = (*at + 1) % n;
                         true
                     }
@@ -388,63 +454,119 @@ impl Form {
     }
 }
 
+// The caret walks whole grapheme clusters, the same unit `layout::truncate`
+// cuts on and the same unit the terminal paints as one glyph. Stepping by
+// `char` instead parks the caret between a base letter and its combining mark,
+// where the block glyph wears the accent and Backspace eats only the mark.
+
 fn prev_boundary(s: &str, at: usize) -> usize {
     s[..at]
-        .chars()
+        .graphemes(true)
         .next_back()
-        .map(|c| at - c.len_utf8())
+        .map(|g| at - g.len())
         .unwrap_or(0)
 }
 
 fn next_boundary(s: &str, at: usize) -> usize {
     s[at..]
-        .chars()
+        .graphemes(true)
         .next()
-        .map(|c| at + c.len_utf8())
+        .map(|g| at + g.len())
         .unwrap_or(at)
+}
+
+/// At most `budget` columns of `s`, always including the column the caret sits
+/// in. Anything cut is marked with `\u{2026}`.
+fn window(s: &str, caret: usize, budget: usize) -> String {
+    if layout::width(s) <= budget {
+        return s.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    // The caret is still within the first screenful: an ordinary end-cut.
+    if caret < budget {
+        return layout::truncate(s, budget);
+    }
+    // Scrolled. The caret rides the right edge, one column goes to the marker.
+    let keep = budget - 1;
+    let from = (caret + 1).saturating_sub(keep);
+    let mut out = String::new();
+    let mut col = 0;
+    let mut used = 0;
+    for cluster in s.graphemes(true) {
+        let w = layout::width(cluster);
+        if col + w <= from {
+            col += w;
+            continue;
+        }
+        if used + w > keep {
+            break;
+        }
+        out.push_str(cluster);
+        used += w;
+        col += w;
+    }
+    format!("{CUT}{out}")
 }
 
 // -------------------------------------------------------------------- render
 
-/// The lines the box holds, flat, so the width can be measured before the
-/// widget is built and every line clipped to the same budget.
-fn body(form: &Form) -> Vec<(String, Style)> {
-    let width = form
-        .fields
+/// The field rows, and the footer that must survive whatever the box cannot
+/// fit. `budget`, when known, is the columns one whole row may occupy.
+///
+/// Split in two because they do not compete on equal terms: a box shorter than
+/// its content used to drop from the bottom, which threw away the error line
+/// and the hint — the reason a submit failed and the only way out — and kept
+/// the fields, which are already on screen.
+fn rows(form: &Form, budget: Option<usize>) -> Vec<(String, Style)> {
+    let label_w = form
+        .fields()
         .iter()
         .filter(|f| f.focusable())
         .map(|f| layout::width(f.label()))
         .max()
         .unwrap_or(0);
-    let mut out: Vec<(String, Style)> = Vec::new();
-    for (i, field) in form.fields.iter().enumerate() {
-        let focused = i == form.focus;
-        let style = if focused {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else if matches!(field, Field::Note(_)) {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default()
-        };
-        let marker = if focused { FOCUS } else { "  " };
-        let text = match field {
-            Field::Note(note) => format!("{marker}{note}"),
-            _ => format!(
-                "{marker}{:>width$}  {}",
-                field.label(),
-                field.shown(focused)
-            ),
-        };
-        out.push((text, style));
-    }
+    // What is left of a row once the focus marker, the label and the gap
+    // between them have taken their columns.
+    let value_budget = budget.map(|b| b.saturating_sub(label_w + 4));
+    form.fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let focused = i == form.focus;
+            let style = if focused {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else if matches!(field, Field::Note(_)) {
+                Style::default().add_modifier(Modifier::DIM)
+            } else {
+                Style::default()
+            };
+            let marker = if focused { FOCUS } else { "  " };
+            let text = match field {
+                Field::Note(note) => format!("{marker}{note}"),
+                _ => format!(
+                    "{marker}{:>label_w$}  {}",
+                    field.label(),
+                    field.shown(focused, value_budget)
+                ),
+            };
+            (text, style)
+        })
+        .collect()
+}
+
+/// The error, then the hint — in that order, and that is also the order they
+/// survive in: with room for one line the reason a submit failed beats the way
+/// out, because the box covers the status bar and the hint is repeated there.
+fn footer(form: &Form) -> Vec<(String, Style)> {
+    let mut out = Vec::new();
     if let Some(error) = form.error() {
-        out.push((String::new(), Style::default()));
         out.push((
             format!("  {error}"),
             Style::default().add_modifier(Modifier::BOLD),
         ));
     }
-    out.push((String::new(), Style::default()));
     out.push((
         format!("  {}", form.hint),
         Style::default().add_modifier(Modifier::DIM),
@@ -461,15 +583,17 @@ pub fn render(frame: &mut Frame, area: Rect, form: &Form) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let lines = body(form);
-    let inner = lines
+    let (rows, footer) = (rows(form, None), footer(form));
+    let inner = rows
         .iter()
+        .chain(footer.iter())
         .map(|(text, _)| layout::width(text))
         .chain(std::iter::once(layout::width(&form.title) + 2))
         .max()
         .unwrap_or(0);
     let want_w = (inner as u16).saturating_add(BOX_CHROME);
-    let want_h = (lines.len() as u16).saturating_add(2);
+    // One blank line between the fields and the footer.
+    let want_h = (rows.len() + footer.len() + 1) as u16 + 2;
 
     if area.height < 3 || want_w <= BOX_CHROME {
         render_cramped(frame, area, form);
@@ -477,15 +601,30 @@ pub fn render(frame: &mut Frame, area: Rect, form: &Form) {
     }
     let box_area = layout::centered(area, want_w, want_h);
     let budget = box_area.width.saturating_sub(BOX_CHROME) as usize;
-    let shown: Vec<Line> = lines
+    let height = box_area.height.saturating_sub(2) as usize;
+    // Re-laid out against the width actually granted, so a focused field wider
+    // than the box scrolls with its caret rather than being cut at the start.
+    let rows = self::rows(form, Some(budget));
+
+    // The footer takes its lines first, whatever they cost the fields: the
+    // fields are already on screen, the error and the hint are not.
+    let kept = footer.len().min(height);
+    let room = height - kept;
+    let mut shown: Vec<(String, Style)> = Vec::with_capacity(height);
+    shown.extend(rows.into_iter().take(room));
+    if shown.len() < room {
+        shown.push((String::new(), Style::default()));
+    }
+    shown.extend(footer.into_iter().take(kept));
+
+    let lines: Vec<Line> = shown
         .into_iter()
-        .take(box_area.height.saturating_sub(2) as usize)
         .map(|(text, style)| Line::from(Span::styled(layout::truncate(&text, budget), style)))
         .collect();
 
     frame.render_widget(Clear, box_area);
     frame.render_widget(
-        Paragraph::new(shown).block(
+        Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" {} ", form.title))
@@ -497,17 +636,23 @@ pub fn render(frame: &mut Frame, area: Rect, form: &Form) {
 
 /// One row, no border: the title and whatever has focus.
 fn render_cramped(frame: &mut Frame, area: Rect, form: &Form) {
-    let focused = form.focused();
-    let tail = match (form.error(), focused) {
+    let head = format!("{}: ", form.title);
+    // What the value may have once the title and the label are paid for.
+    let budget = (area.width as usize).saturating_sub(layout::width(&head));
+    let tail = match (form.error(), form.focused()) {
         (Some(error), _) => error.to_string(),
-        (None, Some(field)) => format!("{} {}", field.label(), field.shown(true)),
+        (None, Some(field)) => {
+            let label = field.label();
+            let value = field.shown(true, Some(budget.saturating_sub(label.len() + 1)));
+            format!("{label} {value}")
+        }
         (None, None) => form.hint.clone(),
     };
     let row = Rect { height: 1, ..area };
     frame.render_widget(Clear, row);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            layout::truncate(&format!("{}: {tail}", form.title), area.width as usize),
+            layout::truncate(&format!("{head}{tail}"), area.width as usize),
             Style::default().add_modifier(Modifier::BOLD),
         ))),
         row,
@@ -608,6 +753,42 @@ mod tests {
         assert_eq!(f.trimmed("f"), "");
     }
 
+    /// The caret steps by grapheme cluster — the unit `layout::truncate` cuts
+    /// on and the unit the terminal paints. By `char` it parks between a base
+    /// letter and its combining mark: the block glyph wears the accent, and
+    /// Backspace eats only the mark.
+    #[test]
+    fn the_caret_walks_whole_grapheme_clusters() {
+        // `e` + U+0301, painted as one `é`.
+        let mut f = Form::new("t").text("f", "cafe\u{301}", "");
+        f.handle(Input::Left);
+        assert_eq!(f.trimmed("f"), "cafe\u{301}");
+        type_in(&mut f, "X");
+        assert_eq!(
+            f.trimmed("f"),
+            "cafXe\u{301}",
+            "the caret split the cluster"
+        );
+        f.handle(Input::End);
+        f.handle(Input::Backspace);
+        assert_eq!(
+            f.trimmed("f"),
+            "cafX",
+            "Backspace left a naked combining mark"
+        );
+        // Delete, from the other side.
+        let mut f = Form::new("t").text("f", "e\u{301}x", "");
+        f.handle(Input::Home);
+        f.handle(Input::Delete);
+        assert_eq!(f.trimmed("f"), "x");
+        // And a flag, which is a pair of regional indicators.
+        let mut f = Form::new("t").text("f", "\u{1f1ed}\u{1f1f7}!", "");
+        f.handle(Input::Home);
+        f.handle(Input::Right);
+        type_in(&mut f, "Z");
+        assert_eq!(f.trimmed("f"), "\u{1f1ed}\u{1f1f7}Z!");
+    }
+
     /// A multi-byte character must not be cut in half by a caret move.
     #[test]
     fn the_caret_walks_whole_characters() {
@@ -687,17 +868,15 @@ mod tests {
         assert_eq!(f.error(), None);
     }
 
+    /// A label the form does not have reads as "nothing was given" rather
+    /// than panicking — a form is data, and its readers are shared.
     #[test]
-    fn fill_blank_never_overwrites() {
-        let mut f = form();
-        f.fill_blank("goal", "from the template");
-        assert_eq!(f.trimmed("goal"), "ship it");
-        f.fill_blank("name", "from the template");
-        assert_eq!(f.trimmed("name"), "from the template");
-        // An unknown label is a no-op, not a panic.
-        f.fill_blank("nope", "x");
+    fn an_unknown_label_reads_as_blank() {
+        let f = form();
         assert_eq!(f.trimmed("nope"), "");
         assert_eq!(f.optional("nope"), None);
+        assert_eq!(f.choice("nope"), "");
+        assert!(!f.is_on("nope"));
     }
 
     #[test]
@@ -743,10 +922,192 @@ mod tests {
     /// outcome this layer may not produce.
     #[test]
     fn a_tiny_terminal_still_shows_the_form() {
+        let mut f = form();
+        f.set_error("no such directory: /nope");
+        // Narrow-and-tall as well as short-and-wide: the box is on the render
+        // path at every size a terminal can be.
+        for (w, h) in [
+            (80, 24),
+            (40, 10),
+            (20, 4),
+            (30, 2),
+            (30, 1),
+            (8, 1),
+            (8, 40),
+            (3, 30),
+            (1, 40),
+            (2, 24),
+            (200, 3),
+            (1, 1),
+        ] {
+            let drawn = draw(&f, w, h);
+            for line in &drawn {
+                assert!(layout::width(line) <= w as usize, "{w}x{h}: {line:?}");
+            }
+            assert!(
+                !drawn.join("").trim().is_empty(),
+                "nothing drawn at {w}x{h}"
+            );
+        }
+    }
+
+    // ------------------------------------------- the affirmative is a choice
+
+    #[test]
+    fn a_form_with_an_action_row_does_not_submit_on_a_bare_enter() {
+        let mut f = Form::new("close x?").action("close").note("kills tmux q-x");
+        assert!(!f.confirmed());
+        for _ in 0..3 {
+            assert_eq!(f.handle(Input::Enter), Outcome::Editing);
+        }
+        // And it says what is missing, rather than looking broken.
+        let error = f.error().unwrap();
+        assert!(error.contains("nothing done"), "{error}");
+        assert!(error.contains("close"), "{error}");
+
+        f.handle(Input::Right);
+        assert!(f.confirmed());
+        assert_eq!(f.handle(Input::Enter), Outcome::Submit);
+        // Esc is still the way out at any point.
+        assert_eq!(f.handle(Input::Esc), Outcome::Cancel);
+    }
+
+    /// Bracketed paste is off, so pasted text arrives as ordinary keys. Space
+    /// cycles an ordinary select; on the action row it must not, or a space in
+    /// a paste arms the very thing the row guards and the newline after it
+    /// fires.
+    #[test]
+    fn space_cycles_an_ordinary_select_but_never_the_action_row() {
+        let mut f = Form::new("t")
+            .select("m", vec!["a".into(), "b".into()], 0)
+            .action("close");
+        f.handle(Input::Char(' '));
+        assert_eq!(f.choice("m"), "b");
+
+        f.handle(Input::Tab);
+        assert_eq!(f.focused().map(Field::label), Some(ACTION));
+        for c in "fix the thing".chars() {
+            f.handle(Input::Char(c));
+        }
+        assert!(!f.confirmed(), "a pasted space armed the action");
+        assert_eq!(f.handle(Input::Enter), Outcome::Editing);
+        // The arrows, which no paste carries as text, still work both ways.
+        f.handle(Input::Right);
+        assert!(f.confirmed());
+        f.handle(Input::Left);
+        assert!(!f.confirmed());
+    }
+
+    /// A form with no action row is unguarded: its Enter is its submission.
+    #[test]
+    fn a_form_without_an_action_row_submits_on_enter() {
+        let mut f = Form::new("rename x").text("slug", "x", "");
+        assert!(f.confirmed());
+        assert_eq!(f.handle(Input::Enter), Outcome::Submit);
+    }
+
+    // -------------------------------------------------------- what is drawn
+
+    /// The error is the reason a submit failed and the hint is the way out. On
+    /// a box too short for its content they used to be the first two lines
+    /// dropped, and the box covers the status bar, so the reason appeared
+    /// nowhere at all.
+    #[test]
+    fn the_error_and_the_hint_survive_a_box_too_short_for_them() {
+        let mut f = form();
+        f.set_error("no such directory: /nope");
+        for h in [20u16, 9, 7, 5, 4, 3] {
+            let drawn = draw(&f, 60, h).join("\n");
+            assert!(
+                drawn.contains("no such directory"),
+                "the reason vanished at 60x{h}:\n{drawn}"
+            );
+            // With room for only one of the two the error wins; the hint is
+            // also in the status bar, and the reason is not.
+            if h > 3 {
+                assert!(
+                    drawn.contains("Esc cancel"),
+                    "the way out vanished at 60x{h}:\n{drawn}"
+                );
+            }
+        }
+    }
+
+    /// With no error to show, the hint alone still gets the last line.
+    #[test]
+    fn the_hint_survives_on_its_own() {
         let f = form();
-        for (w, h) in [(80, 24), (40, 10), (20, 4), (30, 2), (30, 1), (8, 1)] {
-            let drawn = draw(&f, w, h).join("");
-            assert!(!drawn.trim().is_empty(), "nothing drawn at {w}x{h}");
+        for h in [20u16, 6, 4, 3] {
+            let drawn = draw(&f, 60, h).join("\n");
+            assert!(drawn.contains("Esc cancel"), "at 60x{h}:\n{drawn}");
+        }
+    }
+
+    /// Typing past the right edge of the box used to give no feedback at all:
+    /// the value was built whole and then cut from the right, taking the caret
+    /// with it. The field scrolls instead.
+    #[test]
+    fn a_text_field_scrolls_to_keep_its_caret_in_view() {
+        let mut f = Form::new("t").text("goal", "", "");
+        type_in(&mut f, "make the CDC backfill idempotent across retries");
+        let drawn = draw(&f, 30, 8).join("\n");
+        assert!(drawn.contains(CARET), "the caret left the box:\n{drawn}");
+        assert!(drawn.contains("retries"), "the tail is not shown:\n{drawn}");
+        assert!(drawn.contains(CUT), "no cut marker:\n{drawn}");
+
+        // Home scrolls back, and the head is shown from the start.
+        f.handle(Input::Home);
+        let drawn = draw(&f, 30, 8).join("\n");
+        assert!(drawn.contains("make the"), "{drawn}");
+        assert!(drawn.contains(CARET), "{drawn}");
+        assert!(!drawn.contains("retries"), "{drawn}");
+    }
+
+    #[test]
+    fn the_window_keeps_the_caret_and_marks_what_it_cut() {
+        // Fits: untouched.
+        assert_eq!(window("abc", 1, 8), "abc");
+        // Caret still near the head: an ordinary end-cut.
+        assert_eq!(window("abcdefgh", 0, 4), "abc\u{2026}");
+        // Scrolled: the caret rides the right edge, the head is marked.
+        assert_eq!(window("abcdefgh", 7, 4), "\u{2026}fgh");
+        assert_eq!(window("abcdefgh", 8, 4), "\u{2026}gh");
+        // Degenerate budgets never panic.
+        assert_eq!(window("abcdefgh", 4, 0), "");
+        assert_eq!(window("abcdefgh", 7, 1), "\u{2026}");
+    }
+
+    /// Wide and combining characters are cut between clusters, never through
+    /// one — a cut through a wide char paints half a glyph, and a cut through
+    /// a flag leaves a stray letter.
+    #[test]
+    fn a_scrolled_field_never_splits_a_glyph() {
+        // A two-column cluster that does not fit is left out whole.
+        assert_eq!(window("日本語", 0, 4), "日\u{2026}");
+        assert_eq!(window("日本語", 6, 4), "\u{2026}語");
+        // A wider budget shows more context, still whole clusters.
+        assert_eq!(window("日本語", 6, 5), "\u{2026}本語");
+        // `e` + combining acute is one cluster, so it moves as one.
+        assert_eq!(window("abcde\u{301}", 5, 3), "\u{2026}e\u{301}");
+        // A flag is a pair of regional indicators; half of one is a letter.
+        assert_eq!(
+            window("xxxx\u{1f1ed}\u{1f1f7}", 6, 4),
+            "\u{2026}\u{1f1ed}\u{1f1f7}"
+        );
+        assert_eq!(
+            window("\u{1f1ed}\u{1f1f7}xxxx", 0, 3),
+            "\u{1f1ed}\u{1f1f7}\u{2026}"
+        );
+
+        // And the whole box survives every width, at every caret position.
+        let mut f = Form::new("t").text("f", "", "");
+        type_in(&mut f, "日本語のテキストはとても長い");
+        for w in 1..40u16 {
+            for _ in 0..14 {
+                assert!(!draw(&f, w, 8).join("").is_empty(), "nothing drawn at {w}");
+                f.handle(Input::Left);
+            }
+            f.handle(Input::End);
         }
     }
 

@@ -17,10 +17,11 @@ use crate::Ctx;
 use crate::commands::{QuestRow, close, fill_progress, fmt, load_quests, new, rename, resume};
 use crate::error::QError;
 use crate::model::{
-    DisplayState, Event, Link, NameSource, Quest, Session, SessionRole, SessionStatus, Template,
+    DisplayState, Event, Link, NameSource, Quest, QuestState, Session, SessionRole, SessionStatus,
+    Template,
 };
 
-use super::app::{Action, App, Prompt, Tab};
+use super::app::{Action, App, Prompt, Tab, Target};
 use super::form::Form;
 use super::keys::Input;
 use super::layout::{self, RowMode};
@@ -67,8 +68,8 @@ const F_BEADS: &str = "beads epic";
 const F_SLUG: &str = "slug";
 const F_CLOSE_EPIC: &str = "close beads epic";
 const F_PROMPT: &str = "prompt";
-/// The template select's "no template" option; never a legal template name,
-/// which `q tpl add` validates.
+/// The template select's "no template" option. Parenthesised, so no template
+/// name can collide with it: a name is a slug (`^[a-z0-9]+(-[a-z0-9]+)*$`).
 const NO_TEMPLATE: &str = "(none)";
 
 /// Per-tab state, owned by `App`.
@@ -284,7 +285,7 @@ pub fn refresh(ctx: &Ctx, app: &mut App) -> anyhow::Result<()> {
     // `f` decides whether finished Quests are even fetched; the filter in
     // `visible` then only has the machine and the query left to do.
     let mut rows = load_quests(ctx, app.quests.show_finished)?;
-    fill_progress(&mut rows);
+    fill_progress(ctx, &mut rows);
 
     let db = ctx.db()?;
     let mut links = Vec::with_capacity(rows.len());
@@ -577,7 +578,7 @@ fn open_new(app: &mut App) -> Action {
         .collect();
     let has_templates = templates.len() > 1;
     let mut form = Form::new("new quest")
-        .hint("Tab field \u{b7} \u{2190}\u{2192} cycles \u{b7} \u{23ce} creates \u{b7} Esc cancels")
+        .hint("Tab field \u{b7} \u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels")
         .text(F_NAME, "", "(auto)")
         .text(F_GOAL, "", "(none)")
         .text(F_DIR, "", "(where q was started)")
@@ -586,10 +587,29 @@ fn open_new(app: &mut App) -> Action {
         .select(F_TEMPLATE, templates, 0)
         .toggle(F_BEADS, true);
     if has_templates {
-        form = form.note("a template fills goal · dir · workflow left blank");
+        // Every field a template supplies, including the two that are not
+        // cosmetic: the label its epic carries, and the master's first prompt.
+        form = form.note(
+            "a template fills goal · dir · workflow left blank, and brings its \
+             beads repo and the master's first prompt",
+        );
     }
-    app.open(Prompt::NewQuest, form);
+    // Last, so typing still lands in the first field. `n` starts a tmux
+    // session and a Claude inside it; that is not something a stray Enter — or
+    // a newline in a pasted goal — gets to do.
+    app.open(Prompt::NewQuest, form.action("create"));
     Action::None
+}
+
+/// What a prompt records about the Quest it was opened against (see
+/// [`Target`]): its identity, and what the box was about to tell the user.
+fn target_of(row: &QuestRow) -> Target {
+    Target {
+        quest: row.view.quest.id.clone(),
+        slug: row.view.quest.slug.clone(),
+        created_at: row.view.quest.created_at,
+        finished: row.view.display_state == DisplayState::Finished,
+    }
 }
 
 /// `r` — SPEC §10: a manual slug, which also renames the tmux session and
@@ -598,12 +618,14 @@ fn open_rename(app: &mut App) -> Action {
     let Some(row) = app.quests.selected_row() else {
         return Action::None;
     };
-    let (quest, slug) = (row.view.quest.id.clone(), row.view.quest.slug.clone());
-    let form = Form::new(format!("rename {slug}"))
+    let target = target_of(row);
+    // No action row: a rename destroys nothing and starts nothing, and a bare
+    // Enter re-submits the slug the Quest already has, which is a no-op.
+    let form = Form::new(format!("rename {}", target.slug))
         .hint("\u{23ce} renames \u{b7} Esc cancels")
-        .text(F_SLUG, &slug, "")
+        .text(F_SLUG, &target.slug, "")
         .note("lowercase kebab-case, at most 40 characters");
-    app.open(Prompt::Rename { quest, slug }, form);
+    app.open(Prompt::Rename(target), form);
     Action::None
 }
 
@@ -616,15 +638,19 @@ fn open_close(app: &mut App) -> Action {
     let Some(row) = app.quests.selected_row() else {
         return Action::None;
     };
-    let quest = &row.view.quest;
-    let (id, slug) = (quest.id.clone(), quest.slug.clone());
-    let epic = quest.beads_epic.clone();
-    let finished = row.view.display_state == DisplayState::Finished;
+    let target = target_of(row);
+    let epic = row.view.quest.beads_epic.clone();
     let live = row.view.live_sessions;
-    let tmux = format!("{}{slug}", app.tmux_prefix);
+    let tmux = format!("{}{}", app.tmux_prefix, target.slug);
 
-    let mut form = Form::new(format!("close {slug}?")).hint("\u{23ce} closes \u{b7} Esc cancels");
-    form = if finished {
+    // The action row is first, and starts on `cancel`. This box stands in for
+    // `q close`'s `[y/N]`, which reads a bare Enter as *abort*; there is
+    // nothing to type here, so the affirmative is one arrow key away and a
+    // keystroke that merely arrived is never it.
+    let mut form = Form::new(format!("close {}?", target.slug))
+        .hint("\u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels")
+        .action("close");
+    form = if target.finished {
         form.note("already finished — only the epic is left to do".to_string())
     } else {
         form.note(format!("kills tmux {tmux} · ends {live} live session(s)"))
@@ -636,10 +662,7 @@ fn open_close(app: &mut App) -> Action {
         None => form.note("no beads epic"),
     };
     app.open(
-        Prompt::Close {
-            quest: id,
-            slug: slug.clone(),
-        },
+        Prompt::Close(target),
         form.note("brain summary (--summarize) lands with brain integration"),
     );
     Action::None
@@ -650,12 +673,14 @@ fn open_resume(app: &mut App) -> Action {
     let Some(row) = app.quests.selected_row() else {
         return Action::None;
     };
-    let (quest, slug) = (row.view.quest.id.clone(), row.view.quest.slug.clone());
-    let form = Form::new(format!("resume {slug}"))
-        .hint("\u{23ce} resumes \u{b7} Esc cancels")
+    let target = target_of(row);
+    let form = Form::new(format!("resume {}", target.slug))
+        .hint("Tab field \u{b7} \u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels")
         .text(F_PROMPT, "", "(none — the master comes up on its brief)")
-        .note("spawns a new master; the old session rows stay as history");
-    app.open(Prompt::Resume { quest, slug }, form);
+        .note("spawns a new master; the old session rows stay as history")
+        // After the field, so the prompt can still be typed straight away.
+        .action("resume");
+    app.open(Prompt::Resume(target), form);
     Action::None
 }
 
@@ -671,18 +696,55 @@ fn open_resume(app: &mut App) -> Action {
 pub fn submit(ctx: &Ctx, app: &mut App, prompt: &Prompt, form: &Form) -> anyhow::Result<()> {
     match prompt {
         Prompt::NewQuest => create(ctx, app, form),
-        Prompt::Rename { quest, slug } => rename_quest(ctx, app, quest, slug, form),
-        Prompt::Close { quest, slug } => close_quest(ctx, app, quest, slug, form),
-        Prompt::Resume { quest, slug } => resume_quest(ctx, app, quest, slug, form),
+        Prompt::Rename(target) => rename_quest(ctx, app, target, form),
+        Prompt::Close(target) => close_quest(ctx, app, target, form),
+        Prompt::Resume(target) => resume_quest(ctx, app, target, form),
     }
 }
 
-/// By id, not by the selection: a tick can have reordered the listing while
-/// the prompt was up, and `q rm` can have removed the Quest outright.
-fn quest_by_id(ctx: &Ctx, id: &str, slug: &str) -> anyhow::Result<Quest> {
-    ctx.db()?
-        .get_quest(id)?
-        .ok_or_else(|| QError::NotFound(format!("quest {slug} ({id}) is gone")).into())
+/// The Quest the box was opened against, re-read now — by id, not by the
+/// selection: a tick can have reordered the listing while the prompt was up,
+/// and `q rm` can have removed the Quest outright.
+///
+/// The id alone is not identity. `new_id` is 16 bits and its retry loop only
+/// checks live rows, so a `q rm` and a `q new` in another terminal can hand a
+/// deleted Quest's id to a new one; `created_at` is the column nothing can
+/// change. The slug is checked too, because the box put it in its title and a
+/// rename underneath would make it name a Quest the user did not pick.
+fn quest_for(ctx: &Ctx, target: &Target) -> anyhow::Result<Quest> {
+    let quest = ctx
+        .db()?
+        .get_quest(&target.quest)?
+        .filter(|q| q.created_at == target.created_at)
+        .ok_or_else(|| {
+            QError::NotFound(format!("quest {} ({}) is gone", target.slug, target.quest))
+        })?;
+    if quest.slug != target.slug {
+        return Err(QError::Invalid(format!(
+            "{} was renamed to {} while this box was up; Esc and try again",
+            target.slug, quest.slug
+        ))
+        .into());
+    }
+    Ok(quest)
+}
+
+/// The same, for the two prompts whose text depends on whether the Quest is
+/// finished. The box promised to kill a tmux session and end N sessions, or
+/// promised that only the epic was left; acting on the other branch would do
+/// something the user was never shown.
+fn quest_for_state(ctx: &Ctx, target: &Target) -> anyhow::Result<Quest> {
+    let quest = quest_for(ctx, target)?;
+    let finished = quest.state == QuestState::Finished;
+    if finished != target.finished {
+        let now = if finished { "finished" } else { "running" };
+        return Err(QError::Invalid(format!(
+            "{} is {now} now, which is not what this box says; Esc and try again",
+            quest.slug
+        ))
+        .into());
+    }
+    Ok(quest)
 }
 
 fn create(ctx: &Ctx, app: &mut App, form: &Form) -> anyhow::Result<()> {
@@ -716,6 +778,8 @@ fn create(ctx: &Ctx, app: &mut App, form: &Form) -> anyhow::Result<()> {
     let created = new::create(
         ctx,
         &new::Args {
+            // SPEC §11: the Quest records which template made it.
+            template: template.as_ref().map(|t| t.id.as_str()),
             name: form.optional(F_NAME),
             goal: goal.as_deref(),
             dir: dir.as_deref(),
@@ -737,8 +801,8 @@ fn create(ctx: &Ctx, app: &mut App, form: &Form) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn rename_quest(ctx: &Ctx, app: &mut App, id: &str, slug: &str, form: &Form) -> anyhow::Result<()> {
-    let quest = quest_by_id(ctx, id, slug)?;
+fn rename_quest(ctx: &Ctx, app: &mut App, target: &Target, form: &Form) -> anyhow::Result<()> {
+    let quest = quest_for(ctx, target)?;
     let renamed = rename::apply(ctx, &quest, form.trimmed(F_SLUG), NameSource::Manual, None)?;
     // Same Quest, so `resync` would keep it anyway; said out loud because the
     // slug it is keyed on is not the one the selection was made under.
@@ -747,8 +811,8 @@ fn rename_quest(ctx: &Ctx, app: &mut App, id: &str, slug: &str, form: &Form) -> 
     Ok(())
 }
 
-fn close_quest(ctx: &Ctx, app: &mut App, id: &str, slug: &str, form: &Form) -> anyhow::Result<()> {
-    let quest = quest_by_id(ctx, id, slug)?;
+fn close_quest(ctx: &Ctx, app: &mut App, target: &Target, form: &Form) -> anyhow::Result<()> {
+    let quest = quest_for_state(ctx, target)?;
     let closed = close::apply(ctx, &quest, form.is_on(F_CLOSE_EPIC))?;
     // The selection is deliberately *not* moved: with `f` off the Quest drops
     // out of the listing and `resync` clamps the index, which lands on the row
@@ -758,8 +822,8 @@ fn close_quest(ctx: &Ctx, app: &mut App, id: &str, slug: &str, form: &Form) -> a
     Ok(())
 }
 
-fn resume_quest(ctx: &Ctx, app: &mut App, id: &str, slug: &str, form: &Form) -> anyhow::Result<()> {
-    let quest = quest_by_id(ctx, id, slug)?;
+fn resume_quest(ctx: &Ctx, app: &mut App, target: &Target, form: &Form) -> anyhow::Result<()> {
+    let quest = quest_for_state(ctx, target)?;
     let resumed = resume::apply(ctx, &quest, form.optional(F_PROMPT))?;
     app.quests.focus_on(&resumed.quest.id);
     app.say(format!("{} · o enters it", resumed.describe()));
@@ -2129,7 +2193,17 @@ mod form_tests {
     }
 
     impl Rig {
+        /// Beads refuses every call, which is what a test that is not about
+        /// beads wants: reaching `bd` by accident is then a failure, not a
+        /// subprocess.
         fn new() -> Rig {
+            Rig::with_bd(Box::new(crate::beads::stub::NoBd))
+        }
+
+        /// A rig whose `bd` is the caller's, so the epic paths SPEC §5 step 2
+        /// and §13 describe run in-crate — the paths that used to be
+        /// unreachable here, and where B1 lived.
+        fn with_bd(bd: Box<dyn crate::beads::Bd>) -> Rig {
             let tmux = tempfile::tempdir().unwrap();
             let path = tmux.path().join("tmux.json");
             std::fs::write(&path, "{}").unwrap();
@@ -2138,7 +2212,8 @@ mod form_tests {
                     Config::default(),
                     Db::open_in_memory().unwrap(),
                     Box::new(crate::tmux::FixtureTmux::new(path)),
-                ),
+                )
+                .with_bd(bd),
                 tmux,
                 cwd: tempfile::tempdir().unwrap(),
             }
@@ -2234,8 +2309,47 @@ mod form_tests {
         assert!(!app.modal.as_ref().unwrap().form.is_on(F_BEADS));
     }
 
+    /// Whether the open form has an action row (B2). `rename` has none.
+    fn has_action(app: &App) -> bool {
+        app.modal.as_ref().is_some_and(|m| {
+            m.form
+                .fields()
+                .iter()
+                .any(|f| f.label() == crate::tui::form::ACTION)
+        })
+    }
+
+    /// Move the action row off `cancel`, the way the user has to before any
+    /// of these prompts does anything.
+    fn choose_action(app: &mut App) {
+        if !has_action(app) {
+            return;
+        }
+        focus(app, crate::tui::form::ACTION);
+        // Idempotent: a form left up by a failed submit keeps the choice
+        // already made, so this must land on the verb, not cycle past it.
+        for _ in 0..3 {
+            if app.modal.as_ref().unwrap().form.confirmed() {
+                return;
+            }
+            app.handle(Input::Right);
+        }
+        panic!("the action row never left `{}`", crate::tui::form::CANCEL);
+    }
+
+    /// One key, treated exactly as the event loop treats it: the work happens
+    /// only if the state machine asked for it.
+    fn press(rig: &Rig, app: &mut App, input: Input) -> Action {
+        let action = app.handle(input);
+        if action == Action::Submit {
+            crate::tui::submit(&rig.ctx, app);
+        }
+        action
+    }
+
     /// Exactly what the event loop does with `Action::Submit`.
     fn submit(rig: &Rig, app: &mut App) {
+        choose_action(app);
         assert_eq!(app.handle(Input::Enter), Action::Submit);
         crate::tui::submit(&rig.ctx, app);
     }
@@ -2528,6 +2642,9 @@ mod form_tests {
 
     #[test]
     fn the_close_prompt_shows_what_it_will_do_and_both_of_its_options() {
+        // A Quest with an epic reaches `progress_all_with`, which shares the
+        // process-wide failure window.
+        let _guard = crate::beads::backoff::acquire();
         let rig = Rig::new();
         let mut app = rig.app();
         make(&rig, &mut app, "with-epic");
@@ -2847,6 +2964,628 @@ mod form_tests {
             // And the bar says it too, for a terminal too short for the box.
             assert!(app.status.contains(title), "{key}: {:?}", app.status);
             assert!(text.contains("Esc cancel"), "{key}: no way out\n{text}");
+        }
+    }
+
+    // ------------------------------------------------- beads, and B1's hole
+    //
+    // Everything below reaches `bd`. Before the client was injectable these
+    // paths were unreachable in-crate — `beads::client()` read its fixture off
+    // the process environment, which no in-crate test may touch — so every
+    // submission here turned beads off, and the stderr writes on the other
+    // side of them went unnoticed until a real terminal tore up.
+
+    /// The Quest's epic (SPEC §5 step 2) is created through the same client
+    /// the CLI uses, and stored on the row.
+    #[test]
+    fn the_new_quest_form_creates_the_beads_epic_by_default() {
+        let _guard = crate::beads::backoff::acquire();
+        let bd = std::sync::Arc::new(crate::beads::stub::StubBd::working("bd-e1"));
+        let rig = Rig::with_bd(Box::new(bd.clone()));
+        let mut app = rig.app();
+
+        app.handle(Input::Char('n'));
+        set(&mut app, F_NAME, "with-beads");
+        set(&mut app, F_GOAL, "ship the thing");
+        set(&mut app, F_DIR, &rig.dir());
+        assert!(
+            app.modal.as_ref().unwrap().form.is_on(F_BEADS),
+            "the epic is on by default"
+        );
+        submit(&rig, &mut app);
+
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+        let quest = &rig.quests()[0];
+        assert_eq!(quest.beads_epic.as_deref(), Some("bd-e1"));
+        let created = bd.created.lock().unwrap().clone();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].0, "with-beads: ship the thing");
+        assert!(created[0].1.contains(&format!("quest:{}", quest.id)));
+        // Nothing to report, so nothing is appended to the bar.
+        assert!(
+            app.status.starts_with("created with-beads"),
+            "{}",
+            app.status
+        );
+    }
+
+    /// B1. `n` with the epic on and a `bd` that will not answer. `q new` writes
+    /// that warning to stderr; here the same call is running in raw mode on the
+    /// alternate screen, where a write scrolls the pane and leaves ratatui
+    /// painting over garbage it never repaints. So it comes back as data.
+    #[test]
+    fn a_bd_that_fails_a_create_reports_through_the_status_bar_not_the_screen() {
+        let _guard = crate::beads::backoff::acquire();
+        let bd = std::sync::Arc::new(crate::beads::stub::StubBd::failing("connection refused"));
+        let rig = Rig::with_bd(Box::new(bd.clone()));
+        let mut app = rig.app();
+
+        app.handle(Input::Char('n'));
+        set(&mut app, F_NAME, "no-tracker");
+        set(&mut app, F_DIR, &rig.dir());
+        submit(&rig, &mut app);
+
+        // The Quest is made either way: a missing epic is a warning, not a
+        // failed `q new` (SPEC §13).
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+        let quest = &rig.quests()[0];
+        assert_eq!(quest.slug, "no-tracker");
+        assert_eq!(quest.beads_epic, None);
+
+        // The warning reached the bar, and the frame.
+        assert!(
+            app.status.contains("warning: no beads epic"),
+            "{}",
+            app.status
+        );
+        assert!(app.status.contains("connection refused"), "{}", app.status);
+        assert!(
+            screen(&mut app).contains("warning: no beads epic"),
+            "{}",
+            screen(&mut app)
+        );
+        // And nothing was left buffered to surface against a later action.
+        assert!(rig.ctx.take_warnings().is_empty());
+    }
+
+    /// The same, on the path where the create itself fails: the rollback closes
+    /// the epic it had already minted, and a `bd` that refuses even that is the
+    /// one record of an epic that outlived its Quest. It goes in the form, next
+    /// to the error that kept the box up.
+    #[test]
+    fn a_rollback_that_cannot_close_its_epic_says_so_in_the_form() {
+        let _guard = crate::beads::backoff::acquire();
+        let bd = std::sync::Arc::new(crate::beads::stub::StubBd {
+            create: Ok("bd-e9".to_string()),
+            close: Err("bd is wedged".to_string()),
+            listing: None,
+            created: std::sync::Mutex::new(Vec::new()),
+            closed: std::sync::Mutex::new(Vec::new()),
+        });
+        let rig = Rig::with_bd(Box::new(bd.clone()));
+        let mut app = rig.app();
+        rig.break_new_session("no server running on /tmp/tmux-501/default");
+
+        app.handle(Input::Char('n'));
+        set(&mut app, F_NAME, "half-made");
+        set(&mut app, F_DIR, &rig.dir());
+        submit(&rig, &mut app);
+
+        let error = app
+            .modal
+            .as_ref()
+            .expect("the form was thrown away")
+            .form
+            .error()
+            .unwrap()
+            .to_string();
+        // The error leads, the warning follows it — on one line, in the box.
+        assert!(error.contains("no server running"), "{error}");
+        assert!(error.contains("bd close bd-e9"), "{error}");
+        assert_eq!(bd.closed_ids(), ["bd-e9"]);
+        assert!(rig.quests().is_empty());
+        assert!(screen(&mut app).contains("no server running"));
+        assert!(rig.ctx.take_warnings().is_empty());
+    }
+
+    /// SPEC §13: `c` with `close beads epic` on closes the epic through the
+    /// same `bd close` the CLI runs.
+    #[test]
+    fn closing_with_the_epic_toggle_on_closes_the_epic() {
+        let _guard = crate::beads::backoff::acquire();
+        let bd = std::sync::Arc::new(crate::beads::stub::StubBd::working("bd-e1"));
+        let rig = Rig::with_bd(Box::new(bd.clone()));
+        let mut app = rig.app();
+        make(&rig, &mut app, "done-with-it");
+        let id = rig.quests()[0].id.clone();
+        rig.ctx
+            .db()
+            .unwrap()
+            .update_quest(
+                &id,
+                &crate::db::quest::QuestPatch {
+                    beads_epic: Some(Some("bd-e1".to_string())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        refresh(&rig.ctx, &mut app).unwrap();
+
+        app.handle(Input::Char('c'));
+        focus(&mut app, F_CLOSE_EPIC);
+        app.handle(Input::Char(' '));
+        submit(&rig, &mut app);
+
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+        assert_eq!(bd.closed_ids(), ["bd-e1"]);
+        assert!(app.status.contains("epic bd-e1 closed"), "{}", app.status);
+        assert!(rig.ctx.take_warnings().is_empty());
+    }
+
+    /// B1's second reproduction, the one where **nothing failed**: closing an
+    /// already-closed epic a second time. `q close` prints a note; the TUI must
+    /// not, and the note must still reach the user.
+    #[test]
+    fn a_second_close_of_the_same_epic_notes_it_in_the_bar_not_over_the_frame() {
+        let _guard = crate::beads::backoff::acquire();
+        let bd = std::sync::Arc::new(crate::beads::stub::StubBd::working("bd-e1"));
+        let rig = Rig::with_bd(Box::new(bd.clone()));
+        let mut app = rig.app();
+        make(&rig, &mut app, "twice-closed");
+        let id = rig.quests()[0].id.clone();
+        let db = rig.ctx.db().unwrap();
+        db.update_quest(
+            &id,
+            &crate::db::quest::QuestPatch {
+                beads_epic: Some(Some("bd-e1".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        refresh(&rig.ctx, &mut app).unwrap();
+
+        // First close, epic and all.
+        app.handle(Input::Char('c'));
+        focus(&mut app, F_CLOSE_EPIC);
+        app.handle(Input::Char(' '));
+        submit(&rig, &mut app);
+        assert_eq!(bd.closed_ids(), ["bd-e1"]);
+
+        // Second, on the finished Quest, asking for the epic again.
+        app.quests.show_finished = true;
+        refresh(&rig.ctx, &mut app).unwrap();
+        app.quests.focus_on(&id);
+        app.handle(Input::Char('c'));
+        assert!(screen(&mut app).contains("already finished"));
+        focus(&mut app, F_CLOSE_EPIC);
+        app.handle(Input::Char(' '));
+        submit(&rig, &mut app);
+
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+        assert_eq!(
+            bd.closed_ids(),
+            ["bd-e1"],
+            "the epic must not be closed a second time"
+        );
+        assert!(
+            app.status.contains("already closed by an earlier"),
+            "{}",
+            app.status
+        );
+        // The bar is 120 columns wide, so only the head of the note fits.
+        assert!(
+            screen(&mut app).contains("note: beads epic"),
+            "{}",
+            screen(&mut app)
+        );
+        assert!(rig.ctx.take_warnings().is_empty());
+    }
+
+    /// A `bd close` that fails leaves the Quest closed and says what did not
+    /// happen — as data, again.
+    #[test]
+    fn a_bd_that_refuses_to_close_the_epic_still_closes_the_quest() {
+        let _guard = crate::beads::backoff::acquire();
+        let bd = std::sync::Arc::new(crate::beads::stub::StubBd::failing("bd is wedged"));
+        let rig = Rig::with_bd(Box::new(bd.clone()));
+        let mut app = rig.app();
+        make(&rig, &mut app, "epic-stuck");
+        let id = rig.quests()[0].id.clone();
+        rig.ctx
+            .db()
+            .unwrap()
+            .update_quest(
+                &id,
+                &crate::db::quest::QuestPatch {
+                    beads_epic: Some(Some("bd-e1".to_string())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        refresh(&rig.ctx, &mut app).unwrap();
+
+        app.handle(Input::Char('c'));
+        focus(&mut app, F_CLOSE_EPIC);
+        app.handle(Input::Char(' '));
+        submit(&rig, &mut app);
+
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+        assert_eq!(
+            rig.quests()[0].state,
+            QuestState::Finished,
+            "the epic is not the Quest"
+        );
+        assert!(
+            app.status.contains("`bd close bd-e1` failed"),
+            "{}",
+            app.status
+        );
+        assert!(rig.ctx.take_warnings().is_empty());
+    }
+
+    // -------------------------------------------- the affirmative is a choice
+
+    /// B2. `q close` asks `[y/N]` and reads a bare Enter as *abort*. So does
+    /// this box. A `c` and an Enter that arrived together — a burst buffered
+    /// during a stall, a newline in a paste — must not end a Quest.
+    #[test]
+    fn a_bare_enter_on_the_close_prompt_closes_nothing() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        make(&rig, &mut app, "still-mine");
+        let id = rig.quests()[0].id.clone();
+
+        // Exactly the burst, through the loop's own dispatch: `c`, then
+        // Enter, with no key in between.
+        press(&rig, &mut app, Input::Char('c'));
+        for _ in 0..3 {
+            assert_eq!(
+                press(&rig, &mut app, Input::Enter),
+                Action::None,
+                "Enter alone must not submit"
+            );
+        }
+        assert!(app.modal.is_some(), "the box was taken down");
+
+        let quest = rig.quests().into_iter().find(|q| q.id == id).unwrap();
+        assert_eq!(quest.state, QuestState::Active);
+        assert!(quest.finished_at.is_none());
+        assert!(
+            rig.fixture()
+                .load()
+                .unwrap()
+                .panes
+                .iter()
+                .any(|p| p.session_name == "q-still-mine"),
+            "the tmux session was killed by a keystroke nobody aimed"
+        );
+        // And the box says what is missing.
+        let text = screen(&mut app);
+        assert!(text.contains("nothing done"), "{text}");
+        assert!(text.contains("close"), "{text}");
+    }
+
+    /// Chosen, it still closes — the box is a guard, not a wall.
+    #[test]
+    fn choosing_the_action_closes_the_quest() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        make(&rig, &mut app, "for-real");
+        let id = rig.quests()[0].id.clone();
+
+        app.handle(Input::Char('c'));
+        assert_eq!(
+            app.modal
+                .as_ref()
+                .unwrap()
+                .form
+                .choice(crate::tui::form::ACTION),
+            crate::tui::form::CANCEL,
+            "the action row starts on cancel"
+        );
+        // The focus starts on it, so it is one arrow key and an Enter away.
+        assert_eq!(
+            app.modal.as_ref().unwrap().form.focused().map(Field::label),
+            Some(crate::tui::form::ACTION)
+        );
+        app.handle(Input::Right);
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+        crate::tui::submit(&rig.ctx, &mut app);
+
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+        let quest = rig.quests().into_iter().find(|q| q.id == id).unwrap();
+        assert_eq!(quest.state, QuestState::Finished);
+    }
+
+    /// The paste vector. Bracketed paste is off, so pasted text arrives as
+    /// ordinary keys: a space would cycle an ordinary select, and the newline
+    /// after it would submit. The action row does not answer to Space.
+    #[test]
+    fn pasted_text_cannot_arm_a_destructive_prompt() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        make(&rig, &mut app, "paste-proof");
+
+        app.handle(Input::Char('c'));
+        for c in "fix the thing".chars() {
+            app.handle(Input::Char(c));
+        }
+        assert!(
+            !app.modal.as_ref().unwrap().form.confirmed(),
+            "a space armed the close"
+        );
+        assert_eq!(app.handle(Input::Enter), Action::None);
+        assert_eq!(rig.quests()[0].state, QuestState::Active);
+    }
+
+    /// `n` and `R` start processes, so they are guarded the same way — but
+    /// their fields are still typed into from the first keystroke, which is
+    /// why their action row is last and not first.
+    #[test]
+    fn the_prompts_that_start_a_process_are_guarded_too() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        make(&rig, &mut app, "one-quest");
+
+        for key in ['n', 'R'] {
+            app.modal = None;
+            app.handle(Input::Char(key));
+            assert!(
+                !app.modal.as_ref().unwrap().form.confirmed(),
+                "{key} is armed on arrival"
+            );
+            // Typing goes into the field, not into the action row.
+            assert!(
+                matches!(
+                    app.modal.as_ref().unwrap().form.focused(),
+                    Some(Field::Text { .. })
+                ),
+                "{key} does not start on a text field"
+            );
+            assert_eq!(app.handle(Input::Enter), Action::None, "{key}");
+            assert!(app.modal.is_some(), "{key}");
+            app.handle(Input::Esc);
+        }
+        // Nothing was created, nothing was resumed.
+        assert_eq!(rig.slugs(), ["one-quest"]);
+    }
+
+    /// `r` has no action row: it destroys nothing, starts nothing, and a bare
+    /// Enter re-submits the slug the Quest already has.
+    #[test]
+    fn rename_is_not_guarded_and_a_bare_enter_is_a_no_op() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        make(&rig, &mut app, "same-name");
+        app.handle(Input::Char('r'));
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+        crate::tui::submit(&rig.ctx, &mut app);
+        assert_eq!(rig.slugs(), ["same-name"]);
+    }
+
+    // ------------------------------------------- the Quest under the prompt
+
+    /// N1. An id can be minted twice. The prompt carries `created_at`, the one
+    /// column nothing can change, so a Quest that was deleted and whose id was
+    /// handed to a new one is "gone" rather than "closed".
+    #[test]
+    fn a_prompt_will_not_act_on_a_quest_that_reused_its_id() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        make(&rig, &mut app, "the-original");
+        let id = rig.quests()[0].id.clone();
+        let db = rig.ctx.db().unwrap();
+
+        app.handle(Input::Char('c'));
+        // `q rm` in another terminal, then a `q new` that draws the same id —
+        // and, to leave `created_at` as the only difference, the same slug.
+        db.delete_quest(&id).unwrap();
+        let mut impostor = Quest::new("the-original", "/tmp/work", "laptop");
+        impostor.id = id.clone();
+        impostor.created_at += 60;
+        db.insert_quest(&impostor).unwrap();
+
+        submit(&rig, &mut app);
+        let form = &app.modal.as_ref().expect("the form was thrown away").form;
+        assert!(form.error().unwrap().contains("is gone"), "{form:?}");
+        assert_eq!(
+            db.get_quest(&id).unwrap().unwrap().state,
+            QuestState::Active,
+            "the impostor was closed"
+        );
+    }
+
+    /// N2. The box named a slug and a tmux session. A rename underneath makes
+    /// both a lie, so the submit refuses rather than acting on the new one.
+    #[test]
+    fn a_prompt_refuses_a_quest_renamed_while_the_box_was_up() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        make(&rig, &mut app, "old-name");
+        let quest = rig.quests()[0].clone();
+
+        app.handle(Input::Char('c'));
+        assert!(screen(&mut app).contains("kills tmux q-old-name"));
+        crate::commands::rename::apply(
+            &rig.ctx,
+            &quest,
+            "new-name",
+            crate::model::NameSource::Manual,
+            None,
+        )
+        .unwrap();
+
+        submit(&rig, &mut app);
+        let form = &app.modal.as_ref().expect("the form was thrown away").form;
+        assert!(
+            form.error().unwrap().contains("renamed to new-name"),
+            "{form:?}"
+        );
+        assert_eq!(rig.quests()[0].state, QuestState::Active);
+    }
+
+    /// N2, the dangerous half: the box said "already finished — only the epic
+    /// is left", somebody resumed the Quest from another terminal, and the
+    /// full-close branch would kill the master they just started.
+    #[test]
+    fn a_close_refuses_a_quest_that_was_resumed_while_the_box_was_up() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        make(&rig, &mut app, "back-again");
+        let id = rig.quests()[0].id.clone();
+        // Close it, then open the prompt against the finished Quest.
+        app.handle(Input::Char('c'));
+        submit(&rig, &mut app);
+        app.quests.show_finished = true;
+        refresh(&rig.ctx, &mut app).unwrap();
+        app.quests.focus_on(&id);
+        app.handle(Input::Char('c'));
+        assert!(screen(&mut app).contains("already finished"));
+
+        // Another terminal brings it back.
+        let quest = rig.quests().into_iter().find(|q| q.id == id).unwrap();
+        crate::commands::resume::apply(&rig.ctx, &quest, None).unwrap();
+        let live = rig
+            .ctx
+            .db()
+            .unwrap()
+            .list_sessions_by_quest(&id)
+            .unwrap()
+            .iter()
+            .filter(|s| s.status != SessionStatus::Ended)
+            .count();
+        assert_eq!(live, 1);
+
+        submit(&rig, &mut app);
+        let form = &app.modal.as_ref().expect("the form was thrown away").form;
+        assert!(form.error().unwrap().contains("is running now"), "{form:?}");
+        assert_eq!(
+            rig.quests().into_iter().find(|q| q.id == id).unwrap().state,
+            QuestState::Active,
+            "the freshly resumed master was killed"
+        );
+    }
+
+    /// N9. The id-carrying claim, for `close` — the prompt where acting on the
+    /// wrong Quest is not recoverable. (`rename` is covered above.)
+    #[test]
+    fn a_close_acts_on_the_quest_it_was_opened_against() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        make(&rig, &mut app, "aaa-doomed");
+        make(&rig, &mut app, "zzz-bystander");
+        let target = app.quests.selected_row().unwrap().view.quest.id.clone();
+
+        app.handle(Input::Char('c'));
+        // A tick reloads and the selection is dragged elsewhere under the box.
+        refresh(&rig.ctx, &mut app).unwrap();
+        let other = rig
+            .quests()
+            .iter()
+            .find(|q| q.id != target)
+            .unwrap()
+            .id
+            .clone();
+        app.quests.focus_on(&other);
+        assert_ne!(app.quests.selected_row().unwrap().view.quest.id, target);
+
+        submit(&rig, &mut app);
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+        let quests = rig.quests();
+        let closed = quests.iter().find(|q| q.id == target).unwrap();
+        let bystander = quests.iter().find(|q| q.id == other).unwrap();
+        assert_eq!(closed.state, QuestState::Finished);
+        assert_eq!(bystander.state, QuestState::Active);
+    }
+
+    // --------------------------------------------------------- the template
+
+    /// N7. SPEC §11: the Quest records the template it came from, and the note
+    /// says what a template actually brings — including the master's first
+    /// prompt, which is not a cosmetic default.
+    #[test]
+    fn a_templated_quest_records_its_template_and_takes_its_prompt() {
+        let rig = Rig::new();
+        let mut template = crate::model::Template::new("weekly-hygiene");
+        template.goal = Some("tidy up".to_string());
+        template.cwd = Some(rig.dir());
+        template.master_prompt = Some("start with the backlog".to_string());
+        rig.ctx.db().unwrap().insert_template(&template).unwrap();
+
+        let mut app = rig.app();
+        app.handle(Input::Char('n'));
+        let text = screen(&mut app);
+        assert!(text.contains("master's first prompt"), "{text}");
+        assert!(text.contains("beads repo"), "{text}");
+
+        set(&mut app, F_NAME, "from-template");
+        focus(&mut app, F_TEMPLATE);
+        app.handle(Input::Right);
+        no_beads(&mut app);
+        submit(&rig, &mut app);
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+
+        let quest = &rig.quests()[0];
+        assert_eq!(quest.template_id.as_deref(), Some(template.id.as_str()));
+        assert_eq!(quest.goal.as_deref(), Some("tidy up"));
+        // The prompt went to the master, which is what the note now promises.
+        let pane = rig
+            .fixture()
+            .load()
+            .unwrap()
+            .panes
+            .into_iter()
+            .find(|p| p.session_name == "q-from-template")
+            .unwrap();
+        assert!(
+            pane.command
+                .as_deref()
+                .is_some_and(|c| c.contains("start with the backlog")),
+            "{:?}",
+            pane.command
+        );
+    }
+
+    // ----------------------------------------------------------- the mouse
+
+    /// N5. A wheel nudge over an open box would step its focus with nothing
+    /// about the gesture saying a field had changed — onto `close beads epic`,
+    /// or off the action row.
+    #[test]
+    fn the_wheel_does_not_move_focus_inside_a_form() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        make(&rig, &mut app, "wheel-proof");
+        // Both shapes: the many-field form, and a close prompt whose epic
+        // toggle a nudge could land on without the user noticing.
+        rig.ctx
+            .db()
+            .unwrap()
+            .update_quest(
+                &rig.quests()[0].id.clone(),
+                &crate::db::quest::QuestPatch {
+                    beads_epic: Some(Some("bd-e1".to_string())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let _guard = crate::beads::backoff::acquire();
+        refresh(&rig.ctx, &mut app).unwrap();
+
+        for key in ['n', 'c'] {
+            app.modal = None;
+            app.handle(Input::Char(key));
+            let before = app.modal.as_ref().unwrap().form.clone();
+            for wheel in [
+                crate::tui::keys::MouseInput::ScrollDown,
+                crate::tui::keys::MouseInput::ScrollUp,
+            ] {
+                for _ in 0..3 {
+                    assert_eq!(app.handle_mouse(wheel), Action::None, "{key}");
+                    assert_eq!(&before, &app.modal.as_ref().unwrap().form, "{key}");
+                }
+            }
+            assert!(!app.modal.as_ref().unwrap().form.confirmed(), "{key}");
         }
     }
 

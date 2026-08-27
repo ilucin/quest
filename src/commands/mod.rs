@@ -130,9 +130,9 @@ pub fn load_quests(ctx: &Ctx, include_finished: bool) -> anyhow::Result<Vec<Ques
 
 /// One `bd` call for the whole listing, capped and cache-backed, so a slow or
 /// missing `bd` can never hold up a listing or a TUI tick (SPEC §13).
-pub fn fill_progress(rows: &mut [QuestRow]) {
+pub fn fill_progress(ctx: &Ctx, rows: &mut [QuestRow]) {
     let quests: Vec<&Quest> = rows.iter().map(|r| &r.view.quest).collect();
-    let progress = beads::progress_all(&quests);
+    let progress = beads::progress_all_with(ctx.bd(), &quests);
     for row in rows.iter_mut() {
         row.view.progress = progress.get(&row.view.quest.id).copied();
     }
@@ -177,6 +177,17 @@ pub fn pane_pid(ctx: &Ctx, pane_id: &str) -> Option<i64> {
 pub fn sweep_quiet(ctx: &Ctx) -> anyhow::Result<()> {
     tmux::sweep(ctx.db()?, ctx.tmux())?;
     Ok(())
+}
+
+/// Write out and clear whatever the call buffered on the `Ctx` (see
+/// [`Ctx::warn`]). Every command that can warn calls this before its own
+/// output, so the order on the terminal is exactly what it was when these were
+/// `eprintln!`s inside the library — and the TUI, which drains the same buffer
+/// into its status bar, never sees a byte reach the screen behind its back.
+pub fn flush_warnings(ctx: &Ctx) {
+    for warning in ctx.take_warnings() {
+        eprintln!("{warning}");
+    }
 }
 
 /// `[y/N]` on a terminal, asked on stderr so it never pollutes the payload.

@@ -492,21 +492,57 @@ fn event_loop(
 /// field the user typed with the reason next to it. A failure is never fatal:
 /// a Quest that would not close leaves the TUI exactly where it was.
 ///
+/// Whatever the library wanted to say about `bd` comes back as data on the
+/// `Ctx` and is put on screen from here. It cannot say it itself: `q new` and
+/// `q close` reach these paths on a terminal they own, the TUI reaches them in
+/// raw mode on the alternate screen, and a write there scrolls the pane and
+/// leaves ratatui's diff renderer painting over garbage that never clears.
+///
 /// Dispatch lives here rather than in the tab so bd-8lz.4.5's Sessions prompts
 /// have somewhere to hang; today every [`app::Prompt`] is a Quest prompt.
 fn submit(ctx: &Ctx, app: &mut App) {
     let Some(mut modal) = app.modal.take() else {
         return;
     };
-    if let Err(e) = quests::submit(ctx, app, &modal.prompt, &modal.form) {
-        modal.form.set_error(format!("{e:#}"));
-        app.modal = Some(modal);
+    let outcome = quests::submit(ctx, app, &modal.prompt, &modal.form);
+    let warnings = ctx.take_warnings();
+    match outcome {
+        Ok(()) => {
+            if !warnings.is_empty() {
+                let said = app.status.clone();
+                app.say(joined(&said, &warnings));
+            }
+        }
+        Err(e) => {
+            // The error leads: it is why the form is still up. The warnings
+            // follow, because on the rollback path one of them names an epic
+            // that outlived its Quest.
+            modal.form.set_error(joined(&format!("{e:#}"), &warnings));
+            app.modal = Some(modal);
+        }
     }
+}
+
+/// `head`, then anything buffered, on one line.
+fn joined(head: &str, rest: &[String]) -> String {
+    std::iter::once(head)
+        .chain(rest.iter().map(String::as_str))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ")
 }
 
 fn refresh_now(ctx: &Ctx, app: &mut App) {
     let result = refresh(ctx, app);
     report_refresh(app, result);
+    // Nothing on the reload path warns today. Drained anyway: a warning left
+    // in the buffer would surface against a later, unrelated action, and in a
+    // process that runs for hours the buffer would only grow.
+    let warnings = ctx.take_warnings();
+    if !warnings.is_empty() {
+        let said = app.status.clone();
+        app.say(joined(&said, &warnings));
+    }
 }
 
 /// The redraw preamble: bring the active tab's per-selection data in line with
@@ -631,9 +667,12 @@ fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
 /// user needs. `the_status_hint_fits_the_segment_it_is_given` pins that.
 fn hint(app: &App) -> &'static str {
     // With a form up, `q` is a letter and `x` is a letter: advertising them
-    // would be advertising keys that do not work.
+    // would be advertising keys that do not work. `⏎ ok` is not advertised
+    // either — on a prompt that destroys or spawns something, Enter alone is
+    // deliberately nothing (B2), and the box's own hint, which is the head of
+    // this same bar, says what it wants instead.
     if app.modal.is_some() {
-        return " Tab field · ⏎ ok · Esc cancel ";
+        return " Tab field · ←→ choose · Esc cancel ";
     }
     match app.tab {
         Tab::Quests => " ? help · o attach · b brief · q quit ",
@@ -1316,22 +1355,35 @@ mod tests {
         for w in [1u16, 2, 20, 70, 100, 200] {
             for h in [1u16, 2, 3, 24] {
                 for help in [false, true] {
-                    for tab in Tab::ALL {
-                        let mut app = app();
-                        app.tab = tab;
-                        app.help = help;
-                        // The sweep itself is the assertion: `draw` panics on
-                        // a widget written outside its area, and every band of
-                        // the chrome is exercised at every breakpoint.
-                        let lines = draw(&mut app, w, h);
-                        // The chrome always wins the last line it was given:
-                        // a body that overran would have taken it.
-                        if h >= 2 && w >= 40 {
-                            let status = lines.last().unwrap();
-                            assert!(
-                                status.contains("q quit") || help,
-                                "{w}x{h} {tab:?} help={help}: {status:?}"
-                            );
+                    // A modal is drawn over the whole frame, whatever tab and
+                    // whatever size — so it belongs in the sweep, not only in
+                    // `form`'s own tests.
+                    for modal in [false, true] {
+                        for tab in Tab::ALL {
+                            let mut app = app();
+                            app.tab = tab;
+                            app.help = help;
+                            if modal {
+                                let mut form = crate::tui::form::Form::new("close x?")
+                                    .action("close")
+                                    .note("kills tmux q-x");
+                                form.set_error("a rather long reason it did not work");
+                                app.open(app::Prompt::NewQuest, form);
+                            }
+                            // The sweep itself is the assertion: `draw` panics
+                            // on a widget written outside its area, and every
+                            // band of the chrome is exercised at every
+                            // breakpoint.
+                            let lines = draw(&mut app, w, h);
+                            // The chrome always wins the last line it was
+                            // given: a body that overran would have taken it.
+                            if h >= 2 && w >= 40 && !modal {
+                                let status = lines.last().unwrap();
+                                assert!(
+                                    status.contains("q quit") || help,
+                                    "{w}x{h} {tab:?} help={help}: {status:?}"
+                                );
+                            }
                         }
                     }
                 }

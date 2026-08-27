@@ -69,6 +69,7 @@ pub fn run(ctx: &Ctx, target: &str, key: SetKey, value: &str) -> anyhow::Result<
         SetKey::BeadsRepo => relabel_epic(ctx, &quest, had_repo.as_deref(), &stored),
         _ => false,
     };
+    crate::commands::flush_warnings(ctx);
     let key = key_name(key);
     db.append_event(
         &quest.id,
@@ -112,18 +113,18 @@ fn relabel_epic(ctx: &Ctx, quest: &crate::model::Quest, old: Option<&str>, new: 
     let old = old.map(str::trim).filter(|o| !o.is_empty());
     if new.is_empty() {
         if let Some(old) = old {
-            eprintln!(
+            ctx.warn(format!(
                 "note: quest {} no longer records a repo label, but epic {epic} still \
                  carries repo:{old}; remove it with `bd label remove {epic} repo:{old}`",
                 quest.slug
-            );
+            ));
         }
         return false;
     }
     // Re-setting the same value is how a label that drifted gets repaired, so
     // there is nothing to remove in that case — only the label to (re)add.
     let remove = old.filter(|o| *o != new);
-    match beads::client().relabel_repo(epic, remove, new) {
+    match ctx.bd().relabel_repo(epic, remove, new) {
         Ok(()) => {
             let _ = ctx.db().and_then(|db| {
                 db.append_event(
@@ -140,11 +141,11 @@ fn relabel_epic(ctx: &Ctx, quest: &crate::model::Quest, old: Option<&str>, new: 
                 Some(old) => format!(" --remove-label repo:{old}"),
                 None => String::new(),
             };
-            eprintln!(
+            ctx.warn(format!(
                 "warning: epic {epic} could not be relabelled ({e}); it still carries \
                  repo:{}; fix it with `bd update {epic}{undo} --add-label repo:{new}`",
                 old.unwrap_or("-")
-            );
+            ));
             false
         }
     }

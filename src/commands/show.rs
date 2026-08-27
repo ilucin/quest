@@ -30,7 +30,7 @@ pub fn run(ctx: &Ctx, target: &str) -> anyhow::Result<()> {
     let sessions = db.list_sessions_by_quest(&quest.id)?;
     let events = db.list_events_by_quest(&quest.id, EVENTS)?;
     let tmux_session = session_name(&ctx.config, &quest.slug);
-    let progress = beads::progress(&quest);
+    let progress = beads::progress_with(ctx.bd(), &quest);
     let payload = ShowView {
         view: QuestView::new(quest, &sessions).with_progress(progress),
         sessions,

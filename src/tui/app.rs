@@ -79,28 +79,49 @@ pub enum Action {
     Quit,
 }
 
-/// What an open form will do when it is submitted.
+/// The Quest a prompt was opened against, and enough of what the box said
+/// about it to notice if it stopped being true.
 ///
 /// The Quest is carried by **id**, not by "whatever is selected when Enter
 /// lands": a tick can reload and reorder the listing while a prompt is up, and
 /// closing the wrong Quest because the rows moved under a confirmation is the
 /// one failure this shape makes impossible.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub quest: String,
+    /// The slug the box named. A rename from another terminal makes the box a
+    /// lie — about which Quest, and about which tmux session dies with it.
+    pub slug: String,
+    /// The one column nothing can change. An id can be minted twice: `new_id`
+    /// is 16 bits and its retry only checks *live* rows, so a `q rm` followed
+    /// by a `q new` can hand the id of a deleted Quest to a new one, and a
+    /// re-fetch by id alone would find a stranger.
+    pub created_at: i64,
+    /// Whether the Quest was finished when the box was drawn. The close and
+    /// resume prompts say different things — and mean different things — on
+    /// either side of this.
+    pub finished: bool,
+}
+
+/// What an open form will do when it is submitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Prompt {
     NewQuest,
-    Rename { quest: String, slug: String },
-    Close { quest: String, slug: String },
-    Resume { quest: String, slug: String },
+    Rename(Target),
+    Close(Target),
+    Resume(Target),
 }
 
 impl Prompt {
     /// The Quest the prompt was opened against, if any.
     pub fn quest(&self) -> Option<&str> {
+        self.target().map(|t| t.quest.as_str())
+    }
+
+    pub fn target(&self) -> Option<&Target> {
         match self {
             Prompt::NewQuest => None,
-            Prompt::Rename { quest, .. }
-            | Prompt::Close { quest, .. }
-            | Prompt::Resume { quest, .. } => Some(quest),
+            Prompt::Rename(t) | Prompt::Close(t) | Prompt::Resume(t) => Some(t),
         }
     }
 }
@@ -482,6 +503,12 @@ impl App {
                 Action::None
             }
             MouseInput::Click { .. } => Action::None,
+            // A wheel nudge over an open box would step its focus — onto the
+            // `close beads epic` toggle, or off the action row — with nothing
+            // about the gesture saying a field changed. The list underneath is
+            // not scrollable while a box owns the keyboard anyway.
+            MouseInput::ScrollUp if self.modal.is_some() => Action::None,
+            MouseInput::ScrollDown if self.modal.is_some() => Action::None,
             MouseInput::ScrollUp => self.handle(Input::Up),
             MouseInput::ScrollDown => self.handle(Input::Down),
         }
@@ -503,6 +530,7 @@ fn machines(config: &Config, machine: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::form::{self, Field};
     use crate::tui::keys::{self, Input};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -791,7 +819,19 @@ mod tests {
         assert_eq!(a.tab, Tab::Quests);
         assert!(a.modal.is_some());
 
-        // Enter is the submission; the loop does the work.
+        // Enter alone does nothing: `n` starts a process, so its action row
+        // begins on `cancel` (B2).
+        assert_eq!(a.handle(Input::Enter), Action::None);
+        assert!(a.modal.is_some(), "Enter must not take the form down");
+        assert_eq!(a.tab, Tab::Quests);
+        // Chosen, it is the submission; the loop does the work.
+        for _ in 0..24 {
+            if a.modal.as_ref().unwrap().form.focused().map(Field::label) == Some(form::ACTION) {
+                break;
+            }
+            a.handle(Input::Tab);
+        }
+        a.handle(Input::Right);
         assert_eq!(a.handle(Input::Enter), Action::Submit);
         assert!(a.modal.is_some(), "Enter must not take the form down");
         // Esc does.
