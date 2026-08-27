@@ -284,6 +284,15 @@ pub struct App {
     /// success cannot wipe a message a keypress just wrote (and so a failure
     /// survives until the next reload rather than until the next keypress).
     pub refresh_error: Option<String>,
+    /// Every machine that did not answer the last remote round (SPEC §15),
+    /// one `⚠` note each. A chip rather than a message: it is a standing fact
+    /// about what is on screen — the rows of a machine that is down are the
+    /// cache, or missing — and the next keypress must not erase it.
+    pub remote_note: Option<String>,
+    /// Each remote's `[tmux] session_prefix`, as it reported it in the last
+    /// round it answered. `o` on a remote row needs it to name the session to
+    /// attach to, and only that machine can know it (SPEC §15).
+    pub remote_tmux: std::collections::BTreeMap<String, String>,
     /// The Quest a tab handed to another tab — `s` on the Quests tab means
     /// "the Sessions tab, filtered to this one" (SPEC §17).
     pub focus_quest: Option<String>,
@@ -324,6 +333,8 @@ impl App {
             status: String::new(),
             status_at: 0,
             refresh_error: None,
+            remote_note: None,
+            remote_tmux: std::collections::BTreeMap::new(),
             focus_quest: None,
             detail: false,
             modal: None,
@@ -510,6 +521,21 @@ impl App {
         }
         let ttl = (STATUS_SECS / self.tick_secs.max(1)).max(1);
         (self.ticks.saturating_sub(self.status_at) < ttl).then_some(self.status.as_str())
+    }
+
+    /// What the status bar shows in brackets: the unhappy remotes first, then
+    /// the active tab's filters. Both are modes rather than messages, so they
+    /// lead the line and stay until they stop being true.
+    pub fn chips(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(note) = self.remote_note.as_deref() {
+            parts.push(note.to_string());
+        }
+        let filters = self.filters();
+        if !filters.is_empty() {
+            parts.push(filters);
+        }
+        parts.join(" ")
     }
 
     /// The active tab's filter indicator, empty when nothing is filtered.

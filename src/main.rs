@@ -17,7 +17,7 @@ mod tmux;
 mod tui;
 
 use std::io::IsTerminal;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 
@@ -42,8 +42,10 @@ pub struct Ctx {
     /// fix — a broken environment.
     db: Option<Db>,
     tmux: Box<dyn Tmux>,
-    /// ssh, like tmux, behind a trait so no test reaches a real host.
-    ssh: Box<dyn Ssh>,
+    /// ssh, like tmux, behind a trait so no test reaches a real host. `Arc`
+    /// rather than `Box` because the TUI's remote poller runs the same client
+    /// from its own thread (`Ssh` is `Send + Sync` for exactly that).
+    ssh: Arc<dyn Ssh>,
     /// `bd`, like `tmux`, behind a trait and owned rather than discovered, so
     /// a test drives the beads paths without the process environment and the
     /// TUI can hand `bd` a client that does not chatter at the screen.
@@ -83,6 +85,18 @@ impl Ctx {
         let machine_override = match &args.machine {
             Some(m) => {
                 remote::validate_target(&config, m)?;
+                // `--machine <remote>` says "that machine only"; `--no-remote`
+                // says "no machine but this one". Together they can only
+                // produce an empty answer, and an empty answer about a machine
+                // reads as a fact about that machine — so it is refused rather
+                // than silently returned.
+                if args.no_remote && *m != config.machine.name {
+                    return Err(QError::Other(format!(
+                        "--machine {m} with --no-remote: `{m}` is a remote machine, \
+                         and --no-remote suppresses every remote"
+                    ))
+                    .into());
+                }
                 Some(m.clone())
             }
             None => None,
@@ -95,7 +109,7 @@ impl Ctx {
             no_remote: args.no_remote,
             db,
             tmux: tmux::tmux(),
-            ssh: remote::ssh(),
+            ssh: remote::ssh().into(),
             bd: beads::client(),
             warnings: Mutex::new(Vec::new()),
         })
@@ -137,7 +151,7 @@ impl Ctx {
             no_remote: args.no_remote,
             db: None,
             tmux: tmux::tmux(),
-            ssh: remote::ssh(),
+            ssh: remote::ssh().into(),
             bd: beads::client(),
             warnings: Mutex::new(Vec::new()),
         })
@@ -155,6 +169,12 @@ impl Ctx {
 
     pub fn ssh(&self) -> &dyn Ssh {
         self.ssh.as_ref()
+    }
+
+    /// The same client, for a thread that outlives this borrow — the TUI's
+    /// [`remote::Poller`].
+    pub fn ssh_shared(&self) -> Arc<dyn Ssh> {
+        Arc::clone(&self.ssh)
     }
 
     pub fn bd(&self) -> &dyn beads::Bd {
@@ -195,7 +215,7 @@ impl Ctx {
             no_remote: false,
             db: Some(db),
             tmux,
-            ssh: Box::new(remote::stub::NoSsh),
+            ssh: Arc::new(remote::stub::NoSsh),
             bd: Box::new(beads::stub::NoBd),
             warnings: Mutex::new(Vec::new()),
         }
@@ -208,7 +228,7 @@ impl Ctx {
     }
 
     #[cfg(test)]
-    pub fn with_ssh(mut self, ssh: Box<dyn Ssh>) -> Ctx {
+    pub fn with_ssh(mut self, ssh: Arc<dyn Ssh>) -> Ctx {
         self.ssh = ssh;
         self
     }

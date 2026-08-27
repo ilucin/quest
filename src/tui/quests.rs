@@ -72,8 +72,15 @@ const NO_TEMPLATE: &str = "(none)";
 /// Per-tab state, owned by `App`.
 #[derive(Default)]
 pub struct State {
-    /// The listing as last loaded: already swept, machine-filtered and ranked.
+    /// The listing as last loaded: already swept, machine-filtered and ranked,
+    /// with the last remote round folded in.
     rows: Vec<QuestRow>,
+    /// The rows the last remote round brought back (SPEC §15), kept apart from
+    /// `rows` because the two arrive on different clocks: `[ui] tick_local`
+    /// reloads the database every 2 s, `[ui] tick_remote` asks the machines
+    /// every 10 s. A local reload re-merges this snapshot rather than waiting
+    /// for ssh, so a machine that is down never slows a tick down.
+    pub(super) remote: Vec<QuestRow>,
     /// Links per row, index-aligned with `rows`.
     links: Vec<Vec<Link>>,
     /// The selected Quest's most recent events; only the selection needs them.
@@ -81,12 +88,12 @@ pub struct State {
     /// Which Quest [`State::events`] was read for. Selection keys move faster
     /// than any reload, so the pairing is carried explicitly rather than
     /// assumed: the panel shows nothing before it shows the wrong Quest's.
-    events_for: Option<String>,
+    events_for: Option<Anchor>,
     /// Index into the *visible* rows.
     selected: usize,
-    /// The selected Quest's id, so a reload that reorders keeps the selection
-    /// on the same Quest rather than on the same line.
-    selected_id: Option<String>,
+    /// The selected Quest, so a reload that reorders keeps the selection on the
+    /// same Quest rather than on the same line.
+    selected_id: Option<Anchor>,
     /// First row drawn — moved only when the selection would leave the view,
     /// so an arrow key does not scroll a list that did not need to.
     offset: usize,
@@ -102,11 +109,55 @@ pub struct State {
     templates: Vec<Template>,
 }
 
+/// Which Quest the selection (or a loaded set of events) is on.
+///
+/// Not the id alone: a Quest id is 16 bits and unique only per **machine**, so
+/// with a remote machine in the listing two rows can carry the same one. An
+/// anchor that was just an id re-attaches to whichever row matches first —
+/// always a local one, because the merge appends the remotes — so the
+/// highlight jumps off the remote row on the next tick, and every key the
+/// `LOCAL_ONLY` guard exists to gate then acts on the wrong Quest.
+///
+/// `remote` is part of it as well as the machine name, because a local Quest
+/// can carry a remote's name in its `machine` column (`q new --machine ws`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Anchor {
+    remote: bool,
+    machine: String,
+    id: String,
+}
+
+impl Anchor {
+    fn of(row: &QuestRow) -> Anchor {
+        Anchor {
+            remote: row.origin.is_remote(),
+            machine: row.view.quest.machine.clone(),
+            id: row.view.quest.id.clone(),
+        }
+    }
+
+    /// A Quest in this machine's own database — what `n`, `r` and `R` hand
+    /// back.
+    fn local(quest: &Quest) -> Anchor {
+        Anchor {
+            remote: false,
+            machine: quest.machine.clone(),
+            id: quest.id.clone(),
+        }
+    }
+}
+
 impl State {
     /// Whether `/` has the keyboard. The shell asks before claiming its own
     /// bare-letter keys, so typing `q` into the box does not quit.
     pub fn capturing(&self) -> bool {
         self.searching
+    }
+
+    /// The listing as last loaded, for the shell's own tests.
+    #[cfg(test)]
+    pub(super) fn loaded(&self) -> &[QuestRow] {
+        &self.rows
     }
 
     /// Give the keyboard back and drop the half-typed query. Leaving the tab
@@ -149,7 +200,7 @@ impl State {
     /// Quest, so a selection the reload has not caught up with shows nothing
     /// rather than the previous Quest's history under the new one's title.
     fn selected_events(&self) -> &[Event] {
-        match (self.events_for.as_deref(), self.selected_id.as_deref()) {
+        match (self.events_for.as_ref(), self.selected_id.as_ref()) {
             (Some(loaded), Some(selected)) if loaded == selected => &self.events,
             _ => &[],
         }
@@ -207,16 +258,16 @@ impl State {
             self.offset = 0;
             return;
         }
-        if let Some(id) = self.selected_id.as_deref()
+        if let Some(anchor) = self.selected_id.as_ref()
             && let Some(at) = visible
                 .iter()
-                .position(|i| self.rows[*i].view.quest.id == id)
+                .position(|i| Anchor::of(&self.rows[*i]) == *anchor)
         {
             self.selected = at;
         } else {
             self.selected = self.selected.min(visible.len() - 1);
         }
-        self.selected_id = Some(self.rows[visible[self.selected]].view.quest.id.clone());
+        self.selected_id = Some(Anchor::of(&self.rows[visible[self.selected]]));
         self.offset = self.offset.min(self.selected).min(visible.len() - 1);
     }
 
@@ -228,15 +279,28 @@ impl State {
     /// `rows` yet, and `resync` answers "that id is not here" by overwriting
     /// `selected_id` with whatever sits at the clamped index — which would
     /// throw the anchor away one line after it was set.
-    fn focus_on(&mut self, id: &str) {
-        self.selected_id = Some(id.to_string());
+    fn focus_on(&mut self, anchor: Anchor) {
         let visible = self.visible();
         if let Some(at) = visible
             .iter()
-            .position(|i| self.rows[*i].view.quest.id == id)
+            .position(|i| Anchor::of(&self.rows[*i]) == anchor)
         {
             self.selected = at;
         }
+        self.selected_id = Some(anchor);
+    }
+
+    /// [`State::focus_on`] by id, for tests that have one in hand: the row is
+    /// already loaded, so its machine comes from the row itself.
+    #[cfg(test)]
+    fn focus_on_id(&mut self, id: &str) {
+        let anchor = self
+            .rows
+            .iter()
+            .find(|r| r.view.quest.id == id)
+            .map(Anchor::of)
+            .unwrap_or_else(|| panic!("no row with id `{id}`"));
+        self.focus_on(anchor);
     }
 
     fn move_by(&mut self, delta: isize, viewport: usize) {
@@ -264,7 +328,7 @@ impl State {
         let visible = self.visible();
         self.selected_id = visible
             .get(self.selected)
-            .map(|i| self.rows[*i].view.quest.id.clone());
+            .map(|i| Anchor::of(&self.rows[*i]));
         let viewport = viewport.max(1);
         if self.selected < self.offset {
             self.offset = self.selected;
@@ -292,11 +356,24 @@ pub fn refresh(ctx: &Ctx, app: &mut App) -> anyhow::Result<()> {
     // `visible` then only has the machine and the query left to do.
     let mut rows = load_quests(ctx, app.quests.show_finished)?;
     fill_progress(ctx, &mut rows);
+    // The remote rows are the last round's, whatever its age: re-fetching here
+    // would put a 5 s deadline on a 2 s tick. `f` is not forwarded either —
+    // the round asks for `--all` and `visible` hides what the toggle hides, so
+    // a keypress never waits for a machine to answer.
+    rows.extend(app.quests.remote.iter().cloned());
+    crate::commands::sort_quests(&mut rows);
 
     let db = ctx.db()?;
     let mut links = Vec::with_capacity(rows.len());
     for row in &rows {
-        links.push(db.list_links_by_quest(&row.view.quest.id)?);
+        // Links live in the database of the machine that owns the Quest
+        // (SPEC §15: no sync), and ids are not unique across machines — a
+        // lookup by a remote id would show some local Quest's links under it.
+        links.push(if row.origin.is_remote() {
+            Vec::new()
+        } else {
+            db.list_links_by_quest(&row.view.quest.id)?
+        });
     }
 
     let templates = db.list_templates()?;
@@ -326,13 +403,35 @@ pub fn sync(ctx: &Ctx, app: &mut App) -> anyhow::Result<()> {
     if app.quests.events_for == app.quests.selected_id {
         return Ok(());
     }
-    // Only the selection's events are read: the panel shows one Quest's.
-    app.quests.events = match app.quests.selected_id.as_deref() {
-        Some(id) => ctx.db()?.list_events_by_quest(id, EVENTS)?,
-        None => Vec::new(),
+    // Only the selection's events are read: the panel shows one Quest's. A
+    // remote Quest's are in that machine's database, and its id means nothing
+    // in this one, so it is not looked up at all (bd-8lz.5.3 proxies).
+    let remote = app
+        .quests
+        .selected_row()
+        .is_some_and(|row| row.origin.is_remote());
+    app.quests.events = match app.quests.selected_id.as_ref() {
+        Some(anchor) if !remote => ctx.db()?.list_events_by_quest(&anchor.id, EVENTS)?,
+        _ => Vec::new(),
     };
     app.quests.events_for = app.quests.selected_id.clone();
     Ok(())
+}
+
+/// Put a listing straight into the tab, with no database behind it — for the
+/// shell's own tests, which drive `attach` against rows a remote sent.
+/// Finished rows are shown, so a test can select one.
+#[cfg(test)]
+pub(super) fn seed(app: &mut App, rows: Vec<QuestRow>) {
+    app.quests.links = vec![Vec::new(); rows.len()];
+    app.quests.remote = rows
+        .iter()
+        .filter(|r| r.origin.is_remote())
+        .cloned()
+        .collect();
+    app.quests.rows = rows;
+    app.quests.show_finished = true;
+    app.quests.resync();
 }
 
 /// Scroll the selection back into view for the current terminal size — after a
@@ -349,6 +448,12 @@ pub fn settle_view(app: &mut App) {
 pub fn handle(app: &mut App, input: Input) -> Action {
     if app.quests.searching {
         return search_key(app, input);
+    }
+    if let Input::Char(c) = input
+        && LOCAL_ONLY.contains(&c)
+        && refuse_remote(app, c)
+    {
+        return Action::None;
     }
     let page = viewport(app);
     match input {
@@ -427,6 +532,41 @@ pub fn handle(app: &mut App, input: Input) -> Action {
         Input::Char('l') => show_links(app),
         _ => Action::None,
     }
+}
+
+/// The keys that read or write *this* machine's database: sessions, events,
+/// brief, links, rename, close, resume. SPEC §15 keeps every machine's
+/// registry, hooks and database to itself, so on a remote row they would all
+/// run against the wrong one — and not harmlessly: a Quest id is 16 bits and
+/// unique only per machine, so `c` on a remote row could close a local Quest
+/// that happens to share it. Refused until bd-8lz.5.3 proxies them over ssh.
+///
+/// `o` is deliberately not in here: entering a remote Quest is SPEC §15's one
+/// remote action, and it goes over ssh rather than through the database.
+const LOCAL_ONLY: [char; 7] = ['s', 'e', 'r', 'c', 'R', 'b', 'l'];
+
+/// Whether `key` was refused because the selection lives on another machine.
+fn refuse_remote(app: &mut App, key: char) -> bool {
+    let Some(row) = app.quests.selected_row() else {
+        return false;
+    };
+    if !row.origin.is_remote() {
+        return false;
+    }
+    let (slug, machine) = (row.view.quest.slug.clone(), row.view.quest.machine.clone());
+    app.say(format!(
+        "{slug} runs on {machine}; `{key}` needs that machine \u{b7} o enters it over ssh"
+    ));
+    true
+}
+
+/// The machine a remote selection lives on, or `None` when the selection is
+/// this machine's (or there is none).
+pub fn selected_remote(app: &App) -> Option<String> {
+    let row = app.quests.selected_row()?;
+    row.origin
+        .is_remote()
+        .then(|| row.view.quest.machine.clone())
 }
 
 /// How many rows the body can show. The group headers cost a line each, so
@@ -862,7 +1002,7 @@ fn create(ctx: &Ctx, app: &mut App, form: &Form) -> anyhow::Result<()> {
             machine: Some(&machine),
         },
     )?;
-    app.quests.focus_on(&created.quest.id);
+    app.quests.focus_on(Anchor::local(&created.quest));
     app.say(format!("created {} · o enters it", created.quest.slug));
     Ok(())
 }
@@ -872,7 +1012,7 @@ fn rename_quest(ctx: &Ctx, app: &mut App, target: &Target, form: &Form) -> anyho
     let renamed = rename::apply(ctx, &quest, form.trimmed(F_SLUG), NameSource::Manual, None)?;
     // Same Quest, so `resync` would keep it anyway; said out loud because the
     // slug it is keyed on is not the one the selection was made under.
-    app.quests.focus_on(&renamed.quest.id);
+    app.quests.focus_on(Anchor::local(&renamed.quest));
     app.say(renamed.describe());
     Ok(())
 }
@@ -891,7 +1031,7 @@ fn close_quest(ctx: &Ctx, app: &mut App, target: &Target, form: &Form) -> anyhow
 fn resume_quest(ctx: &Ctx, app: &mut App, target: &Target, form: &Form) -> anyhow::Result<()> {
     let quest = quest_for_state(ctx, target)?;
     let resumed = resume::apply(ctx, &quest, form.optional(F_PROMPT))?;
-    app.quests.focus_on(&resumed.quest.id);
+    app.quests.focus_on(Anchor::local(&resumed.quest));
     app.say(format!("{} · o enters it", resumed.describe()));
     Ok(())
 }
@@ -1052,7 +1192,7 @@ fn pack(left: &str, right: &str, width: usize) -> String {
 
 /// The facts SPEC §17 puts at the right end of the first line.
 fn right_facts(row: &QuestRow) -> String {
-    let mut parts = vec![row.view.quest.machine.clone()];
+    let mut parts = vec![machine_cell(row)];
     // An epic with no issues yet has nothing to report: `0/0 ░░░░░░░` is a
     // row's worth of noise saying only that the Quest is new.
     if let Some(p) = row.view.progress.filter(|p| p.total > 0) {
@@ -1070,6 +1210,18 @@ fn right_facts(row: &QuestRow) -> String {
         parts.push(tail);
     }
     parts.join("  ")
+}
+
+/// SPEC §17's machine column, marked when the row is the cache standing in for
+/// a machine that did not answer this round (SPEC §15). The marker is on the
+/// row rather than only in the chip because a listing mixes machines: without
+/// it a stale row and a live one are indistinguishable side by side.
+fn machine_cell(row: &QuestRow) -> String {
+    if row.origin.is_stale() {
+        format!("{} \u{26a0}", row.view.quest.machine)
+    } else {
+        row.view.quest.machine.clone()
+    }
 }
 
 /// Split out because three-line mode keeps it on the first line while the
@@ -1212,7 +1364,7 @@ fn panel_lines<'a>(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<Line
     out.push(Line::from(
         Span::raw(format!(
             "{} · {} · {} ago",
-            view.quest.machine,
+            machine_cell(row),
             fmt::tilde(&view.quest.cwd),
             fmt::age(view.quest.updated_at)
         ))
@@ -1231,7 +1383,20 @@ fn panel_lines<'a>(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<Line
             s.started_at,
         )
     });
-    if sessions.is_empty() {
+    let remote = row.origin.is_remote();
+    if remote {
+        // Not "none": the sessions are real, they are just in that machine's
+        // database (SPEC §15). Saying "none" here would be a claim about a
+        // Quest this `q` has never asked about.
+        out.push(
+            Line::from(Span::raw(format!(
+                "{} live · {}",
+                view.live_sessions,
+                not_fetched(&view.quest.machine)
+            )))
+            .dim(),
+        );
+    } else if sessions.is_empty() {
         out.push(Line::from(Span::raw("none").dim()));
     } else {
         for s in sessions {
@@ -1239,8 +1404,16 @@ fn panel_lines<'a>(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<Line
         }
     }
 
+    // Links and events are read out of *this* machine's database, and a remote
+    // Quest is not in it — `reload` and `sync` skip a remote row rather than
+    // look its id up locally. So the only honest thing the panel can say here
+    // is what the sessions line already says.
     head(&mut out, "links");
-    if links.is_empty() {
+    if remote {
+        out.push(Line::from(
+            Span::raw(not_fetched(&view.quest.machine)).dim(),
+        ));
+    } else if links.is_empty() {
         out.push(Line::from(Span::raw("none").dim()));
     } else {
         for l in links {
@@ -1249,7 +1422,11 @@ fn panel_lines<'a>(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<Line
     }
 
     head(&mut out, "events");
-    if events.is_empty() {
+    if remote {
+        out.push(Line::from(
+            Span::raw(not_fetched(&view.quest.machine)).dim(),
+        ));
+    } else if events.is_empty() {
         out.push(Line::from(Span::raw("none").dim()));
     } else {
         for e in events {
@@ -1262,6 +1439,13 @@ fn panel_lines<'a>(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<Line
         }
     }
     out
+}
+
+/// What every panel section says about a remote Quest: the rows exist, on that
+/// machine, and this `q` has not asked for them (SPEC §15). One wording so the
+/// sections cannot contradict each other.
+fn not_fetched(machine: &str) -> String {
+    format!("on {machine}, not fetched")
 }
 
 /// `bd-42 · 3/7 closed · 2 open`, or why there is nothing to say.
@@ -1312,6 +1496,52 @@ mod tests {
         q
     }
 
+    /// A local and a remote row sharing an id — a Quest id is 16 bits, so with
+    /// thirty Quests a side the collision is about a 1.4 % event.
+    fn colliding_rows() -> Vec<QuestRow> {
+        let mut local = quest("local-one", QuestState::Active, 2);
+        let mut far = quest("remote-one", QuestState::Active, 1);
+        far.machine = "ws".to_string();
+        local.id.clone_from(&far.id);
+        let view = QuestView::new(far, &[]);
+        let raw = serde_json::to_value(&view).unwrap();
+        vec![
+            QuestRow::local(QuestView::new(local, &[]), Vec::new()),
+            QuestRow::remote(crate::remote::RemoteQuest { view, raw }, false),
+        ]
+    }
+
+    /// The selection is anchored on the machine as well as the id. Anchored on
+    /// the id alone, the next 2 s tick re-attaches it to whichever row matches
+    /// first — always the local one, because the merge appends the remotes —
+    /// and every key `LOCAL_ONLY` guards then acts on the wrong Quest.
+    #[test]
+    fn the_selection_does_not_jump_to_a_local_row_with_the_same_id() {
+        let mut state = State {
+            rows: colliding_rows(),
+            show_finished: true,
+            ..State::default()
+        };
+        state.links = vec![Vec::new(); state.rows.len()];
+        state.selected = 1;
+        state.settle(10);
+        assert_eq!(state.selected_row().unwrap().view.quest.slug, "remote-one");
+
+        // What every tick does.
+        state.resync();
+        let row = state.selected_row().unwrap();
+        assert_eq!(row.view.quest.slug, "remote-one", "the selection jumped");
+        assert!(row.origin.is_remote());
+
+        // …and `focus_on` latches onto the right one too.
+        state.selected = 0;
+        state.settle(10);
+        assert_eq!(state.selected_row().unwrap().view.quest.slug, "local-one");
+        let want = Anchor::of(&state.rows[1]);
+        state.focus_on(want);
+        assert_eq!(state.selected_row().unwrap().view.quest.slug, "remote-one");
+    }
+
     fn session(quest_id: &str, role: SessionRole, status: SessionStatus) -> Session {
         let mut s = Session::new(quest_id, role, "master", "q-x", "%1");
         s.status = status;
@@ -1319,10 +1549,17 @@ mod tests {
     }
 
     fn row(quest: Quest, sessions: Vec<Session>) -> QuestRow {
-        QuestRow {
-            view: QuestView::new(quest, &sessions),
-            sessions,
-        }
+        QuestRow::local(QuestView::new(quest, &sessions), sessions)
+    }
+
+    /// A row as a remote's `q list --json` produced it — no sessions, and
+    /// marked stale when it came out of the cache.
+    fn remote_row(machine: &str, slug: &str, state: QuestState, stale: bool) -> QuestRow {
+        let mut q = quest(slug, state, 4);
+        q.machine = machine.to_string();
+        let view = QuestView::new(q, &[]);
+        let raw = serde_json::to_value(&view).unwrap();
+        QuestRow::remote(crate::remote::RemoteQuest { view, raw }, stale)
     }
 
     fn app_with(rows: Vec<QuestRow>) -> App {
@@ -1814,7 +2051,10 @@ mod tests {
             "quest-07",
             "the tab switch relocated the selection\n{text}"
         );
-        assert_eq!(app.quests.selected_id.as_deref(), Some(want.id.as_str()));
+        assert_eq!(
+            app.quests.selected_id.as_ref().map(|a| a.id.as_str()),
+            Some(want.id.as_str())
+        );
     }
 
     #[test]
@@ -2327,6 +2567,165 @@ mod tests {
         assert_eq!(link_cell(&enriched), "PR #7 open (CI ✓)");
         assert_eq!(pr_number("https://github.com/a/b/pull/7?x=1"), Some("7"));
         assert_eq!(pr_number("https://github.com/a/b/pull/"), None);
+    }
+
+    // ------------------------------------------------------- remote rows
+
+    /// SPEC §15's machine column, and the mark that says a row is the cache
+    /// standing in for a machine that did not answer.
+    #[test]
+    fn a_row_from_a_machine_that_is_down_is_drawn_as_stale() {
+        let mut app = app_with(vec![
+            row(quest("here", QuestState::Active, 9), Vec::new()),
+            remote_row("ws", "fresh", QuestState::Active, false),
+            remote_row("box", "cached", QuestState::Active, true),
+        ]);
+        let text = screen(&mut app, 120, 20);
+        assert!(text.contains("laptop"), "{text}");
+        assert!(text.contains("ws"), "{text}");
+        assert!(text.contains("box \u{26a0}"), "{text}");
+    }
+
+    /// `m` (SPEC §17) cycles whatever machines the merged listing holds, this
+    /// one included — the remote rows are in `rows` like any other.
+    #[test]
+    fn m_narrows_to_a_remote_machine_and_back() {
+        let mut app = app_with(vec![
+            row(quest("here", QuestState::Active, 9), Vec::new()),
+            remote_row("ws", "over-there", QuestState::Active, false),
+        ]);
+        assert_eq!(app.quests.visible().len(), 2);
+
+        handle(&mut app, Input::Char('m'));
+        assert_eq!(app.quests.machine.as_deref(), Some("laptop"));
+        assert_eq!(app.quests.visible().len(), 1);
+        assert_eq!(app.quests.selected_row().unwrap().view.quest.slug, "here");
+
+        handle(&mut app, Input::Char('m'));
+        assert_eq!(app.quests.machine.as_deref(), Some("ws"));
+        assert_eq!(app.quests.visible().len(), 1);
+        assert_eq!(
+            app.quests.selected_row().unwrap().view.quest.slug,
+            "over-there"
+        );
+        assert!(app.filters().contains("m ws"));
+
+        handle(&mut app, Input::Char('m'));
+        assert_eq!(app.quests.machine, None);
+        assert_eq!(app.quests.visible().len(), 2);
+    }
+
+    /// A machine name is searchable, so `/ws` narrows the merged listing the
+    /// same way `m` does.
+    #[test]
+    fn a_machine_name_is_part_of_the_search_haystack() {
+        let mut app = app_with(vec![
+            row(quest("here", QuestState::Active, 9), Vec::new()),
+            remote_row("ws", "over-there", QuestState::Active, false),
+        ]);
+        app.quests.query = "ws".to_string();
+        app.quests.resync();
+        assert_eq!(app.quests.visible().len(), 1);
+    }
+
+    /// Every key but `o` runs against *this* machine's database, and a Quest
+    /// id is unique only per machine — so `c` on a remote row could otherwise
+    /// close a local Quest that happens to share the id.
+    #[test]
+    fn the_local_only_keys_are_refused_on_a_remote_row() {
+        let mut app = app_with(vec![remote_row(
+            "ws",
+            "over-there",
+            QuestState::Active,
+            false,
+        )]);
+        for key in ['s', 'e', 'r', 'c', 'R', 'b', 'l'] {
+            app.status.clear();
+            let action = handle(&mut app, Input::Char(key));
+            assert_eq!(action, Action::None, "`{key}` acted on a remote row");
+            assert!(app.modal.is_none(), "`{key}` opened a form");
+            assert_eq!(app.tab, Tab::Quests, "`{key}` switched tabs");
+            assert!(
+                app.status.contains("runs on ws"),
+                "`{key}` said nothing: {}",
+                app.status
+            );
+        }
+        // `o` is the one remote action SPEC §15 defines.
+        assert_eq!(handle(&mut app, Input::Char('o')), Action::Attach);
+        // And a local row still answers all of them.
+        let mut app = app_with(vec![row(quest("here", QuestState::Active, 9), Vec::new())]);
+        assert_eq!(handle(&mut app, Input::Char('r')), Action::None);
+        assert!(app.modal.is_some(), "the rename form did not open");
+    }
+
+    #[test]
+    fn selected_remote_names_the_machine_only_for_a_remote_row() {
+        let mut app = app_with(vec![
+            row(quest("here", QuestState::Active, 9), Vec::new()),
+            remote_row("ws", "over-there", QuestState::Active, false),
+        ]);
+        assert_eq!(selected_remote(&app), None);
+        handle(&mut app, Input::Down);
+        assert_eq!(selected_remote(&app).as_deref(), Some("ws"));
+    }
+
+    fn panel_text(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<String> {
+        panel_lines(row, links, events)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The panel says where a remote Quest's sessions, links and events are
+    /// rather than claiming there are none: this `q` has never asked that
+    /// machine, and `none` reads as a fact about the Quest.
+    #[test]
+    fn the_panel_does_not_claim_a_remote_quest_is_empty() {
+        let mut far = remote_row("ws", "over-there", QuestState::Active, false);
+        far.view.live_sessions = 2;
+        let lines = panel_text(&far, &[], &[]);
+
+        assert!(
+            lines.contains(&"2 live · on ws, not fetched".to_string()),
+            "{lines:#?}"
+        );
+        // Sessions, links and events — all three, in one wording.
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("on ws, not fetched"))
+                .count(),
+            3,
+            "{lines:#?}"
+        );
+        assert!(!lines.iter().any(|l| l == "none"), "{lines:#?}");
+
+        let mut app = app_with(vec![far]);
+        app.detail = true;
+        let text = screen(&mut app, 140, 30);
+        assert!(text.contains("on ws, not fetched"), "{text}");
+    }
+
+    /// …while a local Quest that really has nothing still says so.
+    #[test]
+    fn the_panel_still_says_none_for_an_empty_local_quest() {
+        let here = row(quest("here", QuestState::Active, 9), Vec::new());
+        let lines = panel_text(&here, &[], &[]);
+        assert_eq!(
+            lines.iter().filter(|l| *l == "none").count(),
+            3,
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("not fetched")),
+            "{lines:#?}"
+        );
     }
 }
 
@@ -2844,13 +3243,12 @@ mod form_tests {
         db.insert_quest(&Quest::new("no-epic", "/tmp/work", "laptop"))
             .unwrap();
         refresh(&rig.ctx, &mut app).unwrap();
-        app.quests.focus_on(
+        app.quests.focus_on_id(
             &rig.quests()
                 .iter()
                 .find(|q| q.slug == "no-epic")
                 .unwrap()
-                .id
-                .clone(),
+                .id,
         );
         app.handle(Input::Char('c'));
         let text = screen(&mut app);
@@ -3013,14 +3411,8 @@ mod form_tests {
         // The list reloads and the selection is dragged elsewhere while the
         // box is up — exactly what a 2 s tick can do.
         refresh(&rig.ctx, &mut app).unwrap();
-        app.quests.focus_on(
-            &rig.quests()
-                .iter()
-                .find(|q| q.id != target)
-                .unwrap()
-                .id
-                .clone(),
-        );
+        app.quests
+            .focus_on_id(&rig.quests().iter().find(|q| q.id != target).unwrap().id);
         assert_ne!(app.quests.selected_row().unwrap().view.quest.id, target);
 
         set(&mut app, F_SLUG, "renamed-target");
@@ -3327,7 +3719,7 @@ mod form_tests {
         // Second, on the finished Quest, asking for the epic again.
         app.quests.show_finished = true;
         refresh(&rig.ctx, &mut app).unwrap();
-        app.quests.focus_on(&id);
+        app.quests.focus_on_id(&id);
         app.handle(Input::Char('c'));
         assert!(screen(&mut app).contains("already finished"));
         focus(&mut app, F_CLOSE_EPIC);
@@ -3795,7 +4187,7 @@ mod form_tests {
         submit(&rig, &mut app);
         app.quests.show_finished = true;
         refresh(&rig.ctx, &mut app).unwrap();
-        app.quests.focus_on(&id);
+        app.quests.focus_on_id(&id);
         app.handle(Input::Char('c'));
         assert!(screen(&mut app).contains("already finished"));
 
@@ -3843,7 +4235,7 @@ mod form_tests {
             .unwrap()
             .id
             .clone();
-        app.quests.focus_on(&other);
+        app.quests.focus_on_id(&other);
         assert_ne!(app.quests.selected_row().unwrap().view.quest.id, target);
 
         submit(&rig, &mut app);
