@@ -849,7 +849,10 @@ fn hint(app: &App) -> &'static str {
         // The two that take over the terminal lead here too: `⏎` lands in the
         // agent's own window, `p` opens its pane in a pager.
         Tab::Sessions => " ? help · ⏎ enter · p peek · q quit ",
-        _ => " ? help · x refresh · q quit ",
+        // The tail's own two: what narrows it, and how to get back onto it
+        // once the selection has been moved off the newest row.
+        Tab::Events => " ? help · / kind · G tail · q quit ",
+        Tab::Templates => " ? help · x refresh · q quit ",
     }
 }
 
@@ -1491,10 +1494,21 @@ mod tests {
         let f1 = Event::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
         assert_eq!(apply_event(&mut app, f1), (Action::None, false));
 
-        // A tab switch returns `Action::None` too, and absolutely needs a redraw.
+        // A tab switch absolutely needs a redraw. It also asks for a reload
+        // here, because the Sessions tab has never loaded and drawing its
+        // empty listing first would claim the fleet is idle without looking.
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(apply_event(&mut app, tab), (Action::None, true));
+        assert_eq!(apply_event(&mut app, tab), (Action::Refresh, true));
         assert_eq!(app.tab, Tab::Sessions);
+        // BackTab walks the other way and still costs a redraw. It asks for no
+        // reload, but that says nothing about warmth: the Quests tab is the
+        // tick's own tab and `needs_reload` answers `false` for it whatever it
+        // has loaded. That a tab which HAS loaded is free of I/O is what
+        // `events::tests::the_first_visit_to_a_data_tab_loads_before_it_draws`
+        // tests, with a real database behind the two tabs that can be cold.
+        let back = Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(apply_event(&mut app, back), (Action::None, true));
+        assert_eq!(app.tab, Tab::Quests);
         assert_eq!(
             apply_event(&mut app, Event::Resize(80, 24)),
             (Action::None, true)
@@ -1710,15 +1724,22 @@ mod tests {
         let body = draw(&mut app, 100, 20).join("\n");
         assert!(body.contains("no open quests"), "{body}");
 
+        // Same for the Events tab since bd-8lz.4.6.
         app.handle(Input::Char('4'));
         let body = draw(&mut app, 100, 20).join("\n");
-        assert!(body.contains("Events tab"), "{body}");
+        assert!(body.contains("no events yet"), "{body}");
         assert!(!body.contains("no open quests"), "{body}");
+
+        // The Templates tab is the one that is still a stub.
+        app.handle(Input::Char('3'));
+        let body = draw(&mut app, 100, 20).join("\n");
+        assert!(body.contains("Templates tab"), "{body}");
+        assert!(!body.contains("no events yet"), "{body}");
 
         app.handle(Input::Char('1'));
         let body = draw(&mut app, 100, 20).join("\n");
         assert!(body.contains("no open quests"), "{body}");
-        assert!(!body.contains("Events tab"), "{body}");
+        assert!(!body.contains("Templates tab"), "{body}");
     }
 
     #[test]
@@ -1753,13 +1774,20 @@ mod tests {
         assert!(fleet.contains("\u{23ce} enter"), "{fleet:?}");
         assert!(fleet.contains("p peek"), "{fleet:?}");
         assert!(!fleet.contains("brief"), "{fleet:?}");
-        // The stub tabs have none of them, and advertise the reload instead.
+        // Events is read-only: its two keys are what narrows the tail and how
+        // to get back onto it.
+        let events = on(Tab::Events);
+        assert!(events.contains("/ kind"), "{events:?}");
+        assert!(events.contains("G tail"), "{events:?}");
+        // The remaining stub tab advertises the reload instead.
+        let stub = on(Tab::Templates);
+        assert!(stub.contains("x refresh"), "{stub:?}");
+        // Nothing that takes the terminal is advertised on a read-only tab.
         for tab in [Tab::Templates, Tab::Events] {
             let other = on(tab);
             assert!(!other.contains("attach"), "{tab:?}: {other:?}");
             assert!(!other.contains("brief"), "{tab:?}: {other:?}");
             assert!(!other.contains("peek"), "{tab:?}: {other:?}");
-            assert!(other.contains("x refresh"), "{tab:?}: {other:?}");
         }
         // `?` and `q` are on every tab: one opens the list of everything the
         // hint had no room for, the other is the way out.
@@ -1818,8 +1846,13 @@ mod tests {
 
         app.handle(Input::Char('4'));
         let events = draw(&mut app, 100, 20).last().unwrap().clone();
-        assert!(events.contains("x refresh"), "{events:?}");
+        assert!(events.contains("G tail"), "{events:?}");
         assert!(!events.contains("o attach"), "{events:?}");
+
+        app.handle(Input::Char('3'));
+        let stub = draw(&mut app, 100, 20).last().unwrap().clone();
+        assert!(stub.contains("x refresh"), "{stub:?}");
+        assert!(!stub.contains("o attach"), "{stub:?}");
     }
 
     #[test]
@@ -2288,8 +2321,9 @@ mod tests {
     fn on_session(ctx: &Ctx, label: &str) -> App {
         let mut app = loaded(ctx);
         // Through the shell's own key, so the tab switch goes through
-        // `App::select` exactly as it does for a user.
-        assert_eq!(app.handle(Input::Char('2')), Action::None);
+        // `App::select` exactly as it does for a user. The tab has never
+        // loaded, so the switch asks for its rows on the way in.
+        assert_eq!(app.handle(Input::Char('2')), Action::Refresh);
         assert_eq!(app.tab, Tab::Sessions);
         refresh_now(ctx, &mut app);
         for _ in 0..6 {
@@ -2643,7 +2677,8 @@ mod tests {
         assert_ne!(fresh.id, old);
 
         let mut app = loaded(&ctx);
-        assert_eq!(app.handle(Input::Char('2')), Action::None);
+        // The cold Sessions tab asks for its rows on the way in.
+        assert_eq!(app.handle(Input::Char('2')), Action::Refresh);
         // `a` shows the ended rows, and the reload it asks for is what puts
         // them in the listing.
         assert_eq!(app.handle(Input::Char('a')), Action::Refresh);

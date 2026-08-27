@@ -8,7 +8,7 @@
 //! This module only turns those rows into lines.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
@@ -31,6 +31,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("o", "enter the master (attach to its tmux session)"),
     ("Enter", "toggle the detail panel"),
     ("s", "this Quest's sessions"),
+    ("e", "this Quest's events, in the tail"),
     ("n", "new Quest (a form)"),
     ("r / c / R", "rename · close · resume (each prompts)"),
     ("b", "brief in a pager"),
@@ -47,10 +48,6 @@ const EVENTS: usize = 10;
 const BAR: usize = 7;
 /// Groups a listing can be split into: needs-you, active, idle, finished.
 const GROUPS: usize = 4;
-/// Columns the detail panel wants when it can have them.
-const PANEL_COLS: u16 = 44;
-/// Below this the panel takes the whole body rather than squeezing the list.
-const PANEL_SPLIT_COLS: u16 = 88;
 /// Payload text kept in an event line.
 const PAYLOAD_COLS: usize = 40;
 /// How far the second line is indented under the glyphs.
@@ -274,6 +271,15 @@ impl State {
         } else if self.selected >= self.offset + viewport {
             self.offset = self.selected + 1 - viewport;
         }
+        // Both branches above only ever push `offset` FORWARD, so a viewport
+        // that GREW since the last frame would leave the body half empty with
+        // rows stranded above the fold. Pulling back to the last full screen
+        // is what heals it. `viewport` reserves a header line for every group
+        // the LISTING has, and the window starting at `offset` may span fewer
+        // of them, so the clamp is a LOWER bound on what the body could hold:
+        // it never pushes a row off the bottom, and what it can still leave is
+        // the headers of the groups the window does not reach.
+        self.offset = self.offset.min(visible.len().saturating_sub(viewport));
     }
 }
 
@@ -392,6 +398,7 @@ pub fn handle(app: &mut App, input: Input) -> Action {
             Action::None
         }
         Input::Char('s') => sessions_of_selection(app),
+        Input::Char('e') => events_of_selection(app),
         Input::Char('f') => {
             app.quests.show_finished = !app.quests.show_finished;
             app.quests.resync();
@@ -422,12 +429,19 @@ pub fn handle(app: &mut App, input: Input) -> Action {
     }
 }
 
-/// How many rows the body can show. There are at most four groups, so
-/// reserving four lines for their headers is a bound rather than a guess, and
-/// the selection is on screen however the rows happen to be grouped.
+/// How many rows the body can show. The group headers cost a line each, so
+/// the listing's *own* headers are reserved rather than all [`GROUPS`] of
+/// them: a listing with nothing finished pays three headers, not four, and
+/// reserving the fourth costs a whole row of a two-line listing.
 fn viewport(app: &App) -> usize {
     let body = app.height.saturating_sub(2) as usize;
-    (body.saturating_sub(GROUPS) / app.row_mode().lines() as usize).max(1)
+    let state = &app.quests;
+    let mut seen = [false; GROUPS];
+    for i in state.visible() {
+        seen[crate::commands::rank(&state.rows[i].view) as usize] = true;
+    }
+    let headers = seen.iter().filter(|s| **s).count();
+    (body.saturating_sub(headers) / app.row_mode().lines() as usize).max(1)
 }
 
 /// The `/` box. Only Esc, Enter and editing keys mean anything here; every
@@ -521,9 +535,24 @@ fn toggle_detail(app: &mut App) -> Action {
     Action::None
 }
 
-/// `s` — hand the selection to the Sessions tab (bd-8lz.4.5 reads
-/// `App::focus_quest`; until then the tab is still its placeholder).
+/// `s` — hand the selection to the Sessions tab, which reads it out of
+/// `App::focus_quest` on its next reload.
 fn sessions_of_selection(app: &mut App) -> Action {
+    hand_over(app, Tab::Sessions, "sessions")
+}
+
+/// `e` — the same hand-off to the Events tab (SPEC §17: "filter po questu").
+fn events_of_selection(app: &mut App) -> Action {
+    hand_over(app, Tab::Events, "events")
+}
+
+/// Both hand-offs, which differ only in where they land: the selected Quest's
+/// id goes into `App::focus_quest` and the target tab consumes it in `refresh`.
+///
+/// The `Action::Refresh` is what makes it a hand-off rather than a tab switch:
+/// the target tab has to reload before it can honour the filter, and until it
+/// does it is still showing the previous listing.
+fn hand_over(app: &mut App, tab: Tab, what: &str) -> Action {
     let Some(row) = app.quests.selected_row() else {
         return Action::None;
     };
@@ -531,8 +560,8 @@ fn sessions_of_selection(app: &mut App) -> Action {
     app.focus_quest = Some(id);
     // Through `select`, not by assignment: it is what tears a capture down, and
     // an armed capture behind an inactive tab is invisible.
-    app.select(Tab::Sessions);
-    app.say(format!("sessions of {slug}"));
+    app.select(tab);
+    app.say(format!("{what} of {slug}"));
     Action::Refresh
 }
 
@@ -878,28 +907,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     // missed rather than on the next keypress.
     settle_view(app);
     let app = &*app;
-    let (list, panel) = split(area, app.detail && app.quests.selected_row().is_some());
+    let (list, panel) =
+        layout::panel_split(area, app.detail && app.quests.selected_row().is_some());
     if let Some(list) = list {
         render_list(frame, list, app);
     }
     if let Some(panel) = panel {
         render_panel(frame, panel, app);
     }
-}
-
-/// With the panel up, a wide body is split and a narrow one is handed over
-/// whole — a list squeezed into thirty columns shows nothing worth reading.
-fn split(area: Rect, panel: bool) -> (Option<Rect>, Option<Rect>) {
-    if !panel {
-        return (Some(area), None);
-    }
-    if area.width < PANEL_SPLIT_COLS {
-        return (None, Some(area));
-    }
-    let want = PANEL_COLS.min(area.width / 2);
-    let [list, panel] =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(want)]).areas(area);
-    (Some(list), Some(panel))
 }
 
 fn render_list(frame: &mut Frame, area: Rect, app: &App) {
@@ -1859,6 +1874,33 @@ mod tests {
         assert!(app.status.contains("sessions of running"), "{}", app.status);
     }
 
+    /// The same for `e` (bd-8lz.4.6). `e` is genuinely unreachable while the
+    /// box is open -- every key is text in it -- so this is the only place the
+    /// tear-down can be shown, and the invariant it protects is the same one:
+    /// a capture is only ever armed on the ACTIVE tab.
+    #[test]
+    fn handing_the_selection_to_events_tears_down_an_armed_capture() {
+        let mut app = grouped();
+        app.quests.searching = true;
+        app.quests.query = "run".to_string();
+        app.quests.resync();
+        let want = app.quests.selected_row().unwrap().view.quest.id.clone();
+
+        assert_eq!(events_of_selection(&mut app), Action::Refresh);
+        assert_eq!(app.tab, Tab::Events);
+        assert_eq!(app.focus_quest.as_deref(), Some(want.as_str()));
+        assert!(
+            !app.quests.capturing(),
+            "the box is still holding the keyboard behind an inactive tab"
+        );
+        assert!(
+            app.quests.query.is_empty(),
+            "an uncommitted query outlived the tab: {:?}",
+            app.quests.query
+        );
+        assert!(app.status.contains("events of running"), "{}", app.status);
+    }
+
     #[test]
     fn the_prompt_keys_open_their_forms_against_the_selection() {
         for (key, title) in [
@@ -2143,6 +2185,89 @@ mod tests {
         assert!(line_of(&lines, &selected).is_some(), "{lines:#?}");
         let lines = draw(&mut app, 120, 8);
         assert!(line_of(&lines, &selected).is_some(), "{lines:#?}");
+    }
+
+    /// The same defect the Events tab was carrying (bd-8lz.4.6 D1), latent
+    /// here only because the selection usually sits near the top: `settle`
+    /// pushed `offset` forward and never back, so a viewport that GREW between
+    /// two frames left the bottom of the listing blank with rows stranded
+    /// above the fold.
+    #[test]
+    fn a_grown_viewport_refills_the_listing() {
+        let rows: Vec<QuestRow> = (0..20)
+            .map(|n| {
+                row(
+                    quest(&format!("quest-{n:02}"), QuestState::Active, n as i64),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let mut app = app_with(rows);
+        // A short terminal with the cursor at the end pushes `offset` as far
+        // forward as it goes.
+        app.set_size(120, 12);
+        handle(&mut app, Input::End);
+        draw(&mut app, 120, 12);
+        assert!(app.quests.offset > 0, "the short frame never scrolled");
+
+        // Now the terminal grows past the whole listing. Every Quest fits, so
+        // every Quest has to be on screen.
+        let lines = draw(&mut app, 120, 60);
+        for n in 0..20 {
+            let slug = format!("quest-{n:02}");
+            assert!(
+                line_of(&lines, &slug).is_some(),
+                "{slug} stranded: {lines:#?}"
+            );
+        }
+        // And the pull-back went the whole way. Without this a clamp that only
+        // came half the distance — `len - viewport / 2`, say — would still show
+        // every row on a body this tall and pass the loop above.
+        assert_eq!(app.quests.offset, 0, "the pull-back stopped short");
+    }
+
+    /// The pull-back is only as good as the `viewport` it clamps against, and
+    /// `viewport` used to reserve all four group headers whether the listing
+    /// had them or not. So it UNDER-counted the body's real capacity, `len -
+    /// viewport` came out too large, and the grow healed the listing only
+    /// partway: 60 Quests at 120x12 with the cursor at the end, grown to
+    /// 120x30, left three body lines blank with `quest-12` still above the
+    /// fold. `viewport` reserves the headers the listing actually has.
+    #[test]
+    fn a_grown_viewport_leaves_no_blank_line_a_row_could_have_filled() {
+        let rows: Vec<QuestRow> = (0..60)
+            .map(|n| {
+                row(
+                    quest(&format!("quest-{n:02}"), QuestState::Active, n as i64),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let mut app = app_with(rows);
+        app.set_size(120, 12);
+        handle(&mut app, Input::End);
+        draw(&mut app, 120, 12);
+        assert!(app.quests.offset > 0, "the short frame never scrolled");
+
+        // The grown terminal still cannot hold all 60, so rows stay above the
+        // fold — and every body line the renderer left blank is a line one of
+        // them could have used.
+        let lines = draw(&mut app, 120, 30);
+        assert!(app.quests.offset > 0, "the whole listing fit after all");
+        let body = &lines[1..lines.len() - 1];
+        let blank = body.iter().rev().take_while(|l| l.is_empty()).count();
+        assert!(
+            blank < RowMode::Two.lines() as usize,
+            "{blank} blank body lines with {} rows above the fold:\n{}",
+            app.quests.offset,
+            lines.join("\n")
+        );
+        // The row that was stranded, named.
+        assert!(
+            line_of(&lines, "quest-12").is_some(),
+            "quest-12 stranded:\n{}",
+            lines.join("\n")
+        );
     }
 
     /// A committed filter hides rows for as long as it is on; a one-shot

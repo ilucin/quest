@@ -203,7 +203,8 @@ pub fn help_rows(tab: Tab) -> Vec<(&'static str, &'static str)> {
     let own: &[(&str, &str)] = match tab {
         Tab::Quests => quests::HELP,
         Tab::Sessions => sessions::HELP,
-        _ => &[],
+        Tab::Events => events::HELP,
+        Tab::Templates => &[],
     };
     if !own.is_empty() {
         rows.push(("", ""));
@@ -399,6 +400,7 @@ impl App {
         }
         match self.tab {
             Tab::Quests => quests::paste(self, text),
+            Tab::Events => events::paste(self, text),
             _ => false,
         }
     }
@@ -455,14 +457,8 @@ impl App {
                 self.help = true;
                 Some(Action::None)
             }
-            Input::Tab => {
-                self.select(self.tab.next());
-                Some(Action::None)
-            }
-            Input::BackTab => {
-                self.select(self.tab.prev());
-                Some(Action::None)
-            }
+            Input::Tab => Some(self.switch(self.tab.next())),
+            Input::BackTab => Some(self.switch(self.tab.prev())),
             Input::Char('x') => {
                 self.refreshes += 1;
                 Some(Action::Refresh)
@@ -474,10 +470,10 @@ impl App {
                 // An out-of-range digit is still the shell's to swallow, not
                 // the tab's — otherwise `5` would mean something on one tab
                 // only.
-                if let Some(tab) = Tab::from_digit(digit) {
-                    self.select(tab);
-                }
-                Some(Action::None)
+                Some(match Tab::from_digit(digit) {
+                    Some(tab) => self.switch(tab),
+                    None => Action::None,
+                })
             }
         }
     }
@@ -491,6 +487,7 @@ impl App {
         }
         match self.tab {
             Tab::Quests => self.quests.capturing(),
+            Tab::Events => self.events.capturing(),
             _ => false,
         }
     }
@@ -520,13 +517,16 @@ impl App {
         match self.tab {
             Tab::Quests => self.quests.filters(),
             Tab::Sessions => self.sessions.filters(),
-            _ => String::new(),
+            Tab::Events => self.events.filters(),
+            Tab::Templates => String::new(),
         }
     }
 
     /// The one way to change tabs: every tab switch has to go through the
     /// capture teardown, not only the ones the tab bar drives.
-    pub(super) fn select(&mut self, tab: Tab) {
+    ///
+    /// Returns whether the tab it landed on has to reload before it is drawn.
+    pub(super) fn select(&mut self, tab: Tab) -> bool {
         if self.tab != tab {
             // Whatever was being typed is abandoned with the tab: a capture
             // left armed behind an inactive tab is invisible, and the mouse
@@ -535,6 +535,38 @@ impl App {
             self.tab = tab;
             self.status.clear();
         }
+        self.needs_reload()
+    }
+
+    /// [`select`](Self::select) as a key or click handler wants it: the tab
+    /// change, plus the reload it owes.
+    ///
+    /// Abandoning a `/` box drops a filter that had reached the SQL, so the
+    /// rows behind it are narrower than the chips claim — and can be empty
+    /// with a full log in the database. Not every tab switch reloads; only
+    /// one that arrives at rows fetched under filters that are gone.
+    fn switch(&mut self, tab: Tab) -> Action {
+        if self.select(tab) {
+            Action::Refresh
+        } else {
+            Action::None
+        }
+    }
+
+    /// Whether the active tab has to reload before it is drawn: either its
+    /// rows were fetched under filters that are no longer in force, or it has
+    /// never been loaded at all.
+    ///
+    /// The never-loaded half is not a filter question. A cold tab has nothing
+    /// to be stale against, so without it the first visit drew "no events yet"
+    /// — or "no live sessions" — for up to a whole tick, which is a claim
+    /// about the database made before anyone asked it.
+    fn needs_reload(&self) -> bool {
+        match self.tab {
+            Tab::Events => !self.events.loaded() || self.events.stale(),
+            Tab::Sessions => !self.sessions.loaded(),
+            _ => false,
+        }
     }
 
     /// Give the keyboard back, whatever was holding it. A form is a Quests-tab
@@ -542,8 +574,10 @@ impl App {
     /// exactly as it abandons a half-typed `/` query.
     fn cancel_capture(&mut self) {
         self.modal = None;
-        if self.tab == Tab::Quests {
-            self.quests.cancel_capture();
+        match self.tab {
+            Tab::Quests => self.quests.cancel_capture(),
+            Tab::Events => self.events.cancel_capture(),
+            _ => {}
         }
     }
 
@@ -565,12 +599,10 @@ impl App {
             return Action::None;
         }
         match ev {
-            MouseInput::Click { col, row: 0 } => {
-                if let Some(tab) = tab_at_column(col, self.tab_bar_width) {
-                    self.select(tab);
-                }
-                Action::None
-            }
+            MouseInput::Click { col, row: 0 } => match tab_at_column(col, self.tab_bar_width) {
+                Some(tab) => self.switch(tab),
+                None => Action::None,
+            },
             MouseInput::Click { .. } => Action::None,
             // A wheel nudge over an open box would step its focus — onto the
             // `close beads epic` toggle, or off the action row — with nothing
@@ -628,7 +660,14 @@ mod tests {
         let mut a = app();
         assert_eq!(a.tab, Tab::Quests);
         for want in [Tab::Sessions, Tab::Templates, Tab::Events, Tab::Quests] {
-            assert_eq!(a.handle(Input::Tab), Action::None);
+            // A data tab that has never loaded asks for its rows on the way
+            // in; Quests (already loaded by the shell) and Templates do not.
+            let asks = if matches!(want, Tab::Sessions | Tab::Events) {
+                Action::Refresh
+            } else {
+                Action::None
+            };
+            assert_eq!(a.handle(Input::Tab), asks, "{want:?}");
             assert_eq!(a.tab, want);
         }
         for want in [Tab::Events, Tab::Templates, Tab::Sessions, Tab::Quests] {
