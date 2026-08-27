@@ -3,7 +3,7 @@
 //! can be unit-tested at their boundaries.
 #![allow(dead_code)]
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -87,6 +87,30 @@ pub fn chrome(area: Rect) -> Chrome {
 /// leaves the tab bar zero columns — so the left band always keeps a third.
 pub fn right_segment(total: u16, want: u16) -> u16 {
     want.min(total.saturating_sub(total.div_ceil(3)))
+}
+
+/// Columns the detail panel wants when it can have them.
+pub const PANEL_COLS: u16 = 44;
+/// Below this the panel takes the whole body rather than squeezing the list.
+pub const PANEL_SPLIT_COLS: u16 = 88;
+
+/// Split a tab body between its listing and the detail panel.
+///
+/// With the panel up, a wide body is split and a narrow one is handed over
+/// whole — a list squeezed into thirty columns shows nothing worth reading.
+/// Shared by the Quests and Events tabs so `Enter` opens the same shape of
+/// panel wherever it is pressed.
+pub fn panel_split(area: Rect, panel: bool) -> (Option<Rect>, Option<Rect>) {
+    if !panel {
+        return (Some(area), None);
+    }
+    if area.width < PANEL_SPLIT_COLS {
+        return (None, Some(area));
+    }
+    let want = PANEL_COLS.min(area.width / 2);
+    let [list, panel] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(want)]).areas(area);
+    (Some(list), Some(panel))
 }
 
 /// A `w`×`h` box centred in `area`, clamped to it — the help overlay.

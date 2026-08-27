@@ -849,7 +849,10 @@ fn hint(app: &App) -> &'static str {
         // The two that take over the terminal lead here too: `⏎` lands in the
         // agent's own window, `p` opens its pane in a pager.
         Tab::Sessions => " ? help · ⏎ enter · p peek · q quit ",
-        _ => " ? help · x refresh · q quit ",
+        // The tail's own two: what narrows it, and how to get back onto it
+        // once the selection has been moved off the newest row.
+        Tab::Events => " ? help · / kind · G tail · q quit ",
+        Tab::Templates => " ? help · x refresh · q quit ",
     }
 }
 
@@ -1710,15 +1713,22 @@ mod tests {
         let body = draw(&mut app, 100, 20).join("\n");
         assert!(body.contains("no open quests"), "{body}");
 
+        // Same for the Events tab since bd-8lz.4.6.
         app.handle(Input::Char('4'));
         let body = draw(&mut app, 100, 20).join("\n");
-        assert!(body.contains("Events tab"), "{body}");
+        assert!(body.contains("no events yet"), "{body}");
         assert!(!body.contains("no open quests"), "{body}");
+
+        // The Templates tab is the one that is still a stub.
+        app.handle(Input::Char('3'));
+        let body = draw(&mut app, 100, 20).join("\n");
+        assert!(body.contains("Templates tab"), "{body}");
+        assert!(!body.contains("no events yet"), "{body}");
 
         app.handle(Input::Char('1'));
         let body = draw(&mut app, 100, 20).join("\n");
         assert!(body.contains("no open quests"), "{body}");
-        assert!(!body.contains("Events tab"), "{body}");
+        assert!(!body.contains("Templates tab"), "{body}");
     }
 
     #[test]
@@ -1753,13 +1763,20 @@ mod tests {
         assert!(fleet.contains("\u{23ce} enter"), "{fleet:?}");
         assert!(fleet.contains("p peek"), "{fleet:?}");
         assert!(!fleet.contains("brief"), "{fleet:?}");
-        // The stub tabs have none of them, and advertise the reload instead.
+        // Events is read-only: its two keys are what narrows the tail and how
+        // to get back onto it.
+        let events = on(Tab::Events);
+        assert!(events.contains("/ kind"), "{events:?}");
+        assert!(events.contains("G tail"), "{events:?}");
+        // The remaining stub tab advertises the reload instead.
+        let stub = on(Tab::Templates);
+        assert!(stub.contains("x refresh"), "{stub:?}");
+        // Nothing that takes the terminal is advertised on a read-only tab.
         for tab in [Tab::Templates, Tab::Events] {
             let other = on(tab);
             assert!(!other.contains("attach"), "{tab:?}: {other:?}");
             assert!(!other.contains("brief"), "{tab:?}: {other:?}");
             assert!(!other.contains("peek"), "{tab:?}: {other:?}");
-            assert!(other.contains("x refresh"), "{tab:?}: {other:?}");
         }
         // `?` and `q` are on every tab: one opens the list of everything the
         // hint had no room for, the other is the way out.
@@ -1818,8 +1835,13 @@ mod tests {
 
         app.handle(Input::Char('4'));
         let events = draw(&mut app, 100, 20).last().unwrap().clone();
-        assert!(events.contains("x refresh"), "{events:?}");
+        assert!(events.contains("G tail"), "{events:?}");
         assert!(!events.contains("o attach"), "{events:?}");
+
+        app.handle(Input::Char('3'));
+        let stub = draw(&mut app, 100, 20).last().unwrap().clone();
+        assert!(stub.contains("x refresh"), "{stub:?}");
+        assert!(!stub.contains("o attach"), "{stub:?}");
     }
 
     #[test]

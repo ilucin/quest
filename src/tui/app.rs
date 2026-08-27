@@ -203,7 +203,8 @@ pub fn help_rows(tab: Tab) -> Vec<(&'static str, &'static str)> {
     let own: &[(&str, &str)] = match tab {
         Tab::Quests => quests::HELP,
         Tab::Sessions => sessions::HELP,
-        _ => &[],
+        Tab::Events => events::HELP,
+        Tab::Templates => &[],
     };
     if !own.is_empty() {
         rows.push(("", ""));
@@ -399,6 +400,7 @@ impl App {
         }
         match self.tab {
             Tab::Quests => quests::paste(self, text),
+            Tab::Events => events::paste(self, text),
             _ => false,
         }
     }
@@ -491,6 +493,7 @@ impl App {
         }
         match self.tab {
             Tab::Quests => self.quests.capturing(),
+            Tab::Events => self.events.capturing(),
             _ => false,
         }
     }
@@ -520,7 +523,8 @@ impl App {
         match self.tab {
             Tab::Quests => self.quests.filters(),
             Tab::Sessions => self.sessions.filters(),
-            _ => String::new(),
+            Tab::Events => self.events.filters(),
+            Tab::Templates => String::new(),
         }
     }
 
@@ -542,8 +546,10 @@ impl App {
     /// exactly as it abandons a half-typed `/` query.
     fn cancel_capture(&mut self) {
         self.modal = None;
-        if self.tab == Tab::Quests {
-            self.quests.cancel_capture();
+        match self.tab {
+            Tab::Quests => self.quests.cancel_capture(),
+            Tab::Events => self.events.cancel_capture(),
+            _ => {}
         }
     }
 

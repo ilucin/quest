@@ -8,7 +8,7 @@
 //! This module only turns those rows into lines.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
@@ -31,6 +31,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("o", "enter the master (attach to its tmux session)"),
     ("Enter", "toggle the detail panel"),
     ("s", "this Quest's sessions"),
+    ("e", "this Quest's events, in the tail"),
     ("n", "new Quest (a form)"),
     ("r / c / R", "rename · close · resume (each prompts)"),
     ("b", "brief in a pager"),
@@ -47,10 +48,6 @@ const EVENTS: usize = 10;
 const BAR: usize = 7;
 /// Groups a listing can be split into: needs-you, active, idle, finished.
 const GROUPS: usize = 4;
-/// Columns the detail panel wants when it can have them.
-const PANEL_COLS: u16 = 44;
-/// Below this the panel takes the whole body rather than squeezing the list.
-const PANEL_SPLIT_COLS: u16 = 88;
 /// Payload text kept in an event line.
 const PAYLOAD_COLS: usize = 40;
 /// How far the second line is indented under the glyphs.
@@ -392,6 +389,7 @@ pub fn handle(app: &mut App, input: Input) -> Action {
             Action::None
         }
         Input::Char('s') => sessions_of_selection(app),
+        Input::Char('e') => events_of_selection(app),
         Input::Char('f') => {
             app.quests.show_finished = !app.quests.show_finished;
             app.quests.resync();
@@ -521,9 +519,24 @@ fn toggle_detail(app: &mut App) -> Action {
     Action::None
 }
 
-/// `s` — hand the selection to the Sessions tab (bd-8lz.4.5 reads
-/// `App::focus_quest`; until then the tab is still its placeholder).
+/// `s` — hand the selection to the Sessions tab, which reads it out of
+/// `App::focus_quest` on its next reload.
 fn sessions_of_selection(app: &mut App) -> Action {
+    hand_over(app, Tab::Sessions, "sessions")
+}
+
+/// `e` — the same hand-off to the Events tab (SPEC §17: "filter po questu").
+fn events_of_selection(app: &mut App) -> Action {
+    hand_over(app, Tab::Events, "events")
+}
+
+/// Both hand-offs, which differ only in where they land: the selected Quest's
+/// id goes into `App::focus_quest` and the target tab consumes it in `refresh`.
+///
+/// The `Action::Refresh` is what makes it a hand-off rather than a tab switch:
+/// the target tab has to reload before it can honour the filter, and until it
+/// does it is still showing the previous listing.
+fn hand_over(app: &mut App, tab: Tab, what: &str) -> Action {
     let Some(row) = app.quests.selected_row() else {
         return Action::None;
     };
@@ -531,8 +544,8 @@ fn sessions_of_selection(app: &mut App) -> Action {
     app.focus_quest = Some(id);
     // Through `select`, not by assignment: it is what tears a capture down, and
     // an armed capture behind an inactive tab is invisible.
-    app.select(Tab::Sessions);
-    app.say(format!("sessions of {slug}"));
+    app.select(tab);
+    app.say(format!("{what} of {slug}"));
     Action::Refresh
 }
 
@@ -878,28 +891,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     // missed rather than on the next keypress.
     settle_view(app);
     let app = &*app;
-    let (list, panel) = split(area, app.detail && app.quests.selected_row().is_some());
+    let (list, panel) =
+        layout::panel_split(area, app.detail && app.quests.selected_row().is_some());
     if let Some(list) = list {
         render_list(frame, list, app);
     }
     if let Some(panel) = panel {
         render_panel(frame, panel, app);
     }
-}
-
-/// With the panel up, a wide body is split and a narrow one is handed over
-/// whole — a list squeezed into thirty columns shows nothing worth reading.
-fn split(area: Rect, panel: bool) -> (Option<Rect>, Option<Rect>) {
-    if !panel {
-        return (Some(area), None);
-    }
-    if area.width < PANEL_SPLIT_COLS {
-        return (None, Some(area));
-    }
-    let want = PANEL_COLS.min(area.width / 2);
-    let [list, panel] =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(want)]).areas(area);
-    (Some(list), Some(panel))
 }
 
 fn render_list(frame: &mut Frame, area: Rect, app: &App) {
@@ -1857,6 +1856,33 @@ mod tests {
             app.quests.query
         );
         assert!(app.status.contains("sessions of running"), "{}", app.status);
+    }
+
+    /// The same for `e` (bd-8lz.4.6). `e` is genuinely unreachable while the
+    /// box is open -- every key is text in it -- so this is the only place the
+    /// tear-down can be shown, and the invariant it protects is the same one:
+    /// a capture is only ever armed on the ACTIVE tab.
+    #[test]
+    fn handing_the_selection_to_events_tears_down_an_armed_capture() {
+        let mut app = grouped();
+        app.quests.searching = true;
+        app.quests.query = "run".to_string();
+        app.quests.resync();
+        let want = app.quests.selected_row().unwrap().view.quest.id.clone();
+
+        assert_eq!(events_of_selection(&mut app), Action::Refresh);
+        assert_eq!(app.tab, Tab::Events);
+        assert_eq!(app.focus_quest.as_deref(), Some(want.as_str()));
+        assert!(
+            !app.quests.capturing(),
+            "the box is still holding the keyboard behind an inactive tab"
+        );
+        assert!(
+            app.quests.query.is_empty(),
+            "an uncommitted query outlived the tab: {:?}",
+            app.quests.query
+        );
+        assert!(app.status.contains("events of running"), "{}", app.status);
     }
 
     #[test]
