@@ -205,9 +205,11 @@ impl State {
         // Both branches above only ever push `offset` FORWARD, so a viewport
         // that GREW since the last frame would leave the body half empty with
         // rows stranded above the fold. Pulling back to the last full screen
-        // is what heals it. `visible.len()` counts rows and `viewport` is
-        // already net of the group headers, so this errs towards showing MORE
-        // than fits — which the renderer then cuts — never towards a gap.
+        // is what heals it. `viewport` reserves a header line for every group
+        // the LISTING has, and the window starting at `offset` may span fewer
+        // of them, so the clamp is a LOWER bound on what the body could hold:
+        // it never pushes a row off the bottom, and what it can still leave is
+        // the headers of the groups the window does not reach.
         self.offset = self.offset.min(visible.len().saturating_sub(viewport));
     }
 }
@@ -1282,9 +1284,10 @@ mod tests {
         draw(&mut app, 120, 12);
         assert!(app.sessions.offset > 0, "the short frame never scrolled");
 
-        // Now the terminal grows past the whole listing. Every session fits,
-        // so every session has to be on screen.
-        let lines = draw(&mut app, 120, 60);
+        // Now the terminal grows to hold the whole listing — with a line to
+        // spare, not a screenful, so `len - viewport` is the only clamp that
+        // reaches zero and a half-hearted one cannot hide behind saturation.
+        let lines = draw(&mut app, 120, 24);
         for n in 0..20 {
             let label = format!("worker-{n:02}");
             assert!(
@@ -1292,6 +1295,10 @@ mod tests {
                 "{label} stranded: {lines:#?}"
             );
         }
+        // And the pull-back went the whole way. Without this a clamp that only
+        // came half the distance — `len - viewport / 2`, say — would still show
+        // every row on a body this tall and pass the loop above.
+        assert_eq!(app.sessions.offset, 0, "the pull-back stopped short");
     }
 
     /// N-7. `viewport` reserved all five group headers unconditionally, so at

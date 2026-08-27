@@ -1500,7 +1500,12 @@ mod tests {
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(apply_event(&mut app, tab), (Action::Refresh, true));
         assert_eq!(app.tab, Tab::Sessions);
-        // Back to a tab that HAS loaded: free of I/O, and still a redraw.
+        // BackTab walks the other way and still costs a redraw. It asks for no
+        // reload, but that says nothing about warmth: the Quests tab is the
+        // tick's own tab and `needs_reload` answers `false` for it whatever it
+        // has loaded. That a tab which HAS loaded is free of I/O is what
+        // `events::tests::the_first_visit_to_a_data_tab_loads_before_it_draws`
+        // tests, with a real database behind the two tabs that can be cold.
         let back = Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
         assert_eq!(apply_event(&mut app, back), (Action::None, true));
         assert_eq!(app.tab, Tab::Quests);

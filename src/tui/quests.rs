@@ -274,9 +274,11 @@ impl State {
         // Both branches above only ever push `offset` FORWARD, so a viewport
         // that GREW since the last frame would leave the body half empty with
         // rows stranded above the fold. Pulling back to the last full screen
-        // is what heals it. `visible.len()` counts rows and `viewport` is
-        // already net of the group headers, so this errs towards showing MORE
-        // than fits — which the renderer then cuts — never towards a gap.
+        // is what heals it. `viewport` reserves a header line for every group
+        // the LISTING has, and the window starting at `offset` may span fewer
+        // of them, so the clamp is a LOWER bound on what the body could hold:
+        // it never pushes a row off the bottom, and what it can still leave is
+        // the headers of the groups the window does not reach.
         self.offset = self.offset.min(visible.len().saturating_sub(viewport));
     }
 }
@@ -427,12 +429,19 @@ pub fn handle(app: &mut App, input: Input) -> Action {
     }
 }
 
-/// How many rows the body can show. There are at most four groups, so
-/// reserving four lines for their headers is a bound rather than a guess, and
-/// the selection is on screen however the rows happen to be grouped.
+/// How many rows the body can show. The group headers cost a line each, so
+/// the listing's *own* headers are reserved rather than all [`GROUPS`] of
+/// them: a listing with nothing finished pays three headers, not four, and
+/// reserving the fourth costs a whole row of a two-line listing.
 fn viewport(app: &App) -> usize {
     let body = app.height.saturating_sub(2) as usize;
-    (body.saturating_sub(GROUPS) / app.row_mode().lines() as usize).max(1)
+    let state = &app.quests;
+    let mut seen = [false; GROUPS];
+    for i in state.visible() {
+        seen[crate::commands::rank(&state.rows[i].view) as usize] = true;
+    }
+    let headers = seen.iter().filter(|s| **s).count();
+    (body.saturating_sub(headers) / app.row_mode().lines() as usize).max(1)
 }
 
 /// The `/` box. Only Esc, Enter and editing keys mean anything here; every
@@ -2211,6 +2220,54 @@ mod tests {
                 "{slug} stranded: {lines:#?}"
             );
         }
+        // And the pull-back went the whole way. Without this a clamp that only
+        // came half the distance — `len - viewport / 2`, say — would still show
+        // every row on a body this tall and pass the loop above.
+        assert_eq!(app.quests.offset, 0, "the pull-back stopped short");
+    }
+
+    /// The pull-back is only as good as the `viewport` it clamps against, and
+    /// `viewport` used to reserve all four group headers whether the listing
+    /// had them or not. So it UNDER-counted the body's real capacity, `len -
+    /// viewport` came out too large, and the grow healed the listing only
+    /// partway: 60 Quests at 120x12 with the cursor at the end, grown to
+    /// 120x30, left three body lines blank with `quest-12` still above the
+    /// fold. `viewport` reserves the headers the listing actually has.
+    #[test]
+    fn a_grown_viewport_leaves_no_blank_line_a_row_could_have_filled() {
+        let rows: Vec<QuestRow> = (0..60)
+            .map(|n| {
+                row(
+                    quest(&format!("quest-{n:02}"), QuestState::Active, n as i64),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let mut app = app_with(rows);
+        app.set_size(120, 12);
+        handle(&mut app, Input::End);
+        draw(&mut app, 120, 12);
+        assert!(app.quests.offset > 0, "the short frame never scrolled");
+
+        // The grown terminal still cannot hold all 60, so rows stay above the
+        // fold — and every body line the renderer left blank is a line one of
+        // them could have used.
+        let lines = draw(&mut app, 120, 30);
+        assert!(app.quests.offset > 0, "the whole listing fit after all");
+        let body = &lines[1..lines.len() - 1];
+        let blank = body.iter().rev().take_while(|l| l.is_empty()).count();
+        assert!(
+            blank < RowMode::Two.lines() as usize,
+            "{blank} blank body lines with {} rows above the fold:\n{}",
+            app.quests.offset,
+            lines.join("\n")
+        );
+        // The row that was stranded, named.
+        assert!(
+            line_of(&lines, "quest-12").is_some(),
+            "quest-12 stranded:\n{}",
+            lines.join("\n")
+        );
     }
 
     /// A committed filter hides rows for as long as it is on; a one-shot

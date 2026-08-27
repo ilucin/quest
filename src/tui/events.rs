@@ -272,7 +272,10 @@ impl State {
         // that GREW since the last frame would leave the body half empty with
         // rows above the fold and nothing able to scroll back to them — and on
         // a tail, where the selection is pinned to the last row, nothing ever
-        // does. Pulling back to the last full screen is what heals it.
+        // does. Pulling back to the last full screen is what heals it. A tail
+        // carries no group headers, so `viewport` IS the body's row capacity
+        // and the pull-back lands flush — unlike the grouped tabs, where the
+        // headers make the same clamp a lower bound.
         self.offset = self.offset.min(visible.len().saturating_sub(viewport));
     }
 }
