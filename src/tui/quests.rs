@@ -467,6 +467,22 @@ fn search_key(app: &mut App, input: Input) -> Action {
     }
 }
 
+/// A paste while `/` holds the keyboard: text into the query, and nothing
+/// else. Ignored when the box is not open — a paste is not a way to start one.
+pub(super) fn paste(app: &mut App, text: &str) -> bool {
+    if !app.quests.searching {
+        return false;
+    }
+    let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+    if clean.is_empty() {
+        return false;
+    }
+    app.quests.query.push_str(&clean);
+    app.quests.resync();
+    typing(app);
+    true
+}
+
 /// The box *is* the status bar: there is no room for a second one, and the
 /// filtered list above it is the other half of the feedback.
 fn typing(app: &mut App) {
@@ -609,6 +625,7 @@ fn target_of(row: &QuestRow) -> Target {
         slug: row.view.quest.slug.clone(),
         created_at: row.view.quest.created_at,
         finished: row.view.display_state == DisplayState::Finished,
+        epic: row.view.quest.beads_epic.clone(),
     }
 }
 
@@ -619,9 +636,12 @@ fn open_rename(app: &mut App) -> Action {
         return Action::None;
     };
     let target = target_of(row);
-    // No action row: a rename destroys nothing and starts nothing, and a bare
-    // Enter re-submits the slug the Quest already has, which is a no-op.
+    // Declared harmless rather than merely left without an action row: a
+    // rename destroys nothing and starts nothing, and a bare Enter re-submits
+    // the slug the Quest already has, which is a no-op. Without the claim the
+    // form would refuse to submit at all (N-2).
     let form = Form::new(format!("rename {}", target.slug))
+        .harmless()
         .hint("\u{23ce} renames \u{b7} Esc cancels")
         .text(F_SLUG, &target.slug, "")
         .note("lowercase kebab-case, at most 40 characters");
@@ -733,6 +753,11 @@ fn quest_for(ctx: &Ctx, target: &Target) -> anyhow::Result<Quest> {
 /// finished. The box promised to kill a tmux session and end N sessions, or
 /// promised that only the epic was left; acting on the other branch would do
 /// something the user was never shown.
+///
+/// The epic is checked here for the same reason: the close box names it, and
+/// `close --close-epic` closes whatever the *refetched* Quest carries. A
+/// `q set <slug> beads_epic <other>` underneath an open box would otherwise
+/// close an epic the box never mentioned (N-6).
 fn quest_for_state(ctx: &Ctx, target: &Target) -> anyhow::Result<Quest> {
     let quest = quest_for(ctx, target)?;
     let finished = quest.state == QuestState::Finished;
@@ -740,6 +765,15 @@ fn quest_for_state(ctx: &Ctx, target: &Target) -> anyhow::Result<Quest> {
         let now = if finished { "finished" } else { "running" };
         return Err(QError::Invalid(format!(
             "{} is {now} now, which is not what this box says; Esc and try again",
+            quest.slug
+        ))
+        .into());
+    }
+    if quest.beads_epic != target.epic {
+        let now = quest.beads_epic.as_deref().unwrap_or("none");
+        let was = target.epic.as_deref().unwrap_or("none");
+        return Err(QError::Invalid(format!(
+            "{}'s beads epic is {now} now, not {was} as this box says; Esc and try again",
             quest.slug
         ))
         .into());
@@ -2176,6 +2210,7 @@ mod form_tests {
     use crate::model::{Quest, QuestState, SessionRole, SessionStatus};
     use crate::tui::form::Field;
     use crate::tui::render;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -2298,10 +2333,10 @@ mod form_tests {
         type_text(app, value);
     }
 
-    /// Beads is on by default (SPEC §5 step 2). In-crate tests must never
-    /// reach the real `bd` — `beads::client()` picks its fixture off the
-    /// process environment, which these tests deliberately do not set — so
-    /// every submission here turns it off first.
+    /// Beads is on by default (SPEC §5 step 2). The rig's `bd` is
+    /// `stub::NoBd` unless a test asked for another one (`Ctx::for_tests`), so
+    /// leaving it on would only earn a refusal and a warning — every
+    /// submission that is not about beads turns it off first.
     fn no_beads(app: &mut App) {
         focus(app, F_BEADS);
         assert!(app.modal.as_ref().unwrap().form.is_on(F_BEADS));
@@ -3084,7 +3119,17 @@ mod form_tests {
         assert!(error.contains("bd close bd-e9"), "{error}");
         assert_eq!(bd.closed_ids(), ["bd-e9"]);
         assert!(rig.quests().is_empty());
-        assert!(screen(&mut app).contains("no server running"));
+        // N-5. The box is not a way around the 120-column cut: `form::render`
+        // truncates every line to its own budget just as the status bar does,
+        // so the actionable tail of this warning does NOT survive. The epic id
+        // does, because it appears early — which is the only part that has to.
+        let drawn = screen(&mut app);
+        assert!(drawn.contains("no server running"), "{drawn}");
+        assert!(drawn.contains("bd-e9"), "{drawn}");
+        assert!(
+            !drawn.contains("bd close bd-e9"),
+            "the box no longer truncates; the claim it does can be dropped\n{drawn}"
+        );
         assert!(rig.ctx.take_warnings().is_empty());
     }
 
@@ -3318,6 +3363,153 @@ mod form_tests {
         assert_eq!(rig.quests()[0].state, QuestState::Active);
     }
 
+    /// The keys a terminal *without* bracketed paste hands over for these
+    /// bytes. Only the two sequences the live demonstration used are modelled,
+    /// because they are the whole attack: `ESC [ C` is CSI-C, which crossterm
+    /// parses as `KeyCode::Right`, and `CR` is `KeyCode::Enter`.
+    fn as_keys(bytes: &str) -> Vec<Event> {
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        let mut out = Vec::new();
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            if let Some(tail) = rest.strip_prefix('\u{1b}') {
+                match tail.strip_prefix("[C") {
+                    Some(tail) => {
+                        out.push(key(KeyCode::Right));
+                        rest = tail;
+                        continue;
+                    }
+                    None => {
+                        out.push(key(KeyCode::Esc));
+                        rest = tail;
+                        continue;
+                    }
+                }
+            }
+            if let Some(tail) = rest.strip_prefix('\r') {
+                out.push(key(KeyCode::Enter));
+                rest = tail;
+                continue;
+            }
+            let c = rest.chars().next().unwrap();
+            out.push(key(KeyCode::Char(c)));
+            rest = &rest[c.len_utf8()..];
+        }
+        out
+    }
+
+    /// What the app actually receives when `bytes` are pasted into the
+    /// terminal the TUI arms. The MODE decides, so this is not an assumption:
+    /// with bracketed paste on the terminal wraps the paste and crossterm
+    /// hands over one `Event::Paste`; with it off the same bytes go straight
+    /// to the key parser.
+    fn pasted(bytes: &str) -> Vec<Event> {
+        if crate::tui::arms_bracketed_paste() {
+            vec![Event::Paste(bytes.to_string())]
+        } else {
+            as_keys(bytes)
+        }
+    }
+
+    /// Everything the event loop does with one crossterm event.
+    fn deliver(rig: &Rig, app: &mut App, ev: Event) -> Action {
+        let (action, _) = crate::tui::apply_event(app, ev);
+        if action == Action::Submit {
+            crate::tui::submit(&rig.ctx, app);
+        }
+        action
+    }
+
+    /// N-1, the demonstrated attack. `ESC [ C` parses as `Input::Right`, which
+    /// walks the close box's guarded action row off `cancel`, and the `CR`
+    /// behind it submits. Reproduced live against this branch with
+    /// `tmux send-keys -l 'c'` then `tmux send-keys -H 1b 5b 43 0d`: the Quest
+    /// went active -> finished and its tmux session was killed.
+    ///
+    /// Bracketed paste is what makes those bytes arrive as one `Event::Paste`
+    /// instead — text, and the close prompt has no text field to put it in.
+    #[test]
+    fn a_pasted_csi_arrow_and_a_cr_cannot_close_a_quest() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        make(&rig, &mut app, "not-yours");
+        let id = rig.quests()[0].id.clone();
+
+        app.handle(Input::Char('c'));
+        for ev in pasted("\u{1b}[C\r") {
+            assert_eq!(deliver(&rig, &mut app, ev), Action::None, "a paste acted");
+        }
+        assert!(app.modal.is_some(), "a paste took the box down");
+        assert_eq!(
+            app.modal
+                .as_ref()
+                .unwrap()
+                .form
+                .choice(crate::tui::form::ACTION),
+            crate::tui::form::CANCEL,
+            "a pasted arrow armed the close"
+        );
+        // Nothing ran, and nothing is armed to run on the next Enter either.
+        assert_eq!(press(&rig, &mut app, Input::Enter), Action::None);
+        assert!(app.modal.is_some());
+
+        let quest = rig.quests().into_iter().find(|q| q.id == id).unwrap();
+        assert_eq!(quest.state, QuestState::Active);
+        assert!(quest.finished_at.is_none());
+        assert!(
+            rig.fixture()
+                .load()
+                .unwrap()
+                .panes
+                .iter()
+                .any(|p| p.session_name == "q-not-yours"),
+            "the tmux session was killed by a paste"
+        );
+    }
+
+    /// The same paste on the one Quest prompt that has a text field: the text
+    /// lands in the field, and the escape and the `CR` inside it do not become
+    /// keys.
+    #[test]
+    fn a_paste_into_a_prompt_is_literal_text_with_no_keys_in_it() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        make(&rig, &mut app, "resume-me");
+
+        app.handle(Input::Char('R'));
+        for ev in pasted("\u{1b}[Ckeep\rgoing") {
+            assert_eq!(deliver(&rig, &mut app, ev), Action::None);
+        }
+        let form = &app.modal.as_ref().expect("the paste submitted it").form;
+        assert_eq!(form.trimmed(F_PROMPT), "[Ckeepgoing");
+        assert!(!form.confirmed(), "a pasted arrow armed the resume");
+    }
+
+    /// And the `/` box, the tab's own text field. Pasting with nothing
+    /// capturing goes nowhere at all — a paste is not a way to open a box.
+    #[test]
+    fn a_paste_reaches_the_search_box_and_nothing_else() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        make(&rig, &mut app, "cdc-backfill");
+
+        app.handle(Input::Char('/'));
+        for ev in pasted("\u{1b}[Ccdc\r") {
+            assert_eq!(deliver(&rig, &mut app, ev), Action::None);
+        }
+        assert_eq!(app.quests.query, "[Ccdc");
+
+        app.handle(Input::Esc);
+        assert!(!app.quests.capturing());
+        let paste = Event::Paste("qqq".to_string());
+        assert_eq!(
+            crate::tui::apply_event(&mut app, paste),
+            (Action::None, false)
+        );
+        assert!(!app.should_quit, "a pasted `q` quit the TUI");
+        assert_eq!(app.quests.query, "");
+    }
+
     /// `n` and `R` start processes, so they are guarded the same way — but
     /// their fields are still typed into from the first keystroke, which is
     /// why their action row is last and not first.
@@ -3393,6 +3585,43 @@ mod form_tests {
             QuestState::Active,
             "the impostor was closed"
         );
+    }
+
+    /// N-6, N2's residual. The close box names the epic it is about to close,
+    /// and `close --close-epic` closes whatever the *refetched* Quest carries.
+    /// A `q set <slug> beads_epic <other>` underneath the open box would
+    /// otherwise close an epic the box never mentioned.
+    #[test]
+    fn a_prompt_refuses_a_quest_whose_epic_changed_while_the_box_was_up() {
+        let _guard = crate::beads::backoff::acquire();
+        let bd = std::sync::Arc::new(crate::beads::stub::StubBd::working("bd-e1"));
+        let rig = Rig::with_bd(Box::new(bd.clone()));
+        let mut app = rig.app();
+        make(&rig, &mut app, "swapped-epic");
+        let id = rig.quests()[0].id.clone();
+        let db = rig.ctx.db().unwrap();
+        let patch = |epic: &str| crate::db::quest::QuestPatch {
+            beads_epic: Some(Some(epic.to_string())),
+            ..Default::default()
+        };
+        db.update_quest(&id, &patch("bd-e1")).unwrap();
+        refresh(&rig.ctx, &mut app).unwrap();
+
+        app.handle(Input::Char('c'));
+        assert!(screen(&mut app).contains("epic bd-e1"));
+        // Another terminal repoints the Quest at a different epic.
+        db.update_quest(&id, &patch("bd-e2")).unwrap();
+        focus(&mut app, F_CLOSE_EPIC);
+        app.handle(Input::Char(' '));
+        submit(&rig, &mut app);
+
+        let form = &app.modal.as_ref().expect("the form was thrown away").form;
+        assert!(
+            form.error().unwrap().contains("beads epic is bd-e2 now"),
+            "{form:?}"
+        );
+        assert!(bd.closed_ids().is_empty(), "an unnamed epic was closed");
+        assert_eq!(rig.quests()[0].state, QuestState::Active);
     }
 
     /// N2. The box named a slug and a tmux session. A rename underneath makes

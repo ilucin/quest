@@ -85,16 +85,19 @@ pub fn default_target(arg: Option<&str>) -> anyhow::Result<String> {
 
 /// What sections 4 and 8 shell out to. Stubbed in tests and under `Q_FIXTURE`.
 pub trait External {
-    /// `bd list -l quest:<id> --json`; `None` when `bd` is missing or failed.
     /// `brain show <slug>`; `None` when `brain` is missing or failed.
     fn brain_show(&self, slug: &str) -> Option<String>;
 
     /// The Quest's issues, always through `beads.rs` — the very call `q show`
     /// makes, so the brief cannot show a shorter or differently filtered list.
     /// `$Q_FIXTURE` is honoured in there, not here.
-    fn bd_list(&self, quest_id: &str) -> Option<String> {
-        beads::client().list_quest(quest_id)
-    }
+    ///
+    /// Required rather than defaulted: the default was `beads::client()`, a
+    /// client discovered off the process environment that writes its progress
+    /// notices to stderr — which is a torn frame when the caller is the TUI,
+    /// and the real `bd` when the caller is a unit test (N-4). Every impl now
+    /// has to say where its `bd` comes from.
+    fn bd_list(&self, quest_id: &str) -> Option<String>;
 }
 
 /// The real tools, or — under `$Q_FIXTURE` — canned output from the files
@@ -114,6 +117,9 @@ impl External for RealExternal {
     fn brain_show(&self, slug: &str) -> Option<String> {
         proc::run_capped("brain", &["show", slug], EXTERNAL_TIMEOUT)
     }
+    fn bd_list(&self, quest_id: &str) -> Option<String> {
+        beads::client().list_quest(quest_id)
+    }
 }
 
 struct FixtureExternal;
@@ -121,6 +127,36 @@ struct FixtureExternal;
 impl External for FixtureExternal {
     fn brain_show(&self, _slug: &str) -> Option<String> {
         fixture_file("Q_FIXTURE_BRAIN")
+    }
+    fn bd_list(&self, quest_id: &str) -> Option<String> {
+        beads::client().list_quest(quest_id)
+    }
+}
+
+/// The tools a caller that already owns a `bd` uses: `brain` as usual (or its
+/// fixture), and issues through the caller's client rather than one discovered
+/// here. The TUI's `b` goes through this — `Ctx` holds a quiet client, and a
+/// notice written from inside the call would land on the alternate screen.
+pub struct WithBd<'a> {
+    bd: &'a dyn beads::Bd,
+    brain: Box<dyn External>,
+}
+
+impl<'a> WithBd<'a> {
+    pub fn new(bd: &'a dyn beads::Bd) -> WithBd<'a> {
+        WithBd {
+            bd,
+            brain: external(),
+        }
+    }
+}
+
+impl External for WithBd<'_> {
+    fn brain_show(&self, slug: &str) -> Option<String> {
+        self.brain.brain_show(slug)
+    }
+    fn bd_list(&self, quest_id: &str) -> Option<String> {
+        self.bd.list_quest(quest_id)
     }
 }
 

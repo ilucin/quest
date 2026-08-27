@@ -30,6 +30,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Config;
+// Only the real cache root resolves a database path; see `cache_root`.
+#[cfg(not(test))]
 use crate::db::Db;
 use crate::model::{Quest, now};
 use crate::proc;
@@ -725,11 +727,67 @@ struct Cached {
 }
 
 fn cache_path(quest_id: &str) -> Option<PathBuf> {
-    Some(
-        cache_dir(&Db::path().ok()?)
-            .join("cache")
-            .join(format!("beads-{quest_id}.json")),
-    )
+    Some(cache_root()?.join(format!("beads-{quest_id}.json")))
+}
+
+/// The directory the per-Quest cache files live in.
+///
+/// `Db::path()` falls back to the real `~/.local/share/q` when `Q_DB` is
+/// unset, and the in-crate tests run in one process that inherits the
+/// developer's home. A hit read out of it short-circuits `progress_all_with`
+/// before `bd` is ever asked, which is a real (if low-rate) flake and a
+/// violation of the repo's "never touch the real `~/.local/share/q`" rule —
+/// so under `cfg(test)` there is no default at all (N-3).
+#[cfg(not(test))]
+fn cache_root() -> Option<PathBuf> {
+    Some(cache_dir(&Db::path().ok()?).join("cache"))
+}
+
+#[cfg(test)]
+fn cache_root() -> Option<PathBuf> {
+    cache_override::root()
+}
+
+/// The in-crate cache directory: none unless a test says otherwise, so no
+/// test can read or write the developer's own cache. See [`cache_root`].
+#[cfg(test)]
+pub(crate) mod cache_override {
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    fn exclusive() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    pub(super) fn root() -> Option<PathBuf> {
+        ROOT.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Points the cache at `dir` until the guard is dropped. `ROOT` is
+    /// process-global, so the guard also serializes the tests that use it.
+    pub(crate) struct Guard(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *ROOT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    pub(crate) fn at(dir: PathBuf) -> Guard {
+        let guard = none();
+        *ROOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir);
+        guard
+    }
+
+    /// The default — no cache anywhere — held against a concurrent [`at`].
+    pub(crate) fn none() -> Guard {
+        let lock = exclusive().lock().unwrap_or_else(|e| e.into_inner());
+        *ROOT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        Guard(lock)
+    }
 }
 
 /// A bare relative `Q_DB` (`q.db`) has an empty parent; its cache belongs in
@@ -1369,6 +1427,49 @@ mod tests {
         assert_eq!(sanitize("some repo"), "some-repo");
         assert_eq!(sanitize("a,b"), "a-b");
         assert_eq!(sanitize("plain"), "plain");
+    }
+
+    /// N-3. `Db::path()` falls back to the real `~/.local/share/q` when `Q_DB`
+    /// is unset, and every in-crate test runs in one process that inherits the
+    /// developer's home. A *fresh* hit read out of it short-circuits
+    /// `progress_all_with` before `bd` is asked: with a `$HOME` cache seeded
+    /// for all 65536 possible quest ids, `a_failing_bd_is_not_respawned_on_
+    /// every_tick` and `the_backoff_window_does_not_leak_between_tests` both
+    /// fail. A real cache holds a handful of entries, so it is a low-rate
+    /// flake — and a violation of the repo's "never touch the real
+    /// `~/.local/share/q`" rule either way.
+    #[test]
+    fn the_in_crate_cache_never_resolves_to_the_developers_home() {
+        // Against the one test that points the cache somewhere on purpose.
+        let _none = cache_override::none();
+        assert!(
+            cache_path("dead").is_none(),
+            "an in-crate test can read the real cache"
+        );
+        assert!(read_cache("dead").is_none());
+        // And a write is a no-op rather than a file in somebody's home.
+        write_cache("dead", &Progress::default());
+        assert!(read_cache("dead").is_none());
+    }
+
+    /// The cache still works — pointed at a directory the test owns.
+    #[test]
+    fn the_cache_round_trips_through_an_explicit_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let _at = cache_override::at(dir.path().to_path_buf());
+        let progress = Progress {
+            open: 1,
+            in_progress: 2,
+            closed: 3,
+            blocked: 0,
+            total: 6,
+        };
+        write_cache("abcd", &progress);
+        assert_eq!(read_cache("abcd").map(|c| c.progress), Some(progress));
+        assert!(dir.path().join("beads-abcd.json").exists());
+        // And `q rm` drops it.
+        forget("abcd");
+        assert!(read_cache("abcd").is_none());
     }
 
     #[test]

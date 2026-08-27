@@ -30,7 +30,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::cursor::Show;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, poll, read as read_event,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyEventKind, poll, read as read_event,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -72,6 +73,12 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
 static RAW_ON: AtomicBool = AtomicBool::new(false);
 static ALT_ON: AtomicBool = AtomicBool::new(false);
 static MOUSE_ON: AtomicBool = AtomicBool::new(false);
+/// Bracketed paste (CSI ?2004h). Not optional the way the mouse is: with it
+/// off the terminal hands pasted bytes over as if they had been typed, so a
+/// `ESC [ C` in a paste is an arrow key that walks a guarded action row off
+/// `cancel` and the `CR` after it submits. With it on the same bytes arrive as
+/// one `Event::Paste`, which is text and nothing else.
+static PASTE_ON: AtomicBool = AtomicBool::new(false);
 static HOOK: Once = Once::new();
 
 /// The terminal-level effects the lifecycle performs, behind a trait so
@@ -81,6 +88,7 @@ trait TermIo {
     fn raw(&mut self, on: bool) -> io::Result<()>;
     fn alt(&mut self, on: bool) -> io::Result<()>;
     fn mouse(&mut self, on: bool) -> io::Result<()>;
+    fn paste(&mut self, on: bool) -> io::Result<()>;
     fn show_cursor(&mut self) -> io::Result<()>;
     fn flush(&mut self) -> io::Result<()>;
 }
@@ -94,6 +102,9 @@ impl<T: TermIo + ?Sized> TermIo for &mut T {
     }
     fn mouse(&mut self, on: bool) -> io::Result<()> {
         (**self).mouse(on)
+    }
+    fn paste(&mut self, on: bool) -> io::Result<()> {
+        (**self).paste(on)
     }
     fn show_cursor(&mut self) -> io::Result<()> {
         (**self).show_cursor()
@@ -134,6 +145,15 @@ impl TermIo for Stdio {
             execute!(out, EnableMouseCapture)
         } else {
             execute!(out, DisableMouseCapture)
+        }
+    }
+
+    fn paste(&mut self, on: bool) -> io::Result<()> {
+        let mut out = io::stdout();
+        if on {
+            execute!(out, EnableBracketedPaste)
+        } else {
+            execute!(out, DisableBracketedPaste)
         }
     }
 
@@ -190,6 +210,10 @@ fn arm_steps<T: TermIo>(io: &mut T, mouse: bool) -> io::Result<()> {
     io.raw(true)?;
     ALT_ON.store(true, Ordering::SeqCst);
     io.alt(true)?;
+    // Unconditional, unlike the mouse: this one is a safety property, not a
+    // preference, and a terminal that does not know the sequence ignores it.
+    PASTE_ON.store(true, Ordering::SeqCst);
+    io.paste(true)?;
     if mouse {
         MOUSE_ON.store(true, Ordering::SeqCst);
         io.mouse(true)?;
@@ -228,9 +252,10 @@ fn restore() {
 /// it.
 fn restore_with<T: TermIo>(io: &mut T) {
     let mouse = MOUSE_ON.load(Ordering::SeqCst);
+    let paste = PASTE_ON.load(Ordering::SeqCst);
     let alt = ALT_ON.load(Ordering::SeqCst);
     let raw = RAW_ON.load(Ordering::SeqCst);
-    if !(mouse || alt || raw) {
+    if !(mouse || paste || alt || raw) {
         return;
     }
     // First, and whatever else is on: ratatui hides the cursor on every draw,
@@ -241,6 +266,10 @@ fn restore_with<T: TermIo>(io: &mut T) {
     if mouse {
         let _ = io.mouse(false);
         MOUSE_ON.store(false, Ordering::SeqCst);
+    }
+    if paste {
+        let _ = io.paste(false);
+        PASTE_ON.store(false, Ordering::SeqCst);
     }
     if alt {
         let _ = io.alt(false);
@@ -361,10 +390,18 @@ where
     };
     // Rendered before the handoff: a brief that cannot be built is a status
     // message, not a reason to blank the screen and start a pager on nothing.
-    let markdown = match ctx
-        .db()
-        .and_then(|db| brief::render(db, &quest, &brief::Opts::default()))
-    {
+    //
+    // Through the `Ctx`'s own `bd`, not `brief::render`'s discovered one: this
+    // runs while the TUI still owns the alternate screen, and the discovered
+    // client writes its progress notices to stderr (N-4).
+    let markdown = match ctx.db().and_then(|db| {
+        brief::render_with(
+            db,
+            &quest,
+            &brief::Opts::default(),
+            &brief::WithBd::new(ctx.bd()),
+        )
+    }) {
         Ok(markdown) => markdown,
         Err(e) => {
             app.say(format!("cannot brief {}: {e:#}", quest.slug));
@@ -407,6 +444,11 @@ fn apply_event(app: &mut App, ev: Event) -> (Action, bool) {
             Some(input) => (app.handle_mouse(input), true),
             None => (Action::None, false),
         },
+        // Text, never keys. Bracketed paste is armed precisely so this arm
+        // exists: dropping it here would put the bytes back through the key
+        // parser, which is what let a pasted `ESC [ C` arm a guarded action
+        // row (N-1).
+        Event::Paste(text) => (Action::None, app.paste(&text)),
         Event::Resize(w, h) => {
             app.set_size(w, h);
             (Action::None, true)
@@ -516,7 +558,11 @@ fn submit(ctx: &Ctx, app: &mut App) {
         Err(e) => {
             // The error leads: it is why the form is still up. The warnings
             // follow, because on the rollback path one of them names an epic
-            // that outlived its Quest.
+            // that outlived its Quest — and the id is what has to survive:
+            // `form::render` truncates each line to the box budget exactly as
+            // the status bar does, so at 120 columns the actionable *tail*
+            // ("close it with `bd close bd-e9`") is cut. The id appears early
+            // enough that it is not (N-5).
             modal.form.set_error(joined(&format!("{e:#}"), &warnings));
             app.modal = Some(modal);
         }
@@ -799,6 +845,44 @@ pub(crate) fn placeholder(frame: &mut Frame, area: Rect, title: &str, bead: &str
 
 /// The lifecycle flags are process-global, so every test that touches them —
 /// here and in [`signals`] — takes this first and always leaves them clear.
+/// Whether [`arm_steps`] actually turns bracketed paste on — asked of the
+/// code rather than assumed, so a test can model what the terminal will hand
+/// the app for a paste (`Event::Paste` with the mode on, raw key events
+/// without it) instead of asserting the answer it hopes for.
+#[cfg(test)]
+pub(super) fn arms_bracketed_paste() -> bool {
+    #[derive(Default)]
+    struct Probe(bool);
+    impl TermIo for Probe {
+        fn raw(&mut self, _on: bool) -> io::Result<()> {
+            Ok(())
+        }
+        fn alt(&mut self, _on: bool) -> io::Result<()> {
+            Ok(())
+        }
+        fn mouse(&mut self, _on: bool) -> io::Result<()> {
+            Ok(())
+        }
+        fn paste(&mut self, on: bool) -> io::Result<()> {
+            self.0 |= on;
+            Ok(())
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    // The flags are process-global, and the probe leaves them as it found
+    // them: clear on the way in (the lock does that) and clear on the way out.
+    let _lock = lifecycle_lock();
+    let mut probe = Probe::default();
+    let _ = arm_steps(&mut probe, false);
+    restore_with(&mut probe);
+    probe.0
+}
+
 #[cfg(test)]
 pub(super) fn lifecycle_lock() -> std::sync::MutexGuard<'static, ()> {
     static LIFECYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -806,6 +890,7 @@ pub(super) fn lifecycle_lock() -> std::sync::MutexGuard<'static, ()> {
     RAW_ON.store(false, Ordering::SeqCst);
     ALT_ON.store(false, Ordering::SeqCst);
     MOUSE_ON.store(false, Ordering::SeqCst);
+    PASTE_ON.store(false, Ordering::SeqCst);
     guard
 }
 
@@ -847,24 +932,30 @@ mod tests {
         RAW_ON.store(false, Ordering::SeqCst);
         ALT_ON.store(false, Ordering::SeqCst);
         MOUSE_ON.store(false, Ordering::SeqCst);
+        PASTE_ON.store(false, Ordering::SeqCst);
     }
 
-    fn flags() -> (bool, bool, bool) {
+    fn flags() -> Flags {
         (
             RAW_ON.load(Ordering::SeqCst),
             ALT_ON.load(Ordering::SeqCst),
             MOUSE_ON.load(Ordering::SeqCst),
+            PASTE_ON.load(Ordering::SeqCst),
         )
     }
+
+    /// `(raw, alt, mouse, paste)`, the four terminal-state flags.
+    type Flags = (bool, bool, bool, bool);
 
     /// Records the escape/termios steps instead of performing them, and can be
     /// told to fail at one of them — or to let a signal land after one.
     #[derive(Debug, Default)]
     struct FakeTerm {
         calls: Vec<&'static str>,
-        /// `(step, (raw, alt, mouse))` as each step was issued, so a teardown
-        /// that drops a flag too early is visible rather than merely narrow.
-        snapshots: Vec<(&'static str, (bool, bool, bool))>,
+        /// `(step, (raw, alt, mouse, paste))` as each step was issued, so a
+        /// teardown that drops a flag too early is visible rather than merely
+        /// narrow.
+        snapshots: Vec<(&'static str, Flags)>,
         fail_on: Option<&'static str>,
         signal_after: Option<&'static str>,
     }
@@ -902,6 +993,9 @@ mod tests {
         fn mouse(&mut self, on: bool) -> io::Result<()> {
             self.step(if on { "mouse on" } else { "mouse off" })
         }
+        fn paste(&mut self, on: bool) -> io::Result<()> {
+            self.step(if on { "paste on" } else { "paste off" })
+        }
         fn show_cursor(&mut self) -> io::Result<()> {
             self.step("cursor show")
         }
@@ -918,22 +1012,24 @@ mod tests {
         let mut term = FakeTerm::default();
         {
             let _guard = arm(&mut term, true).expect("arm");
-            assert_eq!(flags(), (true, true, true));
+            assert_eq!(flags(), (true, true, true, true));
         }
         assert_eq!(
             term.calls,
             [
                 "raw on",
                 "alt on",
+                "paste on",
                 "mouse on",
                 "cursor show",
                 "mouse off",
+                "paste off",
                 "alt off",
                 "raw off",
                 "flush",
             ]
         );
-        assert_eq!(flags(), (false, false, false));
+        assert_eq!(flags(), (false, false, false, false));
     }
 
     #[test]
@@ -942,7 +1038,7 @@ mod tests {
         let mut term = FakeTerm::default();
         {
             let _guard = arm(&mut term, false).expect("arm");
-            assert_eq!(flags(), (true, true, false));
+            assert_eq!(flags(), (true, true, false, true));
         }
         // Nothing is undone that was never switched on.
         assert_eq!(
@@ -950,7 +1046,9 @@ mod tests {
             [
                 "raw on",
                 "alt on",
+                "paste on",
                 "cursor show",
+                "paste off",
                 "alt off",
                 "raw off",
                 "flush"
@@ -983,15 +1081,34 @@ mod tests {
                     "flush",
                 ],
             ),
+            // Bracketed paste is armed between the alternate screen and the
+            // mouse, and its flag is set before its own call — so a failure
+            // here still leaves `?2004l` in the teardown.
+            (
+                true,
+                "paste on",
+                vec![
+                    "raw on",
+                    "alt on",
+                    "paste on",
+                    "cursor show",
+                    "paste off",
+                    "alt off",
+                    "raw off",
+                    "flush",
+                ],
+            ),
             (
                 true,
                 "mouse on",
                 vec![
                     "raw on",
                     "alt on",
+                    "paste on",
                     "mouse on",
                     "cursor show",
                     "mouse off",
+                    "paste off",
                     "alt off",
                     "raw off",
                     "flush",
@@ -1018,7 +1135,7 @@ mod tests {
             };
             assert!(err.to_string().contains(step), "{err} at {step}");
             assert_eq!(term.calls, want, "failing at {step}");
-            assert_eq!(flags(), (false, false, false), "failing at {step}");
+            assert_eq!(flags(), (false, false, false, false), "failing at {step}");
         }
     }
 
@@ -1056,15 +1173,16 @@ mod tests {
         assert_eq!(
             term.snapshots,
             [
-                // (raw, alt, mouse) as each step was issued.
-                ("cursor show", (true, true, true)),
-                ("mouse off", (true, true, true)),
-                ("alt off", (true, true, false)),
-                ("raw off", (true, false, false)),
-                ("flush", (false, false, false)),
+                // (raw, alt, mouse, paste) as each step was issued.
+                ("cursor show", (true, true, true, true)),
+                ("mouse off", (true, true, true, true)),
+                ("paste off", (true, true, false, true)),
+                ("alt off", (true, true, false, false)),
+                ("raw off", (true, false, false, false)),
+                ("flush", (false, false, false, false)),
             ]
         );
-        assert_eq!(flags(), (false, false, false));
+        assert_eq!(flags(), (false, false, false, false));
     }
 
     /// The other half of N1: a signal really landing mid-teardown restores
@@ -1087,14 +1205,22 @@ mod tests {
         let mut want = Vec::new();
         want.extend_from_slice(b"\x1b[?25h");
         want.extend_from_slice(b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+        want.extend_from_slice(b"\x1b[?2004l");
         want.extend_from_slice(b"\x1b[?1049l");
         assert_eq!(escapes, want, "the signal restored nothing");
         // And the guard finished its own sequence regardless.
         assert_eq!(
             term.calls,
-            ["cursor show", "mouse off", "alt off", "raw off", "flush"]
+            [
+                "cursor show",
+                "mouse off",
+                "paste off",
+                "alt off",
+                "raw off",
+                "flush"
+            ]
         );
-        assert_eq!(flags(), (false, false, false));
+        assert_eq!(flags(), (false, false, false, false));
     }
 
     /// The panic hook and the guard both restore, in whichever order they run.
@@ -1106,7 +1232,7 @@ mod tests {
         std::mem::forget(guard);
 
         restore_with(&mut term);
-        assert_eq!(flags(), (false, false, false));
+        assert_eq!(flags(), (false, false, false, false));
         term.calls.clear();
         restore_with(&mut term);
         assert!(term.calls.is_empty(), "{:?}", term.calls);
@@ -1258,6 +1384,53 @@ mod tests {
             apply_event(&mut app, mouse(MouseEventKind::Down(MouseButton::Left))),
             (Action::None, false)
         );
+    }
+
+    /// N-1. The demonstrated attack was a *paste*: with bracketed paste off
+    /// the terminal hands the pasted bytes straight to the key parser, where
+    /// `ESC [ C` is `Input::Right` — the key that walks a guarded action row
+    /// off `cancel` — and the `CR` behind it is Enter. Reproduced live against
+    /// this branch with `tmux send-keys -l 'c'` followed by
+    /// `tmux send-keys -H 1b 5b 43 0d`: the Quest went active -> finished and
+    /// its tmux session was killed.
+    ///
+    /// So the mode is armed on the way in, and every way out disables it —
+    /// including the signal path, which writes its own bytes.
+    #[test]
+    fn the_tui_arms_bracketed_paste_and_every_exit_disables_it() {
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        {
+            let _guard = arm(&mut term, true).expect("arm");
+            assert!(
+                PASTE_ON.load(Ordering::SeqCst),
+                "pasted bytes still arrive as keys"
+            );
+        }
+        assert!(term.calls.contains(&"paste on"), "{:?}", term.calls);
+        assert!(term.calls.contains(&"paste off"), "{:?}", term.calls);
+        assert!(!PASTE_ON.load(Ordering::SeqCst));
+
+        // And a signal, which never reaches the guard, carries the same undo.
+        clear_flags();
+        PASTE_ON.store(true, Ordering::SeqCst);
+        let ((), escapes) = signals::capturing_output(signals::restore_from_signal);
+        assert_eq!(
+            escapes, b"\x1b[?25h\x1b[?2004l",
+            "a killed TUI leaves the shell wrapping every paste in markers"
+        );
+    }
+
+    /// The other half of N-1: a paste is one `Event::Paste`, and `apply_event`
+    /// treats it as text. It can never become an [`Action`], and with nothing
+    /// capturing it is dropped rather than replayed through the key parser.
+    #[test]
+    fn a_paste_is_text_and_never_a_key() {
+        let mut app = app();
+        let paste = Event::Paste("\u{1b}[C\rq".to_string());
+        assert_eq!(apply_event(&mut app, paste), (Action::None, false));
+        assert!(!app.should_quit, "a pasted `q` quit the TUI");
+        assert!(app.modal.is_none());
     }
 
     #[test]
@@ -1675,18 +1848,28 @@ mod tests {
             flags()
         })
         .expect("handoff");
-        assert_eq!(seen, (false, false, false), "the body ran in TUI mode");
-        assert_eq!(flags(), (true, true, true), "TUI mode never came back");
+        assert_eq!(
+            seen,
+            (false, false, false, false),
+            "the body ran in TUI mode"
+        );
+        assert_eq!(
+            flags(),
+            (true, true, true, true),
+            "TUI mode never came back"
+        );
         assert_eq!(
             term.calls,
             [
                 "cursor show",
                 "mouse off",
+                "paste off",
                 "alt off",
                 "raw off",
                 "flush",
                 "raw on",
                 "alt on",
+                "paste on",
                 "mouse on",
             ]
         );
@@ -1705,16 +1888,18 @@ mod tests {
 
         let mut terminal = test_terminal();
         handoff(&mut term, &mut terminal, false, || ()).expect("handoff");
-        assert_eq!(flags(), (true, true, false));
+        assert_eq!(flags(), (true, true, false, true));
         assert_eq!(
             term.calls,
             [
                 "cursor show",
+                "paste off",
                 "alt off",
                 "raw off",
                 "flush",
                 "raw on",
-                "alt on"
+                "alt on",
+                "paste on"
             ]
         );
         restore_with(&mut term);
@@ -1733,12 +1918,14 @@ mod tests {
         let mut terminal = test_terminal();
         let err = handoff(&mut term, &mut terminal, false, || ()).unwrap_err();
         assert!(err.to_string().contains("alt on"), "{err}");
-        // Half armed — and armed is what makes the undo run at all.
-        assert_eq!(flags(), (true, true, false));
+        // Half armed — and armed is what makes the undo run at all. Bracketed
+        // paste comes after the alternate screen, so `alt on` failing means it
+        // was never reached.
+        assert_eq!(flags(), (true, true, false, false));
         term.calls.clear();
         restore_with(&mut term);
         assert_eq!(term.calls[0], "cursor show");
-        assert_eq!(flags(), (false, false, false));
+        assert_eq!(flags(), (false, false, false, false));
     }
 
     // ------------------------------------------------------------- attaching
@@ -1771,7 +1958,11 @@ mod tests {
         assert_eq!(state.attach_mode.as_deref(), Some("child"));
         assert!(app.status.contains("back from needs-me"), "{}", app.status);
         assert!(!app.should_quit);
-        assert_eq!(flags(), (true, true, true), "the TUI did not come back");
+        assert_eq!(
+            flags(),
+            (true, true, true, true),
+            "the TUI did not come back"
+        );
         assert!(term.calls.contains(&"raw off"), "{:?}", term.calls);
         assert!(term.calls.ends_with(&["mouse on"]), "{:?}", term.calls);
         restore_with(&mut term);
@@ -1809,7 +2000,7 @@ mod tests {
             app.status
         );
         assert!(!app.status.contains("back from"), "{}", app.status);
-        assert_eq!(flags(), (true, true, true));
+        assert_eq!(flags(), (true, true, true, true));
         restore_with(&mut term);
     }
 
@@ -1836,10 +2027,17 @@ mod tests {
 
         assert_eq!(fixture(&_dir).attach_mode.as_deref(), Some("exec"));
         assert!(app.should_quit, "the TUI kept running with no terminal");
-        assert_eq!(flags(), (false, false, false));
+        assert_eq!(flags(), (false, false, false, false));
         assert_eq!(
             term.calls,
-            ["cursor show", "mouse off", "alt off", "raw off", "flush"],
+            [
+                "cursor show",
+                "mouse off",
+                "paste off",
+                "alt off",
+                "raw off",
+                "flush"
+            ],
             "the terminal was not handed back before the exec"
         );
     }
@@ -1876,7 +2074,7 @@ mod tests {
             assert!(fixture(&_dir).attached.is_none(), "{what}: it attached");
             // The screen was never given away, so there is nothing to rebuild.
             assert!(term.calls.is_empty(), "{what}: {:?}", term.calls);
-            assert_eq!(flags(), (true, true, true), "{what}");
+            assert_eq!(flags(), (true, true, true, true), "{what}");
             assert!(!app.should_quit, "{what}");
             restore_with(&mut term);
         }
@@ -1960,16 +2158,75 @@ mod tests {
             [
                 "cursor show",
                 "mouse off",
+                "paste off",
                 "alt off",
                 "raw off",
                 "flush",
                 "raw on",
                 "alt on",
+                "paste on",
                 "mouse on",
             ]
         );
-        assert_eq!(flags(), (true, true, true));
+        assert_eq!(flags(), (true, true, true, true));
         restore_with(&mut term);
+    }
+
+    /// N-4. The brief is the one library call the TUI used to make with a `bd`
+    /// discovered off the process environment: `brief::render`'s default
+    /// `bd_list` was `beads::client()`, a client that writes progress notices
+    /// to stderr — onto the alternate screen the TUI still owns — and that a
+    /// unit test cannot replace, so it shells out to the real `bd`.
+    ///
+    /// Now the brief goes through `Ctx`'s own client, which is what this
+    /// proves: the issue below exists only in the injected stub.
+    #[test]
+    fn the_brief_reads_beads_through_the_ctxs_own_client() {
+        let (ctx, _dir) = quest_ctx(
+            "needs-me",
+            crate::model::QuestState::Active,
+            true,
+            &[("q-needs-me", "%1")],
+        );
+        let quest = ctx.db().unwrap().list_quests(true).unwrap().remove(0);
+        ctx.db()
+            .unwrap()
+            .update_quest(
+                &quest.id,
+                &crate::db::quest::QuestPatch {
+                    beads_epic: Some(Some("bd-e1".to_string())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let label = format!("quest:{}", quest.id);
+        let mut stub = crate::beads::stub::StubBd::working("bd-e1");
+        stub.listing = Some(
+            serde_json::json!([
+                { "id": "bd-77", "title": "only the stub knows this",
+                  "status": "blocked", "labels": [&label] },
+            ])
+            .to_string(),
+        );
+        let ctx = ctx.with_bd(Box::new(std::sync::Arc::new(stub)));
+        let mut app = loaded(&ctx);
+
+        let out = _dir.path().join("paged.md");
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        let mut terminal = test_terminal();
+        pager::with_pager(Some(&format!("tee {}", out.display())), || {
+            brief_in_pager(&ctx, &mut term, &mut terminal, &mut app).expect("brief");
+        });
+        restore_with(&mut term);
+
+        let paged = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            paged.contains("only the stub knows this"),
+            "the brief went to a `bd` the Ctx does not own\n{paged}"
+        );
     }
 
     /// A pager that will not start is a status message; the TUI is still there
@@ -1996,7 +2253,7 @@ mod tests {
             "{}",
             app.status
         );
-        assert_eq!(flags(), (true, true, true));
+        assert_eq!(flags(), (true, true, true, true));
         restore_with(&mut term);
     }
 
@@ -2019,7 +2276,7 @@ mod tests {
         let ((), escapes) = signals::capturing_output(signals::restore_from_signal);
         assert!(!escapes.is_empty(), "the handler restored nothing");
         assert!(escapes.starts_with(b"\x1b[?25h"), "{escapes:?}");
-        assert_eq!(flags(), (false, false, false));
+        assert_eq!(flags(), (false, false, false, false));
 
         // The guard now has nothing left to do, so a `q` that was killed mid
         // teardown cannot double-write the escapes.

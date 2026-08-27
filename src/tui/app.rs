@@ -101,6 +101,10 @@ pub struct Target {
     /// resume prompts say different things — and mean different things — on
     /// either side of this.
     pub finished: bool,
+    /// The beads epic the box named. `q set <slug> beads_epic <other>` from
+    /// another terminal would otherwise leave the box saying `bd-e1` while the
+    /// refetched Quest closes `bd-e2` (N-6).
+    pub epic: Option<String>,
 }
 
 /// What an open form will do when it is submitted.
@@ -332,6 +336,29 @@ impl App {
             Tab::Sessions => sessions::handle(self, input),
             Tab::Templates => templates::handle(self, input),
             Tab::Events => events::handle(self, input),
+        }
+    }
+
+    /// A bracketed paste. Text, and only ever text: it goes into the focused
+    /// text field of whatever is capturing, and nowhere else.
+    ///
+    /// Nothing here can return an [`Action`]. That is the point — a paste
+    /// carrying `ESC [ C` and a `CR` used to arrive as an arrow key and an
+    /// Enter, which walked a guarded action row off `cancel` and submitted it
+    /// (N-1). With no capture on screen a paste is dropped outright rather
+    /// than replayed as keys.
+    ///
+    /// Returns whether anything on screen changed.
+    pub fn paste(&mut self, text: &str) -> bool {
+        if self.help {
+            return false;
+        }
+        if let Some(modal) = self.modal.as_mut() {
+            return modal.form.paste(text);
+        }
+        match self.tab {
+            Tab::Quests => quests::paste(self, text),
+            _ => false,
         }
     }
 

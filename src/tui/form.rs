@@ -7,6 +7,12 @@
 //! so there is one place where "a box is holding the keyboard" is implemented
 //! and one place where it is drawn.
 //!
+//! Every form has to say what Enter means: [`Form::action`] for anything that
+//! destroys or spawns, [`Form::harmless`] for anything that does not. There is
+//! no third option — a form that says neither refuses to submit at all, which
+//! is what keeps the guard from being something each new prompt has to
+//! remember (see [`Commit`]).
+//!
 //! Pure, like the rest of the state machine: [`Form::handle`] only edits the
 //! form and says what happened, and [`render`] only draws it.
 
@@ -33,6 +39,24 @@ pub const ACTION: &str = "action";
 pub const CANCEL: &str = "cancel";
 /// Marks a cut in a value too wide for the box.
 const CUT: char = '\u{2026}';
+
+/// What Enter means on a form with no [`action`](Form::action) row.
+///
+/// Default-deny, and deliberately not a `bool` with a `false` default that
+/// reads as "not yet decided": a prompt that destroys something or starts a
+/// process and forgets its action row used to be *submittable by a bare
+/// Enter*, so the guard was opt-in and every future prompt had to remember it
+/// (N-2). Now forgetting means the form refuses to submit at all — loud, and
+/// visible the first time it is opened — and the only way past it is
+/// [`Form::harmless`], which is a claim the author has to make out loud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Commit {
+    /// Nothing may run until an action row says so.
+    Guarded,
+    /// Declared harmless: submitting destroys nothing and starts nothing, so
+    /// Enter is just Enter. `r` (rename) is the one prompt like this.
+    Harmless,
+}
 
 /// What a keypress did to a form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,10 +86,11 @@ pub enum Field {
         label: String,
         options: Vec<String>,
         at: usize,
-        /// Whether Space is refused as a way to cycle it. The affirmative on a
-        /// destructive prompt is `guarded`: bracketed paste is off, so a paste
-        /// arrives as ordinary keys, and a space in pasted text must not be
-        /// able to arm the very option the prompt is guarding.
+        /// Whether Space is refused as a way to cycle it. Belt and braces on a
+        /// destructive prompt: bracketed paste already makes pasted bytes
+        /// text rather than keys, and this keeps a space that reaches the
+        /// alphabet some other way — a terminal without the mode, a key
+        /// buffered during a stall — from arming what the prompt guards.
         guarded: bool,
     },
     /// Flipped with `←`/`→`/space.
@@ -143,6 +168,8 @@ pub struct Form {
     /// `usize::MAX` when nothing in the form can take focus.
     focus: usize,
     error: Option<String>,
+    /// What Enter means without an action row. See [`Commit`].
+    commit: Commit,
 }
 
 impl Form {
@@ -153,7 +180,16 @@ impl Form {
             fields: Vec::new(),
             focus: usize::MAX,
             error: None,
+            commit: Commit::Guarded,
         }
+    }
+
+    /// Declare that submitting this form destroys nothing and starts nothing,
+    /// so it needs no [`action`](Form::action) row. The *only* way to make a
+    /// bare Enter mean something without one — see [`Commit`].
+    pub fn harmless(mut self) -> Form {
+        self.commit = Commit::Harmless;
+        self
     }
 
     pub fn hint(mut self, hint: impl Into<String>) -> Form {
@@ -214,12 +250,16 @@ impl Form {
         }
     }
 
-    /// Whether a submit means anything: true for a form with no action row at
-    /// all, and for one whose action row has been moved off `cancel`.
+    /// Whether a submit means anything: for a form with an action row, that
+    /// the row has been moved off `cancel`; without one, that the form was
+    /// declared [`harmless`](Form::harmless).
+    ///
+    /// Fails closed. A prompt that is neither is a programming error, and one
+    /// that runs a bare Enter is the hazard this whole row exists to close.
     pub fn confirmed(&self) -> bool {
         match self.find(ACTION) {
             Some(_) => self.choice(ACTION) != CANCEL,
-            None => true,
+            None => self.commit == Commit::Harmless,
         }
     }
 
@@ -311,10 +351,17 @@ impl Form {
                 if self.confirmed() {
                     Outcome::Submit
                 } else {
-                    let verb = self.verb().unwrap_or("go ahead").to_string();
-                    self.set_error(format!(
-                        "nothing done \u{b7} choose \u{2039} {verb} \u{203a} on the {ACTION} row (\u{2190}\u{2192}), or Esc"
-                    ));
+                    self.set_error(match self.verb() {
+                        Some(verb) => format!(
+                            "nothing done \u{b7} choose \u{2039} {verb} \u{203a} on the {ACTION} row (\u{2190}\u{2192}), or Esc"
+                        ),
+                        // Neither an action row nor `harmless()`: a prompt
+                        // built wrong. Refused rather than run, and said so
+                        // the first time anybody opens it.
+                        None => format!(
+                            "nothing done \u{b7} this prompt has no {ACTION} row and is not marked harmless \u{b7} Esc"
+                        ),
+                    });
                     Outcome::Editing
                 }
             }
@@ -334,6 +381,25 @@ impl Form {
                 Outcome::Editing
             }
         }
+    }
+
+    /// Pasted text, into the focused text field and nowhere else.
+    ///
+    /// Control characters are dropped rather than inserted: a paste is text,
+    /// and the whole point of `Event::Paste` is that the `ESC`, `CR` and `LF`
+    /// inside it are *not* keys. Returns whether anything changed.
+    pub fn paste(&mut self, text: &str) -> bool {
+        let Some(Field::Text { value, cursor, .. }) = self.fields.get_mut(self.focus) else {
+            return false;
+        };
+        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+        if clean.is_empty() {
+            return false;
+        }
+        value.insert_str(*cursor, &clean);
+        *cursor += clean.len();
+        self.error = None;
+        true
     }
 
     /// Wraps, and skips notes. A form of nothing but notes never moves.
@@ -665,8 +731,11 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    /// A plain data form: no action row, so it has to say it is harmless
+    /// before Enter means anything (N-2).
     fn form() -> Form {
         Form::new("new quest")
+            .harmless()
             .text("name", "", "(auto)")
             .text("goal", "ship it", "(none)")
             .select("machine", vec!["laptop".into(), "ws".into()], 0)
@@ -712,7 +781,7 @@ mod tests {
 
     #[test]
     fn a_form_of_nothing_but_notes_has_no_focus_and_moves_nowhere() {
-        let mut f = Form::new("close").note("kills tmux q-x");
+        let mut f = Form::new("close").harmless().note("kills tmux q-x");
         assert!(f.focused().is_none());
         f.handle(Input::Tab);
         assert!(f.focused().is_none());
@@ -842,6 +911,7 @@ mod tests {
     #[test]
     fn enter_submits_and_esc_cancels() {
         let mut f = form();
+        // `form()` is `harmless()`; an undeclared one would refuse.
         assert_eq!(f.handle(Input::Enter), Outcome::Submit);
         assert_eq!(f.handle(Input::Esc), Outcome::Cancel);
     }
@@ -998,12 +1068,42 @@ mod tests {
         assert!(!f.confirmed());
     }
 
-    /// A form with no action row is unguarded: its Enter is its submission.
+    /// N-2. A form with no action row submits on Enter **only** once it has
+    /// declared itself harmless. Before this, no action row meant `confirmed()
+    /// == true`, so the guard was opt-in and a prompt that destroys something
+    /// and forgets `.action(...)` silently regained the bare-Enter hazard —
+    /// which is exactly the prompt bd-8lz.4.5 is about to add.
     #[test]
-    fn a_form_without_an_action_row_submits_on_enter() {
-        let mut f = Form::new("rename x").text("slug", "x", "");
+    fn a_form_that_declares_itself_harmless_submits_on_enter() {
+        let mut f = Form::new("rename x").harmless().text("slug", "x", "");
         assert!(f.confirmed());
         assert_eq!(f.handle(Input::Enter), Outcome::Submit);
+    }
+
+    /// The other half, and the one that matters: forgetting BOTH fails
+    /// closed. A prompt built this way can never run, and says so.
+    #[test]
+    fn a_form_with_neither_an_action_row_nor_a_harmless_claim_refuses_to_submit() {
+        let mut f = Form::new("send text").text("text", "rm -rf /", "");
+        assert!(!f.confirmed(), "a bare Enter would have run this");
+        assert_eq!(f.handle(Input::Enter), Outcome::Editing);
+        assert_eq!(f.handle(Input::Enter), Outcome::Editing);
+        let said = f.error().unwrap();
+        assert!(said.contains("nothing done"), "{said}");
+        assert!(said.contains(ACTION), "{said}");
+    }
+
+    /// And every prompt the TUI actually opens is on one side of that line or
+    /// the other — the `quests` module's own tests pin which.
+    #[test]
+    fn declaring_a_form_harmless_is_the_only_way_past_a_missing_action_row() {
+        // An action row is enough on its own, and still starts on `cancel`.
+        let guarded = Form::new("close x").action("close");
+        assert!(!guarded.confirmed());
+        // `harmless()` does not override an action row that is still on
+        // `cancel`: the row wins, so a stray claim cannot re-arm a guard.
+        let both = Form::new("close x").harmless().action("close");
+        assert!(!both.confirmed());
     }
 
     // -------------------------------------------------------- what is drawn

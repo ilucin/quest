@@ -4,8 +4,9 @@
 //! Quitting, Ctrl-C (raw mode delivers it as a key, not a signal) and a panic
 //! all leave through [`super::restore_with`]. A signal does not: without a
 //! handler the process dies with raw mode on, the alternate screen entered,
-//! the cursor hidden and ANY-MOTION mouse tracking armed — after which mouse
-//! movement is injected into the user's shell as literal text.
+//! the cursor hidden, bracketed paste on and ANY-MOTION mouse tracking armed —
+//! after which mouse movement is injected into the user's shell as literal
+//! text and every paste into it carries `ESC [200~` markers.
 //!
 //! [`HANDLED`] carries which signals are covered and which are knowingly not.
 //!
@@ -21,7 +22,7 @@ use std::mem::MaybeUninit;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-use super::{ALT_ON, MOUSE_ON, RAW_ON};
+use super::{ALT_ON, MOUSE_ON, PASTE_ON, RAW_ON};
 
 /// The signals worth handling: every catchable way the process is *ended*
 /// from outside while the terminal is armed — `kill`, `kill -INT`,
@@ -46,6 +47,10 @@ const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 /// against it in the tests, since drift here is invisible until a terminal is
 /// left with mouse reporting on.
 const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+/// Exactly what `crossterm::event::DisableBracketedPaste` writes. A terminal
+/// left in bracketed-paste mode wraps the next paste into the user's *shell*
+/// with `ESC [200~` markers it never asked for.
+const PASTE_OFF: &[u8] = b"\x1b[?2004l";
 /// `crossterm::terminal::LeaveAlternateScreen`.
 const ALT_OFF: &[u8] = b"\x1b[?1049l";
 
@@ -54,15 +59,15 @@ const ALT_OFF: &[u8] = b"\x1b[?1049l";
 /// terminal; empty slices are the steps that were never armed.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Plan {
-    pub bytes: [&'static [u8]; 3],
+    pub bytes: [&'static [u8]; 4],
     /// Whether raw mode is still on and the saved termios has to go back.
     pub termios: bool,
 }
 
-pub(super) fn plan(mouse: bool, alt: bool, raw: bool) -> Plan {
-    if !(mouse || alt || raw) {
+pub(super) fn plan(mouse: bool, paste: bool, alt: bool, raw: bool) -> Plan {
+    if !(mouse || paste || alt || raw) {
         return Plan {
-            bytes: [b"", b"", b""],
+            bytes: [b"", b"", b"", b""],
             termios: false,
         };
     }
@@ -70,6 +75,7 @@ pub(super) fn plan(mouse: bool, alt: bool, raw: bool) -> Plan {
         bytes: [
             SHOW_CURSOR,
             if mouse { MOUSE_OFF } else { b"" },
+            if paste { PASTE_OFF } else { b"" },
             if alt { ALT_OFF } else { b"" },
         ],
         termios: raw,
@@ -85,9 +91,10 @@ pub(super) fn plan(mouse: bool, alt: bool, raw: bool) -> Plan {
 /// undo the same step. Every undo is idempotent, and the handler never returns
 /// to let the guard resume, so the overlap costs nothing; see `restore_with`'s
 /// own doc for why that ordering is the safe one.
-pub(super) fn take_flags() -> (bool, bool, bool) {
+pub(super) fn take_flags() -> (bool, bool, bool, bool) {
     (
         MOUSE_ON.swap(false, Ordering::SeqCst),
+        PASTE_ON.swap(false, Ordering::SeqCst),
         ALT_ON.swap(false, Ordering::SeqCst),
         RAW_ON.swap(false, Ordering::SeqCst),
     )
@@ -233,8 +240,8 @@ fn preserving_errno<T>(f: impl FnOnce() -> T) -> T {
 /// Errno-neutral on its own, so the test can pin it without a signal.
 pub(super) fn restore_from_signal() {
     preserving_errno(|| {
-        let (mouse, alt, raw) = take_flags();
-        let plan = plan(mouse, alt, raw);
+        let (mouse, paste, alt, raw) = take_flags();
+        let plan = plan(mouse, paste, alt, raw);
         for bytes in plan.bytes {
             if !bytes.is_empty() {
                 write_all(bytes);
@@ -352,7 +359,7 @@ pub(super) fn install() {
 mod tests {
     use super::*;
     use crossterm::cursor::Show;
-    use crossterm::event::DisableMouseCapture;
+    use crossterm::event::{DisableBracketedPaste, DisableMouseCapture};
     use crossterm::queue;
     use crossterm::terminal::LeaveAlternateScreen;
 
@@ -373,6 +380,10 @@ mod tests {
             emitted(|o| queue!(o, DisableMouseCapture).unwrap())
         );
         assert_eq!(
+            PASTE_OFF,
+            emitted(|o| queue!(o, DisableBracketedPaste).unwrap())
+        );
+        assert_eq!(
             ALT_OFF,
             emitted(|o| queue!(o, LeaveAlternateScreen).unwrap())
         );
@@ -382,29 +393,34 @@ mod tests {
     /// at all when nothing is.
     #[test]
     fn the_plan_undoes_exactly_what_was_armed() {
-        let all = plan(true, true, true);
-        assert_eq!(all.bytes, [SHOW_CURSOR, MOUSE_OFF, ALT_OFF]);
+        let all = plan(true, true, true, true);
+        assert_eq!(all.bytes, [SHOW_CURSOR, MOUSE_OFF, PASTE_OFF, ALT_OFF]);
         assert!(all.termios);
         // The cursor comes back first, whatever else was on.
         assert_eq!(all.bytes[0], SHOW_CURSOR);
 
         // `[ui] mouse = false`: nothing is written that was never armed.
-        let no_mouse = plan(false, true, true);
-        assert_eq!(no_mouse.bytes, [SHOW_CURSOR, b"", ALT_OFF]);
+        let no_mouse = plan(false, true, true, true);
+        assert_eq!(no_mouse.bytes, [SHOW_CURSOR, b"", PASTE_OFF, ALT_OFF]);
         assert!(no_mouse.termios);
 
         // Half-armed, the way `arm_steps` can leave it when a step fails.
-        let raw_only = plan(false, false, true);
-        assert_eq!(raw_only.bytes, [SHOW_CURSOR, b"", b""]);
+        let raw_only = plan(false, false, false, true);
+        assert_eq!(raw_only.bytes, [SHOW_CURSOR, b"", b"", b""]);
         assert!(raw_only.termios);
-        let alt_only = plan(false, true, false);
-        assert_eq!(alt_only.bytes, [SHOW_CURSOR, b"", ALT_OFF]);
+        let alt_only = plan(false, false, true, false);
+        assert_eq!(alt_only.bytes, [SHOW_CURSOR, b"", b"", ALT_OFF]);
         assert!(!alt_only.termios);
+        // Armed as far as bracketed paste and no further — `arm_steps` sets
+        // the flag before the call, so this is what a failing `mouse on`
+        // leaves behind.
+        let to_paste = plan(false, true, true, true);
+        assert_eq!(to_paste.bytes, [SHOW_CURSOR, b"", PASTE_OFF, ALT_OFF]);
 
         // Nothing armed: a signal outside the TUI must not spray escapes at a
         // shell that never asked for them.
-        let none = plan(false, false, false);
-        assert_eq!(none.bytes, [b"", b"", b""]);
+        let none = plan(false, false, false, false);
+        assert_eq!(none.bytes, [b"", b"", b"", b""]);
         assert!(!none.termios);
     }
 
@@ -416,10 +432,11 @@ mod tests {
         RAW_ON.store(true, Ordering::SeqCst);
         ALT_ON.store(true, Ordering::SeqCst);
         MOUSE_ON.store(true, Ordering::SeqCst);
-        assert_eq!(take_flags(), (true, true, true));
-        assert_eq!(take_flags(), (false, false, false));
+        PASTE_ON.store(true, Ordering::SeqCst);
+        assert_eq!(take_flags(), (true, true, true, true));
+        assert_eq!(take_flags(), (false, false, false, false));
         // And a plan built from the second take does nothing.
-        assert_eq!(plan(false, false, false).bytes, [b"", b"", b""]);
+        assert_eq!(plan(false, false, false, false).bytes, [b"", b"", b"", b""]);
     }
 
     /// The list itself is the contract: the test below walks `HANDLED` and so
@@ -475,14 +492,16 @@ mod tests {
         RAW_ON.store(true, Ordering::SeqCst);
         ALT_ON.store(true, Ordering::SeqCst);
         MOUSE_ON.store(true, Ordering::SeqCst);
+        PASTE_ON.store(true, Ordering::SeqCst);
 
         let ((), written) = capturing_output(restore_from_signal);
         let mut want = Vec::new();
         want.extend_from_slice(SHOW_CURSOR);
         want.extend_from_slice(MOUSE_OFF);
+        want.extend_from_slice(PASTE_OFF);
         want.extend_from_slice(ALT_OFF);
         assert_eq!(written, want);
-        assert_eq!(take_flags(), (false, false, false));
+        assert_eq!(take_flags(), (false, false, false, false));
 
         // Nothing armed writes nothing at all — a signal outside the TUI must
         // not spray escapes at a shell that never asked for them.
@@ -508,6 +527,7 @@ mod tests {
         RAW_ON.store(true, Ordering::SeqCst);
         ALT_ON.store(true, Ordering::SeqCst);
         MOUSE_ON.store(true, Ordering::SeqCst);
+        PASTE_ON.store(true, Ordering::SeqCst);
 
         let slot = errno_slot();
         assert!(!slot.is_null(), "no errno accessor for this target");
