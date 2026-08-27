@@ -457,14 +457,8 @@ impl App {
                 self.help = true;
                 Some(Action::None)
             }
-            Input::Tab => {
-                self.select(self.tab.next());
-                Some(Action::None)
-            }
-            Input::BackTab => {
-                self.select(self.tab.prev());
-                Some(Action::None)
-            }
+            Input::Tab => Some(self.switch(self.tab.next())),
+            Input::BackTab => Some(self.switch(self.tab.prev())),
             Input::Char('x') => {
                 self.refreshes += 1;
                 Some(Action::Refresh)
@@ -476,10 +470,10 @@ impl App {
                 // An out-of-range digit is still the shell's to swallow, not
                 // the tab's — otherwise `5` would mean something on one tab
                 // only.
-                if let Some(tab) = Tab::from_digit(digit) {
-                    self.select(tab);
-                }
-                Some(Action::None)
+                Some(match Tab::from_digit(digit) {
+                    Some(tab) => self.switch(tab),
+                    None => Action::None,
+                })
             }
         }
     }
@@ -530,7 +524,9 @@ impl App {
 
     /// The one way to change tabs: every tab switch has to go through the
     /// capture teardown, not only the ones the tab bar drives.
-    pub(super) fn select(&mut self, tab: Tab) {
+    ///
+    /// Returns whether the tab it landed on has to reload before it is drawn.
+    pub(super) fn select(&mut self, tab: Tab) -> bool {
         if self.tab != tab {
             // Whatever was being typed is abandoned with the tab: a capture
             // left armed behind an inactive tab is invisible, and the mouse
@@ -538,6 +534,31 @@ impl App {
             self.cancel_capture();
             self.tab = tab;
             self.status.clear();
+        }
+        self.needs_reload()
+    }
+
+    /// [`select`](Self::select) as a key or click handler wants it: the tab
+    /// change, plus the reload it owes.
+    ///
+    /// Abandoning a `/` box drops a filter that had reached the SQL, so the
+    /// rows behind it are narrower than the chips claim — and can be empty
+    /// with a full log in the database. Not every tab switch reloads; only
+    /// one that arrives at rows fetched under filters that are gone.
+    fn switch(&mut self, tab: Tab) -> Action {
+        if self.select(tab) {
+            Action::Refresh
+        } else {
+            Action::None
+        }
+    }
+
+    /// Whether the active tab's rows were fetched under filters that are no
+    /// longer in force.
+    fn needs_reload(&self) -> bool {
+        match self.tab {
+            Tab::Events => self.events.stale(),
+            _ => false,
         }
     }
 
@@ -571,12 +592,10 @@ impl App {
             return Action::None;
         }
         match ev {
-            MouseInput::Click { col, row: 0 } => {
-                if let Some(tab) = tab_at_column(col, self.tab_bar_width) {
-                    self.select(tab);
-                }
-                Action::None
-            }
+            MouseInput::Click { col, row: 0 } => match tab_at_column(col, self.tab_bar_width) {
+                Some(tab) => self.switch(tab),
+                None => Action::None,
+            },
             MouseInput::Click { .. } => Action::None,
             // A wheel nudge over an open box would step its focus — onto the
             // `close beads epic` toggle, or off the action row — with nothing

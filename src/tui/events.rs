@@ -75,6 +75,12 @@ pub struct State {
     /// `/`: the kind patterns, and whether the box is open.
     query: String,
     filtering: bool,
+    /// The kind patterns `rows` were actually fetched under. The `/` box
+    /// reaches the SQL, so a query that changes without a reload leaves rows
+    /// that are narrower than the filters claim — and, when the dropped box
+    /// matched nothing, an EMPTY listing that would otherwise read as "no
+    /// events yet" with a full log in the database.
+    loaded_query: String,
     /// Whether the tail follows the newest event. True until the selection is
     /// moved off the last row, and true again the moment it comes back — so
     /// `G` is "resume" and there is no separate mode key to get out of step
@@ -93,6 +99,7 @@ impl Default for State {
             quest_slug: None,
             query: String::new(),
             filtering: false,
+            loaded_query: String::new(),
             follow: true,
         }
     }
@@ -103,6 +110,13 @@ impl State {
     /// bare-letter keys, so typing `q` into the box does not quit.
     pub fn capturing(&self) -> bool {
         self.filtering
+    }
+
+    /// Whether `rows` were fetched under a filter that is no longer in force.
+    /// Derived rather than flagged: a remembered bit is one more thing to
+    /// forget to clear, and the two strings cannot drift.
+    pub fn stale(&self) -> bool {
+        self.loaded_query != self.query
     }
 
     /// Give the keyboard back and drop the half-typed filter. Leaving the tab
@@ -331,6 +345,7 @@ pub fn refresh(ctx: &Ctx, app: &mut App) -> anyhow::Result<()> {
         session_id: None,
     };
     app.events.rows = feed::load(db, &quests, &filter, TAIL)?;
+    app.events.loaded_query = app.events.query.clone();
     app.events.resync();
     settle_view(app);
     // The box reports how many rows match, and the reload is what decided
@@ -572,10 +587,19 @@ fn empty_lines(state: &State) -> Vec<Line<'static>> {
     // emptiness the `/` box caused. The box's own text is the honest witness.
     let why = if !state.rows.is_empty() || !state.query.is_empty() {
         "no events match the filters"
-    } else if state.quest.is_some() {
+    } else if state.stale() {
+        // The box that emptied these rows is gone and what the wider filter
+        // admits has not been asked for yet. Blaming the fleet here is the
+        // same lie one branch up, one reload later.
+        "reloading the tail\u{2026}"
+    } else if state.quest.is_none() {
+        "no events yet"
+    } else if state.quest_slug.is_some() {
         "this quest has no events yet"
     } else {
-        "no events yet"
+        // The slug is re-derived every reload, so a Quest filter with no slug
+        // behind it is a Quest that was deleted while the filter was up.
+        "that quest is gone \u{b7} Esc for all quests"
     };
     vec![
         Line::from(Span::raw(why).bold()),
@@ -761,6 +785,7 @@ mod tests {
     use crate::db::Db;
     use crate::model::{Event, Session, SessionRole};
     use crate::tui::app::Tab;
+    use crate::tui::keys::MouseInput;
     use crate::tui::render;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -851,6 +876,22 @@ mod tests {
         /// it returns the way the loop does.
         fn key(&self, app: &mut App, input: Input) -> Action {
             let action = app.handle(input);
+            if action == Action::Refresh {
+                self.reload(app);
+            }
+            action
+        }
+
+        /// A click on `tab`'s label in the tab bar, through the real
+        /// `App::handle_mouse` and honouring its `Action` the way the loop
+        /// does. The bar's geometry is whatever the last frame published, so
+        /// the caller has to have drawn one.
+        fn click_tab(&self, app: &mut App, tab: Tab) -> Action {
+            let (_, _, col, _) = crate::tui::app::tab_layout()
+                .into_iter()
+                .find(|(t, _, _, _)| *t == tab)
+                .unwrap();
+            let action = app.handle_mouse(MouseInput::Click { col, row: 0 });
             if action == Action::Refresh {
                 self.reload(app);
             }
@@ -1088,7 +1129,10 @@ mod tests {
         assert!(app.events.capturing());
         assert_eq!(app.events.visible().len(), 1);
 
-        // Through `select`, which is what the tab bar and the digit keys use.
+        // Through `select`. A tab-bar CLICK is the only thing that reaches it
+        // with the box open: `handle_global` is gated on `capturing()`, so
+        // while the box has the keyboard a digit is text and `Tab` does
+        // nothing.
         app.select(Tab::Quests);
         assert!(!app.events.capturing(), "the box outlived the tab");
         assert!(app.events.query.is_empty());
@@ -1098,14 +1142,81 @@ mod tests {
         anchored(&app);
 
         // The rows the wider filter admits were never fetched -- the committed
-        // filter reached the SQL -- so the listing is only as wide as the tick
-        // that follows makes it. `select` is not a key handler and cannot
-        // return an `Action`, so that tick is the loop's, one `tick_local`
-        // away. Until it lands the tail is short, never wrong.
+        // filter reached the SQL -- so until the reload lands the listing is
+        // SHORT AND MISLABELLED, not merely short. That is what `stale()` is
+        // for, and why arriving on this tab reloads; here `select` is called
+        // directly, below the handler that honours it.
+        assert!(app.events.stale());
         assert_eq!(app.events.visible().len(), 1);
         rig.reload(&mut app);
+        assert!(!app.events.stale());
         assert_eq!(app.events.visible().len(), 4);
         anchored(&app);
+    }
+
+    /// B1: the mouse is the one way out of an open `/` box that is not Esc or
+    /// Enter, and the filter it drops had reached the SQL. Coming back to rows
+    /// fetched under a filter that no longer exists must not read as "no
+    /// events yet" with a full log in the database.
+    #[test]
+    fn clicking_off_an_open_filter_box_never_leaves_the_tail_lying() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        for kind in ["note", "session.start", "note", "note"] {
+            rig.event(&quest, kind);
+        }
+        let mut app = rig.app();
+        // The tab bar's geometry is whatever the last frame published.
+        draw(&mut app, 120, 30);
+
+        rig.key(&mut app, Input::Char('/'));
+        for c in "zzz".chars() {
+            rig.key(&mut app, Input::Char(c));
+        }
+        assert!(
+            app.events.rows.is_empty(),
+            "the committed filter has to reach the SQL for this to be the bug"
+        );
+
+        // Out of the box the only way the keyboard cannot go.
+        rig.click_tab(&mut app, Tab::Quests);
+        assert_eq!(app.tab, Tab::Quests);
+        assert!(!app.events.capturing());
+        assert!(app.events.query.is_empty());
+
+        // ...and back. The reload is owed by the tab that is arriving, so it
+        // has happened before the first frame is drawn.
+        rig.click_tab(&mut app, Tab::Events);
+        assert_eq!(app.tab, Tab::Events);
+        assert_eq!(kinds(&app), ["note", "session.start", "note", "note"]);
+        anchored(&app);
+
+        let screen = screen(&mut app, 120, 30);
+        assert!(!screen.contains("no events yet"), "{screen}");
+        assert!(screen.contains("session.start"), "{screen}");
+    }
+
+    /// N4: the slug is re-derived on every reload, so a Quest filter with
+    /// nothing behind it is a Quest that was deleted from another terminal.
+    /// Blaming it for having "no events yet" is the B1 lie in its other shape.
+    #[test]
+    fn a_quest_deleted_under_the_filter_is_not_blamed_for_the_emptiness() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        rig.event(&quest, "note");
+        let mut app = rig.app();
+        app.focus_quest = Some(quest.id.clone());
+        rig.reload(&mut app);
+        assert_eq!(app.events.quest_slug.as_deref(), Some("alpha"));
+
+        rig.db().delete_quest(&quest.id).unwrap();
+        rig.reload(&mut app);
+        assert!(app.events.quest.is_some());
+        assert_eq!(app.events.quest_slug, None);
+
+        let screen = screen(&mut app, 120, 30);
+        assert!(!screen.contains("no events yet"), "{screen}");
+        assert!(screen.contains("that quest is gone"), "{screen}");
     }
 
     /// The quest filter is the other half of SPEC §17's "filter po questu".
