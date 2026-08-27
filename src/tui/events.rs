@@ -86,6 +86,10 @@ pub struct State {
     /// `G` is "resume" and there is no separate mode key to get out of step
     /// with where the selection actually is.
     follow: bool,
+    /// Whether [`refresh`] has ever run for this tab. Empty `rows` alone
+    /// cannot say: "the log is empty" and "nobody has asked yet" look
+    /// identical, and only one of them is honest to draw.
+    loaded: bool,
 }
 
 impl Default for State {
@@ -101,6 +105,7 @@ impl Default for State {
             filtering: false,
             loaded_query: String::new(),
             follow: true,
+            loaded: false,
         }
     }
 }
@@ -110,6 +115,12 @@ impl State {
     /// bare-letter keys, so typing `q` into the box does not quit.
     pub fn capturing(&self) -> bool {
         self.filtering
+    }
+
+    /// Whether this tab has ever been loaded. A tab that has not must reload
+    /// before it is drawn, whatever its filters say.
+    pub fn loaded(&self) -> bool {
+        self.loaded
     }
 
     /// Whether `rows` were fetched under a filter that is no longer in force.
@@ -257,7 +268,12 @@ impl State {
         } else if self.selected >= self.offset + viewport {
             self.offset = self.selected + 1 - viewport;
         }
-        self.offset = self.offset.min(visible.len() - 1);
+        // Both branches above only ever push `offset` FORWARD, so a viewport
+        // that GREW since the last frame would leave the body half empty with
+        // rows above the fold and nothing able to scroll back to them — and on
+        // a tail, where the selection is pinned to the last row, nothing ever
+        // does. Pulling back to the last full screen is what heals it.
+        self.offset = self.offset.min(visible.len().saturating_sub(viewport));
     }
 }
 
@@ -346,6 +362,7 @@ pub fn refresh(ctx: &Ctx, app: &mut App) -> anyhow::Result<()> {
     };
     app.events.rows = feed::load(db, &quests, &filter, TAIL)?;
     app.events.loaded_query = app.events.query.clone();
+    app.events.loaded = true;
     app.events.resync();
     settle_view(app);
     // The box reports how many rows match, and the reload is what decided
@@ -1868,6 +1885,130 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// D1. The viewport GROWING between two frames has to pull `offset` back,
+    /// or the tail leaves the bottom of the screen blank and never heals: on
+    /// this tab the selection sits at the END of the listing, so `offset` is
+    /// always about `len - viewport` and nothing — not `G`, not `k`, not a
+    /// reload — moves the selection far enough to scroll the view up again.
+    ///
+    /// A sweep rather than the one repro, and the axis that matters is the
+    /// pair of shapes: listing size x shape BEFORE x shape AFTER x where the
+    /// cursor sits. A sweep that only ever draws one shape per selection
+    /// cannot see this. Both orders are swept, so shrinking is covered too,
+    /// and 69 and 70 columns are in the list because that is where three-line
+    /// rows become two and the body's row count doubles without the height
+    /// changing at all.
+    #[test]
+    fn a_grown_viewport_refills_the_body() {
+        const SHAPES: [(u16, u16); 6] =
+            [(100, 40), (100, 10), (69, 20), (70, 20), (120, 4), (60, 30)];
+        for len in [7usize, 25, 60] {
+            let rig = Rig::new();
+            let quest = rig.quest("alpha");
+            for n in 0..len {
+                rig.event_with(
+                    &quest,
+                    None,
+                    &format!("kind.{n}"),
+                    serde_json::json!({ "text": format!("payload {n}") }),
+                );
+            }
+            let mut app = rig.app();
+            app.detail = false;
+            for (w1, h1) in SHAPES {
+                for (w2, h2) in SHAPES {
+                    for up in [0usize, 1, 5, 1_000] {
+                        app.set_size(w1, h1);
+                        app.handle(Input::Char('G'));
+                        for _ in 0..up {
+                            app.handle(Input::Char('k'));
+                        }
+                        // The first frame settles the view for the first
+                        // shape. The second frame IS the resize.
+                        draw(&mut app, w1, h1);
+                        let lines = draw(&mut app, w2, h2);
+
+                        let at = format!("{len} events, {w1}x{h1} -> {w2}x{h2}, up={up}");
+                        let per_row = app.row_mode().lines() as usize;
+                        let rows = viewport(&app);
+                        let visible = app.events.visible().len();
+                        let body = &lines[1..lines.len() - 1];
+                        let heads = body
+                            .iter()
+                            .filter(|l| !l.is_empty() && !l.starts_with(INDENT))
+                            .count();
+                        let drawn = body.iter().filter(|l| !l.is_empty()).count();
+
+                        // The body is FULL whenever there are enough events to
+                        // fill it: as many rows as fit, or the whole listing.
+                        assert_eq!(
+                            heads,
+                            rows.min(visible),
+                            "{at}: {heads} rows in a body that holds {rows}: {body:?}"
+                        );
+                        // And every drawn row is drawn whole. The exception is
+                        // a body with no room for even one, where the head is
+                        // all there is and nothing below it can be mistaken
+                        // for the next event.
+                        assert_eq!(
+                            drawn,
+                            (heads * per_row).min(body.len()),
+                            "{at}: a row is half off the bottom: {body:?}"
+                        );
+                        // The cursor is on screen, exactly once.
+                        let marked = body.iter().filter(|l| l.contains('\u{25b8}')).count();
+                        assert_eq!(marked, 1, "{at}: {marked} cursors: {body:?}");
+                        anchored(&app);
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------- the first visit
+
+    /// N1. A tab that has never loaded has to load BEFORE it is drawn.
+    /// `stale()` cannot see this on its own: on a cold tab nothing was ever
+    /// fetched, so there is no loaded filter to disagree with the live one and
+    /// the switch used to return `Action::None`. The tab then drew its "there
+    /// is nothing here" copy — a claim about the database made without having
+    /// asked it — for up to a whole tick.
+    #[test]
+    fn the_first_visit_to_a_data_tab_loads_before_it_draws() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        rig.event(&quest, "session.start");
+
+        let mut app = App::new(&rig.ctx.config, "laptop");
+        app.set_size(120, 30);
+        // The loop's own first refresh, which lands on the Quests tab.
+        rig.reload(&mut app);
+        assert_eq!(app.tab, Tab::Quests);
+
+        // The Sessions tab says "no live sessions" until it has looked.
+        assert_eq!(
+            rig.key(&mut app, Input::Char('2')),
+            Action::Refresh,
+            "a cold Sessions tab drew before it loaded"
+        );
+        // And the Events tab says "no events yet" — with an event in the log.
+        assert_eq!(
+            rig.key(&mut app, Input::Char('4')),
+            Action::Refresh,
+            "a cold Events tab drew before it loaded"
+        );
+        let text = screen(&mut app, 120, 30);
+        assert!(!text.contains("no events yet"), "{text}");
+        assert!(text.contains("session.start"), "{text}");
+
+        // Having loaded once, neither tab reloads just for being visited:
+        // the tick owns that, and a reload per keystroke would put a
+        // synchronous query behind the tab bar.
+        assert_eq!(rig.key(&mut app, Input::Char('1')), Action::None);
+        assert_eq!(rig.key(&mut app, Input::Char('2')), Action::None);
+        assert_eq!(rig.key(&mut app, Input::Char('4')), Action::None);
     }
 
     // ------------------------------------------------------ the `e` hand-off

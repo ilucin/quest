@@ -83,6 +83,10 @@ pub struct State {
     warn_pct: u8,
     /// `[context] reset_strategy`, so the `Z` box can name what it will type.
     strategy: &'static str,
+    /// Whether [`refresh`] has ever run for this tab. Empty `rows` alone
+    /// cannot say: "the fleet is idle" and "nobody has asked yet" look
+    /// identical, and only one of them is honest to draw.
+    loaded: bool,
 }
 
 impl State {
@@ -97,7 +101,15 @@ impl State {
             show_ended: false,
             warn_pct: config.context.worker_warn_pct,
             strategy: reset::Strategy::from_config(config).as_str(),
+            loaded: false,
         }
+    }
+
+    /// Whether this tab has ever been loaded. A tab that has not must reload
+    /// before it is drawn: until then its empty listing is a claim about the
+    /// fleet made without having looked.
+    pub fn loaded(&self) -> bool {
+        self.loaded
     }
 
     /// The filters currently hiding (or revealing) rows, for the chrome line.
@@ -190,6 +202,13 @@ impl State {
         } else if self.selected >= self.offset + viewport {
             self.offset = self.selected + 1 - viewport;
         }
+        // Both branches above only ever push `offset` FORWARD, so a viewport
+        // that GREW since the last frame would leave the body half empty with
+        // rows stranded above the fold. Pulling back to the last full screen
+        // is what heals it. `visible.len()` counts rows and `viewport` is
+        // already net of the group headers, so this errs towards showing MORE
+        // than fits — which the renderer then cuts — never towards a gap.
+        self.offset = self.offset.min(visible.len().saturating_sub(viewport));
     }
 }
 
@@ -232,6 +251,7 @@ pub fn refresh(ctx: &Ctx, app: &mut App) -> anyhow::Result<()> {
         None => None,
     };
     app.sessions.rows = rows;
+    app.sessions.loaded = true;
     app.sessions.resync();
     settle_view(app);
     Ok(())
@@ -1236,6 +1256,42 @@ mod tests {
             assert!(app.modal.is_none(), "{key} opened a box on nothing");
         }
         assert_eq!(handle(&mut app, Input::Enter), Action::None);
+    }
+
+    /// The same defect the Events tab was carrying (bd-8lz.4.6 D1), latent
+    /// here only because the selection usually sits near the top: `settle`
+    /// pushed `offset` forward and never back, so a viewport that GREW between
+    /// two frames left the bottom of the listing blank with rows stranded
+    /// above the fold.
+    #[test]
+    fn a_grown_viewport_refills_the_listing() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        for n in 0..20 {
+            rig.session(
+                &quest,
+                &format!("%{n}"),
+                spec(&format!("worker-{n:02}"), SessionStatus::Idle),
+            );
+        }
+        let mut app = rig.app();
+        // A short terminal with the cursor at the end pushes `offset` as far
+        // forward as it goes.
+        app.set_size(120, 12);
+        handle(&mut app, Input::End);
+        draw(&mut app, 120, 12);
+        assert!(app.sessions.offset > 0, "the short frame never scrolled");
+
+        // Now the terminal grows past the whole listing. Every session fits,
+        // so every session has to be on screen.
+        let lines = draw(&mut app, 120, 60);
+        for n in 0..20 {
+            let label = format!("worker-{n:02}");
+            assert!(
+                line_of(&lines, &label).is_some(),
+                "{label} stranded: {lines:#?}"
+            );
+        }
     }
 
     /// N-7. `viewport` reserved all five group headers unconditionally, so at

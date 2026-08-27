@@ -1494,10 +1494,16 @@ mod tests {
         let f1 = Event::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
         assert_eq!(apply_event(&mut app, f1), (Action::None, false));
 
-        // A tab switch returns `Action::None` too, and absolutely needs a redraw.
+        // A tab switch absolutely needs a redraw. It also asks for a reload
+        // here, because the Sessions tab has never loaded and drawing its
+        // empty listing first would claim the fleet is idle without looking.
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(apply_event(&mut app, tab), (Action::None, true));
+        assert_eq!(apply_event(&mut app, tab), (Action::Refresh, true));
         assert_eq!(app.tab, Tab::Sessions);
+        // Back to a tab that HAS loaded: free of I/O, and still a redraw.
+        let back = Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(apply_event(&mut app, back), (Action::None, true));
+        assert_eq!(app.tab, Tab::Quests);
         assert_eq!(
             apply_event(&mut app, Event::Resize(80, 24)),
             (Action::None, true)
@@ -2310,8 +2316,9 @@ mod tests {
     fn on_session(ctx: &Ctx, label: &str) -> App {
         let mut app = loaded(ctx);
         // Through the shell's own key, so the tab switch goes through
-        // `App::select` exactly as it does for a user.
-        assert_eq!(app.handle(Input::Char('2')), Action::None);
+        // `App::select` exactly as it does for a user. The tab has never
+        // loaded, so the switch asks for its rows on the way in.
+        assert_eq!(app.handle(Input::Char('2')), Action::Refresh);
         assert_eq!(app.tab, Tab::Sessions);
         refresh_now(ctx, &mut app);
         for _ in 0..6 {
@@ -2665,7 +2672,8 @@ mod tests {
         assert_ne!(fresh.id, old);
 
         let mut app = loaded(&ctx);
-        assert_eq!(app.handle(Input::Char('2')), Action::None);
+        // The cold Sessions tab asks for its rows on the way in.
+        assert_eq!(app.handle(Input::Char('2')), Action::Refresh);
         // `a` shows the ended rows, and the reload it asks for is what puts
         // them in the listing.
         assert_eq!(app.handle(Input::Char('a')), Action::Refresh);

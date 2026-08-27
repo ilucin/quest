@@ -553,11 +553,18 @@ impl App {
         }
     }
 
-    /// Whether the active tab's rows were fetched under filters that are no
-    /// longer in force.
+    /// Whether the active tab has to reload before it is drawn: either its
+    /// rows were fetched under filters that are no longer in force, or it has
+    /// never been loaded at all.
+    ///
+    /// The never-loaded half is not a filter question. A cold tab has nothing
+    /// to be stale against, so without it the first visit drew "no events yet"
+    /// — or "no live sessions" — for up to a whole tick, which is a claim
+    /// about the database made before anyone asked it.
     fn needs_reload(&self) -> bool {
         match self.tab {
-            Tab::Events => self.events.stale(),
+            Tab::Events => !self.events.loaded() || self.events.stale(),
+            Tab::Sessions => !self.sessions.loaded(),
             _ => false,
         }
     }
@@ -653,7 +660,14 @@ mod tests {
         let mut a = app();
         assert_eq!(a.tab, Tab::Quests);
         for want in [Tab::Sessions, Tab::Templates, Tab::Events, Tab::Quests] {
-            assert_eq!(a.handle(Input::Tab), Action::None);
+            // A data tab that has never loaded asks for its rows on the way
+            // in; Quests (already loaded by the shell) and Templates do not.
+            let asks = if matches!(want, Tab::Sessions | Tab::Events) {
+                Action::Refresh
+            } else {
+                Action::None
+            };
+            assert_eq!(a.handle(Input::Tab), asks, "{want:?}");
             assert_eq!(a.tab, want);
         }
         for want in [Tab::Events, Tab::Templates, Tab::Sessions, Tab::Quests] {

@@ -271,6 +271,13 @@ impl State {
         } else if self.selected >= self.offset + viewport {
             self.offset = self.selected + 1 - viewport;
         }
+        // Both branches above only ever push `offset` FORWARD, so a viewport
+        // that GREW since the last frame would leave the body half empty with
+        // rows stranded above the fold. Pulling back to the last full screen
+        // is what heals it. `visible.len()` counts rows and `viewport` is
+        // already net of the group headers, so this errs towards showing MORE
+        // than fits — which the renderer then cuts — never towards a gap.
+        self.offset = self.offset.min(visible.len().saturating_sub(viewport));
     }
 }
 
@@ -2169,6 +2176,41 @@ mod tests {
         assert!(line_of(&lines, &selected).is_some(), "{lines:#?}");
         let lines = draw(&mut app, 120, 8);
         assert!(line_of(&lines, &selected).is_some(), "{lines:#?}");
+    }
+
+    /// The same defect the Events tab was carrying (bd-8lz.4.6 D1), latent
+    /// here only because the selection usually sits near the top: `settle`
+    /// pushed `offset` forward and never back, so a viewport that GREW between
+    /// two frames left the bottom of the listing blank with rows stranded
+    /// above the fold.
+    #[test]
+    fn a_grown_viewport_refills_the_listing() {
+        let rows: Vec<QuestRow> = (0..20)
+            .map(|n| {
+                row(
+                    quest(&format!("quest-{n:02}"), QuestState::Active, n as i64),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let mut app = app_with(rows);
+        // A short terminal with the cursor at the end pushes `offset` as far
+        // forward as it goes.
+        app.set_size(120, 12);
+        handle(&mut app, Input::End);
+        draw(&mut app, 120, 12);
+        assert!(app.quests.offset > 0, "the short frame never scrolled");
+
+        // Now the terminal grows past the whole listing. Every Quest fits, so
+        // every Quest has to be on screen.
+        let lines = draw(&mut app, 120, 60);
+        for n in 0..20 {
+            let slug = format!("quest-{n:02}");
+            assert!(
+                line_of(&lines, &slug).is_some(),
+                "{slug} stranded: {lines:#?}"
+            );
+        }
     }
 
     /// A committed filter hides rows for as long as it is on; a one-shot
