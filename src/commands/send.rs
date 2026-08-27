@@ -11,7 +11,9 @@ use crate::Ctx;
 use crate::commands::fmt::{EVENT_PROMPT_CHARS, truncate};
 use crate::commands::{sweep_quiet, target};
 use crate::error::QError;
+use crate::model::Session;
 use crate::output;
+use crate::registry::Verdict;
 
 pub struct Args<'a> {
     pub session: &'a str,
@@ -19,20 +21,46 @@ pub struct Args<'a> {
     pub force: bool,
 }
 
-pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
-    let text = args.text.trim_end_matches(['\r', '\n']);
+/// What a send did, for the caller to report however it reports.
+pub struct Sent {
+    pub session: Session,
+    /// `<slug>/<label>` — what the session is called to the user.
+    pub name: String,
+    /// The gate's objection, when `force` overrode one; `None` when the two
+    /// sources agreed the session was between turns.
+    pub forced_past: Option<String>,
+    /// Whether the text went in as a bracketed paste rather than typed keys.
+    pub pasted: bool,
+    pub verdict: Verdict,
+}
+
+impl Sent {
+    pub fn describe(&self) -> String {
+        match &self.forced_past {
+            Some(reason) => format!("sent to {} (forced past: {reason})", self.name),
+            None => format!("sent to {}", self.name),
+        }
+    }
+}
+
+/// Type `text` into the session's pane, refusing unless the session is between
+/// turns (SPEC §23 #5) or `force` says otherwise.
+///
+/// Split out of [`run`] so the TUI's `t` (SPEC §17) goes through the same gate
+/// and the same send-keys/paste decision, and so nothing writes to a terminal
+/// the TUI still owns.
+pub fn apply(ctx: &Ctx, found: &target::Target, text: &str, force: bool) -> anyhow::Result<Sent> {
+    let text = text.trim_end_matches(['\r', '\n']);
     if text.trim().is_empty() {
         return Err(QError::Invalid("nothing to send".to_string()).into());
     }
-    sweep_quiet(ctx)?;
-    let found = target::resolve(ctx, args.session)?;
     found.require_live()?;
 
     let (verdict, refusal) = found.idle_gate(ctx);
-    let session = &found.session;
+    let session = found.session.clone();
     let name = found.name();
     if let Some(reason) = &refusal
-        && !args.force
+        && !force
     {
         let hint = verdict
             .hint()
@@ -62,29 +90,41 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         "session.send",
         &serde_json::json!({
             "text": truncate(text, EVENT_PROMPT_CHARS),
-            "forced": args.force,
+            "forced": force,
             "pasted": pasted,
         }),
     )?;
+
+    Ok(Sent {
+        session,
+        name,
+        forced_past: refusal.filter(|_| force),
+        pasted,
+        verdict,
+    })
+}
+
+pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
+    let text = args.text.trim_end_matches(['\r', '\n']);
+    sweep_quiet(ctx)?;
+    let found = target::resolve(ctx, args.session)?;
+    let sent = apply(ctx, &found, text, args.force)?;
 
     if ctx.json || !ctx.quiet {
         output::emit(
             ctx.json,
             &serde_json::json!({
-                "session": session.id,
+                "session": sent.session.id,
                 "quest": found.quest.slug,
-                "label": session.label,
-                "pane": session.tmux_pane,
+                "label": sent.session.label,
+                "pane": sent.session.tmux_pane,
                 "text": text,
                 "forced": args.force,
-                "pasted": pasted,
-                "status": session.status,
-                "registry": verdict,
+                "pasted": sent.pasted,
+                "status": sent.session.status,
+                "registry": sent.verdict,
             }),
-            || match &refusal {
-                Some(reason) => format!("sent to {name} (forced past: {reason})"),
-                None => format!("sent to {name}"),
-            },
+            || sent.describe(),
         )?;
     }
     Ok(())

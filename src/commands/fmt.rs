@@ -96,6 +96,29 @@ pub fn or_dash(value: Option<&str>) -> String {
     }
 }
 
+/// The glyph ramp of SPEC §8's context bar, lowest first.
+const CTX_RAMP: [char; 4] = ['\u{2581}', '\u{2583}', '\u{2585}', '\u{2587}'];
+/// Cells the bar occupies. Four, so each covers a quarter of the window.
+pub const CTX_CELLS: usize = 4;
+
+/// SPEC §8's `▁▃▅▇` context bar for a `ctx_pct` reading.
+///
+/// Each cell owns a 25-point band and is drawn at the height its band is
+/// filled to, quantised onto the ramp in four ~6-point steps — so every glyph
+/// SPEC §8 names actually appears, and the bar is monotone in the percentage.
+/// A reading above 100 (a hook that reported nonsense) is clamped rather than
+/// dropped: the number beside it is the honest part.
+pub fn ctx_bar(pct: u8) -> String {
+    let pct = (pct as usize).min(100);
+    let band = 100 / CTX_CELLS;
+    (0..CTX_CELLS)
+        .map(|i| {
+            let local = pct.saturating_sub(i * band).min(band);
+            CTX_RAMP[(local * CTX_RAMP.len() / band).min(CTX_RAMP.len() - 1)]
+        })
+        .collect()
+}
+
 /// An event payload as `k=v k=v`; anything that is not an object falls back to
 /// its compact JSON. Absent or empty payloads render as `-`.
 pub fn payload(payload: Option<&Value>, max: usize) -> String {
@@ -230,5 +253,36 @@ mod tests {
             table(&["ID", "V"], &rows),
             "ID   V\na    long value\nbbb  x"
         );
+    }
+
+    /// SPEC §8's `▁▃▅▇` bar, at the boundaries that decide what it says.
+    #[test]
+    fn the_context_bar_reads_every_boundary_the_way_spec_8_draws_it() {
+        assert_eq!(ctx_bar(0), "▁▁▁▁");
+        assert_eq!(ctx_bar(100), "▇▇▇▇");
+        // Each cell owns a quarter, and fills before the next one starts.
+        assert_eq!(ctx_bar(25), "▇▁▁▁");
+        assert_eq!(ctx_bar(50), "▇▇▁▁");
+        assert_eq!(ctx_bar(75), "▇▇▇▁");
+        // Every glyph SPEC §8 names actually appears.
+        assert_eq!(ctx_bar(41), "▇▅▁▁");
+        assert_eq!(ctx_bar(7), "▃▁▁▁");
+        assert_eq!(ctx_bar(65), "▇▇▅▁");
+        assert_eq!(ctx_bar(70), "▇▇▇▁");
+        // Four cells, whatever the reading, so the column never shifts.
+        for pct in 0..=100u8 {
+            assert_eq!(ctx_bar(pct).chars().count(), CTX_CELLS, "{pct}");
+        }
+        // Monotone: a higher reading never draws a shorter bar.
+        let level = |s: &str| -> usize {
+            s.chars()
+                .map(|c| CTX_RAMP.iter().position(|r| *r == c).unwrap())
+                .sum()
+        };
+        for pct in 1..=100u8 {
+            assert!(level(&ctx_bar(pct)) >= level(&ctx_bar(pct - 1)), "{pct}");
+        }
+        // A hook that reported nonsense is clamped rather than panicking.
+        assert_eq!(ctx_bar(255), "▇▇▇▇");
     }
 }

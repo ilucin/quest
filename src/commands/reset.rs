@@ -83,7 +83,7 @@ impl Strategy {
 
     /// `[context] reset_strategy`. Validated on load, so an unknown spelling
     /// can only come from a config `q` itself rejected — fall back to `clear`.
-    fn from_config(config: &Config) -> Strategy {
+    pub fn from_config(config: &Config) -> Strategy {
         match config.context.reset_strategy.as_str() {
             "compact" => Strategy::Compact,
             _ => Strategy::Clear,
@@ -280,7 +280,7 @@ fn schedule(
     }
 
     let strategy = Strategy::from_config(config);
-    let argv = argv(&row.id, strategy)?;
+    let argv = argv(&row.id, strategy, SCHEDULED_DELAY)?;
     let mut payload = serde_json::json!({
         "ctx_pct": ctx_pct,
         "threshold": threshold,
@@ -350,18 +350,76 @@ fn recently_scheduled(db: &Db, quest_id: &str, session_id: &str) -> bool {
 
 /// The detached command line, or `None` when this binary's own path is
 /// unknowable (nothing to re-invoke).
-fn argv(session_id: &str, strategy: Strategy) -> Option<Vec<String>> {
+fn argv(session_id: &str, strategy: Strategy, delay: u64) -> Option<Vec<String>> {
     let exe = std::env::current_exe().ok()?;
     Some(vec![
         exe.to_string_lossy().into_owned(),
         "reset".to_string(),
         session_id.to_string(),
         "--delay".to_string(),
-        SCHEDULED_DELAY.to_string(),
+        delay.to_string(),
         "--strategy".to_string(),
         strategy.as_str().to_string(),
         "--quiet".to_string(),
     ])
+}
+
+/// A reset asked for by hand — the TUI's `Z` (SPEC §17) — handed to the same
+/// detached `q reset` the `Stop` hook uses.
+///
+/// Detached for the same reason the hook detaches: [`attempt`] waits for the
+/// fresh brief (up to [`COMPACT_TIMEOUT`]), and a caller that must not block
+/// cannot afford that. The TUI's event loop is exactly such a caller — a
+/// synchronous `Z` would freeze the whole UI for the length of the wait.
+///
+/// The idle gate is taken *here* as well as in the child, so a session that is
+/// mid-turn is refused in front of the user rather than silently in a process
+/// nobody is watching. `--delay 0` marks the child as the scheduled path, so
+/// what it cannot do lands as a `session.reset_skipped` / `session.reset_failed`
+/// event instead of an exit code nobody reads.
+///
+/// Returns the command line that was scheduled.
+pub fn spawn_detached(
+    ctx: &Ctx,
+    found: &target::Target,
+    strategy: Strategy,
+) -> anyhow::Result<Vec<String>> {
+    if found.session.role == SessionRole::Master && found.session.tmux_pane.is_empty() {
+        return Err(QError::Other(format!("{} has no pane", found.name())).into());
+    }
+    found.require_live()?;
+    let (_, refusal) = found.idle_gate(ctx);
+    if let Some(reason) = refusal {
+        return Err(QError::Conflict(format!("{} is not idle: {reason}", found.name())).into());
+    }
+
+    let argv = argv(&found.session.id, strategy, 0)
+        .ok_or_else(|| QError::Other("cannot find this q binary to re-invoke".to_string()))?;
+    let payload = serde_json::json!({
+        "ctx_pct": found.session.ctx_pct,
+        "strategy": strategy.as_str(),
+        "delay": 0,
+        "manual": true,
+        "argv": argv,
+    });
+    if detach(&argv) == Launch::Failed {
+        let mut failed = payload.clone();
+        failed["stage"] = serde_json::json!("spawn");
+        let _ = ctx.db()?.append_event(
+            &found.quest.id,
+            Some(&found.session.id),
+            "session.reset_failed",
+            &failed,
+        );
+        return Err(QError::Other(format!("cannot start `q reset {}`", found.name())).into());
+    }
+    ctx.db()?.append_event(
+        &found.quest.id,
+        Some(&found.session.id),
+        "session.reset_scheduled",
+        &payload,
+    )?;
+    Ok(argv)
 }
 
 /// What became of the detached child. `Suppressed` is a decision, not a
@@ -739,7 +797,7 @@ mod tests {
 
     #[test]
     fn the_scheduled_argv_re_invokes_this_binary() {
-        let argv = argv("s-0001", Strategy::Compact).unwrap();
+        let argv = argv("s-0001", Strategy::Compact, SCHEDULED_DELAY).unwrap();
         assert_eq!(
             argv[1..],
             [

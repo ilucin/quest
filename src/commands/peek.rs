@@ -10,16 +10,22 @@ use crate::output;
 /// read in a terminal.
 pub const DEFAULT_LINES: usize = 40;
 
-pub fn run(ctx: &Ctx, session_target: &str, lines: usize) -> anyhow::Result<()> {
+/// What the pane shows right now. Split out of [`run`] so the TUI's `p`
+/// (SPEC §17) captures through the same checks rather than reaching for tmux
+/// itself — and so nothing writes to a terminal the TUI still owns.
+pub fn capture(ctx: &Ctx, found: &target::Target, lines: usize) -> anyhow::Result<String> {
     if lines == 0 {
         return Err(QError::Invalid("--lines must be at least 1".to_string()).into());
     }
-    sweep_quiet(ctx)?;
-    let found = target::resolve(ctx, session_target)?;
     // A pane that is gone has no output to show, and the sweep just proved it.
     found.require_live()?;
+    ctx.tmux().capture_pane(&found.session.tmux_pane, lines)
+}
 
-    let text = ctx.tmux().capture_pane(&found.session.tmux_pane, lines)?;
+pub fn run(ctx: &Ctx, session_target: &str, lines: usize) -> anyhow::Result<()> {
+    sweep_quiet(ctx)?;
+    let found = target::resolve(ctx, session_target)?;
+    let text = capture(ctx, &found, lines)?;
     if ctx.json || !ctx.quiet {
         output::emit(
             ctx.json,
