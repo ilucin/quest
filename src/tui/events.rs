@@ -460,7 +460,15 @@ fn filter_key(app: &mut App, input: Input) -> Action {
                     Err(why) => app.say(format!("{why} \u{b7} Esc clears")),
                 }
             }
-            Action::None
+            // A paste carries no `Action` by design, so a filter that arrived
+            // that way reaches the SQL only when something else asks. This is
+            // that something: committing the box is the last moment the query
+            // could still be ahead of the rows.
+            if app.events.stale() {
+                Action::Refresh
+            } else {
+                Action::None
+            }
         }
         Input::Backspace => {
             app.events.query.pop();
@@ -665,9 +673,14 @@ fn widths_of(cells: &[Cells], across: bool) -> [usize; 3] {
 }
 
 /// One event: when, where and what kind, with the payload on a line of its
-/// own underneath. SPEC §17's narrow band gets a third line, and spends it the
-/// way the Quests tab spends its own — moving the fixed-width fact (here the
-/// kind) off the meta line so the variable-width one keeps the full terminal.
+/// own underneath. SPEC §17's narrow band gets a third line, spent on the same
+/// trade the Quests tab makes — the fixed-width fact (here the kind) moves off
+/// the meta line so the variable-width one keeps the full terminal.
+///
+/// The cursor is NOT drawn the way Quests draws its own: there the reversed
+/// style is on the head line alone and the third line is dimmed even on the
+/// selected row, so the block is one line tall. Here every line of the row
+/// carries it, because an event is two or three lines and has to read as one.
 fn row_lines<'a>(
     c: &Cells,
     w: &[usize; 3],
@@ -931,6 +944,28 @@ mod tests {
 
     fn screen(app: &mut App, w: u16, h: u16) -> String {
         draw(app, w, h).join("\n")
+    }
+
+    /// Every drawn line carrying the cursor's reversed style, as
+    /// `(row, text)`. The style is what the block IS — reading the glyphs back
+    /// would only find the `\u{25b8}` marker on the head line.
+    fn reversed_rows(app: &mut App, w: u16, h: u16) -> Vec<(u16, String)> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .filter(|y| {
+                buffer
+                    .cell((0, *y))
+                    .is_some_and(|c| c.modifier.contains(Modifier::REVERSED))
+            })
+            .map(|y| {
+                let text = (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>();
+                (y, text.trim_end().to_string())
+            })
+            .collect()
     }
 
     fn kinds(app: &App) -> Vec<String> {
@@ -1316,6 +1351,79 @@ mod tests {
         anchored(&app);
     }
 
+    /// N-A: a paste carries no `Action` — that is deliberate — so the key
+    /// that COMMITS a pasted filter is the one that has to fetch what it
+    /// admits. `Enter` used to close the box over rows fetched under the old
+    /// filter, leaving the chip reading `kind rare.kind` over a screen
+    /// reading "no events match the filters" with the match in the database.
+    #[test]
+    fn enter_after_a_paste_fetches_what_the_pasted_filter_admits() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        rig.event(&quest, "rare.kind");
+        for _ in 0..(TAIL + 20) {
+            rig.event(&quest, "note");
+        }
+        let mut app = rig.app();
+        assert!(
+            !kinds(&app).contains(&"rare.kind".to_string()),
+            "the unfiltered tail should have scrolled it out"
+        );
+
+        rig.key(&mut app, Input::Char('/'));
+        // The real paste path: `App::paste` is all `apply_event` calls, and it
+        // returns a redraw flag, never an `Action` the loop could honour.
+        assert!(app.paste("rare.kind"));
+        assert_eq!(app.events.query, "rare.kind");
+
+        // The commit. Nothing else stands between the paste and the screen.
+        let action = rig.key(&mut app, Input::Enter);
+        assert_eq!(
+            action,
+            Action::Refresh,
+            "the committed filter reached the SQL; the rows have to follow"
+        );
+        assert!(!app.events.capturing());
+        assert!(!app.events.stale());
+
+        let body = screen(&mut app, 120, 12);
+        assert!(
+            !body.contains("no events match the filters"),
+            "the screen denies an event the database has:\n{body}"
+        );
+        assert!(body.contains("rare.kind"), "{body}");
+        assert_eq!(kinds(&app), ["rare.kind"]);
+        anchored(&app);
+    }
+
+    /// The other half of N-A, and the half deliberately left to the tick: a
+    /// paste that is never committed. The box is still open, so this is
+    /// in-progress editing rather than a verdict, and the next tick fetches
+    /// what the pasted filter admits with no key pressed at all.
+    #[test]
+    fn a_pasted_filter_that_is_never_committed_lands_on_the_next_tick() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        rig.event(&quest, "rare.kind");
+        for _ in 0..(TAIL + 20) {
+            rig.event(&quest, "note");
+        }
+        let mut app = rig.app();
+
+        rig.key(&mut app, Input::Char('/'));
+        assert!(app.paste("rare.kind"));
+        assert!(app.events.stale(), "the paste cannot fetch, by design");
+        assert!(app.events.capturing(), "the box is still open");
+
+        // No key. Just the tick `refresh_now` runs anyway.
+        rig.reload(&mut app);
+        assert!(!app.events.stale());
+        assert_eq!(kinds(&app), ["rare.kind"]);
+        let body = screen(&mut app, 120, 12);
+        assert!(body.contains("rare.kind"), "{body}");
+        anchored(&app);
+    }
+
     /// The kind filter goes into the SQL, not only into `visible`: a rare kind
     /// behind more than `TAIL` rows still has to be findable.
     #[test]
@@ -1579,6 +1687,50 @@ mod tests {
             assert!(
                 body.iter().any(|l| l.contains(&row.event.kind)),
                 "{w}: the selected row lost its kind: {body:?}"
+            );
+        }
+    }
+
+    /// N-D: the claim `row_lines` makes about its own cursor. An event is two
+    /// or three lines and has to read as ONE, so the reversed block covers
+    /// every line of the selected row — unlike the Quests tab, which reverses
+    /// its head line alone. Nothing else on screen says which event is which.
+    #[test]
+    fn the_cursor_block_covers_every_line_of_the_selected_event() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        let session = rig.session(&quest, "worker");
+        for n in 0..4 {
+            rig.event_with(
+                &quest,
+                Some(&session),
+                &format!("kind.{n}"),
+                serde_json::json!({ "text": format!("payload {n}") }),
+            );
+        }
+        let mut app = rig.app();
+
+        for (w, per_row) in [(120u16, 2usize), (60, 3)] {
+            app.set_size(w, 16);
+            app.handle(Input::Char('G'));
+            assert_eq!(app.row_mode().lines() as usize, per_row);
+            let reversed = reversed_rows(&mut app, w, 16);
+            assert_eq!(
+                reversed.len(),
+                per_row,
+                "{w}: the block is {} lines over a {per_row}-line row: {reversed:?}",
+                reversed.len()
+            );
+            // Contiguous, and the row under the cursor is the one it covers.
+            let kind = app.events.selected_row().unwrap().event.kind.clone();
+            assert!(
+                reversed.iter().any(|(_, l)| l.contains(&kind)),
+                "{reversed:?}"
+            );
+            let rows: Vec<u16> = reversed.iter().map(|(y, _)| *y).collect();
+            assert!(
+                rows.windows(2).all(|p| p[1] == p[0] + 1),
+                "the block has a hole in it: {rows:?}"
             );
         }
     }

@@ -128,7 +128,7 @@ pub fn load(
 /// them as sessions start, and building a second set for that would run
 /// `list_sessions_by_quest` twice per invocation — once for nothing on the
 /// non-follow path, which returns before the names are ever read.
-pub fn load_with_names(
+fn load_with_names(
     db: &Db,
     quests: &[Quest],
     filter: &EventFilter,
