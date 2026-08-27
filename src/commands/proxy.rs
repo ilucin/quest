@@ -14,10 +14,28 @@
 //! What travels is **this process's own argv**, not a reconstruction of it:
 //! `q` at the front (SPEC §15's `ssh <alias> q …`), `--machine <remote>`
 //! dropped (it named a machine *this* `q` knows, and on the far end it would be
-//! an unknown machine), and `--no-remote` appended. Everything else — `--json`,
+//! an unknown machine), and `--no-remote` inserted. Everything else — `--json`,
 //! `-q`, free text with spaces and quotes in it — is passed through untouched,
 //! and quoting happens once, at the ssh boundary
 //! ([`crate::remote::ssh_argv`]), never here.
+//!
+//! Two things about that line are not "the same arguments":
+//!
+//! * **The target is pinned to what it resolved to here** ([`pin`]). The
+//!   fragment the user typed is resolved on *this* machine, against a listing
+//!   that may be a cached one; sending the fragment on would have the far end
+//!   resolve it a second time, against different data, with nothing checking
+//!   that the two agreed. What travels is the Quest id — exact, and unique on
+//!   the machine that is about to act on it — so the Quest the user was shown
+//!   is the Quest that is acted on.
+//! * **The guard is inserted where the far end will read it as a flag**
+//!   ([`forward`]), not blindly appended: a line with a `--` in it makes
+//!   everything after the separator positional over there, and an appended
+//!   `--no-remote` would land in the far end's free text.
+//!
+//! Both are decided by re-parsing the candidate line with `q`'s own clap
+//! definition — the same reading the far end will give it — rather than by
+//! guessing at argv positions.
 //!
 //! # Why the recursion cannot happen
 //!
@@ -39,12 +57,24 @@
 //! Nothing here streams. A proxied command runs to completion behind a deadline
 //! ([`remote::PROXY_TIMEOUT`]), its stdout and stderr are relayed once it has,
 //! and its exit code is this process's. `q events --follow` is therefore
-//! refused rather than proxied — see [`FOLLOW`].
+//! refused rather than proxied — see [`Refusal::Follow`].
+//!
+//! # Destructive commands
+//!
+//! A `q close` / `q rm` / `q kill` whose target is elsewhere is confirmed
+//! **here**, where the terminal is, and then sent with [`CONFIRMED`] — never
+//! with `-f`. The two are not the same word: `-f` on `q rm` also authorises
+//! killing a tmux session that is still running, which is a *second* question
+//! the far end would otherwise never get to ask. `--confirmed` answers the
+//! `[y/N]` and buys nothing else, so a proxied command is exactly as
+//! destructive as the same command typed on that machine, and no more.
 
 use std::io::{ErrorKind, Write};
 
+use clap::Parser;
+
 use crate::Ctx;
-use crate::cli::{ArtifactAction, Command, LinkAction};
+use crate::cli::{ArtifactAction, Cli, Command, LinkAction};
 use crate::commands::locate::{self, Located};
 use crate::commands::{confirm, enter, flush_warnings, new};
 use crate::config::Remote;
@@ -65,27 +95,56 @@ pub const NO_REMOTE: &str = "--no-remote";
 /// the far end's answer.
 const SSH_FAILED: i32 = 255;
 
-/// Why `--follow` does not travel.
-///
-/// A tail is a stream, and a stream over ssh is a choice between two bad ends.
-/// Without `-t` there is no pty, so killing the local ssh leaves the far `q`
-/// polling for ever with nobody reading it — bd-8lz.5.7's orphan, made
-/// unbounded. With `-t` the far end gets a SIGHUP on disconnect (which is
-/// right) but also a terminal: line endings become `\r\n` and `--json` stops
-/// being valid JSON on stdout, which is the one thing a proxied command must
-/// not do. Neither is worth a silent choice, so the snapshot is proxied, the
-/// tail is refused, and the escape hatch is printed.
-const FOLLOW: &str = "`--follow` tails a live log and does not travel over ssh; \
-                      run it without `--follow` for a snapshot, or tail it there with \
-                      `ssh <alias> q events <quest> -f --no-remote`";
+/// The word a proxied confirmation sends instead of `-f`: the human has
+/// answered the `[y/N]`, and that is all it says. See the module docs.
+pub const CONFIRMED: &str = "--confirmed";
 
-/// Why `q artifact add` does not travel.
-const ARTIFACT: &str = "an artifact is stored by absolute path, and that path is on this \
-                        machine; add it on the machine that runs the Quest";
+/// Why a command is not proxied at all. The reason is rendered with the
+/// machine and Quest that were actually asked for, so an escape hatch it
+/// prints is one the user can paste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// `q events --follow`.
+    ///
+    /// A tail is a stream, and a stream over ssh is a choice between two bad
+    /// ends. Without `-t` there is no pty, so killing the local ssh leaves the
+    /// far `q` polling for ever with nobody reading it — bd-8lz.5.7's orphan,
+    /// made unbounded. With `-t` the far end gets a SIGHUP on disconnect (which
+    /// is right) but also a terminal: line endings become `\r\n` and `--json`
+    /// stops being valid JSON on stdout, which is the one thing a proxied
+    /// command must not do. Neither is worth a silent choice, so the snapshot
+    /// is proxied, the tail is refused, and the escape hatch is printed.
+    ///
+    /// That escape hatch is `ssh -t`, deliberately: a human at a keyboard has a
+    /// terminal, so the pty objection does not apply to them — and it is the
+    /// `-t` that makes the far `q` die with the connection instead of becoming
+    /// the very orphan this refusal exists to avoid.
+    Follow,
+    /// `q artifact add`.
+    Artifact,
+    /// `q phase`.
+    Phase,
+}
 
-/// Why `q phase` does not travel.
-const PHASE: &str = "`q phase` reports for the session it runs in ($Q_SESSION), and a \
-                     session belongs to the machine that runs it";
+impl Refusal {
+    /// The reason, for the machine (`alias` as `ssh` spells it) and Quest that
+    /// were asked for.
+    fn why(self, alias: &str, quest: &str) -> String {
+        match self {
+            Refusal::Follow => format!(
+                "`--follow` tails a live log and does not travel over ssh; \
+                 run it without `--follow` for a snapshot, or tail it there with \
+                 `ssh -t {alias} q events {quest} -f --no-remote`"
+            ),
+            Refusal::Artifact => "an artifact is stored by absolute path, and that path is on \
+                                  this machine; add it on the machine that runs the Quest"
+                .to_string(),
+            Refusal::Phase => "`q phase` reports for the session it runs in ($Q_SESSION), and \
+                               a session belongs to the machine that runs it"
+                .to_string(),
+        }
+    }
+}
 
 /// What a command aims at, for the purpose of deciding where it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,21 +159,36 @@ pub enum Aim<'a> {
     Create,
 }
 
+impl<'a> Aim<'a> {
+    /// The `<label>` half of a `<session>` target, when this aim is one. The
+    /// quest half is [`session_quest`]'s.
+    fn session_label(self) -> Option<&'a str> {
+        match self {
+            Aim::Session(target) => target
+                .split_once('/')
+                .map(|(_, label)| label)
+                .filter(|label| !label.is_empty()),
+            Aim::Quest(_) | Aim::Create => None,
+        }
+    }
+}
+
 /// How a command travels once its target turns out to be elsewhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Passage {
     /// Sent as it stands.
     Proxy,
-    /// Asked about **here**, where the terminal is, then sent with `-f`. The
-    /// far end's stdin is `/dev/null`, so its own prompt could only abort; the
-    /// confirmation is a property of having a human, not of the machine that
-    /// does the work.
+    /// Asked about **here**, where the terminal is, then sent with
+    /// [`CONFIRMED`]. The far end's stdin is `/dev/null`, so its own prompt
+    /// could only abort; the confirmation is a property of having a human, not
+    /// of the machine that does the work. The verb is the question's, and the
+    /// noun is whatever the target actually names — a Quest, or a session.
     Confirm(&'static str),
     /// Sent with `-d`, then the terminal is handed to the far end's tmux —
     /// `q resume`, which is `q new --machine` with an existing Quest.
     ThenEnter,
-    /// Never proxied. The reason is the message.
-    Refuse(&'static str),
+    /// Never proxied. See [`Refusal`].
+    Refuse(Refusal),
 }
 
 /// The whole decision table (SPEC §15, §16). `None` is "this command can only
@@ -154,7 +228,11 @@ pub fn route(command: &Command) -> Option<(Aim<'_>, Passage)> {
             ..
         } => (
             Aim::Quest(quest),
-            if *follow { Refuse(FOLLOW) } else { Proxy },
+            if *follow {
+                Refuse(Refusal::Follow)
+            } else {
+                Proxy
+            },
         ),
         Command::Close { quest, force, .. } => (Aim::Quest(quest), asked(*force, "close quest")),
         Command::Rm { quest, force } => (
@@ -189,10 +267,10 @@ pub fn route(command: &Command) -> Option<(Aim<'_>, Passage)> {
             action: ArtifactAction::Add {
                 quest: Some(quest), ..
             },
-        } => (Aim::Quest(quest), Refuse(ARTIFACT)),
+        } => (Aim::Quest(quest), Refuse(Refusal::Artifact)),
         Command::Phase {
             quest: Some(quest), ..
-        } => (Aim::Quest(quest), Refuse(PHASE)),
+        } => (Aim::Quest(quest), Refuse(Refusal::Phase)),
 
         _ => return None,
     })
@@ -260,15 +338,50 @@ pub fn dispatch(ctx: &Ctx, command: &Command) -> anyhow::Result<Option<u8>> {
     let Some(machine) = found.machine.clone() else {
         return Ok(None);
     };
+    let remote = remote::find(&ctx.config.remotes, &machine)?;
+
+    // What the far end is told to act on: the identity this resolved to here,
+    // not the fragment that was typed. See [`pin`].
+    let raw = raw_args();
+    let pinned = pin(&raw, aim, &found.quest.id);
+    let deadline = deadline(command);
 
     match passage {
-        Passage::Refuse(why) => {
-            Err(QError::Other(format!("{} runs on {machine}: {why}", found.quest.slug)).into())
-        }
-        Passage::Proxy => send(ctx, &machine, &[], false).map(|(code, _)| Some(code)),
+        Passage::Refuse(why) => Err(QError::Other(format!(
+            "{} runs on {machine}: {}",
+            found.quest.slug,
+            why.why(&remote.ssh, &found.quest.slug)
+        ))
+        .into()),
+        Passage::Proxy => send(
+            ctx,
+            remote,
+            pinned.as_ref().unwrap_or(&raw),
+            &[],
+            false,
+            deadline,
+        )
+        .map(|(code, _)| Some(code)),
         Passage::Confirm(verb) => {
-            confirm(ctx, &format!("{verb} {} on {machine}?", found.quest.slug))?;
-            send(ctx, &machine, &["-f"], false).map(|(code, _)| Some(code))
+            // A subject the far end could re-read differently is the whole of
+            // B2: a confirmation that names one Quest while the command
+            // destroys another is worse than no confirmation at all.
+            let Some(pinned) = pinned else {
+                return Err(unpinnable(&found.quest.slug, &machine));
+            };
+            let subject = subject(&found, aim);
+            // The master is refused *before* the question, exactly as
+            // `kill::guard_master` refuses it before `q kill`'s own prompt:
+            // asking a human to authorise something that cannot happen is not
+            // a confirmation, it is a trap.
+            guard_remote_master(&found, aim)?;
+            confirm(ctx, &format!("{verb} {subject} on {machine}?"))?;
+            let extra: &[&str] = if raw.iter().any(|a| a == CONFIRMED) {
+                &[]
+            } else {
+                &[CONFIRMED]
+            };
+            send(ctx, remote, &pinned, extra, false, deadline).map(|(code, _)| Some(code))
         }
         // `-d` because there is no terminal at the far end to attach to; the
         // attach is this machine's, once the Quest is back up over there.
@@ -276,13 +389,74 @@ pub fn dispatch(ctx: &Ctx, command: &Command) -> anyhow::Result<Option<u8>> {
             // Under `--json` the far end's document is held back rather than
             // relayed: the attach is part of the same answer, and two JSON
             // documents on one stdout is not `--json`.
-            let (code, held) = send(ctx, &machine, &["-d"], ctx.json)?;
+            let (code, held) = send(
+                ctx,
+                remote,
+                pinned.as_ref().unwrap_or(&raw),
+                &["-d"],
+                ctx.json,
+                deadline,
+            )?;
             if code != 0 {
                 write_out(std::io::stdout(), &held)?;
                 return Ok(Some(code));
             }
             enter_after(ctx, &found, &machine, held).map(|()| Some(0))
         }
+    }
+}
+
+/// What a confirmation is *about*: the Quest, or — for `q kill` — the session
+/// inside it, which is the only thing that is going to die.
+fn subject(found: &Located, aim: Aim<'_>) -> String {
+    match aim.session_label() {
+        Some(label) => format!("{}/{label}", found.quest.slug),
+        None => found.quest.slug.clone(),
+    }
+}
+
+/// `kill::guard_master`, for a session that lives elsewhere.
+///
+/// The far end runs the real guard (it can see the row's `role`); this one
+/// reads the reserved label out of the target, which is the spelling every
+/// master answers to, and refuses before a human is asked to authorise a kill
+/// that `q kill` would never perform.
+fn guard_remote_master(found: &Located, aim: Aim<'_>) -> anyhow::Result<()> {
+    let Some(label) = aim.session_label() else {
+        return Ok(());
+    };
+    if label != new::MASTER {
+        return Ok(());
+    }
+    Err(QError::Invalid(format!(
+        "{}/{label} is the master of quest {}; run `q close {}` to end the whole Quest",
+        found.quest.slug, found.quest.slug, found.quest.slug
+    ))
+    .into())
+}
+
+/// A target this process cannot restate as an identity is refused rather than
+/// destroyed on a guess — see [`pin`]. Unreachable for every argv `q` accepts;
+/// it is here because "unreachable" and "destroys the wrong Quest" are one
+/// mistake apart.
+fn unpinnable(slug: &str, machine: &str) -> anyhow::Error {
+    QError::Other(format!(
+        "cannot say which quest on {machine} this names ({slug}); \
+         run it there with `q --no-remote`"
+    ))
+    .into()
+}
+
+/// How long the far end gets. [`remote::PROXY_TIMEOUT`] for everything except a
+/// command that was *asked* to wait: `q reset --delay N` sleeps N seconds over
+/// there before it does anything, so the deadline has to clear the sleep or the
+/// command it schedules is always reported as one that may still be running.
+fn deadline(command: &Command) -> std::time::Duration {
+    match command {
+        Command::Reset {
+            delay: Some(delay), ..
+        } => remote::PROXY_TIMEOUT + std::time::Duration::from_secs(*delay),
+        _ => remote::PROXY_TIMEOUT,
     }
 }
 
@@ -333,19 +507,21 @@ fn enter_after(ctx: &Ctx, found: &Located, machine: &str, held: String) -> anyho
     ctx.ssh().attach(&target.alias, &target.argv)
 }
 
-/// This invocation, over ssh to `machine`, with `extra` appended before the
-/// recursion guard. Relays the far end's streams and hands back its exit code —
-/// and, under `hold_stdout`, its stdout instead of writing it, for the one
-/// caller that has something to add to the same answer ([`enter_after`]).
+/// `raw`, over ssh to `remote`, with `extra` and the recursion guard put where
+/// the far end reads them as flags. Relays the far end's streams and hands back
+/// its exit code — and, under `hold_stdout`, its stdout instead of writing it,
+/// for the one caller that has something to add to the same answer
+/// ([`enter_after`]).
 fn send(
     ctx: &Ctx,
-    machine: &str,
+    remote: &Remote,
+    raw: &[String],
     extra: &[&str],
     hold_stdout: bool,
+    deadline: std::time::Duration,
 ) -> anyhow::Result<(u8, String)> {
-    let remote = remote::find(&ctx.config.remotes, machine)?;
-    let argv = forward(&raw_args(), ctx.machine_filter(), extra);
-    relay(ctx, remote, &argv, hold_stdout)
+    let argv = forward(raw, ctx.machine_filter(), extra);
+    relay(ctx, remote, &argv, hold_stdout, deadline)
 }
 
 /// Run `argv` on `remote` and become its result: stdout to stdout, stderr to
@@ -359,9 +535,10 @@ fn relay(
     remote: &Remote,
     argv: &[String],
     hold_stdout: bool,
+    deadline: std::time::Duration,
 ) -> anyhow::Result<(u8, String)> {
     let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let outcome = ctx.ssh().run(&remote.ssh, &borrowed, remote::PROXY_TIMEOUT);
+    let outcome = ctx.ssh().run(&remote.ssh, &borrowed, deadline);
     match outcome {
         SshOutcome::Done {
             code,
@@ -388,13 +565,19 @@ fn relay(
         SshOutcome::TimedOut => Err(QError::Other(format!(
             "`{}` did not finish within {}s on {}; it may still be running there",
             argv.join(" "),
-            remote::PROXY_TIMEOUT.as_secs(),
+            deadline.as_secs(),
             remote.name
         ))
         .into()),
+        // The cap was sized for a listing and now bounds every relayed command,
+        // so it says how big it is rather than leaving the user to guess what
+        // "more" means.
         SshOutcome::TooLarge => Err(QError::Other(format!(
-            "{} sent more output than `q` will relay; run it there",
-            remote.name
+            "{} sent more than the {} MiB `q` will relay; run it there \
+             (`ssh -t {} q … --no-remote`), or ask for less of it",
+            remote.name,
+            remote::MAX_OUTPUT >> 20,
+            remote.ssh
         ))
         .into()),
         SshOutcome::Failed(e) => {
@@ -441,13 +624,36 @@ fn raw_args() -> Vec<String> {
 /// read as free text (`q send s -- --machine=ws`); matching the parsed value
 /// means the only thing dropped is the flag that was really given. With no
 /// `--machine` at all, nothing is dropped and the argv travels untouched.
+///
+/// `extra` and the recursion guard are **inserted**, not appended. A `--` in
+/// the line makes everything after it positional over there, so a guard on the
+/// end of `q note --quest x -- "-- text"` arrives as a second `<TEXT>` and the
+/// far end rejects a command that is perfectly legal on the machine that runs
+/// it. Where they go is decided by asking clap — the far end's own reading —
+/// rather than by guessing: the last position whose parse still sees the guard
+/// as the flag it is wins, and the end of the line is tried first so an
+/// ordinary command travels exactly as it always did.
 pub fn forward(raw: &[String], machine: Option<&str>, extra: &[&str]) -> Vec<String> {
-    debug_assert!(
-        !raw.iter().any(|a| a == NO_REMOTE),
-        "a --no-remote invocation must never reach the proxy"
-    );
-    let mut out = vec![REMOTE_Q.to_string()];
+    let kept = without_machine(raw, machine);
+    let mut flags: Vec<String> = extra.iter().map(|e| (*e).to_string()).collect();
+    flags.push(NO_REMOTE.to_string());
+    for at in (0..=kept.len()).rev() {
+        let candidate = splice(&kept, at, &flags);
+        if guarded(&candidate) {
+            return candidate;
+        }
+    }
+    // No reading of this line has the guard as a flag. Unreachable for every
+    // argv clap accepts here — the position before the subcommand always works,
+    // `--no-remote` being global — so the end of the line is as good a last
+    // resort as any, and the far end says what it did not understand.
+    splice(&kept, kept.len(), &flags)
+}
+
+/// `raw` without the `--machine` that was really given.
+fn without_machine(raw: &[String], machine: Option<&str>) -> Vec<String> {
     let joined = machine.map(|m| format!("--machine={m}"));
+    let mut out = Vec::with_capacity(raw.len());
     let mut dropped = machine.is_none();
     let mut at = 0;
     while at < raw.len() {
@@ -468,9 +674,94 @@ pub fn forward(raw: &[String], machine: Option<&str>, extra: &[&str]) -> Vec<Str
         out.push(arg.clone());
         at += 1;
     }
-    out.extend(extra.iter().map(|e| (*e).to_string()));
-    out.push(NO_REMOTE.to_string());
     out
+}
+
+/// `q`, then `kept` with `flags` inserted at `at`.
+fn splice(kept: &[String], at: usize, flags: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(kept.len() + flags.len() + 1);
+    out.push(REMOTE_Q.to_string());
+    out.extend(kept[..at].iter().cloned());
+    out.extend(flags.iter().cloned());
+    out.extend(kept[at..].iter().cloned());
+    out
+}
+
+/// Would the far end read this line as one carrying the recursion guard?
+/// Answered by `q`'s own parser, so the answer is the far end's.
+fn guarded(argv: &[String]) -> bool {
+    Cli::try_parse_from(argv).is_ok_and(|cli| cli.no_remote)
+}
+
+/// The same line with its `<quest>` target replaced by the identity it resolved
+/// to on this machine.
+///
+/// Resolution happens twice — once here, to find out which machine owns the
+/// target, and once over there, when the far end runs the command. Those two
+/// walk different databases: this one may be reading a `remote_cache` row left
+/// by a listing that timed out at 5 s, while the command itself gets 60 s and
+/// reaches a host that has since renamed, finished or created Quests. Sending
+/// the fragment on lets the two disagree in silence, and a `q rm` is not a
+/// place for that: the user confirms one Quest by name and another one dies.
+///
+/// So what travels is `found.quest.id` — exact, and unique on the machine that
+/// is about to act on it — spliced into the token the target was typed in
+/// (`--quest=alpha` included). Which token that is, is not guessed: each
+/// candidate is re-parsed with `q`'s own clap definition and kept only when
+/// [`route`] reads the new spelling as the target. Exactly one token changed,
+/// and it is the one the target is read from, so nothing else in the line can
+/// have moved.
+///
+/// `None` means no reading of this line names the identity — see
+/// [`unpinnable`].
+fn pin(raw: &[String], aim: Aim<'_>, id: &str) -> Option<Vec<String>> {
+    let (target, want) = match aim {
+        Aim::Create => return Some(raw.to_vec()),
+        Aim::Quest(target) => (target, id.to_string()),
+        Aim::Session(target) => (target, format!("{id}/{}", aim.session_label()?)),
+    };
+    if target == want {
+        return Some(raw.to_vec());
+    }
+    for at in 0..raw.len() {
+        let Some(rewritten) = restate(&raw[at], target, &want) else {
+            continue;
+        };
+        let mut candidate = raw.to_vec();
+        candidate[at] = rewritten;
+        if names(&candidate, &want) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// One argv word with `target` said as `want`: the bare word, or the value half
+/// of a `--flag=value`. Anything else is not a spelling of this target.
+fn restate(arg: &str, target: &str, want: &str) -> Option<String> {
+    if arg == target {
+        return Some(want.to_string());
+    }
+    let (flag, value) = arg.split_once('=')?;
+    (flag.starts_with("--") && value == target).then(|| format!("{flag}={want}"))
+}
+
+/// Does this line name `want` as the Quest (or session) it acts on? Asked of
+/// clap and [`route`], never of the string.
+fn names(raw: &[String], want: &str) -> bool {
+    let mut line = Vec::with_capacity(raw.len() + 1);
+    line.push(REMOTE_Q.to_string());
+    line.extend(raw.iter().cloned());
+    let Ok(cli) = Cli::try_parse_from(line) else {
+        return false;
+    };
+    let Some(command) = cli.command else {
+        return false;
+    };
+    matches!(
+        route(&command),
+        Some((Aim::Quest(target) | Aim::Session(target), _)) if target == want
+    )
 }
 
 // ------------------------------------------------------------------ create
@@ -506,6 +797,12 @@ fn create(ctx: &Ctx, command: &Command) -> anyhow::Result<Option<u8>> {
     else {
         return Ok(None);
     };
+    // A relative `--dir` is the `link add` relative-`<ref>` caveat again (see
+    // `route`): it is made absolute against the far end's login directory, not
+    // this one. The common case is an absolute path or none at all, and the
+    // far end refuses a directory it does not have, so the command travels and
+    // the caveat is documented rather than refused.
+    //
     // `--prompt-file -` reads *this* machine's stdin, so it is resolved here
     // and travels as text.
     let prompt = new::resolve_prompt(prompt.as_deref(), prompt_file.as_deref())?;
@@ -587,15 +884,21 @@ pub fn create_remote(
             .into());
         }
         SshOutcome::TooLarge => {
-            return Err(QError::Other(format!("{} sent an unreadable answer", remote.name)).into());
+            return Err(QError::Other(format!(
+                "{} sent an unreadable answer{MAY_EXIST}",
+                remote.name
+            ))
+            .into());
         }
         SshOutcome::Failed(e) => {
             return Err(QError::Other(format!("cannot reach {}: {e}", remote.name)).into());
         }
     };
+    // Exit 0 over there means the Quest exists over there, whatever this end
+    // can make of the answer.
     let payload: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|e| {
         QError::Other(format!(
-            "cannot read `q new --json` from {}: {e}",
+            "cannot read `q new --json` from {}: {e}{MAY_EXIST}",
             remote.name
         ))
     })?;
@@ -605,7 +908,7 @@ pub fn create_remote(
             .map(str::to_string)
             .ok_or_else(|| {
                 QError::Other(format!(
-                    "`q new --json` from {} has no `{key}`",
+                    "`q new --json` from {} has no `{key}`{MAY_EXIST}",
                     remote.name
                 ))
                 .into()
@@ -624,9 +927,24 @@ pub fn create_remote(
     })
 }
 
+/// What is added to every `q new --machine` failure that could have happened
+/// *after* the far end committed the Quest.
+///
+/// A `q new` that fails on the way there leaves nothing behind; one whose ssh
+/// drops on the way back, or whose answer this `q` cannot read, may already
+/// have created a Quest and a tmux session over there. Saying only "cannot
+/// reach ws" invites a retry that creates a second one.
+const MAY_EXIST: &str = "; the quest may already have been created there — check `q list` \
+                         before retrying";
+
 fn create_failed(machine: &str, code: Option<i32>, stderr: &str) -> anyhow::Error {
     if code == Some(SSH_FAILED) || code.is_none() {
-        return unreachable_remote(machine, code, stderr);
+        // The command ran; only the answer was lost.
+        return QError::Other(format!(
+            "{:#}{MAY_EXIST}",
+            unreachable_remote(machine, code, stderr)
+        ))
+        .into();
     }
     // `q --json` puts `{"error": …}` on stderr; anything else is relayed as it
     // came.
@@ -793,13 +1111,19 @@ mod tests {
             let cli = parse(line);
             route(cli.command.as_ref().unwrap()).unwrap().1
         };
-        assert_eq!(passage("events alpha --follow"), Passage::Refuse(FOLLOW));
+        assert_eq!(
+            passage("events alpha --follow"),
+            Passage::Refuse(Refusal::Follow)
+        );
         assert_eq!(passage("events alpha"), Passage::Proxy);
         assert_eq!(
             passage("artifact add /p --quest alpha"),
-            Passage::Refuse(ARTIFACT)
+            Passage::Refuse(Refusal::Artifact)
         );
-        assert_eq!(passage("phase hi --quest alpha"), Passage::Refuse(PHASE));
+        assert_eq!(
+            passage("phase hi --quest alpha"),
+            Passage::Refuse(Refusal::Phase)
+        );
         assert_eq!(passage("resume alpha"), Passage::ThenEnter);
         assert_eq!(passage("resume alpha -d"), Passage::Proxy);
         assert_eq!(passage("close alpha"), Passage::Confirm("close quest"));
@@ -808,6 +1132,122 @@ mod tests {
         assert_eq!(passage("kill alpha/t -f"), Passage::Proxy);
         assert!(matches!(passage("rm alpha"), Passage::Confirm(_)));
         assert_eq!(passage("rm alpha -f"), Passage::Proxy);
+    }
+
+    /// A `--` makes everything after it positional over there, so the guard
+    /// goes where the far end reads it as a flag. Every command with free
+    /// trailing text can be spelled with one.
+    #[test]
+    fn the_guard_lands_before_a_separator_not_after_it() {
+        for line in [
+            "note --quest alpha -- --dashed",
+            "send alpha/tests -- --help",
+            "set alpha goal -- --not-a-flag",
+            "spawn alpha --label t -- --dashed",
+        ] {
+            let raw = args(line);
+            let sent = forward(&raw, None, &[]);
+            let cli = Cli::try_parse_from(&sent).unwrap_or_else(|e| panic!("{line}: {e}"));
+            assert!(cli.no_remote, "{line}: {sent:?}");
+            // The guard is the only thing added, and the text is untouched.
+            let text: Vec<&String> = sent.iter().filter(|w| *w != NO_REMOTE).skip(1).collect();
+            assert_eq!(
+                text.into_iter().cloned().collect::<Vec<String>>(),
+                raw,
+                "{line}"
+            );
+        }
+    }
+
+    /// With no `--` in the line the guard still rides on the end, so an
+    /// ordinary proxied command travels exactly as it always did.
+    #[test]
+    fn an_ordinary_line_still_carries_the_guard_at_the_end() {
+        assert_eq!(
+            forward(&args("show alpha --json"), None, &[]),
+            ["q", "show", "alpha", "--json", "--no-remote"]
+        );
+    }
+
+    /// The target that travels is the identity it resolved to here, in
+    /// whichever token it was typed — the bare positional, the `<quest>` half
+    /// of a session target, or a `--quest=` value.
+    #[test]
+    fn the_target_travels_as_the_identity_it_resolved_to() {
+        for (line, want) in [
+            ("rm alpha", vec!["rm", "q-1234"]),
+            ("rename alpha beta", vec!["rename", "q-1234", "beta"]),
+            ("kill alpha/tests", vec!["kill", "q-1234/tests"]),
+            (
+                "note hi --quest alpha",
+                vec!["note", "hi", "--quest", "q-1234"],
+            ),
+            (
+                "note hi --quest=alpha",
+                vec!["note", "hi", "--quest=q-1234"],
+            ),
+        ] {
+            let cli = parse(line);
+            let command = cli.command.as_ref().expect(line);
+            let (aim, _) = route(command).expect(line);
+            let pinned = pin(&args(line), aim, "q-1234").unwrap_or_else(|| panic!("{line}"));
+            assert_eq!(pinned, want, "{line}");
+        }
+    }
+
+    /// Only the token the target was read from moves, however many other words
+    /// happen to spell the same thing. The candidate is verified by re-parsing,
+    /// so a value that merely looks like the target is never the one rewritten.
+    #[test]
+    fn a_word_that_only_looks_like_the_target_is_left_alone() {
+        // `--label alpha` comes first and reads like the target.
+        let line = "spawn --label alpha alpha go";
+        let cli = parse(line);
+        let (aim, _) = route(cli.command.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            pin(&args(line), aim, "q-1234").unwrap(),
+            ["spawn", "--label", "alpha", "q-1234", "go"]
+        );
+
+        // …and a machine that shares the target's name.
+        let line = "rm ws --machine ws";
+        let cli = parse(line);
+        let (aim, _) = route(cli.command.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            pin(&args(line), aim, "q-1234").unwrap(),
+            ["rm", "q-1234", "--machine", "ws"]
+        );
+    }
+
+    /// `q reset --delay N` is *asked* to wait N seconds over there, so the
+    /// deadline has to clear the sleep — otherwise every scheduled reset is
+    /// reported as one that may still be running.
+    #[test]
+    fn a_delayed_reset_gets_a_deadline_that_clears_its_own_sleep() {
+        let deadline_of = |line: &str| deadline(parse(line).command.as_ref().unwrap());
+        assert_eq!(deadline_of("reset alpha/t"), remote::PROXY_TIMEOUT);
+        assert_eq!(
+            deadline_of("reset alpha/t --delay 90"),
+            remote::PROXY_TIMEOUT + std::time::Duration::from_secs(90)
+        );
+        assert_eq!(deadline_of("rm alpha"), remote::PROXY_TIMEOUT);
+    }
+
+    /// The refusal's escape hatch is one the user can paste: the real alias,
+    /// the real Quest, and `ssh -t` — whose pty is what keeps the far `q` from
+    /// outliving the connection, which is the whole reason `--follow` is
+    /// refused.
+    #[test]
+    fn the_follow_refusal_prints_a_hatch_that_does_not_orphan() {
+        let said = Refusal::Follow.why("ws-host", "over-there");
+        assert!(
+            said.contains("`ssh -t ws-host q events over-there -f --no-remote`"),
+            "{said}"
+        );
+        assert!(
+            !said.contains("<alias>") && !said.contains("<quest>"),
+            "{said}"
+        );
     }
 
     /// Only `<quest>/<label>` can name a session on another machine.

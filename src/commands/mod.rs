@@ -331,12 +331,28 @@ pub fn flush_warnings(ctx: &Ctx) {
 /// `--json` and `$Q_QUEST` (an agent running inside a Quest pane) refuse
 /// without asking at all: nobody is there to answer, and a blocked agent is
 /// worse than a failed command.
+///
+/// `--confirmed` answers it: a human already said yes, on the machine that had
+/// the terminal (SPEC §15's proxy). It skips this question and no other check —
+/// see [`crate::cli::Cli::confirmed`].
 pub fn confirm(ctx: &Ctx, question: &str) -> anyhow::Result<()> {
-    if ctx.json || in_quest_pane() || !std::io::stdin().is_terminal() {
+    if ctx.confirmed() {
+        return Ok(());
+    }
+    if ctx.json || in_quest_pane() {
+        return Err(aborted());
+    }
+    // The fixture stands in for stdin, and for nothing else: the question is
+    // still asked out loud, so a test reads exactly what the human would.
+    let scripted = fixture_answer();
+    if scripted.is_none() && !std::io::stdin().is_terminal() {
         return Err(aborted());
     }
     eprint!("{question} [y/N] ");
     std::io::stderr().flush()?;
+    if let Some(answer) = scripted {
+        return answer;
+    }
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line)?;
     match line.trim().to_ascii_lowercase().as_str() {
@@ -347,6 +363,22 @@ pub fn confirm(ctx: &Ctx, question: &str) -> anyhow::Result<()> {
 
 fn in_quest_pane() -> bool {
     std::env::var_os("Q_QUEST").is_some_and(|v| !v.is_empty())
+}
+
+/// The scripted answer to a `[y/N]`, or `None` when nothing scripted one.
+///
+/// A test has no terminal, so without this the only half of a confirmation the
+/// suite can execute is the abort — and the *yes* is where a destructive
+/// command actually destroys something. Gated on `$Q_FIXTURE`, exactly like the
+/// tmux, ssh, `bd` and `claude` stubs, so a stray variable in a real shell
+/// cannot answer a real question.
+fn fixture_answer() -> Option<anyhow::Result<()>> {
+    std::env::var_os("Q_FIXTURE").filter(|v| !v.is_empty())?;
+    let said = std::env::var("Q_FIXTURE_CONFIRM").ok()?;
+    Some(match said.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(()),
+        _ => Err(aborted()),
+    })
 }
 
 /// What a command did with the terminal, for the payload and the one-liner.

@@ -26,6 +26,17 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_remote: bool,
 
+    /// This command's confirmation has already been answered, by a human, on
+    /// the machine that had the terminal (SPEC §15's proxy).
+    ///
+    /// It skips the `[y/N]` and **nothing else**. `-f` on `q rm` means two
+    /// things — don't ask, *and* kill a tmux session that is still running —
+    /// and a proxied command must not be able to buy the second one with an
+    /// answer to the first. Hidden because it is the wire's word, not a
+    /// spelling anyone needs to type.
+    #[arg(long, global = true, hide = true)]
+    pub confirmed: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

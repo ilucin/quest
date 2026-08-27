@@ -226,7 +226,11 @@ const POLL: Duration = Duration::from_millis(20);
 /// Most a single stream may buffer. A remote is expected to send a listing, not
 /// a stream: past this the read end is dropped, which stops a hostile or broken
 /// far end from spending our memory for the whole deadline.
-const MAX_OUTPUT: u64 = 1 << 20;
+///
+/// It bounds a proxied command's output too (SPEC §15), which is why the
+/// refusal names it — `q peek --lines 20000` against a very long pane is the
+/// one everyday command that can reach it.
+pub const MAX_OUTPUT: u64 = 1 << 20;
 
 impl Ssh for RealSsh {
     fn run(&self, alias: &str, argv: &[&str], timeout: Duration) -> SshOutcome {

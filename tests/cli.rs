@@ -8242,6 +8242,25 @@ impl Env {
         cmd.args(args).assert()
     }
 
+    /// The same, with the `[y/N]` answered.
+    ///
+    /// A test has no terminal, so without a scripted answer the only half of a
+    /// confirmation the suite can execute is the abort — and the *yes* is the
+    /// half in which something is actually destroyed. `Q_FIXTURE_CONFIRM`
+    /// stands in for stdin (and only for stdin: the question is still asked out
+    /// loud, so these tests read exactly what the human would).
+    fn answering(
+        &self,
+        hosts: serde_json::Value,
+        answer: &str,
+        args: &[&str],
+    ) -> assert_cmd::assert::Assert {
+        let mut cmd = self.cmd();
+        self.with_ssh(&mut cmd, hosts);
+        cmd.env("Q_FIXTURE_CONFIRM", answer);
+        cmd.args(args).assert()
+    }
+
     /// Every ssh call that was not the listing fan-out — the proxied ones.
     fn proxy_calls(&self) -> Vec<String> {
         self.ssh_calls()
@@ -8256,70 +8275,79 @@ fn ok_reply() -> serde_json::Value {
     serde_json::json!({ "stdout": "done over there\n" })
 }
 
+/// The id the far end's own listing gives its Quest.
+///
+/// It is what a proxied command puts on the wire in place of whatever fragment
+/// was typed here: the target is resolved once, on the machine with the human,
+/// and the far end is told the identity rather than asked to resolve a
+/// fragment a second time against a database this end may have a stale picture
+/// of (bd-8lz.5.3 review B2).
+fn far_id(hosts: &serde_json::Value, alias: &str) -> String {
+    let listing: serde_json::Value =
+        serde_json::from_str(hosts[alias]["stdout"].as_str().expect("a listing")).expect("json");
+    listing["quests"][0]["id"]
+        .as_str()
+        .expect("an id")
+        .to_string()
+}
+
 /// Every command SPEC §16 gives a `<quest>` (or a `<quest>/<label>`) reaches
 /// the machine that runs it, with its own arguments and the recursion guard.
 #[test]
 fn every_command_that_resolves_a_remote_quest_is_proxied_with_the_guard() {
+    // `{id}` is the identity the target resolved to here — see [`far_id`].
     for (args, sent) in [
-        (vec!["show", "over-there"], "q\tshow\tover-there"),
-        (vec!["brief", "over-there"], "q\tbrief\tover-there"),
-        (vec!["links", "over-there"], "q\tlinks\tover-there"),
-        (vec!["events", "over-there"], "q\tevents\tover-there"),
-        (vec!["sessions", "over-there"], "q\tsessions\tover-there"),
-        (vec!["name", "over-there"], "q\tname\tover-there"),
+        (vec!["show", "over-there"], "q\tshow\t{id}"),
+        (vec!["brief", "over-there"], "q\tbrief\t{id}"),
+        (vec!["links", "over-there"], "q\tlinks\t{id}"),
+        (vec!["events", "over-there"], "q\tevents\t{id}"),
+        (vec!["sessions", "over-there"], "q\tsessions\t{id}"),
+        (vec!["name", "over-there"], "q\tname\t{id}"),
         (
             vec!["rename", "over-there", "renamed"],
-            "q\trename\tover-there\trenamed",
+            "q\trename\t{id}\trenamed",
         ),
         (
             vec!["set", "over-there", "goal", "ship it"],
-            "q\tset\tover-there\tgoal\t'ship it'",
+            "q\tset\t{id}\tgoal\t'ship it'",
         ),
         (
             vec!["spawn", "over-there", "--label", "tests", "run the suite"],
-            "q\tspawn\tover-there\t--label\ttests\t'run the suite'",
+            "q\tspawn\t{id}\t--label\ttests\t'run the suite'",
         ),
-        (
-            vec!["close", "over-there", "-f"],
-            "q\tclose\tover-there\t-f",
-        ),
-        (vec!["rm", "over-there", "-f"], "q\trm\tover-there\t-f"),
-        (
-            vec!["resume", "over-there", "-d"],
-            "q\tresume\tover-there\t-d",
-        ),
-        (
-            vec!["peek", "over-there/master"],
-            "q\tpeek\tover-there/master",
-        ),
+        (vec!["close", "over-there", "-f"], "q\tclose\t{id}\t-f"),
+        (vec!["rm", "over-there", "-f"], "q\trm\t{id}\t-f"),
+        (vec!["resume", "over-there", "-d"], "q\tresume\t{id}\t-d"),
+        (vec!["peek", "over-there/master"], "q\tpeek\t{id}/master"),
         (
             vec!["send", "over-there/master", "carry on"],
-            "q\tsend\tover-there/master\t'carry on'",
+            "q\tsend\t{id}/master\t'carry on'",
         ),
-        (
-            vec!["reset", "over-there/master"],
-            "q\treset\tover-there/master",
-        ),
+        (vec!["reset", "over-there/master"], "q\treset\t{id}/master"),
         (
             vec!["kill", "over-there/tests", "-f"],
-            "q\tkill\tover-there/tests\t-f",
+            "q\tkill\t{id}/tests\t-f",
         ),
         (
             vec!["note", "a note", "--quest", "over-there"],
-            "q\tnote\t'a note'\t--quest\tover-there",
+            "q\tnote\t'a note'\t--quest\t{id}",
         ),
         (
             vec!["link", "add", "https://x/1", "--quest", "over-there"],
-            "q\tlink\tadd\t'https://x/1'\t--quest\tover-there",
+            "q\tlink\tadd\t'https://x/1'\t--quest\t{id}",
         ),
     ] {
         let env = Env::new();
         env.with_remotes(&[("ws", "ws-host")]);
-        env.over_ssh(env.two_faced("over-there", ok_reply()), &args)
-            .success();
+        let hosts = env.two_faced("over-there", ok_reply());
+        let id = far_id(&hosts, "ws-host");
+        env.over_ssh(hosts, &args).success();
         assert_eq!(
             env.proxy_calls(),
-            [format!("ws-host\t{sent}\t--no-remote")],
+            [format!(
+                "ws-host\t{}\t--no-remote",
+                sent.replace("{id}", &id)
+            )],
             "{args:?}"
         );
     }
@@ -8352,18 +8380,17 @@ fn a_proxied_json_command_is_still_valid_json_on_stdout() {
     let env = Env::new();
     env.with_remotes(&[("ws", "ws-host")]);
     let reply = serde_json::json!({ "stdout": "{\"quest\":{\"slug\":\"over-there\"}}\n" });
+    let hosts = env.two_faced("over-there", reply);
+    let id = far_id(&hosts, "ws-host");
     let assert = env
-        .over_ssh(
-            env.two_faced("over-there", reply),
-            &["show", "over-there", "--json"],
-        )
+        .over_ssh(hosts, &["show", "over-there", "--json"])
         .success();
     let out = json_of(&assert);
     assert_eq!(out["quest"]["slug"], "over-there", "{out}");
     // `--json` travelled: the far end has to know to answer in kind.
     assert_eq!(
         env.proxy_calls(),
-        ["ws-host\tq\tshow\tover-there\t--json\t--no-remote"]
+        [format!("ws-host\tq\tshow\t{id}\t--json\t--no-remote")]
     );
 }
 
@@ -8459,27 +8486,51 @@ fn a_command_that_cannot_travel_is_refused_with_a_reason() {
             .stderr(predicate::str::contains("ws"));
         assert!(env.proxy_calls().is_empty(), "{args:?}");
     }
-    // The snapshot, which is what `--follow` is refused in favour of, travels.
+    // The escape hatch the `--follow` refusal prints is one a human can paste:
+    // the real alias and the real Quest, and `ssh -t`, whose pty is what keeps
+    // the far `q` from outliving the connection (bd-8lz.5.3 review S2).
     let env = Env::new();
     env.with_remotes(&[("ws", "ws-host")]);
     env.over_ssh(
         env.two_faced("over-there", ok_reply()),
-        &["events", "over-there"],
+        &["events", "over-there", "--follow"],
     )
-    .success();
+    .code(1)
+    .stderr(predicate::str::contains(
+        "`ssh -t ws-host q events over-there -f --no-remote`",
+    ));
+
+    // The snapshot, which is what `--follow` is refused in favour of, travels.
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let hosts = env.two_faced("over-there", ok_reply());
+    let id = far_id(&hosts, "ws-host");
+    env.over_ssh(hosts, &["events", "over-there"]).success();
     assert_eq!(
         env.proxy_calls(),
-        ["ws-host\tq\tevents\tover-there\t--no-remote"]
+        [format!("ws-host\tq\tevents\t{id}\t--no-remote")]
     );
 }
 
 /// The confirmation belongs to the machine with the human. The far end's stdin
-/// is `/dev/null`, so its own prompt could only abort — so it is asked here and
-/// the command travels with `-f`.
+/// is `/dev/null`, so its own prompt could only abort — so it is asked here,
+/// and what travels is `--confirmed`: the answer to the question, and nothing
+/// else. See the next test for why that is not `-f`.
 #[test]
-fn a_destructive_command_is_confirmed_here_and_forced_over_there() {
-    // No terminal under a test, so the local prompt refuses and nothing is
-    // sent to run.
+fn a_destructive_command_is_confirmed_here_and_travels_as_confirmed() {
+    // Answered "no" — nothing is sent to run.
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.answering(
+        env.two_faced("over-there", ok_reply()),
+        "n",
+        &["close", "over-there"],
+    )
+    .code(1)
+    .stderr(predicate::str::contains("aborted"));
+    assert!(env.proxy_calls().is_empty(), "{:?}", env.proxy_calls());
+
+    // No terminal and nothing scripted is a "no" as well.
     let env = Env::new();
     env.with_remotes(&[("ws", "ws-host")]);
     env.over_ssh(
@@ -8490,18 +8541,187 @@ fn a_destructive_command_is_confirmed_here_and_forced_over_there() {
     .stderr(predicate::str::contains("aborted"));
     assert!(env.proxy_calls().is_empty(), "{:?}", env.proxy_calls());
 
-    // Answered with `-f`, it travels — once, with `-f` still on it.
+    // Answered "yes" — it travels, once, with `--confirmed` and never `-f`.
+    for (args, sent) in [
+        (vec!["close", "over-there"], "q\tclose\t{id}\t--confirmed"),
+        (vec!["rm", "over-there"], "q\trm\t{id}\t--confirmed"),
+        (
+            vec!["kill", "over-there/tests"],
+            "q\tkill\t{id}/tests\t--confirmed",
+        ),
+    ] {
+        let env = Env::new();
+        env.with_remotes(&[("ws", "ws-host")]);
+        let hosts = env.two_faced("over-there", ok_reply());
+        let id = far_id(&hosts, "ws-host");
+        env.answering(hosts, "y", &args).success();
+        let calls = env.proxy_calls();
+        assert_eq!(
+            calls,
+            [format!(
+                "ws-host\t{}\t--no-remote",
+                sent.replace("{id}", &id)
+            )],
+            "{args:?}"
+        );
+        assert!(!calls[0].contains("\t-f"), "{args:?}: {calls:?}");
+    }
+
+    // `-f` given by the user is the user's own word and still travels as `-f`:
+    // the prompt is skipped here, and the far end gets the powers `-f` has
+    // there — which is exactly what the same line typed on that machine does.
     let env = Env::new();
     env.with_remotes(&[("ws", "ws-host")]);
-    env.over_ssh(
-        env.two_faced("over-there", ok_reply()),
-        &["close", "over-there", "-f"],
-    )
-    .success();
+    let hosts = env.two_faced("over-there", ok_reply());
+    let id = far_id(&hosts, "ws-host");
+    env.over_ssh(hosts, &["close", "over-there", "-f"])
+        .success();
     assert_eq!(
         env.proxy_calls(),
-        ["ws-host\tq\tclose\tover-there\t-f\t--no-remote"]
+        [format!("ws-host\tq\tclose\t{id}\t-f\t--no-remote")]
     );
+}
+
+/// B1. Locally, `-f` on `q rm` carries two meanings: skip the prompt, *and*
+/// override the refusal to delete a Quest whose tmux session is still running.
+/// A proxied `q rm` answers the first question only, so `--confirmed` must not
+/// buy the second — otherwise the identical command is strictly more
+/// destructive against a remote Quest than against a local one.
+#[test]
+fn confirmed_answers_the_question_and_buys_nothing_else() {
+    // A live tmux session: the hard refusal, which is not a confirmation at all.
+    let env = Env::new();
+    env.new_quest("foo");
+    env.cmd()
+        .env("Q_FIXTURE_CONFIRM", "y")
+        .args(["rm", "foo", "--confirmed"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("still runs in tmux session q-foo"));
+    assert_eq!(env.count("SELECT count(*) FROM quest"), 1);
+
+    // `-f` is what authorises that, and it still does.
+    env.cmd().args(["rm", "foo", "-f"]).assert().success();
+    assert_eq!(env.count("SELECT count(*) FROM quest"), 0);
+
+    // With no session left there is only the question, and `--confirmed`
+    // answers it.
+    let env = Env::new();
+    env.new_quest("foo");
+    env.write_fixture(serde_json::json!({ "next_pane": 1, "panes": [] }));
+    env.cmd()
+        .args(["rm", "foo", "--confirmed"])
+        .assert()
+        .success();
+    assert_eq!(env.count("SELECT count(*) FROM quest"), 0);
+}
+
+/// B2. The prompt is built from the Quest that was resolved **here**; the far
+/// end must act on that Quest and not re-resolve the fragment against its own
+/// database, which may have moved on since the listing this end read.
+///
+/// So what travels is the identity, and the fragment the user typed is not on
+/// the wire at all: the Quest named in the question is the Quest that dies.
+#[test]
+fn a_destructive_command_names_the_quest_it_destroys() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let hosts = env.two_faced("over-there", ok_reply());
+    let id = far_id(&hosts, "ws-host");
+    // A fragment, not the slug — the shape that resolves differently on two
+    // databases.
+    env.answering(hosts, "y", &["rm", "over"])
+        .success()
+        .stderr(predicate::str::contains(
+            "remove quest (and all of its history) over-there on ws?",
+        ));
+    let calls = env.proxy_calls();
+    assert_eq!(
+        calls,
+        [format!("ws-host\tq\trm\t{id}\t--confirmed\t--no-remote")]
+    );
+    assert!(!calls[0].contains("\tover\t"), "{calls:?}");
+}
+
+/// A `q kill` prompt names the session, which is the only thing that dies —
+/// not the Quest that contains it. And the master is refused before the
+/// question, exactly as `kill::guard_master` refuses it locally: a human must
+/// not be asked to authorise a kill `q` will not perform.
+#[test]
+fn a_remote_kill_asks_about_the_session_and_never_about_the_master() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.answering(
+        env.two_faced("over-there", ok_reply()),
+        "n",
+        &["kill", "over-there/tests"],
+    )
+    .code(1)
+    .stderr(predicate::str::contains(
+        "kill session over-there/tests on ws?",
+    ));
+
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.answering(
+        env.two_faced("over-there", ok_reply()),
+        "y",
+        &["kill", "over-there/master"],
+    )
+    .code(1)
+    .stderr(predicate::str::contains(
+        "is the master of quest over-there",
+    ))
+    .stderr(predicate::str::contains("q close over-there"));
+    assert!(env.proxy_calls().is_empty(), "{:?}", env.proxy_calls());
+}
+
+/// S1. A `--` makes everything after it positional over there, so the guard
+/// cannot ride on the end of the line: it goes where the far end reads it as
+/// the flag it is. Without this, a command that is perfectly legal on the
+/// machine that runs it fails when proxied, blaming an argument the user never
+/// typed.
+#[test]
+fn a_separator_in_the_line_does_not_swallow_the_guard() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let hosts = env.two_faced("over-there", ok_reply());
+    let id = far_id(&hosts, "ws-host");
+    env.over_ssh(
+        hosts,
+        &["note", "--quest", "over-there", "--", "-- a dashed note"],
+    )
+    .success();
+    // Before the separator, so the far end reads it as a flag; the free text is
+    // still one shell word and still says what it said.
+    assert_eq!(
+        env.proxy_calls(),
+        [format!(
+            "ws-host\tq\tnote\t--quest\t{id}\t--no-remote\t--\t'-- a dashed note'"
+        )]
+    );
+}
+
+/// …and the far end, running that exact line, does what the user asked — with
+/// no `--no-remote` anywhere in the note.
+#[test]
+fn the_line_a_separator_produces_is_one_the_far_end_accepts() {
+    let far = Env::new();
+    far.new_quest("over-there");
+    far.cmd()
+        .args(["note", "--quest", "over-there", "--no-remote"])
+        .args(["--", "-- a dashed note"])
+        .assert()
+        .success();
+    let events = far.json(&["events", "over-there"]);
+    let notes: Vec<&str> = events
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter(|e| e["kind"] == "note")
+        .filter_map(|e| e["payload"]["text"].as_str())
+        .collect();
+    assert_eq!(notes, ["-- a dashed note"], "{events}");
 }
 
 /// SPEC §15: `q new --machine ws …` → `ssh <alias> q new … -d`. The Quest is
@@ -8616,14 +8836,12 @@ fn a_remote_creation_that_fails_says_what_the_far_end_said() {
 fn resume_on_a_remote_runs_detached_there_and_attaches_from_here() {
     let env = Env::new();
     env.with_remotes(&[("ws", "ws-host")]);
-    env.over_ssh(
-        env.two_faced("over-there", ok_reply()),
-        &["resume", "over-there"],
-    )
-    .success();
+    let hosts = env.two_faced("over-there", ok_reply());
+    let id = far_id(&hosts, "ws-host");
+    env.over_ssh(hosts, &["resume", "over-there"]).success();
     assert_eq!(
         env.proxy_calls(),
-        ["ws-host\tq\tresume\tover-there\t-d\t--no-remote"]
+        [format!("ws-host\tq\tresume\t{id}\t-d\t--no-remote")]
     );
     assert_eq!(
         attach_calls(&env),
@@ -8730,15 +8948,16 @@ fn free_text_reaches_the_far_end_as_one_shell_word() {
     let env = Env::new();
     env.with_remotes(&[("ws", "ws-host")]);
     let text = "run `make test` for $USER 'now' FOO=1 ~x";
-    env.over_ssh(
-        env.two_faced("over-there", ok_reply()),
-        &["send", "over-there/master", text],
-    )
-    .success();
+    let hosts = env.two_faced("over-there", ok_reply());
+    let id = far_id(&hosts, "ws-host");
+    env.over_ssh(hosts, &["send", "over-there/master", text])
+        .success();
     assert_eq!(
         env.proxy_calls(),
-        ["ws-host\tq\tsend\tover-there/master\t\
-          'run `make test` for $USER '\\''now'\\'' FOO=1 ~x'\t--no-remote"]
+        [format!(
+            "ws-host\tq\tsend\t{id}/master\t\
+             'run `make test` for $USER '\\''now'\\'' FOO=1 ~x'\t--no-remote"
+        )]
     );
 }
 

@@ -38,6 +38,9 @@ pub struct Ctx {
     /// SPEC §15's recursion guard: set on the `q list` we run over ssh, so the
     /// far end answers out of its own database instead of fanning out again.
     no_remote: bool,
+    /// A human already answered this command's confirmation, on the machine
+    /// that had the terminal — see [`cli::Cli::confirmed`].
+    confirmed: bool,
     /// Absent only for `q config`, which has to work before — and in order to
     /// fix — a broken environment.
     db: Option<Db>,
@@ -81,6 +84,12 @@ impl Ctx {
         !self.no_remote
     }
 
+    /// True under `--confirmed`: skip the `[y/N]`, and only that. Nothing in
+    /// `q` may read this as `-f`.
+    pub fn confirmed(&self) -> bool {
+        self.confirmed
+    }
+
     fn new(args: &Cli, config: Config, db: Option<Db>) -> anyhow::Result<Ctx> {
         let machine_override = match &args.machine {
             Some(m) => {
@@ -107,6 +116,7 @@ impl Ctx {
             config,
             machine_override,
             no_remote: args.no_remote,
+            confirmed: args.confirmed,
             db,
             tmux: tmux::tmux(),
             ssh: remote::ssh().into(),
@@ -149,6 +159,7 @@ impl Ctx {
             config: Config::default(),
             machine_override: None,
             no_remote: args.no_remote,
+            confirmed: args.confirmed,
             db: None,
             tmux: tmux::tmux(),
             ssh: remote::ssh().into(),
@@ -213,6 +224,7 @@ impl Ctx {
             config,
             machine_override: None,
             no_remote: false,
+            confirmed: false,
             db: Some(db),
             tmux,
             ssh: Arc::new(remote::stub::NoSsh),
@@ -242,6 +254,12 @@ impl Ctx {
     #[cfg(test)]
     pub fn with_no_remote(mut self, no_remote: bool) -> Ctx {
         self.no_remote = no_remote;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_confirmed(mut self, confirmed: bool) -> Ctx {
+        self.confirmed = confirmed;
         self
     }
 }
