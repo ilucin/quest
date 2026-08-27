@@ -51,9 +51,7 @@ impl Sent {
 /// the TUI still owns.
 pub fn apply(ctx: &Ctx, found: &target::Target, text: &str, force: bool) -> anyhow::Result<Sent> {
     let text = text.trim_end_matches(['\r', '\n']);
-    if text.trim().is_empty() {
-        return Err(QError::Invalid("nothing to send".to_string()).into());
-    }
+    check_text(text)?;
     found.require_live()?;
 
     let (verdict, refusal) = found.idle_gate(ctx);
@@ -104,8 +102,18 @@ pub fn apply(ctx: &Ctx, found: &target::Target, text: &str, force: bool) -> anyh
     })
 }
 
+fn check_text(text: &str) -> anyhow::Result<()> {
+    if text.trim().is_empty() {
+        return Err(QError::Invalid("nothing to send".to_string()).into());
+    }
+    Ok(())
+}
+
 pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     let text = args.text.trim_end_matches(['\r', '\n']);
+    // Ahead of the sweep: an argument that can never be valid must not cost a
+    // database write before it is rejected.
+    check_text(text)?;
     sweep_quiet(ctx)?;
     let found = target::resolve(ctx, args.session)?;
     let sent = apply(ctx, &found, text, args.force)?;

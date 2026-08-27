@@ -327,6 +327,13 @@ struct AttachWant {
     quest: crate::model::Quest,
     label: Option<String>,
     name: String,
+    /// The exact `q` session row the attach must land in, when the caller had
+    /// one in hand. `enter::resolve` finds a label among the Quest's *live*
+    /// sessions, and labels are reused once a worker is gone — so with `a` on,
+    /// selecting an ended `alpha/tests` and pressing `⏎` would attach to its
+    /// live replacement, under a name identical to the one the row showed.
+    /// `None` on the Quests tab, where the master is whichever row holds it.
+    session: Option<String>,
 }
 
 /// Nothing selected is `None`; a selection whose Quest has since been deleted
@@ -337,6 +344,7 @@ fn attach_want(ctx: &Ctx, app: &App) -> anyhow::Result<Option<AttachWant>> {
             name: quest.slug.clone(),
             quest,
             label: None,
+            session: None,
         })),
         Tab::Sessions => {
             let Some(selection) = sessions::selected(app) else {
@@ -352,6 +360,7 @@ fn attach_want(ctx: &Ctx, app: &App) -> anyhow::Result<Option<AttachWant>> {
                 quest,
                 label: Some(selection.label),
                 name: selection.name,
+                session: Some(selection.session),
             }))
         }
         _ => Ok(None),
@@ -396,6 +405,18 @@ where
             return Ok(());
         }
     };
+    // SPEC §17 is "attach to exactly that window". `enter::resolve` answers a
+    // narrower question — which LIVE session of this Quest carries that label —
+    // and a reused label makes the two different rows.
+    if let Some(wanted) = &want.session
+        && &target.session.id != wanted
+    {
+        app.say(format!(
+            "{} is not that session any more (the label was reused); x to reload",
+            want.name
+        ));
+        return Ok(());
+    }
     if !ctx.config.ui.return_after_detach {
         // Hand the terminal back for good: outside tmux the attach replaces
         // this process and never returns, and inside it the client moves to
@@ -2427,6 +2448,225 @@ mod tests {
             Vec::<&str>::new(),
             "the terminal was handed over"
         );
+    }
+
+    /// B1. A row a `q spawn` inserted before its window opened has no pane,
+    /// and `capture-pane -t ''` reads whatever pane is current — q's own.
+    #[test]
+    fn peeking_at_a_row_whose_window_never_opened_never_reaches_the_pager() {
+        let (ctx, _dir) = fleet_ctx();
+        // The worker loses its pane the way a half-finished spawn leaves it:
+        // the row is live, the pane column is empty.
+        ctx.db()
+            .unwrap()
+            .update_session_pane(&session_id(&ctx, "tests"), "")
+            .unwrap();
+        let mut app = on_session(&ctx, "tests");
+
+        let out = _dir.path().join("never");
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let mut terminal = test_terminal();
+        pager::with_pager(Some(&format!("tee {}", out.display())), || {
+            peek_in_pager(&ctx, &mut term, &mut terminal, &mut app).expect("peek");
+        });
+        assert!(!out.exists(), "the pager ran on q's own pane");
+        assert!(app.status.contains("has no pane"), "{}", app.status);
+        assert_eq!(term.calls, Vec::<&str>::new());
+        // Both windows are still there.
+        assert_eq!(fixture(&_dir).panes.len(), 2);
+    }
+
+    // ------------------------------- the event loop's own prompt dispatcher
+
+    /// N-3. Every earlier test of these three prompts called `sessions::submit`
+    /// directly. `tui::submit` is what the event loop actually calls, and if
+    /// its match arm sent session prompts to `quests::submit` they would land
+    /// on that function's `Prompt::Send(_) | Kill(_) | Reset(_) => Ok(())` arm:
+    /// the form would close, the status would say nothing was wrong, and
+    /// nothing would happen. These drive the real dispatcher.
+    fn focus_field(app: &mut App, label: &str) {
+        for _ in 0..24 {
+            let at = app
+                .modal
+                .as_ref()
+                .expect("no form is open")
+                .form
+                .focused()
+                .map(crate::tui::form::Field::label);
+            if at == Some(label) {
+                return;
+            }
+            app.handle(Input::Tab);
+        }
+        panic!("no field labelled {label}");
+    }
+
+    /// Move the action row off `cancel`, the way the user has to.
+    fn arm_action(app: &mut App) {
+        focus_field(app, crate::tui::form::ACTION);
+        for _ in 0..3 {
+            if app.modal.as_ref().unwrap().form.confirmed() {
+                return;
+            }
+            app.handle(Input::Right);
+        }
+        panic!("the action row never left `{}`", crate::tui::form::CANCEL);
+    }
+
+    fn session_id(ctx: &Ctx, label: &str) -> String {
+        ctx.db()
+            .unwrap()
+            .list_live_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.label == label)
+            .unwrap_or_else(|| panic!("no session labelled {label}"))
+            .id
+    }
+
+    #[test]
+    fn the_loops_dispatcher_runs_a_kill_prompt_and_not_a_quest_one() {
+        let (ctx, _dir) = fleet_ctx();
+        let mut app = on_session(&ctx, "tests");
+        assert_eq!(app.handle(Input::Char('k')), Action::None);
+        arm_action(&mut app);
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+
+        submit(&ctx, &mut app);
+        assert!(app.modal.is_none(), "{}", app.status);
+        assert!(app.status.contains("killed alpha/tests"), "{}", app.status);
+        // The proof the prompt was really run: the window is gone.
+        let panes = fixture(&_dir).panes;
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].window_name, "master");
+    }
+
+    #[test]
+    fn the_loops_dispatcher_runs_a_send_prompt_and_not_a_quest_one() {
+        let (ctx, _dir) = fleet_ctx();
+        let mut app = on_session(&ctx, "tests");
+        assert_eq!(app.handle(Input::Char('t')), Action::None);
+        focus_field(&mut app, "text");
+        for c in "carry on".chars() {
+            app.handle(Input::Char(c));
+        }
+        arm_action(&mut app);
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+
+        submit(&ctx, &mut app);
+        assert!(app.modal.is_none(), "{}", app.status);
+        assert!(app.status.contains("sent to alpha/tests"), "{}", app.status);
+        let panes = fixture(&_dir).panes;
+        let worker = panes.iter().find(|p| p.pane_id == "%2").unwrap();
+        assert!(worker.buffer.contains("carry on"), "{:?}", worker.buffer);
+        // And only into that pane.
+        let master = panes.iter().find(|p| p.pane_id == "%1").unwrap();
+        assert!(!master.buffer.contains("carry on"), "{:?}", master.buffer);
+    }
+
+    #[test]
+    fn the_loops_dispatcher_runs_a_reset_prompt_and_not_a_quest_one() {
+        let (ctx, _dir) = fleet_ctx();
+        let mut app = on_session(&ctx, "tests");
+        assert_eq!(app.handle(Input::Char('Z')), Action::None);
+        arm_action(&mut app);
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+
+        submit(&ctx, &mut app);
+        assert!(app.modal.is_none(), "{}", app.status);
+        assert!(
+            app.status.contains("resetting alpha/tests"),
+            "{}",
+            app.status
+        );
+        let id = session_id(&ctx, "tests");
+        let events = ctx
+            .db()
+            .unwrap()
+            .list_events_by_kinds(&quest_id(&ctx), &["session.reset_scheduled"], 10)
+            .unwrap();
+        assert_eq!(events.len(), 1, "nothing was scheduled");
+        assert_eq!(events[0].session_id.as_deref(), Some(id.as_str()));
+    }
+
+    /// A failing session prompt must come back into the form the way a Quest
+    /// prompt does, rather than closing as if it had worked.
+    #[test]
+    fn a_session_prompt_that_fails_keeps_the_form_up_with_the_reason() {
+        let (ctx, _dir) = fleet_ctx();
+        let mut app = on_session(&ctx, "tests");
+        app.handle(Input::Char('k'));
+        // The window dies while the box is up.
+        let tmux = crate::tmux::FixtureTmux::new(fixture_path(&_dir));
+        let mut state = tmux.load().unwrap();
+        state.panes.retain(|p| p.pane_id != "%2");
+        tmux.save(&state).unwrap();
+        arm_action(&mut app);
+        app.handle(Input::Enter);
+
+        submit(&ctx, &mut app);
+        let error = app
+            .modal
+            .as_ref()
+            .expect("the form closed on a failure")
+            .form
+            .error()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("Esc and try again"), "{error}");
+    }
+
+    fn quest_id(ctx: &Ctx) -> String {
+        ctx.db().unwrap().list_quests(true).unwrap()[0].id.clone()
+    }
+
+    /// N-1. SPEC §17's `⏎` is "attach to exactly that window". `enter::resolve`
+    /// answers a narrower question — which *live* session carries this label —
+    /// and a label is reused once its worker is gone, so with `a` on, an ended
+    /// `alpha/tests` would have attached to its live replacement under a name
+    /// identical to the row's.
+    #[test]
+    fn enter_refuses_a_row_whose_label_now_belongs_to_another_session() {
+        use crate::model::{Session, SessionRole, SessionStatus};
+        let (ctx, _dir) = fleet_ctx();
+        // The worker ends and a replacement takes its label and a new pane.
+        let old = session_id(&ctx, "tests");
+        ctx.db()
+            .unwrap()
+            .mark_session_ended(&old, crate::model::now())
+            .unwrap();
+        let quest = quest_id(&ctx);
+        let mut row = Session::new(&quest, SessionRole::Worker, "tests", "q-alpha", "%2");
+        row.status = SessionStatus::Idle;
+        let fresh = ctx.db().unwrap().insert_session(&row).unwrap();
+        assert_ne!(fresh.id, old);
+
+        let mut app = loaded(&ctx);
+        assert_eq!(app.handle(Input::Char('2')), Action::None);
+        // `a` shows the ended rows, and the reload it asks for is what puts
+        // them in the listing.
+        assert_eq!(app.handle(Input::Char('a')), Action::Refresh);
+        refresh_now(&ctx, &mut app);
+        for _ in 0..8 {
+            if sessions::selected(&app).map(|s| s.session) == Some(old.clone()) {
+                break;
+            }
+            app.handle(Input::Down);
+        }
+        assert_eq!(sessions::selected(&app).map(|s| s.session), Some(old));
+
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let mut terminal = test_terminal();
+        attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
+        assert!(
+            app.status.contains("not that session any more"),
+            "it attached to the replacement: {}",
+            app.status
+        );
+        assert!(fixture(&_dir).attached.is_none());
+        assert!(term.calls.is_empty(), "{:?}", term.calls);
     }
 
     /// With nothing selected there is nothing to attach to, and the loop must

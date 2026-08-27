@@ -278,12 +278,19 @@ pub fn settle_view(app: &mut App) {
     app.sessions.settle(page);
 }
 
-/// How many rows the body can show. The group headers cost a line each, and
-/// there are at most [`GROUPS`] of them, so reserving that many is a bound
-/// rather than a guess.
+/// How many rows the body can show. The group headers cost a line each, so the
+/// listing's *own* headers are reserved rather than all [`GROUPS`] of them: a
+/// fleet that is entirely idle costs one header, not five, and on a short
+/// terminal the difference is most of the screen.
 fn viewport(app: &App) -> usize {
     let body = app.height.saturating_sub(2) as usize;
-    body.saturating_sub(GROUPS).max(1)
+    let state = &app.sessions;
+    let mut seen = [false; GROUPS];
+    for i in state.visible() {
+        seen[rank(&state.rows[i]) as usize] = true;
+    }
+    body.saturating_sub(seen.iter().filter(|s| **s).count())
+        .max(1)
 }
 
 // ------------------------------------------------------------------- keymap
@@ -418,6 +425,15 @@ fn not_idle(view: &SessionView) -> Option<String> {
     }
 }
 
+/// A row a `q spawn` inserted before its window opened carries no pane, and
+/// tmux reads an empty `-t` target as "whatever is current" — q's own window,
+/// when q runs inside tmux. The sweep ends such a row a few seconds in; until
+/// then none of the three boxes may open on it, because each of them would say
+/// "pane " with nothing after it and then act on the wrong window.
+fn no_pane(view: &SessionView) -> bool {
+    view.session.tmux_pane.is_empty()
+}
+
 /// `t` — SPEC §17. Typing into a live Claude session is destructive when
 /// mistimed (SPEC §23 #5), so this is an `action` prompt and the idle gate is
 /// on by default: `force` is a separate, explicit switch, exactly as
@@ -429,6 +445,13 @@ fn open_send(app: &mut App) -> Action {
     if view.session.status == SessionStatus::Ended {
         let name = name_of(view);
         app.say(format!("{name} has ended; there is no pane to type into"));
+        return Action::None;
+    }
+    if no_pane(view) {
+        let name = name_of(view);
+        app.say(format!(
+            "{name} has no pane yet; it never finished starting"
+        ));
         return Action::None;
     }
     let gate = not_idle(view);
@@ -470,6 +493,13 @@ fn open_kill(app: &mut App) -> Action {
         app.say(format!("{name} has already ended"));
         return Action::None;
     }
+    if no_pane(view) {
+        let name = name_of(view);
+        app.say(format!(
+            "{name} has no window yet; it never finished starting"
+        ));
+        return Action::None;
+    }
     let pane = view.session.tmux_pane.clone();
     let target = target_of(view);
     let form = Form::new(format!("kill {}?", target.name))
@@ -489,6 +519,13 @@ fn open_reset(app: &mut App) -> Action {
     if view.session.status == SessionStatus::Ended {
         let name = name_of(view);
         app.say(format!("{name} has ended; there is no context to reset"));
+        return Action::None;
+    }
+    if no_pane(view) {
+        let name = name_of(view);
+        app.say(format!(
+            "{name} has no pane yet; it never finished starting"
+        ));
         return Action::None;
     }
     let gate = not_idle(view);
@@ -559,6 +596,19 @@ fn session_for(ctx: &Ctx, target: &SessionTarget) -> anyhow::Result<resolve_targ
             target.name, target.quest
         ))
     })?;
+    // Before the comparison, not after: an empty pane equals an empty pane, so
+    // a row that never opened a window passes the pane check against a target
+    // captured from itself. tmux reads an empty `-t` as "whatever is current",
+    // and inside tmux that is q's own window — `k` would kill it, `p` would
+    // page it, `t --force` would type into it. The commands refuse this too;
+    // saying it here keeps the box honest about which row it is.
+    if session.tmux_pane.is_empty() || target.pane.is_empty() {
+        return Err(QError::Invalid(format!(
+            "{} has no pane; it never finished starting",
+            target.name
+        ))
+        .into());
+    }
     if session.tmux_pane != target.pane {
         return Err(QError::Invalid(format!(
             "{} is pane {} now, not {} as this box says; Esc and try again",
@@ -650,17 +700,21 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
     let mut group: Option<u8> = None;
     for (n, i) in visible.iter().enumerate().skip(state.offset) {
-        if lines.len() >= capacity {
+        let left = capacity - lines.len();
+        if left == 0 {
             break;
         }
         let view = &state.rows[*i];
         let at = rank(view);
-        if group != Some(at) {
-            group = Some(at);
+        // The header only goes in when its row fits under it. Pushing the pair
+        // and truncating afterwards left a header with nothing beneath it —
+        // and at a one-line body that swallowed the selected row entirely.
+        if group != Some(at) && left >= 2 {
             lines.push(Line::from(
                 Span::raw(layout::truncate(group_title(at), width)).dim(),
             ));
         }
+        group = Some(at);
         lines.push(row_line(
             &cells[n],
             &widths,
@@ -669,7 +723,6 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             width,
         ));
     }
-    lines.truncate(capacity);
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1175,6 +1228,63 @@ mod tests {
         assert_eq!(handle(&mut app, Input::Enter), Action::None);
     }
 
+    /// N-7. `viewport` reserved all five group headers unconditionally, so at
+    /// a body of 8 rows the effective page was 3 and PageDown moved 3 with
+    /// five usable lines empty. It reserves the listing's own headers instead.
+    #[test]
+    fn the_viewport_only_pays_for_the_groups_the_listing_actually_has() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        for (n, label) in ["w1", "w2", "w3", "w4", "w5", "w6"].into_iter().enumerate() {
+            let mut row = spec(label, SessionStatus::Idle);
+            row.updated_at = 1_000 + n as i64;
+            rig.session(&quest, &format!("%{}", n + 1), row);
+        }
+        let mut app = rig.app();
+        // One group ("idle"), so a body of 10 shows 9 rows, not 5.
+        app.set_size(120, 12);
+        assert_eq!(viewport(&app), 9);
+
+        // PageDown moves by that page rather than by a constant.
+        assert_eq!(app.sessions.selected, 0);
+        handle(&mut app, Input::PageDown);
+        assert_eq!(app.sessions.selected, 5, "PageDown paged by the wrong step");
+    }
+
+    /// The same off-by-one at the bottom of the loop: the header and its row
+    /// were pushed as a pair and the excess truncated afterwards, so a header
+    /// could render with nothing under it — and at a one-line body it ate the
+    /// selected row entirely.
+    #[test]
+    fn a_group_header_never_renders_without_its_row_under_it() {
+        let (_rig, mut app) = fleet();
+        for h in 1..=12u16 {
+            app.set_size(120, h + 2);
+            let lines = draw(&mut app, 120, h + 2);
+            // The body is everything but the tab bar and the status line.
+            let body: Vec<&String> = lines[1..lines.len().saturating_sub(1)].iter().collect();
+            let headers = ["waiting", "busy", "starting", "idle", "ended"];
+            for (n, line) in body.iter().enumerate() {
+                if !headers.contains(&line.trim()) {
+                    continue;
+                }
+                let under = body.get(n + 1).map(|l| l.trim()).unwrap_or("");
+                assert!(
+                    !under.is_empty() && !headers.contains(&under),
+                    "h={h}: `{}` has nothing under it\n{}",
+                    line.trim(),
+                    lines.join("\n")
+                );
+            }
+            // And whatever the height, the selected row is on screen.
+            assert!(
+                body.iter().any(|l| l.starts_with('\u{25b8}')),
+                "h={h}: the selection is invisible\n{}",
+                lines.join("\n")
+            );
+        }
+    }
+
     // ------------------------------------------------- the Quests hand-off
 
     /// SPEC §17: `s` on the Quests tab means "the Sessions tab, filtered to
@@ -1676,6 +1786,98 @@ mod tests {
         );
     }
 
+    // ------------------------------------------- rows that never got a pane
+
+    /// B1. `q spawn` inserts the worker row *before* it opens the window, and
+    /// the sweep leaves a pane-less row alone for `START_GRACE_SECS`. In that
+    /// window the row is `starting`, live, not master — so every one of the
+    /// three boxes used to open on it, and every five-part identity check used
+    /// to pass, because the target's pane was captured from the same row:
+    /// `"" != ""` is false. tmux reads an empty `-t` as "whatever is current",
+    /// which inside tmux is the window `q` itself is running in.
+    #[test]
+    fn the_three_destructive_keys_refuse_a_row_whose_window_never_opened() {
+        for (key, want) in [
+            ('k', "has no window yet"),
+            ('t', "has no pane yet"),
+            ('Z', "has no pane yet"),
+        ] {
+            let rig = Rig::new();
+            let quest = rig.quest("alpha");
+            // Live, idle, a worker, and young enough that the sweep leaves the
+            // missing pane alone — nothing else refuses it.
+            rig.session(&quest, "", pending("tests"));
+            // A second Quest with a real window, so there is something for an
+            // empty target to have hit.
+            let beta = rig.quest("beta");
+            rig.session(&beta, "%1", spec("docs", SessionStatus::Idle));
+            let mut app = rig.app();
+            for _ in 0..4 {
+                if sessions_label(&app) == "tests" {
+                    break;
+                }
+                handle(&mut app, Input::Down);
+            }
+            assert_eq!(sessions_label(&app), "tests");
+
+            assert_eq!(handle(&mut app, Input::Char(key)), Action::None);
+            assert!(app.modal.is_none(), "`{key}` opened a box: {}", app.status);
+            assert!(
+                app.status.contains("alpha/tests") && app.status.contains(want),
+                "`{key}` said {:?}",
+                app.status
+            );
+            // Nothing was killed, and nothing was typed anywhere.
+            let panes = rig.fixture().load().unwrap().panes;
+            assert_eq!(panes.len(), 1, "`{key}` killed a window");
+            assert!(panes[0].buffer.is_empty(), "`{key}`: {:?}", panes[0].buffer);
+            let events = rig.db().list_events_by_quest(&quest.id, 10).unwrap();
+            assert!(events.is_empty(), "`{key}`: {events:?}");
+        }
+    }
+
+    /// And the layer under the openers: a prompt carrying a pane-less target
+    /// is refused at submit too, so a future opener that forgets the check
+    /// cannot get past `session_for`.
+    #[test]
+    fn submitting_a_prompt_with_no_pane_is_refused_by_the_identity_check() {
+        for open in [
+            Prompt::Kill as fn(SessionTarget) -> Prompt,
+            Prompt::Send,
+            Prompt::Reset,
+        ] {
+            let rig = Rig::new();
+            let quest = rig.quest("alpha");
+            let session = rig.session(&quest, "", pending("tests"));
+            let beta = rig.quest("beta");
+            rig.session(&beta, "%1", spec("docs", SessionStatus::Idle));
+            let mut app = rig.app();
+
+            let target = SessionTarget {
+                session: session.id.clone(),
+                quest: quest.id.clone(),
+                pane: String::new(),
+                started_at: session.started_at,
+                name: "alpha/tests".to_string(),
+                ended: false,
+            };
+            let form = Form::new("box").text(F_TEXT, "hello", "").action("go");
+            let error = submit(&rig.ctx, &mut app, &open(target), &form)
+                .expect_err("a pane-less target was acted on");
+            assert!(format!("{error:#}").contains("has no pane"), "{error:#}");
+
+            let panes = rig.fixture().load().unwrap().panes;
+            assert_eq!(panes.len(), 1);
+            assert!(panes[0].buffer.is_empty(), "{:?}", panes[0].buffer);
+            assert!(
+                rig.db()
+                    .list_events_by_quest(&quest.id, 10)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
     // ---------------------------------------------------------------- misc
 
     /// `k` is kill here, so half a vim keymap would be a trap.
@@ -1753,6 +1955,18 @@ mod tests {
         for key in ["peek", "send text", "kill this worker", "reset its context"] {
             assert!(text.contains(key), "{key} missing\n{text}");
         }
+    }
+
+    /// A row a `q spawn` inserted but never gave a pane, young enough that the
+    /// sweep's start grace has not run out.
+    fn pending(label: &'static str) -> Spec {
+        let mut spec = spec(label, SessionStatus::Idle);
+        spec.updated_at = crate::model::now();
+        spec
+    }
+
+    fn sessions_label(app: &App) -> String {
+        selected(app).expect("nothing selected").label
     }
 
     fn form_notes(app: &App) -> Vec<String> {

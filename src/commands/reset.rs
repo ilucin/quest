@@ -145,6 +145,11 @@ fn attempt(ctx: &Ctx, args: &Args, scheduled: bool) -> anyhow::Result<u8> {
         .unwrap_or_else(|| Strategy::from_config(&ctx.config));
     let session = &found.session;
     let db = ctx.db()?;
+    // A row whose window never opened has an empty pane, and every `send_keys`
+    // below would then land on whatever window is current — `/clear` typed into
+    // the caller's own terminal. The gate cannot catch it: a `starting` row that
+    // a hook marked idle passes.
+    found.require_pane()?;
 
     let (verdict, refusal) = found.idle_gate(ctx);
     if let Some(reason) = refusal {
@@ -384,25 +389,51 @@ pub fn spawn_detached(
     found: &target::Target,
     strategy: Strategy,
 ) -> anyhow::Result<Vec<String>> {
-    if found.session.role == SessionRole::Master && found.session.tmux_pane.is_empty() {
-        return Err(QError::Other(format!("{} has no pane", found.name())).into());
-    }
+    spawn_detached_with(ctx, found, strategy, &detach)
+}
+
+/// [`spawn_detached`] with its one impure edge injected, the way [`schedule`]
+/// takes it — so a test can prove what was decided without forking anything.
+/// Without this, `current_exe()` inside a unit test is the *test binary*, and
+/// every `Z` test really did spawn a copy of it.
+fn spawn_detached_with(
+    ctx: &Ctx,
+    found: &target::Target,
+    strategy: Strategy,
+    launch: &dyn Fn(&[String]) -> Launch,
+) -> anyhow::Result<Vec<String>> {
+    // `require_live` covers both halves: an ended row, and a row whose window
+    // never opened (an empty pane is "the current window" to tmux, so a reset
+    // would type `/clear` into whatever the caller is looking at).
     found.require_live()?;
     let (_, refusal) = found.idle_gate(ctx);
     if let Some(reason) = refusal {
         return Err(QError::Conflict(format!("{} is not idle: {reason}", found.name())).into());
     }
+    // The same cooldown the AUTO path takes. Without it, a `Z` landing on a
+    // session the `Stop` hook has just scheduled a `--delay 2` reset for runs
+    // two children: this one clears now, the other wakes two seconds later,
+    // re-takes an idle gate the fresh `SessionStart` has just satisfied, and
+    // clears the new context window plus its follow-up (SPEC §8).
+    if recently_scheduled(ctx.db()?, &found.quest.id, &found.session.id) {
+        return Err(QError::Conflict(format!(
+            "{} already has a reset scheduled; wait for it",
+            found.name()
+        ))
+        .into());
+    }
 
     let argv = argv(&found.session.id, strategy, 0)
         .ok_or_else(|| QError::Other("cannot find this q binary to re-invoke".to_string()))?;
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "ctx_pct": found.session.ctx_pct,
         "strategy": strategy.as_str(),
         "delay": 0,
         "manual": true,
         "argv": argv,
     });
-    if detach(&argv) == Launch::Failed {
+    let outcome = launch(&argv);
+    if outcome == Launch::Failed {
         let mut failed = payload.clone();
         failed["stage"] = serde_json::json!("spawn");
         let _ = ctx.db()?.append_event(
@@ -413,6 +444,9 @@ pub fn spawn_detached(
         );
         return Err(QError::Other(format!("cannot start `q reset {}`", found.name())).into());
     }
+    // Same key the auto path records: under `$Q_NO_DETACH`/`$Q_FIXTURE` nothing
+    // was handed to the OS, and the event must not claim otherwise.
+    payload["spawned"] = serde_json::json!(outcome == Launch::Spawned);
     ctx.db()?.append_event(
         &found.quest.id,
         Some(&found.session.id),
@@ -460,7 +494,11 @@ fn detach(argv: &[String]) -> Launch {
 }
 
 fn suppressed() -> bool {
-    env_set("Q_FIXTURE") || env_set("Q_NO_DETACH")
+    // No in-crate test may fork. `current_exe()` there is the *test binary*,
+    // so a real launch spawns a copy of the whole suite with `reset …` on its
+    // command line — which is exactly what the `Z` tests were doing. The
+    // integration tests reach the same branch through `$Q_FIXTURE`.
+    cfg!(test) || env_set("Q_FIXTURE") || env_set("Q_NO_DETACH")
 }
 
 fn env_set(key: &str) -> bool {
@@ -611,6 +649,118 @@ mod tests {
         assert!(schedule(&db, &session, &config, &launcher.as_fn()).is_none());
         assert_eq!(launcher.calls(), 1);
         assert_eq!(scheduled_events(&db, &quest.id).len(), 1);
+    }
+
+    /// A `Ctx` over the same in-memory fleet, with a tmux fixture holding the
+    /// master's pane. Nothing here touches the process environment or a real
+    /// tmux server.
+    fn manual_fleet(
+        status: SessionStatus,
+        pane: &str,
+    ) -> (Ctx, tempfile::TempDir, Quest, target::Target) {
+        let (db, quest, mut session) = fleet(Some(40), status);
+        if session.tmux_pane != pane {
+            db.update_session_pane(&session.id, pane).unwrap();
+            session = db.get_session(&session.id).unwrap().unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tmux.json");
+        std::fs::write(&path, "{}").unwrap();
+        let ctx = Ctx::for_tests(
+            Config::default(),
+            db,
+            Box::new(crate::tmux::FixtureTmux::new(path)),
+        );
+        let found = target::Target {
+            quest: quest.clone(),
+            session,
+        };
+        (ctx, dir, quest, found)
+    }
+
+    /// N-2: `Z` racing the `Stop` hook's own `--delay 2` schedule ran two
+    /// children. The manual one clears now; the auto one wakes two seconds
+    /// later, re-takes an idle gate the fresh `SessionStart` has just
+    /// satisfied, and clears the *new* context window plus its follow-up
+    /// (SPEC §8). The manual path takes the same cooldown the auto path does.
+    #[test]
+    fn a_manual_reset_will_not_double_fire_on_top_of_a_scheduled_one() {
+        let (ctx, _dir, quest, found) = manual_fleet(SessionStatus::Idle, "%1");
+        let launcher = Launcher::new();
+        // The `Stop` hook gets there first.
+        assert!(
+            schedule(
+                ctx.db().unwrap(),
+                &found.session,
+                &ctx.config,
+                &launcher.as_fn()
+            )
+            .is_some()
+        );
+        assert_eq!(launcher.calls(), 1);
+
+        let error = spawn_detached_with(&ctx, &found, Strategy::Clear, &launcher.as_fn())
+            .expect_err("the manual reset was let through on top of the scheduled one");
+        assert!(
+            format!("{error:#}").contains("already has a reset scheduled"),
+            "{error:#}"
+        );
+        assert_eq!(launcher.calls(), 1, "a second child was launched");
+        assert_eq!(scheduled_events(ctx.db().unwrap(), &quest.id).len(), 1);
+    }
+
+    /// And two `Z` presses in a row are the same race with the same answer.
+    #[test]
+    fn a_second_manual_reset_inside_the_cooldown_is_refused() {
+        let (ctx, _dir, quest, found) = manual_fleet(SessionStatus::Idle, "%1");
+        let launcher = Launcher::new();
+        spawn_detached_with(&ctx, &found, Strategy::Clear, &launcher.as_fn()).expect("first Z");
+        assert!(spawn_detached_with(&ctx, &found, Strategy::Clear, &launcher.as_fn()).is_err());
+        assert_eq!(launcher.calls(), 1);
+        assert_eq!(scheduled_events(ctx.db().unwrap(), &quest.id).len(), 1);
+    }
+
+    /// N-6: the manual payload records whether the OS was actually involved,
+    /// exactly as the auto path does. Under a suppressed launch it must not
+    /// claim a child that never ran.
+    #[test]
+    fn a_manual_schedule_records_whether_it_was_really_spawned() {
+        for (outcome, want) in [(Launch::Spawned, true), (Launch::Suppressed, false)] {
+            let (ctx, _dir, quest, found) = manual_fleet(SessionStatus::Idle, "%1");
+            spawn_detached_with(&ctx, &found, Strategy::Clear, &|_| outcome).expect("Z");
+            let events = scheduled_events(ctx.db().unwrap(), &quest.id);
+            let payload = events[0].payload.as_ref().unwrap();
+            assert_eq!(payload["manual"], serde_json::json!(true));
+            assert_eq!(payload["spawned"], serde_json::json!(want), "{outcome:?}");
+        }
+    }
+
+    /// B1: a row whose window never opened has an empty pane, and tmux reads an
+    /// empty `-t` target as "whatever is current". `spawn_detached` used to
+    /// refuse this for a *master* only — the `role ==` conjunct was a slip, and
+    /// every worker `Z` went straight past it.
+    #[test]
+    fn a_reset_of_a_row_with_no_pane_is_refused_whatever_its_role() {
+        for role in [SessionRole::Master, SessionRole::Worker] {
+            let (ctx, _dir, quest, mut found) = manual_fleet(SessionStatus::Idle, "");
+            found.session.role = role;
+            let launcher = Launcher::new();
+            let error = spawn_detached_with(&ctx, &found, Strategy::Clear, &launcher.as_fn())
+                .expect_err("a pane-less row was reset");
+            assert!(format!("{error:#}").contains("has no pane"), "{error:#}");
+            assert_eq!(launcher.calls(), 0);
+            assert!(scheduled_events(ctx.db().unwrap(), &quest.id).is_empty());
+
+            // And the synchronous `q reset` path refuses it too, rather than
+            // typing `/clear` into whatever window is current.
+            let args = Args {
+                session: &found.session.id,
+                delay: None,
+                strategy: Some(Strategy::Clear),
+            };
+            let error = run(&ctx, &args).expect_err("a pane-less row was reset");
+            assert!(format!("{error:#}").contains("has no pane"), "{error:#}");
+        }
     }
 
     #[test]

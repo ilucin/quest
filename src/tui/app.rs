@@ -168,14 +168,6 @@ impl Prompt {
             _ => None,
         }
     }
-
-    /// The session a Sessions-tab prompt was opened against.
-    pub fn session(&self) -> Option<&SessionTarget> {
-        match self {
-            Prompt::Send(t) | Prompt::Kill(t) | Prompt::Reset(t) => Some(t),
-            _ => None,
-        }
-    }
 }
 
 /// A form on screen, holding the keyboard, together with what submitting it

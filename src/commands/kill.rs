@@ -75,6 +75,12 @@ pub fn apply(ctx: &Ctx, found: &target::Target) -> anyhow::Result<Killed> {
             pane_killed: false,
         });
     }
+    // A live row with no pane is a `q spawn` whose window never opened. tmux
+    // reads an empty `-t` target as "whatever is current", so killing it would
+    // take down the window `q` is itself running in. This is the one pane
+    // command that cannot go through `require_live` — it accepts an ended row
+    // on purpose — so it says so here.
+    found.require_pane()?;
 
     // The row must end even if tmux lost the pane between the sweep and now.
     let pane_killed = ctx.tmux().kill_window(&session.tmux_pane).is_ok();

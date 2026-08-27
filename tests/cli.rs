@@ -4355,6 +4355,64 @@ fn enter_refuses_a_session_whose_window_never_opened() {
     assert_eq!(env.json(&["enter", "foo"])["window"], "master");
 }
 
+/// The other half of `enter_refuses_a_session_whose_window_never_opened`: an
+/// empty tmux target is "whatever is current", so `kill`, `peek`, `send` and
+/// `reset` against a row whose window never opened would kill, page or type
+/// into the terminal `q` is itself running in. Every one of them refuses.
+#[test]
+fn kill_peek_send_and_reset_refuse_a_session_whose_window_never_opened() {
+    let env = Env::new();
+    let created = env.new_quest("foo");
+    let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
+    // Fresh, so the sweep leaves it live; idle, so the send/reset gate is not
+    // the thing doing the refusing.
+    let pending = seed_pending_worker(&env, &quest_id, "tests", 0);
+    env.set_status(&pending, "idle", None);
+    let before = env.fixture();
+
+    for args in [
+        vec!["kill", "foo/tests", "-f"],
+        vec!["peek", "foo/tests"],
+        vec!["send", "foo/tests", "hello", "--force"],
+        vec!["reset", "foo/tests"],
+    ] {
+        let message = env.json_err(&args)["error"].as_str().unwrap().to_string();
+        assert!(
+            message.contains("has no pane"),
+            "`q {}` said {message:?}",
+            args.join(" ")
+        );
+    }
+
+    // Nothing was killed, typed into or otherwise touched — the master window
+    // is exactly as it was.
+    assert_eq!(env.fixture()["panes"], before["panes"]);
+    // And the row is still live: refusing is not the same as ending it (the
+    // sweep does that, once the grace has passed).
+    assert_eq!(env.status_of(&pending), "idle");
+}
+
+/// N-4: an argument that can never be valid is rejected before the target is
+/// resolved — and therefore before the liveness sweep writes anything.
+#[test]
+fn peek_and_send_reject_a_bad_argument_before_they_resolve_the_target() {
+    let env = Env::new();
+    env.new_quest("foo");
+
+    let lines = env.json_err(&["peek", "nope", "--lines", "0"]);
+    assert_eq!(lines["error"], "--lines must be at least 1");
+    let empty = env.json_err(&["send", "nope", "   "]);
+    assert_eq!(empty["error"], "nothing to send");
+
+    // The valid-argument path still resolves and still says the target is the
+    // thing that is wrong.
+    let missing = env.json_err(&["peek", "nope"]);
+    assert!(
+        missing["error"].as_str().unwrap().contains("nope"),
+        "{missing}"
+    );
+}
+
 #[test]
 fn spawn_help_only_lists_the_implemented_flags() {
     let assert = q().args(["spawn", "--help"]).assert().success();

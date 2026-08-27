@@ -326,7 +326,10 @@ pub fn is_no_client(e: &anyhow::Error) -> bool {
 
 /// An empty target is not "the current pane" as far as q is concerned: it means
 /// a session row whose window never opened, and tmux would silently act on
-/// whatever is active instead.
+/// whatever is active instead — which, when q runs inside tmux, is q's own
+/// window. Every call that takes a pane id as a `-t` target goes through here,
+/// in both implementations, so the hazard cannot be reintroduced by a new
+/// caller forgetting to check.
 fn require_pane_id(pane_id: &str) -> anyhow::Result<()> {
     if pane_id.is_empty() {
         return Err(QError::Tmux("no pane to select (empty pane id)".to_string()).into());
@@ -479,6 +482,7 @@ impl Tmux for RealTmux {
     }
 
     fn send_keys(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()> {
+        require_pane_id(pane_id)?;
         for argv in args_send_keys(pane_id, text, enter) {
             run(&argv)?;
         }
@@ -486,6 +490,7 @@ impl Tmux for RealTmux {
     }
 
     fn paste(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()> {
+        require_pane_id(pane_id)?;
         let buffer = send_buffer();
         run(&args_set_buffer(&buffer, text))?;
         if let Err(e) = run(&args_paste_buffer(pane_id, &buffer)) {
@@ -500,6 +505,7 @@ impl Tmux for RealTmux {
     }
 
     fn capture_pane(&self, pane_id: &str, lines: usize) -> anyhow::Result<String> {
+        require_pane_id(pane_id)?;
         Ok(tail(&run(&args_capture_pane(pane_id, lines))?, lines))
     }
 
@@ -508,6 +514,7 @@ impl Tmux for RealTmux {
     }
 
     fn rename_window(&self, pane_id: &str, new: &str) -> anyhow::Result<()> {
+        require_pane_id(pane_id)?;
         run(&args_rename_window(pane_id, new)).map(|_| ())
     }
 
@@ -516,6 +523,7 @@ impl Tmux for RealTmux {
     }
 
     fn kill_window(&self, pane_id: &str) -> anyhow::Result<()> {
+        require_pane_id(pane_id)?;
         run(&args_kill_window(pane_id)).map(|_| ())
     }
 
@@ -874,6 +882,7 @@ impl Tmux for FixtureTmux {
     }
 
     fn send_keys(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()> {
+        require_pane_id(pane_id)?;
         self.edit(|state| {
             let pane = state.pane_mut(pane_id)?;
             pane.buffer.push_str(text);
@@ -885,6 +894,7 @@ impl Tmux for FixtureTmux {
     }
 
     fn paste(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()> {
+        require_pane_id(pane_id)?;
         self.edit(|state| {
             let pane = state.pane_mut(pane_id)?;
             pane.pastes.push(text.to_string());
@@ -897,6 +907,7 @@ impl Tmux for FixtureTmux {
     }
 
     fn capture_pane(&self, pane_id: &str, lines: usize) -> anyhow::Result<String> {
+        require_pane_id(pane_id)?;
         let mut state = self.load()?;
         let buffer = state.pane_mut(pane_id)?.buffer.clone();
         Ok(tail(&buffer, lines))
@@ -921,6 +932,7 @@ impl Tmux for FixtureTmux {
     }
 
     fn rename_window(&self, pane_id: &str, new: &str) -> anyhow::Result<()> {
+        require_pane_id(pane_id)?;
         self.edit(|state| {
             state.pane_mut(pane_id)?.window_name = new.to_string();
             Ok(())
@@ -939,6 +951,7 @@ impl Tmux for FixtureTmux {
     }
 
     fn kill_window(&self, pane_id: &str) -> anyhow::Result<()> {
+        require_pane_id(pane_id)?;
         self.edit(|state| {
             let before = state.panes.len();
             state.panes.retain(|p| p.pane_id != pane_id);
@@ -1573,6 +1586,42 @@ mod tests {
         assert!(require_pane_id("%42").is_ok());
         let (_dir, t) = fixture();
         assert!(t.select_window("").is_err());
+    }
+
+    /// Every call that hands tmux a pane as its `-t` target. An empty one is
+    /// the current window, so `kill_window("")` kills the window `q` runs in,
+    /// `capture_pane("")` reads q's own screen and `send_keys("")` types into
+    /// it. Verified against a real tmux on a private socket: with two windows
+    /// up, `kill-window -t ''` took the *active* one down and exited 0.
+    #[test]
+    fn every_pane_targeting_call_refuses_an_empty_target() {
+        let (_dir, t) = fixture();
+        t.new_session(&NewSession {
+            name: "q-alpha".to_string(),
+            window_name: "master".to_string(),
+            ..NewSession::default()
+        })
+        .unwrap();
+
+        let refusals: Vec<anyhow::Error> = vec![
+            t.kill_window("").unwrap_err(),
+            t.send_keys("", "rm -rf /", true).unwrap_err(),
+            t.paste("", "rm -rf /", true).unwrap_err(),
+            t.capture_pane("", 10).unwrap_err(),
+            t.rename_window("", "gone").unwrap_err(),
+            t.select_window("").unwrap_err(),
+        ];
+        for e in &refusals {
+            assert!(
+                format!("{e:#}").contains("empty pane id"),
+                "wrong refusal: {e:#}"
+            );
+        }
+        // The one window that does exist was not touched by any of them.
+        let panes = t.list_panes().unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].window_name, "master");
+        assert_eq!(t.capture_pane(&panes[0].pane_id, 10).unwrap(), "");
     }
 
     #[test]
