@@ -2,9 +2,11 @@
 
 use crate::Ctx;
 use crate::cli::QuestState as StateFilter;
+use crate::commands::flush_warnings;
 use crate::commands::{QuestRow, fill_progress, fmt, load_quests};
 use crate::model::DisplayState;
 use crate::output;
+use crate::remote;
 
 pub fn run(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> anyhow::Result<()> {
     let wanted = state.map(display_state_of);
@@ -14,8 +16,20 @@ pub fn run(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> anyhow::Result<(
     if let Some(want) = wanted {
         rows.retain(|r| r.view.display_state == want);
     }
-    if ctx.json || !ctx.quiet {
-        // Not even the one `bd` call when nothing is going to be printed.
+
+    // Nothing below this line runs when nothing is going to be printed: not the
+    // one `bd` call, and not a fan-out that can cost the full remote deadline.
+    let printing = ctx.json || !ctx.quiet;
+    if printing {
+        // The remote fan-out (SPEC §15), asked for the same listing this one
+        // is. bd-8lz.5.2 merges these rows into the listing and the TUI; until
+        // then the round still runs, so a machine that is down is reported
+        // rather than silently missing.
+        remote::warn_unreachable(ctx, &remote::fetch_all(ctx, all, state));
+    }
+    flush_warnings(ctx);
+
+    if printing {
         fill_progress(ctx, &mut rows);
         let views: Vec<&crate::commands::QuestView> = rows.iter().map(|r| &r.view).collect();
         output::emit(ctx.json, &views, || human(&rows))?;

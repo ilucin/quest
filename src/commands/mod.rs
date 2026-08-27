@@ -31,7 +31,7 @@ pub mod report;
 
 use std::io::{BufRead, IsTerminal, Write};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::Ctx;
 use crate::beads::{self, Progress};
@@ -43,7 +43,12 @@ use crate::tmux;
 
 /// A Quest with the three fields SPEC §4 derives rather than stores. `q list`
 /// flattens it; `q show` nests the Quest itself.
-#[derive(Debug, Serialize)]
+///
+/// `Deserialize` because this *is* the wire format between machines: a remote's
+/// `q list --json` is read straight back into these (SPEC §15), so local and
+/// remote rows need no translation. The optional fields default so a remote on
+/// an older `q` that never learned to report one still parses.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct QuestView {
     #[serde(flatten)]
     pub quest: Quest,
@@ -52,9 +57,11 @@ pub struct QuestView {
     pub live_sessions: usize,
     /// The live master's context reading (SPEC §8); `null` when there is no
     /// live master, or the statusline hook has never reported one.
+    #[serde(default)]
     pub master_ctx_pct: Option<u8>,
     /// Beads counts (SPEC §13); `null` without an epic, or when `bd` has never
     /// answered for this Quest.
+    #[serde(default)]
     pub progress: Option<Progress>,
 }
 

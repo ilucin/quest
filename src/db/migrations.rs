@@ -8,9 +8,9 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::error::QError;
 
 /// The version this binary expects. Must equal the last entry in `MIGRATIONS`.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
-const MIGRATIONS: &[(u32, &str)] = &[(1, V1), (2, V2), (3, V3)];
+const MIGRATIONS: &[(u32, &str)] = &[(1, V1), (2, V2), (3, V3), (4, V4)];
 
 const V1: &str = r#"
 CREATE TABLE quest (
@@ -111,6 +111,17 @@ ALTER TABLE quest ADD COLUMN auto_reset INTEGER;   -- 1 | 0 | NULL = config
 const V3: &str = r#"
 ALTER TABLE name_cache ADD COLUMN source TEXT NOT NULL DEFAULT 'claude';
 ALTER TABLE session ADD COLUMN pending_rename TEXT;
+"#;
+
+/// Multi-machine (SPEC §15): the last answer each remote gave to
+/// `q list --json --no-remote`, so an unreachable machine still shows its
+/// last-known Quests instead of vanishing from the listing.
+const V4: &str = r#"
+CREATE TABLE remote_cache (
+  name       TEXT PRIMARY KEY,   -- remotes[].name from the config
+  payload    TEXT NOT NULL,      -- JSON array of quest views, as the remote sent it
+  fetched_at INTEGER NOT NULL
+);
 "#;
 
 pub fn user_version(conn: &Connection) -> anyhow::Result<u32> {

@@ -12,6 +12,7 @@ mod naming;
 mod output;
 mod proc;
 mod registry;
+mod remote;
 mod tmux;
 mod tui;
 
@@ -24,6 +25,7 @@ use cli::{ArtifactAction, Cli, Command, ConfigAction, HookAction, LinkAction};
 use config::Config;
 use db::Db;
 use error::QError;
+use remote::Ssh;
 use tmux::Tmux;
 
 /// Everything a command needs beyond its own arguments. Built once by the
@@ -33,10 +35,15 @@ pub struct Ctx {
     pub quiet: bool,
     pub config: Config,
     machine_override: Option<String>,
+    /// SPEC §15's recursion guard: set on the `q list` we run over ssh, so the
+    /// far end answers out of its own database instead of fanning out again.
+    no_remote: bool,
     /// Absent only for `q config`, which has to work before — and in order to
     /// fix — a broken environment.
     db: Option<Db>,
     tmux: Box<dyn Tmux>,
+    /// ssh, like tmux, behind a trait so no test reaches a real host.
+    ssh: Box<dyn Ssh>,
     /// `bd`, like `tmux`, behind a trait and owned rather than discovered, so
     /// a test drives the beads paths without the process environment and the
     /// TUI can hand `bd` a client that does not chatter at the screen.
@@ -67,10 +74,15 @@ impl Ctx {
             .unwrap_or(&self.config.machine.name)
     }
 
+    /// False under `--no-remote`: no command may touch a remote machine.
+    pub fn remote_enabled(&self) -> bool {
+        !self.no_remote
+    }
+
     fn new(args: &Cli, config: Config, db: Option<Db>) -> anyhow::Result<Ctx> {
         let machine_override = match &args.machine {
             Some(m) => {
-                config::validate_machine_name(m)?;
+                remote::validate_target(&config, m)?;
                 Some(m.clone())
             }
             None => None,
@@ -80,8 +92,10 @@ impl Ctx {
             quiet: args.quiet,
             config,
             machine_override,
+            no_remote: args.no_remote,
             db,
             tmux: tmux::tmux(),
+            ssh: remote::ssh(),
             bd: beads::client(),
             warnings: Mutex::new(Vec::new()),
         })
@@ -120,8 +134,10 @@ impl Ctx {
             quiet: args.quiet,
             config: Config::default(),
             machine_override: None,
+            no_remote: args.no_remote,
             db: None,
             tmux: tmux::tmux(),
+            ssh: remote::ssh(),
             bd: beads::client(),
             warnings: Mutex::new(Vec::new()),
         })
@@ -135,6 +151,10 @@ impl Ctx {
 
     pub fn tmux(&self) -> &dyn Tmux {
         self.tmux.as_ref()
+    }
+
+    pub fn ssh(&self) -> &dyn Ssh {
+        self.ssh.as_ref()
     }
 
     pub fn bd(&self) -> &dyn beads::Bd {
@@ -172,8 +192,10 @@ impl Ctx {
             quiet: true,
             config,
             machine_override: None,
+            no_remote: false,
             db: Some(db),
             tmux,
+            ssh: Box::new(remote::stub::NoSsh),
             bd: Box::new(beads::stub::NoBd),
             warnings: Mutex::new(Vec::new()),
         }
@@ -182,6 +204,24 @@ impl Ctx {
     #[cfg(test)]
     pub fn with_bd(mut self, bd: Box<dyn beads::Bd>) -> Ctx {
         self.bd = bd;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_ssh(mut self, ssh: Box<dyn Ssh>) -> Ctx {
+        self.ssh = ssh;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_machine(mut self, machine: Option<&str>) -> Ctx {
+        self.machine_override = machine.map(str::to_string);
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_no_remote(mut self, no_remote: bool) -> Ctx {
+        self.no_remote = no_remote;
         self
     }
 }

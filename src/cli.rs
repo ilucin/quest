@@ -21,6 +21,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     pub machine: Option<String>,
 
+    /// Stay on this machine: never reach out over ssh (SPEC §15). Set on the
+    /// commands `q` proxies to a remote, so the recursion stops there.
+    #[arg(long, global = true)]
+    pub no_remote: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

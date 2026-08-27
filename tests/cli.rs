@@ -330,17 +330,17 @@ fn config_edit_reports_an_invalid_result() {
 fn machine_flag_is_a_targeting_flag_not_reflected_by_config_get() {
     // `--machine` targets a remote for this invocation (SPEC §15); it must
     // not change what `config get` reports for `machine.name`.
-    let baseline = q()
-        .args(["config", "get", "machine.name", "--json"])
-        .assert()
-        .success();
-    let default_name = json_of(&baseline)["value"].clone();
-
-    let assert = q()
+    let mut cmd = q();
+    std::fs::write(
+        config_path(&cmd),
+        "[machine]\nname = \"laptop\"\n\n[[remotes]]\nname = \"ws\"\nssh = \"ws-host\"\n",
+    )
+    .unwrap();
+    let assert = cmd
         .args(["--machine", "ws", "config", "get", "machine.name", "--json"])
         .assert()
         .success();
-    assert_eq!(json_of(&assert)["value"], default_name);
+    assert_eq!(json_of(&assert)["value"], "laptop");
 }
 
 #[test]
@@ -349,6 +349,42 @@ fn machine_flag_is_validated() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("machine.name"));
+}
+
+/// A `--machine` that names neither this machine nor a configured remote is a
+/// typo, and answering it with an empty listing would read as a fact about that
+/// machine rather than as the mistake it is.
+#[test]
+fn machine_flag_refuses_a_machine_nobody_has_heard_of() {
+    let mut cmd = q();
+    std::fs::write(
+        config_path(&cmd),
+        "[machine]\nname = \"laptop\"\n\n[[remotes]]\nname = \"ws\"\nssh = \"ws-host\"\n",
+    )
+    .unwrap();
+    let assert = cmd
+        .args(["--machine", "bogus", "list", "--json"])
+        .assert()
+        .code(1);
+    let err = error_json(&assert);
+    assert_eq!(err["code"], "not_found");
+    let said = err["error"].as_str().unwrap();
+    assert!(said.contains("bogus"), "{said}");
+    // It names the ones that would have worked.
+    assert!(said.contains("laptop") && said.contains("ws"), "{said}");
+}
+
+/// The local machine is a valid `--machine`: it filters the listing, it is not
+/// a remote to dial.
+#[test]
+fn machine_flag_accepts_this_machines_own_name() {
+    let mut cmd = q();
+    std::fs::write(config_path(&cmd), "[machine]\nname = \"laptop\"\n").unwrap();
+    let assert = cmd
+        .args(["--machine", "laptop", "list", "--json"])
+        .assert()
+        .success();
+    assert!(json_of(&assert).as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -2178,8 +2214,11 @@ fn list_filters_by_machine_only_when_asked() {
     let env = Env::new();
     env.new_quest("foo");
     assert_eq!(env.json(&["list"]).as_array().unwrap().len(), 1);
+    // `elsewhere` has to be a machine this `q` knows: a configured remote,
+    // asked for nothing here because `--no-remote` keeps the round local.
+    env.with_remotes(&[("elsewhere", "elsewhere-host")]);
     assert!(
-        env.json(&["--machine", "elsewhere", "list"])
+        env.json(&["--machine", "elsewhere", "--no-remote", "list"])
             .as_array()
             .unwrap()
             .is_empty()
@@ -6988,4 +7027,285 @@ fn name_needs_a_quest_that_exists() {
     quest_with_prompt(&env, "foo");
     let err = env.json_err(&["name", "nope", "--auto"]);
     assert_eq!(err["code"], "not_found");
+}
+
+// ---------------------------------------------------------------- q remote
+
+/// The scripted ssh (SPEC §15): a JSON file of canned answers per alias, plus
+/// a log every call appends to. With `Q_FIXTURE` set the fixture backend is
+/// always the one that answers, so no test can reach a real host — an alias
+/// the script does not name simply fails, like an unknown one.
+impl Env {
+    fn write_config(&self, text: &str) {
+        std::fs::write(self.dir.path().join("config.toml"), text).unwrap();
+    }
+
+    /// `[[remotes]]` for each `(name, ssh alias)`.
+    fn with_remotes(&self, remotes: &[(&str, &str)]) {
+        let mut text = String::from("[machine]\nname = \"laptop\"\n");
+        for (name, alias) in remotes {
+            text.push_str(&format!(
+                "\n[[remotes]]\nname = \"{name}\"\nssh = \"{alias}\"\n"
+            ));
+        }
+        self.write_config(&text);
+    }
+
+    fn ssh_log(&self) -> std::path::PathBuf {
+        self.dir.path().join("ssh.log")
+    }
+
+    /// One line per fixture ssh call: the alias then the argv, tab separated.
+    fn ssh_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.ssh_log())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Arms the scripted ssh and records every call it makes.
+    fn with_ssh(&self, cmd: &mut Command, hosts: serde_json::Value) {
+        let path = self.dir.path().join("ssh.json");
+        std::fs::write(&path, serde_json::json!({ "hosts": hosts }).to_string()).unwrap();
+        cmd.env("Q_FIXTURE_SSH", path)
+            .env("Q_FIXTURE_SSH_LOG", self.ssh_log());
+    }
+
+    /// `q list --json` with the scripted ssh in place.
+    fn list(&self, hosts: serde_json::Value) -> assert_cmd::assert::Assert {
+        let mut cmd = self.cmd();
+        self.with_ssh(&mut cmd, hosts);
+        cmd.args(["list", "--json"]).assert()
+    }
+}
+
+/// A real `q list --json` from a second, independent sandbox — exactly what a
+/// remote machine would send back. Generated rather than hand-written so the
+/// wire format cannot drift away from the one this test claims to read.
+fn remote_listing(machine: &str, slug: &str) -> String {
+    let far = Env::new();
+    far.write_config(&format!("[machine]\nname = \"{machine}\"\n"));
+    let work = far.work("repo");
+    far.cmd()
+        .args(["new", "--name", slug, "--no-beads", "-d", "--json"])
+        .args(["--dir", work.to_str().unwrap()])
+        .assert()
+        .success();
+    let assert = far.cmd().args(["list", "--json"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(parsed.as_array().unwrap().len(), 1, "{parsed}");
+    assert_eq!(parsed[0]["machine"], machine);
+    out.trim().to_string()
+}
+
+fn stderr_of(assert: &assert_cmd::assert::Assert) -> String {
+    String::from_utf8(assert.get_output().stderr.clone()).unwrap()
+}
+
+#[test]
+fn every_configured_remote_is_asked_for_its_listing() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host"), ("box", "box-host")]);
+    let assert = env
+        .list(serde_json::json!({
+            "ws-host": { "stdout": "[]" },
+            "box-host": { "stdout": "[]" },
+        }))
+        .success();
+    assert_eq!(stderr_of(&assert), "", "a healthy round says nothing");
+
+    let calls = env.ssh_calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls.contains(&"ws-host\tq\tlist\t--json\t--no-remote".to_string()));
+    assert!(calls.contains(&"box-host\tq\tlist\t--json\t--no-remote".to_string()));
+}
+
+#[test]
+fn without_remotes_configured_no_ssh_runs_at_all() {
+    let env = Env::new();
+    env.list(serde_json::json!({})).success();
+    assert!(env.ssh_calls().is_empty(), "{:?}", env.ssh_calls());
+    assert!(!env.ssh_log().exists());
+}
+
+#[test]
+fn no_remote_skips_the_fan_out() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": "[]" } }),
+    );
+    cmd.args(["list", "--json", "--no-remote"])
+        .assert()
+        .success();
+    assert!(env.ssh_calls().is_empty(), "{:?}", env.ssh_calls());
+
+    // The very same command without the guard does reach out.
+    env.list(serde_json::json!({ "ws-host": { "stdout": "[]" } }))
+        .success();
+    assert_eq!(env.ssh_calls().len(), 1);
+}
+
+#[test]
+fn a_machine_filter_asks_only_that_remote() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host"), ("box", "box-host")]);
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({
+            "ws-host": { "stdout": "[]" },
+            "box-host": { "stdout": "[]" },
+        }),
+    );
+    cmd.args(["list", "--json", "--machine", "box"])
+        .assert()
+        .success();
+    assert_eq!(env.ssh_calls().len(), 1);
+    assert!(env.ssh_calls()[0].starts_with("box-host\t"));
+}
+
+#[test]
+fn a_remote_that_times_out_is_marked_unreachable_and_the_listing_still_succeeds() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let work = env.work("repo");
+    env.cmd()
+        .args(["new", "--name", "local-one", "--no-beads", "-d"])
+        .args(["--dir", work.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let assert = env
+        .list(serde_json::json!({ "ws-host": { "timeout": true } }))
+        .success();
+    let stderr = stderr_of(&assert);
+    assert!(stderr.contains("⚠ unreachable"), "{stderr}");
+    assert!(stderr.contains("ws"), "{stderr}");
+    // The local listing is untouched by the remote being down.
+    let listed = json_of(&assert);
+    assert_eq!(listed[0]["slug"], "local-one");
+}
+
+#[test]
+fn an_unreachable_remote_still_shows_its_last_known_quests() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let payload = remote_listing("ws", "over-there");
+
+    let good = env
+        .list(serde_json::json!({ "ws-host": { "stdout": payload } }))
+        .success();
+    assert_eq!(stderr_of(&good), "");
+
+    // Same command, host now dead: the cached response stands in.
+    let down = env
+        .list(serde_json::json!({ "ws-host": { "timeout": true } }))
+        .success();
+    let stderr = stderr_of(&down);
+    assert!(stderr.contains("⚠ unreachable"), "{stderr}");
+    assert!(stderr.contains("1 cached quest"), "{stderr}");
+}
+
+#[test]
+fn a_remote_answering_with_something_unreadable_is_incompatible() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    for stdout in ["not json at all", "", "[{\"id\":\"q-1\"}]"] {
+        let assert = env
+            .list(serde_json::json!({ "ws-host": { "stdout": stdout } }))
+            .success();
+        let stderr = stderr_of(&assert);
+        assert!(stderr.contains("⚠ incompatible"), "`{stdout}` → {stderr}");
+    }
+}
+
+#[test]
+fn a_remote_without_q_installed_is_unreachable_with_its_own_message() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let assert = env
+        .list(serde_json::json!({
+            "ws-host": { "exit": 127, "stderr": "bash: q: command not found" }
+        }))
+        .success();
+    let stderr = stderr_of(&assert);
+    assert!(stderr.contains("⚠ unreachable"), "{stderr}");
+    assert!(stderr.contains("command not found"), "{stderr}");
+}
+
+/// SPEC §16's listing filters have to travel: a remote answering its own
+/// default listing would contradict the `--all`/`--state` actually asked for
+/// the moment bd-8lz.5.2 merges the rows.
+#[test]
+fn the_listing_filters_are_forwarded_to_the_remote() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": "[]" } }),
+    );
+    cmd.args(["list", "--json", "--all", "--state", "finished"])
+        .assert()
+        .success();
+    assert_eq!(
+        env.ssh_calls(),
+        ["ws-host\tq\tlist\t--json\t--no-remote\t--all\t--state\tfinished"]
+    );
+}
+
+/// `q list -q` prints nothing, so it must not pay for a round that can cost the
+/// whole remote deadline.
+#[test]
+fn a_quiet_listing_does_not_reach_out_at_all() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": "[]" } }),
+    );
+    let assert = cmd.args(["list", "-q"]).assert().success();
+    assert_eq!(
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap(),
+        ""
+    );
+    assert!(env.ssh_calls().is_empty(), "{:?}", env.ssh_calls());
+
+    // `--json` still prints, so it still asks.
+    env.list(serde_json::json!({ "ws-host": { "stdout": "[]" } }))
+        .success();
+    assert_eq!(env.ssh_calls().len(), 1);
+}
+
+/// The far end's own `[machine] name` is not the name this side files it under:
+/// `remotes[].name` is what `--machine` takes and what the machine column shows.
+#[test]
+fn a_remote_that_calls_itself_something_else_is_cached_verbatim_under_its_config_name() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    // The box knows itself as `workstation`; the config reaches it as `ws`.
+    let payload = remote_listing("workstation", "over-there");
+    env.list(serde_json::json!({ "ws-host": { "stdout": payload } }))
+        .success();
+
+    let down = env
+        .list(serde_json::json!({ "ws-host": { "timeout": true } }))
+        .success();
+    let stderr = stderr_of(&down);
+    assert!(stderr.contains("ws ⚠ unreachable"), "{stderr}");
+    assert!(stderr.contains("1 cached quest"), "{stderr}");
+}
+
+#[test]
+fn a_remote_the_script_does_not_know_never_reaches_a_real_host() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let assert = env.list(serde_json::json!({})).success();
+    assert!(stderr_of(&assert).contains("⚠ unreachable"));
 }
