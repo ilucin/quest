@@ -92,6 +92,10 @@ pub enum SshOutcome {
     },
     /// The deadline passed and the child was killed.
     TimedOut,
+    /// The far end sent more than [`MAX_OUTPUT`] on stdout and the read end was
+    /// dropped. Its own outcome, because what ssh then reports is a broken
+    /// pipe — `exited 255`, which says nothing about what happened.
+    TooLarge,
     /// ssh could not be started at all.
     Failed(String),
 }
@@ -287,6 +291,12 @@ fn run_with_deadline(mut cmd: Command, timeout: Duration) -> SshOutcome {
         // never past the deadline the child already respected.
         Ending::Exited(code) => {
             await_drains(&done, deadline);
+            // A capped stdout is truncated JSON at best, and the exit status
+            // that comes with it is ssh's broken-pipe 255. Only stdout is
+            // checked: a remote that floods *stderr* has still sent a listing.
+            if capped(&out) {
+                return SshOutcome::TooLarge;
+            }
             SshOutcome::Done {
                 code,
                 stdout: taken(&out),
@@ -342,6 +352,12 @@ fn drain(pipe: Option<impl Read + Send + 'static>, done: mpsc::Sender<()>) -> Bu
 
 fn taken(buf: &Buffer) -> String {
     String::from_utf8_lossy(&lock(buf.as_ref())).into_owned()
+}
+
+/// Whether the drain hit its cap: `Read::take` stops at exactly [`MAX_OUTPUT`]
+/// bytes, so a buffer that long is one the far end was still writing into.
+fn capped(buf: &Buffer) -> bool {
+    lock(buf.as_ref()).len() as u64 >= MAX_OUTPUT
 }
 
 /// Poison is not news behind any of this module's locks: a drain only ever
@@ -895,6 +911,10 @@ fn interpret(outcome: SshOutcome, timeout: Duration) -> Result<Answer, RemoteSta
         SshOutcome::TimedOut => Err(RemoteStatus::unreachable(format!(
             "no answer within {}s",
             timeout.as_secs()
+        ))),
+        SshOutcome::TooLarge => Err(RemoteStatus::incompatible(format!(
+            "`q list --json` was larger than {} MiB",
+            MAX_OUTPUT >> 20
         ))),
         SshOutcome::Failed(e) => Err(RemoteStatus::unreachable(e)),
         SshOutcome::Done {
@@ -1689,15 +1709,31 @@ mod tests {
         }
     }
 
+    /// The cap holds — and what comes back says so. Truncated JSON cannot be
+    /// read, and the exit status that arrives with it is ssh's broken-pipe
+    /// 255, which on its own reads as "the host is down".
     #[test]
-    fn a_remote_that_floods_the_pipe_is_capped_rather_than_buffered_whole() {
+    fn a_remote_that_floods_the_pipe_is_capped_and_says_why() {
         let flood = MAX_OUTPUT * 4;
         let outcome = run_with_deadline(sh(&format!("yes | head -c {flood}")), TIMEOUT);
+        assert_eq!(outcome, SshOutcome::TooLarge);
+
+        let status = interpret(outcome, TIMEOUT).unwrap_err();
+        assert_eq!(status.marker(), Some(INCOMPATIBLE));
+        let reason = status.reason().unwrap();
+        assert!(reason.contains("larger than 1 MiB"), "{reason}");
+    }
+
+    /// A remote that only floods *stderr* has still sent a listing.
+    #[test]
+    fn a_flood_on_stderr_does_not_discard_a_good_answer() {
+        let flood = MAX_OUTPUT * 2;
+        let outcome = run_with_deadline(
+            sh(&format!("yes >&2 | head -c {flood}; printf '[]'")),
+            TIMEOUT,
+        );
         match outcome {
-            SshOutcome::Done { stdout, .. } => {
-                assert!(!stdout.is_empty());
-                assert!(stdout.len() as u64 <= MAX_OUTPUT, "{} bytes", stdout.len());
-            }
+            SshOutcome::Done { stdout, .. } => assert_eq!(stdout, "[]"),
             other => panic!("{other:?}"),
         }
     }

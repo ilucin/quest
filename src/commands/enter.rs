@@ -157,26 +157,30 @@ struct Candidate<'a> {
 
 impl Candidate<'_> {
     /// How the Quest is named when more than one matched.
-    fn label(&self) -> String {
+    ///
+    /// `local` is this machine's name, and it is spelled out rather than left
+    /// implicit: `q-bd5f (alpha), q-82b8 (alpha) on ws` reads as though `on ws`
+    /// covered the whole list. Every candidate carrying its machine is the only
+    /// version of that line nobody has to parse twice.
+    fn label(&self, local: Option<&str>) -> String {
         let head = format!("{} ({})", self.quest.id, self.quest.slug);
-        match self.machine {
-            Some(machine) => format!("{head} on {machine}"),
-            None => head,
+        match (self.machine, local) {
+            (Some(machine), _) => format!("{head} on {machine}"),
+            (None, Some(local)) => format!("{head} on {local}"),
+            (None, None) => head,
         }
     }
 }
 
-/// The exact rungs of SPEC §16 against this machine's Quests: the one lookup
-/// worth doing before any ssh.
-///
-/// A Quest whose id or slug is *exactly* what was typed is not a guess, so it
-/// is entered without dialling out. Everything below exact is a guess, which is
-/// why the fuzzy rungs wait for the remotes (see [`resolve_target`]).
-fn exact_local<'a>(local: &'a [Quest], target: &str) -> Option<&'a Quest> {
-    local
-        .iter()
-        .find(|q| q.id == target)
-        .or_else(|| local.iter().find(|q| q.slug == target))
+/// Which machines a `q enter` target is resolved against, for the messages
+/// that have to name them.
+#[derive(Debug, Clone, Copy)]
+struct Scope<'a> {
+    /// This machine's name, when more than one machine is in play — `None` for
+    /// a single-machine `q`, whose ambiguity line stays the local one.
+    local: Option<&'a str>,
+    /// The `--machine` this invocation was pinned to, if any.
+    pinned: Option<&'a str>,
 }
 
 /// SPEC §16 target resolution across **every** machine in the listing: exact
@@ -189,13 +193,21 @@ fn exact_local<'a>(local: &'a [Quest], target: &str) -> Option<&'a Quest> {
 /// Quest that exists and lands in a different Quest on a different machine,
 /// with nothing said. Ambiguity across machines is reported the same way
 /// ambiguity on one is: as a list of what matched, with where.
+///
+/// That applies to the *exact* rungs too, and it is why there is no
+/// "exact locally, so skip the ssh" shortcut: a Quest id is 16 bits and unique
+/// only per machine, so an id that is exact on two machines is a genuine
+/// ambiguity, and short-circuiting on the local one would silently pick a
+/// Quest the user may not have meant. The fast path is the one case where the
+/// question cannot arise — no remotes to ask (see [`run`]).
 fn resolve_target<'a>(
     local: &'a [Quest],
     results: &'a [RemoteResult],
     target: &str,
+    scope: Scope<'_>,
 ) -> anyhow::Result<Candidate<'a>> {
     if target.is_empty() {
-        return Err(QError::NotFound("quest ``".to_string()).into());
+        return Err(not_found("", scope).into());
     }
     // Local first, so the order candidates are listed in is this machine's
     // Quests then the remotes in config order.
@@ -233,13 +245,22 @@ fn resolve_target<'a>(
             _ => {
                 return Err(QError::Ambiguous {
                     target: target.to_string(),
-                    candidates: matches.iter().map(Candidate::label).collect(),
+                    candidates: matches.iter().map(|c| c.label(scope.local)).collect(),
                 }
                 .into());
             }
         }
     }
-    Err(QError::NotFound(format!("quest `{target}`")).into())
+    Err(not_found(target, scope).into())
+}
+
+/// `not found: quest `alpha`` — and, under `--machine`, which machine it was
+/// looked for on, so the flag never narrows the search silently.
+fn not_found(target: &str, scope: Scope<'_>) -> QError {
+    match scope.pinned {
+        Some(machine) => QError::NotFound(format!("quest `{target}` on {machine}")),
+        None => QError::NotFound(format!("quest `{target}`")),
+    }
 }
 
 /// Hand the terminal to the machine `found` runs on (SPEC §15).
@@ -318,26 +339,41 @@ fn enter_local(ctx: &Ctx, quest: &Quest, label: Option<&str>) -> anyhow::Result<
 
 pub fn run(ctx: &Ctx, target: &str, label: Option<&str>) -> anyhow::Result<()> {
     sweep_quiet(ctx)?;
-    let local = ctx.db()?.list_quests(true)?;
-    // An exact hit here is entered without ever dialling out.
-    if let Some(quest) = exact_local(&local, target) {
-        return enter_local(ctx, quest, label);
-    }
-    // Anything less than exact has to be held against the other machines
-    // before it is acted on: a local *fragment* match must not shadow a Quest
-    // whose name is exactly what was typed, wherever that Quest runs.
-    let results = if ctx.remote_enabled() && !remote::targets(ctx).is_empty() {
-        // `--all`: a Quest that is finished over there has to be *found*
-        // before it can be refused, exactly as a local one is.
-        let results = remote::fetch_all(ctx, true, None);
-        remote::warn_unreachable(ctx, &results);
-        flush_warnings(ctx);
-        results
+    // `--machine` scopes `q enter` exactly as it scopes `q list`: it says
+    // *which machine's* Quests are candidates. Without this the flag was
+    // accepted and ignored, and `q enter <local quest> --machine ws` attached
+    // to the local Quest while claiming to have gone to `ws`.
+    let local_name = ctx.config.machine.name.as_str();
+    let covers_local = ctx.machine_filter().is_none_or(|m| m == local_name);
+    let local = if covers_local {
+        ctx.db()?.list_quests(true)?
     } else {
         Vec::new()
     };
 
-    let found = resolve_target(&local, &results, target)?;
+    let asking = !remote::targets(ctx).is_empty();
+    if !asking {
+        // Nothing to ask, so nothing an ssh could add: the ladder is the local
+        // one and the common `q enter <slug>` stays a single database read.
+        let scope = Scope {
+            local: None,
+            pinned: ctx.machine_filter(),
+        };
+        let found = resolve_target(&local, &[], target, scope)?;
+        return enter_local(ctx, found.quest, label);
+    }
+
+    // `--all`: a Quest that is finished over there has to be *found* before it
+    // can be refused, exactly as a local one is.
+    let results = remote::fetch_all(ctx, true, None);
+    remote::warn_unreachable(ctx, &results);
+    flush_warnings(ctx);
+
+    let scope = Scope {
+        local: covers_local.then_some(local_name),
+        pinned: ctx.machine_filter(),
+    };
+    let found = resolve_target(&local, &results, target, scope)?;
     match found.machine {
         Some(machine) => enter_remote(ctx, found, machine, label),
         None => enter_local(ctx, found.quest, label),
@@ -473,38 +509,57 @@ mod tests {
         found.machine.unwrap_or("<local>")
     }
 
+    /// The scope of a two-machine `q enter`, with no `--machine` given.
+    fn cross() -> Scope<'static> {
+        Scope {
+            local: Some("laptop"),
+            pinned: None,
+        }
+    }
+
+    /// The scope of a `q` with no remotes at all.
+    fn solo() -> Scope<'static> {
+        Scope {
+            local: None,
+            pinned: None,
+        }
+    }
+
     #[test]
     fn a_remote_quest_is_resolved_by_the_same_rule_as_a_local_one() {
         let results = [result("ws", &["cdc-backfill"]), result("box", &["other"])];
         let id = results[0].quests[0].view.quest.id.clone();
 
         assert_eq!(
-            machine_of(&resolve_target(&[], &results, "cdc-backfill").unwrap()),
+            machine_of(&resolve_target(&[], &results, "cdc-backfill", cross()).unwrap()),
             "ws"
         );
         assert_eq!(
-            machine_of(&resolve_target(&[], &results, &id).unwrap()),
+            machine_of(&resolve_target(&[], &results, &id, cross()).unwrap()),
             "ws"
         );
         // Prefix, then substring.
         assert_eq!(
-            resolve_target(&[], &results, "cdc").unwrap().quest.slug,
-            "cdc-backfill"
-        );
-        assert_eq!(
-            resolve_target(&[], &results, "backfill")
+            resolve_target(&[], &results, "cdc", cross())
                 .unwrap()
                 .quest
                 .slug,
             "cdc-backfill"
         );
         assert_eq!(
-            machine_of(&resolve_target(&[], &results, "oth").unwrap()),
+            resolve_target(&[], &results, "backfill", cross())
+                .unwrap()
+                .quest
+                .slug,
+            "cdc-backfill"
+        );
+        assert_eq!(
+            machine_of(&resolve_target(&[], &results, "oth", cross()).unwrap()),
             "box"
         );
 
         for empty in ["", "nope"] {
-            let e = resolve_target(&[], &results, empty).unwrap_err();
+            let e = resolve_target(&[], &results, empty, cross()).unwrap_err();
             assert_eq!(
                 e.downcast_ref::<QError>().map(QError::code),
                 Some("not_found"),
@@ -518,7 +573,7 @@ mod tests {
     #[test]
     fn a_fragment_that_matches_on_two_machines_names_both() {
         let results = [result("ws", &["cdc-one"]), result("box", &["cdc-two"])];
-        let e = resolve_target(&[], &results, "cdc").unwrap_err();
+        let e = resolve_target(&[], &results, "cdc", cross()).unwrap_err();
         assert_eq!(
             e.downcast_ref::<QError>().map(QError::code),
             Some("ambiguous")
@@ -535,32 +590,97 @@ mod tests {
         let local = [Quest::new("cdc-backfill-v2", "/tmp", "laptop")];
         let results = [result("ws", &["cdc-backfill"])];
 
-        // `exact_local` is what `run` checks before any ssh: the local Quest
-        // is only a prefix match, so it does not qualify.
-        assert!(exact_local(&local, "cdc-backfill").is_none());
-        assert_eq!(
-            exact_local(&local, "cdc-backfill-v2").map(|q| q.slug.as_str()),
-            Some("cdc-backfill-v2")
-        );
-
-        let found = resolve_target(&local, &results, "cdc-backfill").unwrap();
+        let found = resolve_target(&local, &results, "cdc-backfill", cross()).unwrap();
         assert_eq!(found.quest.slug, "cdc-backfill");
         assert_eq!(machine_of(&found), "ws");
 
+        // The local Quest is still reachable by its own exact slug.
+        let found = resolve_target(&local, &results, "cdc-backfill-v2", cross()).unwrap();
+        assert_eq!(found.quest.slug, "cdc-backfill-v2");
+        assert!(found.machine.is_none());
+
         // A fragment that matches on both is ambiguous rather than local-wins.
-        let e = resolve_target(&local, &results, "cdc-back").unwrap_err();
+        let e = resolve_target(&local, &results, "cdc-back", cross()).unwrap_err();
         assert_eq!(
             e.downcast_ref::<QError>().map(QError::code),
             Some("ambiguous")
         );
         let said = e.to_string();
         assert!(said.contains("on ws"), "{said}");
-        // The local candidate is named without a machine suffix, exactly as
-        // `db.resolve_quest` names it.
-        assert!(said.contains("(cdc-backfill-v2)"), "{said}");
+        // Both candidates carry a machine, so `on ws` cannot be read as
+        // covering the whole list.
+        assert!(said.contains("(cdc-backfill-v2) on laptop"), "{said}");
     }
 
-    /// With no remotes in the picture the ladder is the local one, unchanged.
+    /// A Quest id is unique only per machine, so an id that is exact on two of
+    /// them is a genuine ambiguity — not a reason to quietly prefer the local
+    /// Quest, which is what an "exact locally, skip the ssh" shortcut did.
+    #[test]
+    fn an_id_that_is_exact_on_two_machines_is_ambiguous() {
+        let results = [result("ws", &["live-there"])];
+        let id = results[0].quests[0].view.quest.id.clone();
+        let mut collides = Quest::new("local-idle", "/tmp", "laptop");
+        collides.id = id.clone();
+        let local = [collides];
+
+        let e = resolve_target(&local, &results, &id, cross()).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<QError>().map(QError::code),
+            Some("ambiguous")
+        );
+        let said = e.to_string();
+        assert!(said.contains("(local-idle) on laptop"), "{said}");
+        assert!(said.contains("(live-there) on ws"), "{said}");
+
+        // An exact *slug* on both machines is the same story.
+        let local = [Quest::new("live-there", "/tmp", "laptop")];
+        let e = resolve_target(&local, &results, "live-there", cross()).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<QError>().map(QError::code),
+            Some("ambiguous")
+        );
+    }
+
+    /// `--machine` scopes the ladder: a local Quest is not a candidate for a
+    /// target pinned to a remote, and the refusal names the machine it looked
+    /// on rather than claiming the Quest does not exist anywhere.
+    #[test]
+    fn a_pinned_machine_narrows_the_candidates_and_the_refusal() {
+        let local = [Quest::new("local-alpha", "/tmp", "laptop")];
+        let results = [result("ws", &["live-there"])];
+        let pinned = Scope {
+            local: None,
+            pinned: Some("ws"),
+        };
+
+        // The local Quest is not in the candidate set at all: `run` leaves it
+        // out, and the message says where it did look.
+        let e = resolve_target(&[], &results, "local-alpha", pinned).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<QError>().map(QError::code),
+            Some("not_found")
+        );
+        assert!(e.to_string().contains("`local-alpha` on ws"), "{e}");
+
+        // Pinned the other way, the remote rows are the ones left out.
+        let pinned = Scope {
+            local: None,
+            pinned: Some("laptop"),
+        };
+        let e = resolve_target(&local, &[], "live-there", pinned).unwrap_err();
+        assert!(e.to_string().contains("`live-there` on laptop"), "{e}");
+        assert_eq!(
+            resolve_target(&local, &[], "local-alpha", pinned)
+                .unwrap()
+                .quest
+                .slug,
+            "local-alpha"
+        );
+    }
+
+    /// With no remotes in the picture the ladder is the local one, unchanged —
+    /// candidates and all, so a single-machine `q` never grows an `on laptop`
+    /// it has no use for.
     #[test]
     fn without_remotes_the_ladder_is_purely_local() {
         let local = [
@@ -568,23 +688,31 @@ mod tests {
             Quest::new("alpine", "/tmp", "laptop"),
         ];
         assert_eq!(
-            resolve_target(&local, &[], "alpha").unwrap().quest.slug,
+            resolve_target(&local, &[], "alpha", solo())
+                .unwrap()
+                .quest
+                .slug,
             "alpha"
         );
         assert!(
-            resolve_target(&local, &[], "alpha")
+            resolve_target(&local, &[], "alpha", solo())
                 .unwrap()
                 .machine
                 .is_none()
         );
         assert_eq!(
-            resolve_target(&local, &[], "alpi").unwrap().quest.slug,
+            resolve_target(&local, &[], "alpi", solo())
+                .unwrap()
+                .quest
+                .slug,
             "alpine"
         );
-        let e = resolve_target(&local, &[], "alp").unwrap_err();
+        let e = resolve_target(&local, &[], "alp", solo()).unwrap_err();
         assert_eq!(
             e.downcast_ref::<QError>().map(QError::code),
             Some("ambiguous")
         );
+        let said = e.to_string();
+        assert!(!said.contains(" on "), "{said}");
     }
 }

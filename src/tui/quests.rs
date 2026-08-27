@@ -1383,14 +1383,16 @@ fn panel_lines<'a>(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<Line
             s.started_at,
         )
     });
-    if row.origin.is_remote() {
+    let remote = row.origin.is_remote();
+    if remote {
         // Not "none": the sessions are real, they are just in that machine's
         // database (SPEC §15). Saying "none" here would be a claim about a
         // Quest this `q` has never asked about.
         out.push(
             Line::from(Span::raw(format!(
-                "{} live · on {}, not fetched",
-                view.live_sessions, view.quest.machine
+                "{} live · {}",
+                view.live_sessions,
+                not_fetched(&view.quest.machine)
             )))
             .dim(),
         );
@@ -1402,8 +1404,16 @@ fn panel_lines<'a>(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<Line
         }
     }
 
+    // Links and events are read out of *this* machine's database, and a remote
+    // Quest is not in it — `reload` and `sync` skip a remote row rather than
+    // look its id up locally. So the only honest thing the panel can say here
+    // is what the sessions line already says.
     head(&mut out, "links");
-    if links.is_empty() {
+    if remote {
+        out.push(Line::from(
+            Span::raw(not_fetched(&view.quest.machine)).dim(),
+        ));
+    } else if links.is_empty() {
         out.push(Line::from(Span::raw("none").dim()));
     } else {
         for l in links {
@@ -1412,7 +1422,11 @@ fn panel_lines<'a>(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<Line
     }
 
     head(&mut out, "events");
-    if events.is_empty() {
+    if remote {
+        out.push(Line::from(
+            Span::raw(not_fetched(&view.quest.machine)).dim(),
+        ));
+    } else if events.is_empty() {
         out.push(Line::from(Span::raw("none").dim()));
     } else {
         for e in events {
@@ -1425,6 +1439,13 @@ fn panel_lines<'a>(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<Line
         }
     }
     out
+}
+
+/// What every panel section says about a remote Quest: the rows exist, on that
+/// machine, and this `q` has not asked for them (SPEC §15). One wording so the
+/// sections cannot contradict each other.
+fn not_fetched(machine: &str) -> String {
+    format!("on {machine}, not fetched")
 }
 
 /// `bd-42 · 3/7 closed · 2 open`, or why there is nothing to say.
@@ -2649,16 +2670,62 @@ mod tests {
         assert_eq!(selected_remote(&app).as_deref(), Some("ws"));
     }
 
-    /// The panel says where the sessions are rather than claiming there are
-    /// none: this `q` has never asked that machine.
+    fn panel_text(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<String> {
+        panel_lines(row, links, events)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The panel says where a remote Quest's sessions, links and events are
+    /// rather than claiming there are none: this `q` has never asked that
+    /// machine, and `none` reads as a fact about the Quest.
     #[test]
-    fn the_panel_does_not_claim_a_remote_quest_has_no_sessions() {
-        let mut row = remote_row("ws", "over-there", QuestState::Active, false);
-        row.view.live_sessions = 2;
-        let mut app = app_with(vec![row]);
+    fn the_panel_does_not_claim_a_remote_quest_is_empty() {
+        let mut far = remote_row("ws", "over-there", QuestState::Active, false);
+        far.view.live_sessions = 2;
+        let lines = panel_text(&far, &[], &[]);
+
+        assert!(
+            lines.contains(&"2 live · on ws, not fetched".to_string()),
+            "{lines:#?}"
+        );
+        // Sessions, links and events — all three, in one wording.
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("on ws, not fetched"))
+                .count(),
+            3,
+            "{lines:#?}"
+        );
+        assert!(!lines.iter().any(|l| l == "none"), "{lines:#?}");
+
+        let mut app = app_with(vec![far]);
         app.detail = true;
         let text = screen(&mut app, 140, 30);
         assert!(text.contains("on ws, not fetched"), "{text}");
+    }
+
+    /// …while a local Quest that really has nothing still says so.
+    #[test]
+    fn the_panel_still_says_none_for_an_empty_local_quest() {
+        let here = row(quest("here", QuestState::Active, 9), Vec::new());
+        let lines = panel_text(&here, &[], &[]);
+        assert_eq!(
+            lines.iter().filter(|l| *l == "none").count(),
+            3,
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("not fetched")),
+            "{lines:#?}"
+        );
     }
 }
 

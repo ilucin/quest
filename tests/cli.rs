@@ -7705,10 +7705,15 @@ fn iterm_control_mode_is_used_only_outside_tmux() {
     );
 }
 
-/// A local Quest is entered without ever dialling out, and a name that is on
-/// neither machine is still a plain "not found".
+/// A local Quest is entered locally, and a name that is on neither machine is
+/// still a plain "not found" rather than a story about ssh.
+///
+/// The other machine *is* asked first: an id or a slug is unique only per
+/// machine, so "exact here, so skip the ssh" is a guess (see
+/// `an_id_that_is_exact_on_both_machines_is_ambiguous`). What must not happen
+/// is an attach over ssh for a Quest that lives here.
 #[test]
-fn entering_looks_locally_first_and_reports_a_typo_as_a_typo() {
+fn entering_looks_across_machines_and_reports_a_typo_as_a_typo() {
     let env = Env::new();
     env.with_remotes(&[("ws", "ws-host")]);
     env.new_quest("here");
@@ -7718,8 +7723,10 @@ fn entering_looks_locally_first_and_reports_a_typo_as_a_typo() {
         &mut cmd,
         serde_json::json!({ "ws-host": { "stdout": remote_listing("ws", "over-there") } }),
     );
-    cmd.args(["enter", "here"]).assert().success();
-    assert!(env.ssh_calls().is_empty(), "{:?}", env.ssh_calls());
+    let entered = json_of(&cmd.args(["enter", "here", "--json"]).assert().success());
+    assert_eq!(entered["tmux_session"], "q-here");
+    assert_eq!(entered["attach"], "exec");
+    assert!(attach_calls(&env).is_empty(), "{:?}", env.ssh_calls());
 
     let mut cmd = env.cmd();
     env.with_ssh(
@@ -7731,6 +7738,106 @@ fn entering_looks_locally_first_and_reports_a_typo_as_a_typo() {
     assert!(err.contains("not_found"), "{err}");
     assert!(err.contains("nowhere"), "{err}");
     assert!(attach_calls(&env).is_empty());
+}
+
+/// With no `[[remotes]]` at all there is nothing to ask, so the ladder stays
+/// the single database read it always was.
+#[test]
+fn entering_without_remotes_never_leaves_this_machine() {
+    let env = Env::new();
+    env.write_config("[machine]\nname = \"laptop\"\n");
+    env.new_quest("here");
+
+    let mut cmd = env.cmd();
+    env.with_ssh(&mut cmd, serde_json::json!({}));
+    let entered = json_of(&cmd.args(["enter", "here", "--json"]).assert().success());
+    assert_eq!(entered["tmux_session"], "q-here");
+    assert!(env.ssh_calls().is_empty(), "{:?}", env.ssh_calls());
+}
+
+/// A Quest id is 16 bits and unique only per machine, so the same id can name
+/// a different Quest on each. Entering the local one without a word is the
+/// guess SPEC §16 refuses everywhere else — and the candidates say which
+/// machine each is on, so `on ws` cannot be read as covering both.
+#[test]
+fn an_id_that_is_exact_on_both_machines_is_ambiguous() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let id = env.new_quest("here")["quest"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The far end's listing, with its row forced onto the same id.
+    let payload = remote_listing("ws", "over-there");
+    let mut far: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    far["quests"][0]["id"] = serde_json::json!(id);
+    let payload = far.to_string();
+
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": payload } }),
+    );
+    let assert = cmd.args(["enter", &id, "--json"]).assert().code(1);
+    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("ambiguous"), "{err}");
+    assert!(err.contains("(here) on laptop"), "{err}");
+    assert!(err.contains("(over-there) on ws"), "{err}");
+    assert!(attach_calls(&env).is_empty());
+}
+
+/// `--machine` scopes `q enter` as it scopes `q list`: pinned to a remote, a
+/// local Quest is not a candidate at all, and the refusal names the machine it
+/// looked on rather than attaching here and claiming to have gone there.
+#[test]
+fn entering_honours_the_machine_flag() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.new_quest("local-alpha");
+    let payload = remote_listing("ws", "over-there");
+
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": payload.clone() } }),
+    );
+    let assert = cmd
+        .args(["enter", "local-alpha", "--machine", "ws", "--json"])
+        .assert()
+        .code(1);
+    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("not_found"), "{err}");
+    assert!(err.contains("`local-alpha` on ws"), "{err}");
+    assert!(attach_calls(&env).is_empty(), "{:?}", env.ssh_calls());
+
+    // The remote Quest is still entered through the same flag.
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": payload.clone() } }),
+    );
+    let out = json_of(
+        &cmd.args(["enter", "over-there", "--machine", "ws", "--json"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(out["machine"], "ws");
+
+    // Pinned the other way: no ssh, and a remote Quest is out of reach.
+    std::fs::remove_file(env.ssh_log()).unwrap();
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": payload } }),
+    );
+    let assert = cmd
+        .args(["enter", "over-there", "--machine", "laptop", "--json"])
+        .assert()
+        .code(1);
+    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("`over-there` on laptop"), "{err}");
+    assert!(env.ssh_calls().is_empty(), "{:?}", env.ssh_calls());
 }
 
 /// `--no-remote` breaks the recursion, so it also stops `q enter` from
