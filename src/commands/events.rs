@@ -33,9 +33,11 @@ const POLL_LIMIT: usize = 1_000;
 const KIND_WIDTH: usize = 16;
 const PAYLOAD_WIDTH: usize = 100;
 
-/// One `--kind` argument each, parsed. Separate from [`EventFilter`] so the
-/// TUI's filter box reports a bad pattern the same way the CLI does.
-pub fn kinds_of(patterns: &[String]) -> anyhow::Result<Vec<KindPattern>> {
+/// One `--kind` argument each, parsed. Private: the TUI's filter box takes
+/// one string rather than a list and has its own splitter, and both go
+/// through [`KindPattern::parse`], so a second public spelling of this would
+/// only be a second place to look.
+fn kinds_of(patterns: &[String]) -> anyhow::Result<Vec<KindPattern>> {
     patterns.iter().map(|k| KindPattern::parse(k)).collect()
 }
 
@@ -119,6 +121,19 @@ pub fn load(
     filter: &EventFilter,
     limit: usize,
 ) -> anyhow::Result<Vec<EventRow>> {
+    Ok(load_with_names(db, quests, filter, limit)?.1)
+}
+
+/// [`load`], keeping the names it had to build anyway. `--follow` refreshes
+/// them as sessions start, and building a second set for that would run
+/// `list_sessions_by_quest` twice per invocation — once for nothing on the
+/// non-follow path, which returns before the names are ever read.
+pub fn load_with_names(
+    db: &Db,
+    quests: &[Quest],
+    filter: &EventFilter,
+    limit: usize,
+) -> anyhow::Result<(Names, Vec<EventRow>)> {
     let names = Names::of(db, quests)?;
     let mut events: Vec<Event> = Vec::new();
     for quest in quests {
@@ -134,7 +149,8 @@ pub fn load(
             events.drain(..events.len() - limit);
         }
     }
-    Ok(names.rows(events))
+    let rows = names.rows(events);
+    Ok((names, rows))
 }
 
 pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
@@ -155,8 +171,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     }
 
     let quests = std::slice::from_ref(&quest);
-    let mut names = Names::of(db, quests)?;
-    let rows = load(db, quests, &filter, args.limit)?;
+    let (mut names, rows) = load_with_names(db, quests, &filter, args.limit)?;
     // An empty first page (`-n 0`, or a filter nothing matches yet) must not
     // make the tail replay the whole history: start from the newest row.
     let mut last_id = match rows.last() {
@@ -417,6 +432,46 @@ mod tests {
         // The five notes in between would have swallowed the tail had the
         // filter run after it.
         assert_eq!(kinds, ["session.start", "session.stop"]);
+    }
+
+    /// N2: `--follow` needs the names after the first page, and building a
+    /// second set for it ran `list_sessions_by_quest` twice per invocation —
+    /// the first for nothing on the non-follow path. The names the feed
+    /// already built are the ones the tail goes on with.
+    #[test]
+    fn load_hands_back_the_names_it_already_built() {
+        let db = db();
+        let q = quest(&db, "alpha");
+        let session = db
+            .insert_session(&crate::model::Session::new(
+                &q.id,
+                crate::model::SessionRole::Worker,
+                "worker",
+                "q-alpha",
+                "%1",
+            ))
+            .unwrap();
+        db.append_event(
+            &q.id,
+            Some(&session.id),
+            "session.start",
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+
+        let quests = std::slice::from_ref(&q);
+        let filter = EventFilter::default();
+        let (names, rows) = load_with_names(&db, quests, &filter, 10).unwrap();
+        // Everything the follow loop asks the names for, without a second
+        // pass over the sessions.
+        assert!(names.knows_session(&session.id));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session, "worker");
+        assert_eq!(rows[0].quest_slug, "alpha");
+        // And `load` is the same feed with the names dropped.
+        let plain = load(&db, quests, &filter, 10).unwrap();
+        assert_eq!(plain.len(), rows.len());
+        assert_eq!(plain[0].session, rows[0].session);
     }
 
     #[test]
