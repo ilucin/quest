@@ -17,14 +17,19 @@ pub fn run(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> anyhow::Result<(
         rows.retain(|r| r.view.display_state == want);
     }
 
-    // The remote fan-out (SPEC §15). bd-8lz.5.2 merges these rows into the
-    // listing and the TUI; until then the round still runs, so a machine that
-    // is down is reported rather than silently missing.
-    remote::warn_unreachable(ctx, &remote::fetch_all(ctx));
+    // Nothing below this line runs when nothing is going to be printed: not the
+    // one `bd` call, and not a fan-out that can cost the full remote deadline.
+    let printing = ctx.json || !ctx.quiet;
+    if printing {
+        // The remote fan-out (SPEC §15), asked for the same listing this one
+        // is. bd-8lz.5.2 merges these rows into the listing and the TUI; until
+        // then the round still runs, so a machine that is down is reported
+        // rather than silently missing.
+        remote::warn_unreachable(ctx, &remote::fetch_all(ctx, all, state));
+    }
     flush_warnings(ctx);
 
-    if ctx.json || !ctx.quiet {
-        // Not even the one `bd` call when nothing is going to be printed.
+    if printing {
         fill_progress(ctx, &mut rows);
         let views: Vec<&crate::commands::QuestView> = rows.iter().map(|r| &r.view).collect();
         output::emit(ctx.json, &views, || human(&rows))?;

@@ -330,17 +330,17 @@ fn config_edit_reports_an_invalid_result() {
 fn machine_flag_is_a_targeting_flag_not_reflected_by_config_get() {
     // `--machine` targets a remote for this invocation (SPEC §15); it must
     // not change what `config get` reports for `machine.name`.
-    let baseline = q()
-        .args(["config", "get", "machine.name", "--json"])
-        .assert()
-        .success();
-    let default_name = json_of(&baseline)["value"].clone();
-
-    let assert = q()
+    let mut cmd = q();
+    std::fs::write(
+        config_path(&cmd),
+        "[machine]\nname = \"laptop\"\n\n[[remotes]]\nname = \"ws\"\nssh = \"ws-host\"\n",
+    )
+    .unwrap();
+    let assert = cmd
         .args(["--machine", "ws", "config", "get", "machine.name", "--json"])
         .assert()
         .success();
-    assert_eq!(json_of(&assert)["value"], default_name);
+    assert_eq!(json_of(&assert)["value"], "laptop");
 }
 
 #[test]
@@ -349,6 +349,42 @@ fn machine_flag_is_validated() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("machine.name"));
+}
+
+/// A `--machine` that names neither this machine nor a configured remote is a
+/// typo, and answering it with an empty listing would read as a fact about that
+/// machine rather than as the mistake it is.
+#[test]
+fn machine_flag_refuses_a_machine_nobody_has_heard_of() {
+    let mut cmd = q();
+    std::fs::write(
+        config_path(&cmd),
+        "[machine]\nname = \"laptop\"\n\n[[remotes]]\nname = \"ws\"\nssh = \"ws-host\"\n",
+    )
+    .unwrap();
+    let assert = cmd
+        .args(["--machine", "bogus", "list", "--json"])
+        .assert()
+        .code(1);
+    let err = error_json(&assert);
+    assert_eq!(err["code"], "not_found");
+    let said = err["error"].as_str().unwrap();
+    assert!(said.contains("bogus"), "{said}");
+    // It names the ones that would have worked.
+    assert!(said.contains("laptop") && said.contains("ws"), "{said}");
+}
+
+/// The local machine is a valid `--machine`: it filters the listing, it is not
+/// a remote to dial.
+#[test]
+fn machine_flag_accepts_this_machines_own_name() {
+    let mut cmd = q();
+    std::fs::write(config_path(&cmd), "[machine]\nname = \"laptop\"\n").unwrap();
+    let assert = cmd
+        .args(["--machine", "laptop", "list", "--json"])
+        .assert()
+        .success();
+    assert!(json_of(&assert).as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -2178,8 +2214,11 @@ fn list_filters_by_machine_only_when_asked() {
     let env = Env::new();
     env.new_quest("foo");
     assert_eq!(env.json(&["list"]).as_array().unwrap().len(), 1);
+    // `elsewhere` has to be a machine this `q` knows: a configured remote,
+    // asked for nothing here because `--no-remote` keeps the round local.
+    env.with_remotes(&[("elsewhere", "elsewhere-host")]);
     assert!(
-        env.json(&["--machine", "elsewhere", "list"])
+        env.json(&["--machine", "elsewhere", "--no-remote", "list"])
             .as_array()
             .unwrap()
             .is_empty()
@@ -7197,6 +7236,70 @@ fn a_remote_without_q_installed_is_unreachable_with_its_own_message() {
     let stderr = stderr_of(&assert);
     assert!(stderr.contains("⚠ unreachable"), "{stderr}");
     assert!(stderr.contains("command not found"), "{stderr}");
+}
+
+/// SPEC §16's listing filters have to travel: a remote answering its own
+/// default listing would contradict the `--all`/`--state` actually asked for
+/// the moment bd-8lz.5.2 merges the rows.
+#[test]
+fn the_listing_filters_are_forwarded_to_the_remote() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": "[]" } }),
+    );
+    cmd.args(["list", "--json", "--all", "--state", "finished"])
+        .assert()
+        .success();
+    assert_eq!(
+        env.ssh_calls(),
+        ["ws-host\tq\tlist\t--json\t--no-remote\t--all\t--state\tfinished"]
+    );
+}
+
+/// `q list -q` prints nothing, so it must not pay for a round that can cost the
+/// whole remote deadline.
+#[test]
+fn a_quiet_listing_does_not_reach_out_at_all() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let mut cmd = env.cmd();
+    env.with_ssh(
+        &mut cmd,
+        serde_json::json!({ "ws-host": { "stdout": "[]" } }),
+    );
+    let assert = cmd.args(["list", "-q"]).assert().success();
+    assert_eq!(
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap(),
+        ""
+    );
+    assert!(env.ssh_calls().is_empty(), "{:?}", env.ssh_calls());
+
+    // `--json` still prints, so it still asks.
+    env.list(serde_json::json!({ "ws-host": { "stdout": "[]" } }))
+        .success();
+    assert_eq!(env.ssh_calls().len(), 1);
+}
+
+/// The far end's own `[machine] name` is not the name this side files it under:
+/// `remotes[].name` is what `--machine` takes and what the machine column shows.
+#[test]
+fn a_remote_that_calls_itself_something_else_is_cached_verbatim_under_its_config_name() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    // The box knows itself as `workstation`; the config reaches it as `ws`.
+    let payload = remote_listing("workstation", "over-there");
+    env.list(serde_json::json!({ "ws-host": { "stdout": payload } }))
+        .success();
+
+    let down = env
+        .list(serde_json::json!({ "ws-host": { "timeout": true } }))
+        .success();
+    let stderr = stderr_of(&down);
+    assert!(stderr.contains("ws ⚠ unreachable"), "{stderr}");
+    assert!(stderr.contains("1 cached quest"), "{stderr}");
 }
 
 #[test]

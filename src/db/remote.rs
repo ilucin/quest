@@ -2,7 +2,9 @@
 //!
 //! One row per configured remote, overwritten on every successful fan-out. The
 //! payload is stored verbatim as JSON so a listing can be rendered from it
-//! without the remote being up.
+//! without the remote being up — verbatim rather than re-serialized from the
+//! parsed views, so that a field a newer `q` at the far end sent and this one
+//! does not know survives the round trip.
 
 use rusqlite::params;
 

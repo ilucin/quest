@@ -9,18 +9,20 @@
 //!
 //! This module is the plumbing only. Merging these rows into `q list` and the
 //! TUI (bd-8lz.5.2) and proxying commands over ssh (bd-8lz.5.3) build on top.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::Ctx;
+use crate::cli::QuestState as StateFilter;
 use crate::commands::QuestView;
-use crate::config::Remote;
+use crate::config::{Config, Remote};
 use crate::db::Db;
 use crate::error::QError;
 use crate::model::now;
@@ -31,9 +33,33 @@ use crate::output;
 /// not a listing.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// What a remote is asked for. `--no-remote` is the recursion guard: without it
-/// the remote would fan out to *its* remotes, us included.
+/// What a remote is always asked for. `--no-remote` is the recursion guard:
+/// without it the remote would fan out to *its* remotes, us included.
 pub const LIST_ARGV: [&str; 4] = ["q", "list", "--json", "--no-remote"];
+
+/// The remote's `q list`, filtered the same way this one is. The flags have to
+/// travel: a remote answering its own default listing would silently contradict
+/// a `--all` or `--state` the user actually asked for.
+pub fn list_argv(all: bool, state: Option<StateFilter>) -> Vec<String> {
+    let mut argv: Vec<String> = LIST_ARGV.iter().map(|a| (*a).to_string()).collect();
+    if all {
+        argv.push("--all".to_string());
+    }
+    if let Some(state) = state {
+        argv.push("--state".to_string());
+        argv.push(state_flag(state).to_string());
+    }
+    argv
+}
+
+/// The `--state` value clap would have parsed, spelled back out.
+fn state_flag(state: StateFilter) -> &'static str {
+    match state {
+        StateFilter::Active => "active",
+        StateFilter::Idle => "idle",
+        StateFilter::Finished => "finished",
+    }
+}
 
 /// SPEC §15's marker for a machine that did not answer.
 pub const UNREACHABLE: &str = "⚠ unreachable";
@@ -78,15 +104,15 @@ pub fn ssh() -> Box<dyn Ssh> {
 ///
 /// `BatchMode=yes` because nobody is at the keyboard: a host wanting a password
 /// or a passphrase must fail fast rather than hold the listing until the
-/// deadline. `ConnectTimeout` is ssh's own budget for the TCP handshake — the
-/// deadline below covers the whole call, this only makes the common failure
-/// (host down) return sooner.
+/// deadline. `ConnectTimeout` is ssh's own budget for the TCP handshake, set to
+/// *half* the deadline so the common failure (host down, unroutable) gives up
+/// well inside the round rather than burning the whole budget.
 fn ssh_argv(alias: &str, argv: &[&str], timeout: Duration) -> Vec<String> {
     let mut out = vec![
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         "-o".to_string(),
-        format!("ConnectTimeout={}", timeout.as_secs().max(1)),
+        format!("ConnectTimeout={}", (timeout.as_secs() / 2).max(1)),
         alias.to_string(),
     ];
     out.extend(argv.iter().map(|a| (*a).to_string()));
@@ -98,57 +124,92 @@ pub struct RealSsh;
 /// How often the deadline is checked while the child runs.
 const POLL: Duration = Duration::from_millis(20);
 
+/// Most a single stream may buffer. A remote is expected to send a listing, not
+/// a stream: past this the read end is dropped, which stops a hostile or broken
+/// far end from spending our memory for the whole deadline.
+const MAX_OUTPUT: u64 = 1 << 20;
+
 impl Ssh for RealSsh {
     fn run(&self, alias: &str, argv: &[&str], timeout: Duration) -> SshOutcome {
-        let spawned = Command::new("ssh")
-            .args(ssh_argv(alias, argv, timeout))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
-        let mut child = match spawned {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return SshOutcome::Failed("ssh not found on PATH".to_string());
-            }
-            Err(e) => return SshOutcome::Failed(format!("cannot run ssh: {e}")),
-        };
+        let mut cmd = Command::new("ssh");
+        cmd.args(ssh_argv(alias, argv, timeout));
+        run_with_deadline(cmd, timeout)
+    }
+}
 
-        // Drained on their own threads: a child that fills a pipe would block
-        // forever, and this call has a deadline to keep.
-        let out_pipe = child.stdout.take();
-        let err_pipe = child.stderr.take();
-        let (ending, stdout, stderr) = std::thread::scope(|scope| {
-            let out = scope.spawn(move || drain(out_pipe));
-            let err = scope.spawn(move || drain(err_pipe));
-            let deadline = Instant::now() + timeout;
-            let ending = loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break Ending::Exited(status.code()),
-                    Ok(None) if Instant::now() >= deadline => {
-                        // Killing the child closes both pipes, so the drains end.
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break Ending::TimedOut;
-                    }
-                    Ok(None) => std::thread::sleep(POLL),
-                    Err(e) => break Ending::Broken(format!("cannot wait for ssh: {e}")),
-                }
-            };
-            (
-                ending,
-                out.join().unwrap_or_default(),
-                err.join().unwrap_or_default(),
-            )
-        });
-        match ending {
-            Ending::Exited(code) => SshOutcome::Done {
+/// Run `cmd` to completion or to `timeout`, whichever comes first — and return
+/// no later than `timeout` either way.
+///
+/// The deadline has to be hard, because `q list` is also a TUI tick. That rules
+/// out joining the pipe drains: a pipe's write end can outlive the child that
+/// was handed it, and under ssh multiplexing (which SPEC §23 #6 recommends) it
+/// routinely does — the mux master keeps a dup of the client's stderr, so
+/// killing the client leaves our read blocked with nobody left to close it. So
+/// the drains are detached threads writing into shared buffers, and a drain
+/// that has not finished by the deadline is simply abandoned: it holds nothing
+/// but its own capped buffer and ends by itself when the fd finally closes.
+fn run_with_deadline(mut cmd: Command, timeout: Duration) -> SshOutcome {
+    let spawned = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return SshOutcome::Failed("ssh not found on PATH".to_string());
+        }
+        Err(e) => return SshOutcome::Failed(format!("cannot run ssh: {e}")),
+    };
+    let deadline = Instant::now() + timeout;
+
+    // Drained off-thread: a child that fills a pipe would block forever, and
+    // this call has a deadline to keep.
+    let (done_tx, done) = mpsc::channel();
+    let out = drain(child.stdout.take(), done_tx.clone());
+    let err = drain(child.stderr.take(), done_tx);
+
+    let ending = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ending::Exited(status.code()),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Ending::TimedOut;
+            }
+            Ok(None) => std::thread::sleep(POLL),
+            Err(e) => {
+                // Nothing else reaps this child: `Child::drop` neither kills
+                // nor waits, so without this it stays a live ssh and a zombie.
+                let _ = child.kill();
+                let _ = child.wait();
+                break Ending::Broken(format!("cannot wait for ssh: {e}"));
+            }
+        }
+    };
+
+    match ending {
+        // Only this arm uses the output, so only this arm waits for it — and
+        // never past the deadline the child already respected.
+        Ending::Exited(code) => {
+            await_drains(&done, deadline);
+            SshOutcome::Done {
                 code,
-                stdout,
-                stderr,
-            },
-            Ending::TimedOut => SshOutcome::TimedOut,
-            Ending::Broken(e) => SshOutcome::Failed(e),
+                stdout: taken(&out),
+                stderr: taken(&err),
+            }
+        }
+        Ending::TimedOut => SshOutcome::TimedOut,
+        Ending::Broken(e) => SshOutcome::Failed(e),
+    }
+}
+
+/// Wait for both drains, giving up at `deadline` and leaving them running.
+fn await_drains(done: &mpsc::Receiver<()>, deadline: Instant) {
+    for _ in 0..2 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || done.recv_timeout(left).is_err() {
+            return;
         }
     }
 }
@@ -160,13 +221,39 @@ enum Ending {
     Broken(String),
 }
 
-fn drain(pipe: Option<impl Read>) -> String {
-    let Some(mut pipe) = pipe else {
-        return String::new();
-    };
-    let mut buf = Vec::new();
-    let _ = pipe.read_to_end(&mut buf);
-    String::from_utf8_lossy(&buf).into_owned()
+/// Shared with the detached reader, which appends between reads rather than at
+/// the end, so abandoning it still yields everything that had arrived.
+type Buffer = Arc<Mutex<Vec<u8>>>;
+
+fn drain(pipe: Option<impl Read + Send + 'static>, done: mpsc::Sender<()>) -> Buffer {
+    let buf: Buffer = Arc::new(Mutex::new(Vec::new()));
+    let into = Arc::clone(&buf);
+    std::thread::spawn(move || {
+        if let Some(pipe) = pipe {
+            let mut pipe = pipe.take(MAX_OUTPUT);
+            let mut chunk = [0u8; 8 * 1024];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => lock(&into).extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+        let _ = done.send(());
+    });
+    buf
+}
+
+fn taken(buf: &Buffer) -> String {
+    String::from_utf8_lossy(&lock(buf)).into_owned()
+}
+
+/// Poison is not news here: the reader only ever appends, so the bytes that did
+/// arrive are still exactly the bytes that arrived.
+fn lock(buf: &Buffer) -> std::sync::MutexGuard<'_, Vec<u8>> {
+    buf.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ----------------------------------------------------------------- fixture
@@ -204,20 +291,26 @@ pub struct SshHost {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fail: Option<String>,
     /// Wait this long before answering — how a test makes a fan-out that is
-    /// not parallel take N times as long as one that is.
+    /// not parallel take N times as long as one that is. A delay longer than
+    /// the deadline times out, exactly as the real backend would.
     #[serde(default)]
     pub delay_ms: u64,
 }
 
 impl Ssh for FixtureSsh {
-    fn run(&self, alias: &str, argv: &[&str], _timeout: Duration) -> SshOutcome {
+    fn run(&self, alias: &str, argv: &[&str], timeout: Duration) -> SshOutcome {
         log(alias, argv);
         let mut script = script();
         let Some(host) = script.hosts.remove(alias) else {
             return SshOutcome::Failed(format!("no fixture host `{alias}`"));
         };
-        if host.delay_ms > 0 {
-            std::thread::sleep(Duration::from_millis(host.delay_ms));
+        let delay = Duration::from_millis(host.delay_ms);
+        if delay > timeout {
+            std::thread::sleep(timeout);
+            return SshOutcome::TimedOut;
+        }
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
         }
         if let Some(msg) = host.fail {
             return SshOutcome::Failed(msg);
@@ -272,6 +365,8 @@ pub enum RemoteStatus {
 }
 
 impl RemoteStatus {
+    /// For the merge in bd-8lz.5.2, which shows fresh rows differently.
+    #[allow(dead_code)]
     pub fn is_ok(&self) -> bool {
         matches!(self, RemoteStatus::Ok)
     }
@@ -345,15 +440,42 @@ pub fn targets(ctx: &Ctx) -> Vec<&Remote> {
     }
 }
 
-/// Ask every remote at once and fold in the cache. The whole round takes about
-/// as long as the slowest remote, and at most [`TIMEOUT`].
-pub fn fetch_all(ctx: &Ctx) -> Vec<RemoteResult> {
+/// Ask every remote at once, with this invocation's own listing filters, and
+/// fold in the cache. The whole round takes about as long as the slowest
+/// remote, and at most [`TIMEOUT`].
+pub fn fetch_all(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> Vec<RemoteResult> {
     let targets = targets(ctx);
     if targets.is_empty() {
         return Vec::new();
     }
-    let answers = fan_out(ctx.ssh(), &targets, TIMEOUT);
+    let argv = list_argv(all, state);
+    let answers = fan_out(ctx.ssh(), &targets, &argv, TIMEOUT);
     resolve(ctx.db().ok(), &targets, answers, now())
+}
+
+/// Every machine name `--machine` may name: this one, plus the remotes. Used to
+/// turn a typo into an error instead of an empty listing.
+pub fn known_machines(config: &Config) -> Vec<&str> {
+    let mut names = vec![config.machine.name.as_str()];
+    names.extend(config.remotes.iter().map(|r| r.name.as_str()));
+    names
+}
+
+/// `--machine <name>`: well-formed *and* a machine this `q` knows about. A name
+/// that is neither the local machine nor a configured remote can only be a
+/// typo, and answering it with "no quests" would read as a fact about that
+/// machine rather than as the mistake it is.
+pub fn validate_target(config: &Config, name: &str) -> anyhow::Result<()> {
+    crate::config::validate_machine_name(name)?;
+    let known = known_machines(config);
+    if known.contains(&name) {
+        return Ok(());
+    }
+    Err(QError::NotFound(format!(
+        "machine `{name}` — known machines: {}",
+        known.join(", ")
+    ))
+    .into())
 }
 
 /// Buffers one line per unhappy remote onto the `Ctx` (see [`Ctx::warn`]), so
@@ -370,14 +492,17 @@ pub fn warn_unreachable(ctx: &Ctx, results: &[RemoteResult]) {
 fn fan_out(
     ssh: &dyn Ssh,
     targets: &[&Remote],
+    argv: &[String],
     timeout: Duration,
-) -> Vec<Result<Vec<QuestView>, RemoteStatus>> {
+) -> Vec<Result<Answer, RemoteStatus>> {
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let argv = argv.as_slice();
     std::thread::scope(|scope| {
         let handles: Vec<_> = targets
             .iter()
             .map(|remote| {
                 let alias = remote.ssh.as_str();
-                scope.spawn(move || interpret(ssh.run(alias, &LIST_ARGV, timeout), timeout))
+                scope.spawn(move || interpret(ssh.run(alias, argv, timeout), timeout))
             })
             .collect();
         handles
@@ -393,10 +518,19 @@ fn fan_out(
     })
 }
 
-/// What the far end said, turned into either Quests or a reason it is not
-/// usable. Nothing here can panic: garbage, a non-zero exit and JSON from
+/// One remote's answer: the Quests it sent and the bytes they arrived in. The
+/// bytes are what the cache keeps — re-serializing the parsed views would drop
+/// every field a newer `q` at the far end knows and this one does not.
+#[derive(Debug)]
+struct Answer {
+    quests: Vec<QuestView>,
+    raw: String,
+}
+
+/// What the far end said, turned into either an [`Answer`] or a reason it is
+/// not usable. Nothing here can panic: garbage, a non-zero exit and JSON from
 /// another version of `q` all land on a status.
-fn interpret(outcome: SshOutcome, timeout: Duration) -> Result<Vec<QuestView>, RemoteStatus> {
+fn interpret(outcome: SshOutcome, timeout: Duration) -> Result<Answer, RemoteStatus> {
     match outcome {
         SshOutcome::TimedOut => Err(RemoteStatus::Unreachable(format!(
             "no answer within {}s",
@@ -411,7 +545,11 @@ fn interpret(outcome: SshOutcome, timeout: Duration) -> Result<Vec<QuestView>, R
             if code != Some(0) {
                 return Err(RemoteStatus::Unreachable(exit_reason(code, &stderr)));
             }
-            parse(&stdout).map_err(RemoteStatus::Incompatible)
+            let quests = parse(&stdout).map_err(RemoteStatus::Incompatible)?;
+            Ok(Answer {
+                quests,
+                raw: stdout.trim().to_string(),
+            })
         }
     }
 }
@@ -443,20 +581,21 @@ pub fn parse(stdout: &str) -> Result<Vec<QuestView>, String> {
 fn resolve(
     db: Option<&Db>,
     targets: &[&Remote],
-    answers: Vec<Result<Vec<QuestView>, RemoteStatus>>,
+    answers: Vec<Result<Answer, RemoteStatus>>,
     ts: i64,
 ) -> Vec<RemoteResult> {
     targets
         .iter()
         .zip(answers)
         .map(|(remote, answer)| match answer {
-            Ok(quests) => {
-                store(db, &remote.name, &quests, ts);
+            Ok(mut answer) => {
+                store(db, &remote.name, &answer.raw, ts);
+                attribute(&mut answer.quests, &remote.name);
                 RemoteResult {
                     name: remote.name.clone(),
                     ssh: remote.ssh.clone(),
                     status: RemoteStatus::Ok,
-                    quests,
+                    quests: answer.quests,
                     stale: false,
                     fetched_at: Some(ts),
                 }
@@ -476,23 +615,38 @@ fn resolve(
         .collect()
 }
 
-/// Best effort in both directions: a cache that cannot be written or read costs
-/// staleness, never the listing.
-fn store(db: Option<&Db>, name: &str, quests: &[QuestView], ts: i64) {
-    let Some(db) = db else { return };
-    if let Ok(payload) = serde_json::to_string(quests) {
-        let _ = db.put_remote_cache(name, &payload, ts);
+/// `remotes[].name` wins over the `[machine] name` the far end reports.
+///
+/// The two can disagree — a box configured as `workstation` reached through a
+/// remote called `ws`. The config name is the one the user types into
+/// `--machine` and the one this `q` shows in the machine column, so every row
+/// is stamped with it; the remote's own idea of its name is not carried over.
+fn attribute(quests: &mut [QuestView], name: &str) {
+    for quest in quests {
+        if quest.quest.machine != name {
+            quest.quest.machine = name.to_string();
+        }
     }
+}
+
+/// Best effort in both directions: a cache that cannot be written or read costs
+/// staleness, never the listing. The payload is stored exactly as it arrived —
+/// see [`Answer`].
+fn store(db: Option<&Db>, name: &str, payload: &str, ts: i64) {
+    let Some(db) = db else { return };
+    let _ = db.put_remote_cache(name, payload, ts);
 }
 
 fn load(db: Option<&Db>, name: &str) -> Option<(Vec<QuestView>, i64)> {
     let cached = db?.get_remote_cache(name).ok().flatten()?;
-    let quests = parse(&cached.payload).ok()?;
+    let mut quests = parse(&cached.payload).ok()?;
+    attribute(&mut quests, name);
     Some((quests, cached.fetched_at))
 }
 
 /// The configured remote called `name`, for the commands that dispatch to one
 /// (bd-8lz.5.3).
+#[allow(dead_code)]
 pub fn find<'a>(remotes: &'a [Remote], name: &str) -> anyhow::Result<&'a Remote> {
     remotes.iter().find(|r| r.name == name).ok_or_else(|| {
         QError::NotFound(format!("remote `{name}` (see `[[remotes]]` in the config)")).into()
@@ -599,8 +753,21 @@ mod tests {
 
     /// One Quest as a remote's `q list --json` would send it.
     fn payload(slug: &str) -> String {
-        let view = QuestView::new(Quest::new(slug, "/tmp", "ws"), &[]);
+        payload_from("ws", slug)
+    }
+
+    /// The same, from a machine that calls itself `machine`.
+    fn payload_from(machine: &str, slug: &str) -> String {
+        let view = QuestView::new(Quest::new(slug, "/tmp", machine), &[]);
         serde_json::to_string(&[view]).unwrap()
+    }
+
+    /// A remote's answer, the way `interpret` would have built it.
+    fn answer(raw: &str) -> Answer {
+        Answer {
+            quests: parse(raw).unwrap(),
+            raw: raw.to_string(),
+        }
     }
 
     fn ok(stdout: String) -> SshOutcome {
@@ -620,7 +787,8 @@ mod tests {
                 "-o",
                 "BatchMode=yes",
                 "-o",
-                "ConnectTimeout=5",
+                // Half the deadline, so an unroutable host gives up inside it.
+                "ConnectTimeout=2",
                 "ws",
                 "q",
                 "list",
@@ -628,6 +796,38 @@ mod tests {
                 "--no-remote"
             ]
         );
+        // However short the deadline, ssh is never told to wait zero seconds.
+        assert!(
+            ssh_argv("ws", &LIST_ARGV, Duration::from_millis(1))
+                .contains(&"ConnectTimeout=1".to_string())
+        );
+    }
+
+    #[test]
+    fn the_listing_filters_travel_to_the_remote() {
+        assert_eq!(list_argv(false, None), LIST_ARGV);
+        assert_eq!(
+            list_argv(true, Some(StateFilter::Idle)),
+            [
+                "q",
+                "list",
+                "--json",
+                "--no-remote",
+                "--all",
+                "--state",
+                "idle"
+            ]
+        );
+        // Every filter this `q` accepts has a spelling the far end accepts.
+        for state in [
+            StateFilter::Active,
+            StateFilter::Idle,
+            StateFilter::Finished,
+        ] {
+            let argv = list_argv(false, Some(state));
+            assert_eq!(argv[..4], LIST_ARGV);
+            assert_eq!(argv[4], "--state");
+        }
     }
 
     #[test]
@@ -641,21 +841,18 @@ mod tests {
         ])
         .with_delay(Duration::from_millis(50));
 
-        let started = Instant::now();
-        let answers = fan_out(&ssh, &targets, TIMEOUT);
-        let elapsed = started.elapsed();
+        let answers = fan_out(&ssh, &targets, &list_argv(false, None), TIMEOUT);
 
         assert_eq!(answers.len(), 3);
         assert!(answers.iter().all(|a| a.is_ok()));
+        // Overlap, not the wall clock: a loaded CI runner may take as long as
+        // it likes, but three calls cannot be in flight at once unless they
+        // really did run in parallel.
         assert_eq!(ssh.peak(), 3, "the calls did not overlap");
-        assert!(
-            elapsed < Duration::from_millis(150),
-            "serial fan-out: {elapsed:?}"
-        );
         // The answers keep config order whatever order they arrived in.
         let slugs: Vec<&str> = answers
             .iter()
-            .map(|a| a.as_ref().unwrap()[0].quest.slug.as_str())
+            .map(|a| a.as_ref().unwrap().quests[0].quest.slug.as_str())
             .collect();
         assert_eq!(slugs, ["one", "two", "three"]);
         assert_eq!(ssh.calls()[0].1, LIST_ARGV);
@@ -726,12 +923,7 @@ mod tests {
         let remotes = [remote("ws")];
         let targets: Vec<&Remote> = remotes.iter().collect();
 
-        let fresh = resolve(
-            Some(&db),
-            &targets,
-            vec![Ok(parse(&payload("one")).unwrap())],
-            1000,
-        );
+        let fresh = resolve(Some(&db), &targets, vec![Ok(answer(&payload("one")))], 1000);
         assert_eq!(fresh[0].status, RemoteStatus::Ok);
         assert!(!fresh[0].stale);
         assert_eq!(fresh[0].fetched_at, Some(1000));
@@ -778,7 +970,7 @@ mod tests {
     fn without_a_database_the_fan_out_still_works() {
         let remotes = [remote("ws")];
         let targets: Vec<&Remote> = remotes.iter().collect();
-        let out = resolve(None, &targets, vec![Ok(parse(&payload("one")).unwrap())], 1);
+        let out = resolve(None, &targets, vec![Ok(answer(&payload("one")))], 1);
         assert_eq!(out[0].quests.len(), 1);
         let out = resolve(
             None,
@@ -810,7 +1002,7 @@ mod tests {
         // unreachable row rather than as nothing.
         let ctx = ctx_with(&[], Box::new(stub::NoSsh));
         assert!(targets(&ctx).is_empty());
-        assert!(fetch_all(&ctx).is_empty());
+        assert!(fetch_all(&ctx, false, None).is_empty());
     }
 
     #[test]
@@ -818,11 +1010,11 @@ mod tests {
         let remotes = [remote("ws")];
         let ctx = ctx_with(&remotes, Box::new(stub::NoSsh)).with_no_remote(true);
         assert!(targets(&ctx).is_empty());
-        assert!(fetch_all(&ctx).is_empty());
+        assert!(fetch_all(&ctx, false, None).is_empty());
 
         // The same config without the guard does reach for the remote.
         let ctx = ctx_with(&remotes, Box::new(stub::NoSsh));
-        assert_eq!(names(&fetch_all(&ctx)), ["ws"]);
+        assert_eq!(names(&fetch_all(&ctx, false, None)), ["ws"]);
     }
 
     #[test]
@@ -834,16 +1026,21 @@ mod tests {
                 ("box-host", ok(payload("two"))),
             ])) as Box<dyn Ssh>
         };
-        assert_eq!(names(&fetch_all(&ctx_with(&remotes, ssh()))), ["ws", "box"]);
+        assert_eq!(
+            names(&fetch_all(&ctx_with(&remotes, ssh()), false, None)),
+            ["ws", "box"]
+        );
         assert_eq!(
             names(&fetch_all(
-                &ctx_with(&remotes, ssh()).with_machine(Some("box"))
+                &ctx_with(&remotes, ssh()).with_machine(Some("box")),
+                false,
+                None
             )),
             ["box"]
         );
         // The local machine is not a remote: nothing to ask.
         let ctx = ctx_with(&remotes, Box::new(stub::NoSsh)).with_machine(Some("laptop"));
-        assert!(fetch_all(&ctx).is_empty());
+        assert!(fetch_all(&ctx, false, None).is_empty());
     }
 
     #[test]
@@ -853,11 +1050,176 @@ mod tests {
             ("up-host", ok(payload("one"))),
             ("down-host", SshOutcome::TimedOut),
         ]);
-        let results = fetch_all(&ctx_with(&remotes, Box::new(ssh)));
+        let results = fetch_all(&ctx_with(&remotes, Box::new(ssh)), false, None);
         assert_eq!(results[0].status, RemoteStatus::Ok);
         assert_eq!(results[0].quests[0].quest.slug, "one");
         assert_eq!(results[1].status.marker(), Some(UNREACHABLE));
         assert!(results[1].quests.is_empty());
+    }
+
+    // ------------------------------------------- the real child-process path
+
+    /// `/bin/sh -c` stands in for ssh: it spawns, writes to both streams, exits
+    /// and forks exactly like the real thing, with no host anywhere near it.
+    fn sh(script: &str) -> Command {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(script);
+        cmd
+    }
+
+    /// Short enough that a test never waits on it, long enough that a busy
+    /// runner still gets there.
+    const SHORT: Duration = Duration::from_millis(300);
+    /// What "the deadline held" is judged against. Far above [`SHORT`] so a
+    /// loaded runner cannot fail these, and far below the 30 s the grandchildren
+    /// below live for, so a deadline that is not enforced cannot pass them.
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn a_command_that_finishes_is_reported_with_both_its_streams() {
+        let outcome = run_with_deadline(sh("printf hello; printf oops >&2; exit 3"), TIMEOUT);
+        assert_eq!(
+            outcome,
+            SshOutcome::Done {
+                code: Some(3),
+                stdout: "hello".to_string(),
+                stderr: "oops".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_binary_that_is_not_there_is_a_failure_rather_than_a_panic() {
+        let outcome = run_with_deadline(Command::new("q-no-such-binary-anywhere"), TIMEOUT);
+        assert_eq!(
+            outcome,
+            SshOutcome::Failed("ssh not found on PATH".to_string())
+        );
+    }
+
+    #[test]
+    fn a_child_that_will_not_finish_is_killed_at_the_deadline() {
+        let started = Instant::now();
+        assert_eq!(
+            run_with_deadline(sh("sleep 30"), SHORT),
+            SshOutcome::TimedOut
+        );
+        assert!(started.elapsed() < PATIENCE, "{:?}", started.elapsed());
+    }
+
+    /// The regression this whole shape exists for. Under ssh multiplexing the
+    /// mux master keeps a dup of the client's stderr, so killing the client
+    /// leaves our pipe open with nobody left to close it, and a drain that is
+    /// joined unconditionally never returns. A grandchild that inherits the
+    /// pipes and outlives its parent is that exact shape, without a host.
+    #[test]
+    fn a_pipe_held_open_after_the_kill_cannot_outlast_the_deadline() {
+        let started = Instant::now();
+        assert_eq!(
+            run_with_deadline(sh("sleep 30 & sleep 30"), SHORT),
+            SshOutcome::TimedOut
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < PATIENCE,
+            "the deadline was not enforced: {elapsed:?}"
+        );
+    }
+
+    /// The same pipe, but the child exits by itself: what it did say comes
+    /// back, and the fd still held open does not hold the call past the
+    /// deadline either.
+    #[test]
+    fn a_child_that_exits_leaving_its_pipe_open_still_answers_in_time() {
+        let started = Instant::now();
+        let outcome = run_with_deadline(sh("sleep 30 & printf hello"), SHORT);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < PATIENCE,
+            "the deadline was not enforced: {elapsed:?}"
+        );
+        match outcome {
+            SshOutcome::Done { code, stdout, .. } => {
+                assert_eq!(code, Some(0));
+                assert_eq!(stdout, "hello");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_remote_that_floods_the_pipe_is_capped_rather_than_buffered_whole() {
+        let flood = MAX_OUTPUT * 4;
+        let outcome = run_with_deadline(sh(&format!("yes | head -c {flood}")), TIMEOUT);
+        match outcome {
+            SshOutcome::Done { stdout, .. } => {
+                assert!(!stdout.is_empty());
+                assert!(stdout.len() as u64 <= MAX_OUTPUT, "{} bytes", stdout.len());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------ names and caching
+
+    #[test]
+    fn a_machine_that_is_neither_this_one_nor_a_remote_is_an_error() {
+        let mut config = Config::default();
+        config.machine.name = "laptop".to_string();
+        config.remotes = vec![remote("ws")];
+
+        validate_target(&config, "laptop").unwrap();
+        validate_target(&config, "ws").unwrap();
+        assert_eq!(known_machines(&config), ["laptop", "ws"]);
+
+        let e = validate_target(&config, "bogus").unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<QError>().map(QError::code),
+            Some("not_found")
+        );
+        let said = e.to_string();
+        assert!(said.contains("laptop") && said.contains("ws"), "{said}");
+        // The shape is still checked, and first.
+        assert!(validate_target(&config, "Not Valid").is_err());
+    }
+
+    /// `remotes[].name` is authoritative: the far end's own `[machine] name` is
+    /// replaced by the one this config reaches it under, fresh and cached alike.
+    #[test]
+    fn a_remote_that_calls_itself_something_else_is_still_listed_under_its_config_name() {
+        let db = Db::open_in_memory().unwrap();
+        let remotes = [remote("ws")];
+        let targets: Vec<&Remote> = remotes.iter().collect();
+
+        let raw = payload_from("workstation", "over-there");
+        let fresh = resolve(Some(&db), &targets, vec![Ok(answer(&raw))], 1000);
+        assert_eq!(fresh[0].quests[0].quest.machine, "ws");
+
+        let down = resolve(
+            Some(&db),
+            &targets,
+            vec![Err(RemoteStatus::Unreachable("down".to_string()))],
+            2000,
+        );
+        assert!(down[0].stale);
+        assert_eq!(down[0].quests[0].quest.machine, "ws");
+    }
+
+    #[test]
+    fn the_cache_keeps_the_response_verbatim_so_a_newer_remote_loses_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        let remotes = [remote("ws")];
+        let targets: Vec<&Remote> = remotes.iter().collect();
+
+        let mut value: serde_json::Value = serde_json::from_str(&payload("one")).unwrap();
+        value[0]["something_from_the_future"] = serde_json::json!("hello");
+        let raw = value.to_string();
+        resolve(Some(&db), &targets, vec![Ok(answer(&raw))], 1000);
+
+        let cached = db.get_remote_cache("ws").unwrap().unwrap();
+        assert_eq!(cached.payload, raw, "the payload was re-serialized");
+        let back: serde_json::Value = serde_json::from_str(&cached.payload).unwrap();
+        assert_eq!(back[0]["something_from_the_future"], "hello");
     }
 
     #[test]

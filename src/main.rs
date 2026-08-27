@@ -82,7 +82,7 @@ impl Ctx {
     fn new(args: &Cli, config: Config, db: Option<Db>) -> anyhow::Result<Ctx> {
         let machine_override = match &args.machine {
             Some(m) => {
-                config::validate_machine_name(m)?;
+                remote::validate_target(&config, m)?;
                 Some(m.clone())
             }
             None => None,
