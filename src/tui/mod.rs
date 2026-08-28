@@ -9,8 +9,8 @@
 //! * only `run` below talks to a real terminal, and [`handoff`] is the one
 //!   place that hands it to somebody else (tmux, a pager) and takes it back.
 //!
-//! The tab bodies (`quests`, `sessions`, `templates`, `events`) are stubs that
-//! later beads fill in against the seams they already expose.
+//! The tab bodies (`quests`, `sessions`, `templates`, `events`) own their own
+//! loading, keymap and rendering; the shell only decides when each runs.
 
 pub mod app;
 pub mod events;
@@ -96,6 +96,13 @@ trait TermIo {
     fn paste(&mut self, on: bool) -> io::Result<()>;
     fn show_cursor(&mut self) -> io::Result<()>;
     fn flush(&mut self) -> io::Result<()>;
+    /// One line on the terminal this process is about to give away for good.
+    ///
+    /// Only [`land`]'s exec shape uses it, and only after the TUI is off the
+    /// screen: nothing will be drawn again, so the status bar is not a place
+    /// to say anything. Written where the CLI writes the same lines — stderr,
+    /// the way `q tpl run` flushes its warnings before it attaches.
+    fn note(&mut self, line: &str) -> io::Result<()>;
 }
 
 impl<T: TermIo + ?Sized> TermIo for &mut T {
@@ -116,6 +123,9 @@ impl<T: TermIo + ?Sized> TermIo for &mut T {
     }
     fn flush(&mut self) -> io::Result<()> {
         (**self).flush()
+    }
+    fn note(&mut self, line: &str) -> io::Result<()> {
+        (**self).note(line)
     }
 }
 
@@ -168,6 +178,10 @@ impl TermIo for Stdio {
 
     fn flush(&mut self) -> io::Result<()> {
         io::stdout().flush()
+    }
+
+    fn note(&mut self, line: &str) -> io::Result<()> {
+        writeln!(io::stderr(), "{line}")
     }
 }
 
@@ -614,6 +628,97 @@ where
     Ok(())
 }
 
+/// `X` on the Templates tab (SPEC §11): the selected template's TOML, in a
+/// pager — the same document `q tpl export <name>` writes, through the same
+/// [`handoff`] the brief and the peek use.
+fn export_in_pager<B, T>(
+    io: &mut T,
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> anyhow::Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+    T: TermIo,
+{
+    let Some(template) = templates::selected(app) else {
+        return Ok(());
+    };
+    // Rendered before the handoff, like the brief: a definition that will not
+    // serialize is a status message, not a blank screen with a pager on it.
+    let toml = match crate::templates::render(std::slice::from_ref(&template)) {
+        Ok(toml) => toml,
+        Err(e) => {
+            app.say(format!("cannot export {}: {e:#}", template.name));
+            return Ok(());
+        }
+    };
+    let paged = handoff(io, terminal, app.mouse, || pager::show(&toml))?;
+    if let Err(e) = paged {
+        app.say(format!("cannot page the export: {e:#}"));
+    }
+    Ok(())
+}
+
+/// Land in the master a template run just made (SPEC §11: a routine runs from
+/// the TUI in one keypress).
+///
+/// A no-op unless a run queued somewhere to go, so both paths that can produce
+/// one — the bare `⏎` and the argument form — end the same way without the
+/// loop having to know which it was. The two shapes are the attach's, for the
+/// attach's reasons: with `[ui] return_after_detach` the tmux client runs as a
+/// child and the TUI comes back; without it the terminal is given away for
+/// good and this process stops drawing.
+///
+/// Whatever the run wanted to say rides along on the [`templates::Landing`]
+/// and is said from here, on both shapes. It cannot be left on the status bar
+/// for the next redraw: this function overwrites the status bar, and on the
+/// exec shape there is no next redraw.
+fn land<B, T>(
+    ctx: &Ctx,
+    io: &mut T,
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    poller: Option<&remote::Poller>,
+) -> anyhow::Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+    T: TermIo,
+{
+    let Some(landing) = app.templates.take_landing() else {
+        return Ok(());
+    };
+    // Taken only now: with nothing to land in there is no handoff, and pausing
+    // the remote clock for every form submission would cost a fan-out per key.
+    let _away = Away::new(poller);
+    if !ctx.config.ui.return_after_detach {
+        restore_with(io);
+        // After the restore and before the attach, exactly where
+        // `tpl::instantiate` flushes: the screen is the shell's again, and an
+        // attach outside tmux `exec`s this process away.
+        for warning in &landing.warnings {
+            let _ = io.note(warning);
+        }
+        let _ = io.flush();
+        ctx.tmux()
+            .attach(&landing.tmux_session, Some(&landing.pane))?;
+        app.should_quit = true;
+        return Ok(());
+    }
+    let attached = handoff(io, terminal, app.mouse, || {
+        ctx.tmux()
+            .attach_child(&landing.tmux_session, Some(&landing.pane))
+    })?;
+    let said = match attached {
+        Ok(()) if ctx.tmux().in_tmux() => format!("switched to {}", landing.name),
+        Ok(()) => format!("back from {}", landing.name),
+        Err(e) => format!("{} is running; cannot enter it: {e:#}", landing.name),
+    };
+    app.say(joined(&said, &landing.warnings));
+    Ok(())
+}
+
 // ------------------------------------------------------------------ the loop
 
 /// Next tick deadline. A fixed period from the last one so the tick does not
@@ -777,7 +882,26 @@ fn event_loop(
                 // listing, so the reload is part of the action.
                 Action::Submit => {
                     submit(ctx, app);
+                    // A template run submitted through its argument form
+                    // leaves a master to land in; every other prompt does not,
+                    // and `land` is a no-op for them.
+                    land(ctx, &mut Stdio, terminal, app, poller)?;
                     refresh_due = true;
+                }
+                // SPEC §11's one keypress: make the Quest, then hand the
+                // terminal to its master. The reload afterwards is what moves
+                // `run_count` and the last-run age on the row.
+                Action::Run => {
+                    templates::run_now(ctx, app);
+                    land(ctx, &mut Stdio, terminal, app, poller)?;
+                    refresh_due = true;
+                }
+                Action::Export => {
+                    let away = Away::new(poller);
+                    let out = export_in_pager(&mut Stdio, terminal, app);
+                    drop(away);
+                    out?;
+                    dirty = true;
                 }
                 Action::None => {}
             }
@@ -841,6 +965,7 @@ fn submit(ctx: &Ctx, app: &mut App) {
         app::Prompt::Send(_) | app::Prompt::Kill(_) | app::Prompt::Reset(_) => {
             sessions::submit(ctx, app, &modal.prompt, &modal.form)
         }
+        prompt if prompt.is_template() => templates::submit(ctx, app, &modal.prompt, &modal.form),
         _ => quests::submit(ctx, app, &modal.prompt, &modal.form),
     };
     let warnings = ctx.take_warnings();
@@ -1024,7 +1149,10 @@ fn hint(app: &App) -> &'static str {
         // The tail's own two: what narrows it, and how to get back onto it
         // once the selection has been moved off the newest row.
         Tab::Events => " ? help · / kind · G tail · q quit ",
-        Tab::Templates => " ? help · x refresh · q quit ",
+        // The one that takes over the terminal leads, as it does everywhere:
+        // ⏎ runs the routine and lands in its master. `X` is next because
+        // this is the tab where `x` and `X` mean different things.
+        Tab::Templates => " ? help · ⏎ run · X export · q quit ",
     }
 }
 
@@ -1124,27 +1252,6 @@ fn render_help(frame: &mut Frame, area: Rect, tab: Tab) {
     );
 }
 
-/// Shared body for the tab stubs, so all four say the same thing the same way.
-pub(crate) fn placeholder(frame: &mut Frame, area: Rect, title: &str, bead: &str, app: &App) {
-    if area.height == 0 {
-        return;
-    }
-    let body = vec![
-        Line::from(Span::raw(format!("{title} tab")).bold()),
-        Line::from(""),
-        Line::from(Span::raw(format!("not built yet — lands in {bead}")).dim()),
-        Line::from(Span::raw(format!("machine {}", app.machine)).dim()),
-    ];
-    frame.render_widget(
-        Paragraph::new(body).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .padding(ratatui::widgets::Padding::uniform(1)),
-        ),
-        area,
-    );
-}
-
 /// The lifecycle flags are process-global, so every test that touches them —
 /// here and in [`signals`] — takes this first and always leaves them clear.
 /// Whether [`arm_steps`] actually turns bracketed paste on — asked of the
@@ -1173,6 +1280,9 @@ pub(super) fn arms_bracketed_paste() -> bool {
             Ok(())
         }
         fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn note(&mut self, _line: &str) -> io::Result<()> {
             Ok(())
         }
     }
@@ -1254,6 +1364,9 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeTerm {
         calls: Vec<&'static str>,
+        /// Lines written to the terminal on the way out of TUI mode — the
+        /// exec shape of `land` is the only thing that writes any.
+        notes: Vec<String>,
         /// `(step, (raw, alt, mouse, paste))` as each step was issued, so a
         /// teardown that drops a flag too early is visible rather than merely
         /// narrow.
@@ -1303,6 +1416,10 @@ mod tests {
         }
         fn flush(&mut self) -> io::Result<()> {
             self.step("flush")
+        }
+        fn note(&mut self, line: &str) -> io::Result<()> {
+            self.notes.push(line.to_string());
+            Ok(())
         }
     }
 
@@ -1902,16 +2019,18 @@ mod tests {
         assert!(body.contains("no events yet"), "{body}");
         assert!(!body.contains("no open quests"), "{body}");
 
-        // The Templates tab is the one that is still a stub.
+        // And the Templates tab since bd-8lz.6.2. It has never loaded here —
+        // the shell asks for its rows on the way in — so it says so rather
+        // than claiming the database has no templates.
         app.handle(Input::Char('3'));
         let body = draw(&mut app, 100, 20).join("\n");
-        assert!(body.contains("Templates tab"), "{body}");
+        assert!(body.contains("loading templates"), "{body}");
         assert!(!body.contains("no events yet"), "{body}");
 
         app.handle(Input::Char('1'));
         let body = draw(&mut app, 100, 20).join("\n");
         assert!(body.contains("no open quests"), "{body}");
-        assert!(!body.contains("Templates tab"), "{body}");
+        assert!(!body.contains("loading templates"), "{body}");
     }
 
     #[test]
@@ -1951,16 +2070,17 @@ mod tests {
         let events = on(Tab::Events);
         assert!(events.contains("/ kind"), "{events:?}");
         assert!(events.contains("G tail"), "{events:?}");
-        // The remaining stub tab advertises the reload instead.
-        let stub = on(Tab::Templates);
-        assert!(stub.contains("x refresh"), "{stub:?}");
-        // Nothing that takes the terminal is advertised on a read-only tab.
-        for tab in [Tab::Templates, Tab::Events] {
-            let other = on(tab);
-            assert!(!other.contains("attach"), "{tab:?}: {other:?}");
-            assert!(!other.contains("brief"), "{tab:?}: {other:?}");
-            assert!(!other.contains("peek"), "{tab:?}: {other:?}");
-        }
+        // Templates leads with the key that takes over the terminal — `⏎`
+        // runs the routine and lands in its master — and then with the one
+        // key on this tab whose case matters: `X` exports, `x` still reloads.
+        let routines = on(Tab::Templates);
+        assert!(routines.contains("\u{23ce} run"), "{routines:?}");
+        assert!(routines.contains("X export"), "{routines:?}");
+        // Nothing that takes the terminal is advertised on the read-only tab.
+        let events = on(Tab::Events);
+        assert!(!events.contains("attach"), "{events:?}");
+        assert!(!events.contains("brief"), "{events:?}");
+        assert!(!events.contains("peek"), "{events:?}");
         // `?` and `q` are on every tab: one opens the list of everything the
         // hint had no room for, the other is the way out.
         for tab in Tab::ALL {
@@ -2022,9 +2142,9 @@ mod tests {
         assert!(!events.contains("o attach"), "{events:?}");
 
         app.handle(Input::Char('3'));
-        let stub = draw(&mut app, 100, 20).last().unwrap().clone();
-        assert!(stub.contains("x refresh"), "{stub:?}");
-        assert!(!stub.contains("o attach"), "{stub:?}");
+        let templates = draw(&mut app, 100, 20).last().unwrap().clone();
+        assert!(templates.contains("X export"), "{templates:?}");
+        assert!(!templates.contains("o attach"), "{templates:?}");
     }
 
     #[test]
@@ -2607,6 +2727,243 @@ mod tests {
             ],
             "the terminal was not handed back before the exec"
         );
+    }
+
+    // ------------------------------------------------- templates (SPEC §11)
+
+    /// A `Ctx` with one template stored, and an App sitting on the Templates
+    /// tab with it selected. The tmux is a fixture and `bd` refuses every
+    /// call, so a run reaches neither.
+    fn templates_ctx(cwd: &std::path::Path) -> (Ctx, tempfile::TempDir, App) {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let mut template = crate::model::Template::new("weekly-hygiene");
+        template.description = Some("refresh the work repo".to_string());
+        template.goal = Some("tidy up".to_string());
+        template.cwd = Some(cwd.to_string_lossy().to_string());
+        db.insert_template(&template).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tmux.json");
+        std::fs::write(&path, "{}").unwrap();
+        let ctx = Ctx::for_tests(
+            Config::default(),
+            db,
+            Box::new(crate::tmux::FixtureTmux::new(path)),
+        )
+        .with_bd(Box::new(crate::beads::stub::NoBd));
+
+        let mut app = App::new(&ctx.config, "laptop");
+        app.tab = Tab::Templates;
+        app.set_size(120, 30);
+        refresh_now(&ctx, &mut app);
+        (ctx, dir, app)
+    }
+
+    /// SPEC §11's one keypress, end to end through the loop's own machinery:
+    /// `⏎` asks for the run, the run makes the Quest, and `land` hands the
+    /// terminal to the master it started — leaving TUI mode to do it and
+    /// taking it back afterwards.
+    #[test]
+    fn a_template_runs_on_one_keypress_and_lands_in_the_master_it_makes() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (ctx, _dir, mut app) = templates_ctx(cwd.path());
+        assert_eq!(app.handle(Input::Enter), Action::Run);
+        templates::run_now(&ctx, &mut app);
+
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        let mut terminal = test_terminal();
+        land(&ctx, &mut term, &mut terminal, &mut app, None).expect("land");
+
+        // A child attach, so the TUI comes back — `[ui] return_after_detach`
+        // is on by default.
+        assert_eq!(fixture(&_dir).attach_mode.as_deref(), Some("child"));
+        assert!(app.status.contains("back from"), "{}", app.status);
+        assert!(!app.should_quit, "the TUI quit on a returning attach");
+        assert_eq!(
+            flags(),
+            (true, true, true, true),
+            "TUI mode never came back"
+        );
+        // Landed in exactly once: a second call has nothing to do.
+        assert!(app.templates.take_landing().is_none());
+        restore_with(&mut term);
+    }
+
+    /// `[ui] return_after_detach = false`: the same rule the attach follows —
+    /// the terminal is given away before the exec and never taken back.
+    #[test]
+    fn a_template_run_with_return_after_detach_off_gives_the_terminal_away() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut ctx, _dir, mut app) = templates_ctx(cwd.path());
+        ctx.config.ui.return_after_detach = false;
+        app.handle(Input::Enter);
+        templates::run_now(&ctx, &mut app);
+
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        term.calls.clear();
+        let mut terminal = test_terminal();
+        land(&ctx, &mut term, &mut terminal, &mut app, None).expect("land");
+
+        assert_eq!(fixture(&_dir).attach_mode.as_deref(), Some("exec"));
+        assert!(app.should_quit, "the TUI kept running with no terminal");
+        assert_eq!(flags(), (false, false, false, false));
+        // Nothing will be drawn again, so what the run had to say went to the
+        // terminal on the way out — where `q tpl run` flushes the same line.
+        assert!(
+            term.notes.iter().any(|n| n.contains("no beads epic")),
+            "the warning went nowhere: {:?}",
+            term.notes
+        );
+    }
+
+    /// A warning the run raised reaches the user on every shape the landing
+    /// takes. `land` overwrites the status line, so the warning rides on the
+    /// landing and is said from there rather than left on the `Ctx` for a
+    /// redraw that may never come (bd-8lz.6.2).
+    #[test]
+    fn a_run_says_its_warnings_however_it_lands() {
+        let _lock = lifecycle_lock();
+
+        // The bare `⏎`: no form between the keypress and the landing.
+        let cwd = tempfile::tempdir().unwrap();
+        let (ctx, _dir, mut app) = templates_ctx(cwd.path());
+        assert_eq!(app.handle(Input::Enter), Action::Run);
+        templates::run_now(&ctx, &mut app);
+        assert!(
+            ctx.take_warnings().is_empty(),
+            "left buffered, where a later unrelated action would wear it"
+        );
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        let mut terminal = test_terminal();
+        land(&ctx, &mut term, &mut terminal, &mut app, None).expect("land");
+        restore_with(&mut term);
+        assert!(app.status.contains("back from"), "{}", app.status);
+        assert!(app.status.contains("no beads epic"), "{}", app.status);
+        // And the loop's reload afterwards has nothing left to add.
+        let was = app.status.clone();
+        refresh_now(&ctx, &mut app);
+        assert_eq!(app.status, was);
+
+        // The argument form: `submit` drains the warning onto the status line
+        // and `land` used to overwrite it before a single frame was drawn.
+        let cwd = tempfile::tempdir().unwrap();
+        let (ctx, _dir, mut app) = templates_ctx(cwd.path());
+        let mut with_arg = crate::model::Template::new("pr-review");
+        with_arg.goal = Some("review PR {{arg.pr}}".to_string());
+        with_arg.cwd = Some(cwd.path().to_string_lossy().to_string());
+        ctx.db().unwrap().insert_template(&with_arg).unwrap();
+        refresh_now(&ctx, &mut app);
+        app.handle(Input::Char('g'));
+        assert_eq!(app.handle(Input::Enter), Action::None, "no form went up");
+        focus_field(&mut app, "arg pr");
+        for c in "4821".chars() {
+            app.handle(Input::Char(c));
+        }
+        arm_action(&mut app);
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+
+        submit(&ctx, &mut app);
+        assert!(app.modal.is_none(), "{}", app.status);
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        let mut terminal = test_terminal();
+        land(&ctx, &mut term, &mut terminal, &mut app, None).expect("land");
+        restore_with(&mut term);
+        assert!(app.status.contains("back from"), "{}", app.status);
+        assert!(app.status.contains("no beads epic"), "{}", app.status);
+    }
+
+    /// The `Action::Submit` wiring itself: the loop runs the prompt and lands
+    /// in the master it made, in that order and without a frame in between.
+    #[test]
+    fn the_loops_dispatcher_runs_a_template_prompt_and_lands_in_it() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (ctx, _dir, mut app) = templates_ctx(cwd.path());
+        let mut with_arg = crate::model::Template::new("pr-review");
+        with_arg.goal = Some("review PR {{arg.pr}}".to_string());
+        with_arg.cwd = Some(cwd.path().to_string_lossy().to_string());
+        ctx.db().unwrap().insert_template(&with_arg).unwrap();
+        refresh_now(&ctx, &mut app);
+        app.handle(Input::Char('g'));
+        app.handle(Input::Enter);
+        focus_field(&mut app, "arg pr");
+        for c in "4821".chars() {
+            app.handle(Input::Char(c));
+        }
+        arm_action(&mut app);
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        let mut terminal = test_terminal();
+        // Exactly the loop's `Action::Submit` arm.
+        submit(&ctx, &mut app);
+        land(&ctx, &mut term, &mut terminal, &mut app, None).expect("land");
+        restore_with(&mut term);
+
+        let quests = ctx.db().unwrap().list_quests(true).unwrap();
+        assert_eq!(quests.len(), 1);
+        assert_eq!(quests[0].goal.as_deref(), Some("review PR 4821"));
+        assert_eq!(fixture(&_dir).attach_mode.as_deref(), Some("child"));
+        assert!(app.status.contains("back from"), "{}", app.status);
+        assert!(app.templates.take_landing().is_none(), "landed twice");
+    }
+
+    /// Nothing to land in is the ordinary case — every prompt that is not a
+    /// template run goes through the same call.
+    #[test]
+    fn landing_with_nothing_queued_never_touches_the_terminal() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (ctx, _dir, mut app) = templates_ctx(cwd.path());
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let mut terminal = test_terminal();
+        land(&ctx, &mut term, &mut terminal, &mut app, None).expect("land");
+        assert!(term.calls.is_empty(), "{:?}", term.calls);
+        assert!(fixture(&_dir).attach_mode.is_none());
+    }
+
+    /// `X` pages the definition, the same document `q tpl export` writes, and
+    /// through the same handoff the brief uses.
+    #[test]
+    fn the_export_reaches_the_pager_as_the_toml_q_tpl_export_writes() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (_ctx, _dir, mut app) = templates_ctx(cwd.path());
+        assert_eq!(app.handle(Input::Char('X')), Action::Export);
+
+        let out = _dir.path().join("paged.toml");
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        let mut terminal = test_terminal();
+        pager::with_pager(Some(&format!("tee {}", out.display())), || {
+            export_in_pager(&mut term, &mut terminal, &mut app).expect("export");
+        });
+
+        let seen = std::fs::read_to_string(&out).unwrap();
+        assert!(seen.contains("[[template]]"), "{seen}");
+        assert!(seen.contains("weekly-hygiene"), "{seen}");
+        assert!(seen.contains("tidy up"), "{seen}");
+        // Run stats are history and never travel (SPEC §11).
+        assert!(!seen.contains("run_count"), "{seen}");
+        assert_eq!(
+            flags(),
+            (true, true, true, true),
+            "TUI mode never came back"
+        );
+        restore_with(&mut term);
     }
 
     /// Every reason not to attach is the same reason `q enter` gives, and none

@@ -10372,7 +10372,14 @@ fn tpl_add_refuses_a_cwd_that_is_not_a_directory() {
         .args(["tpl", "add", "routine", "--cwd", "/definitely/not/here"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("no such directory"));
+        // One prefix and one mention of the path: the underlying error used
+        // to be wrapped whole, so this read "not found: routine: cwd
+        // `/definitely/not/here`: not found: no such directory:
+        // /definitely/not/here" (bd-8lz.6.2).
+        .stderr(predicate::str::contains(
+            "not found: routine: cwd `/definitely/not/here`: no such directory",
+        ))
+        .stderr(predicate::str::contains("not found: no such directory").not());
 }
 
 #[test]

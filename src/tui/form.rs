@@ -292,6 +292,20 @@ impl Form {
         self.fields.iter().find(|f| f.label() == label)
     }
 
+    /// A text field's value exactly as it was typed.
+    ///
+    /// Only a template argument wants this: `q tpl run t --arg pad=" x "`
+    /// keeps its spaces, so the form standing in for `--arg` has to keep them
+    /// too (`templates::run_with_args`). Every other field is a name, a path
+    /// or a flag value, where surrounding space is a typo — those want
+    /// [`Form::trimmed`].
+    pub fn raw(&self, label: &str) -> &str {
+        match self.find(label) {
+            Some(Field::Text { value, .. }) => value,
+            _ => "",
+        }
+    }
+
     /// A text field's value, trimmed. Missing labels read as empty rather than
     /// panicking: a form is data, and a caller asking for a field it did not
     /// build is asking for "nothing was given".
