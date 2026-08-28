@@ -98,6 +98,12 @@ pub enum Command {
         /// Never auto-reset this Quest's master at the context threshold
         #[arg(long)]
         no_auto_reset: bool,
+        /// Create a brain session note for this Quest (SPEC §14)
+        #[arg(long)]
+        brain: bool,
+        /// Do not create a brain session note (the default)
+        #[arg(long, conflicts_with = "brain")]
+        no_brain: bool,
         /// Do not attach after creating
         #[arg(short = 'd', long)]
         detach: bool,
@@ -132,6 +138,9 @@ pub enum Command {
         /// Also close the Quest's beads epic
         #[arg(long)]
         close_epic: bool,
+        /// Propose a brain knowledge summary via `claude -p` (SPEC §14)
+        #[arg(long)]
+        summarize: bool,
     },
 
     /// Reopen a closed Quest with a fresh master
@@ -731,7 +740,8 @@ pub enum QuestState {
     Finished,
 }
 
-/// TODO(M6): `brain` waits on the brain integration, so it is not offered yet.
+/// `brain_session` is not a `q set` key: it is managed by `q new --brain` and
+/// `q link add --kind brain <slug>` (SPEC §14), never set by hand.
 #[derive(ValueEnum, Clone, Copy, Debug)]
 #[value(rename_all = "snake_case")]
 pub enum SetKey {

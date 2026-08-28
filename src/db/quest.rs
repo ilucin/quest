@@ -23,6 +23,7 @@ pub struct QuestPatch {
     pub ctx_reset_pct: Option<Option<u8>>,
     pub beads_epic: Option<Option<String>>,
     pub beads_repo: Option<Option<String>>,
+    pub brain_session: Option<Option<String>>,
 
     pub auto_reset: Option<Option<bool>>,
 }
@@ -45,6 +46,7 @@ impl QuestPatch {
             && self.ctx_reset_pct.is_none()
             && self.beads_epic.is_none()
             && self.beads_repo.is_none()
+            && self.brain_session.is_none()
             && self.auto_reset.is_none()
     }
 }
@@ -195,6 +197,10 @@ impl Db {
         if let Some(v) = &patch.beads_repo {
             sets.push("beads_repo = :beads_repo");
             binds.push((":beads_repo", v));
+        }
+        if let Some(v) = &patch.brain_session {
+            sets.push("brain_session = :brain_session");
+            binds.push((":brain_session", v));
         }
         if let Some(v) = &patch.auto_reset {
             sets.push("auto_reset = :auto_reset");

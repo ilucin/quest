@@ -1086,6 +1086,8 @@ fn create(ctx: &Ctx, command: &Command) -> anyhow::Result<Option<u8>> {
         prompt,
         prompt_file,
         no_auto_reset,
+        brain,
+        no_brain: _,
         detach,
     } = command
     else {
@@ -1121,6 +1123,7 @@ fn create(ctx: &Ctx, command: &Command) -> anyhow::Result<Option<u8>> {
         prompt: prompt.as_deref(),
         prompt_file: None,
         no_auto_reset: *no_auto_reset,
+        brain: *brain,
         detach: *detach,
         machine: Some(machine),
         template: None,

@@ -1,4 +1,5 @@
 mod beads;
+mod brain;
 mod brief;
 mod cli;
 mod commands;
@@ -477,6 +478,8 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
             prompt,
             prompt_file,
             no_auto_reset,
+            brain,
+            no_brain: _,
             detach,
         } => {
             // SPEC §16's `--template`: the definition fills in what the flags
@@ -512,6 +515,7 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
                     // `--prompt-file` cannot both reach `create`.
                     prompt_file: None,
                     no_auto_reset: *no_auto_reset,
+                    brain: *brain,
                     detach: *detach,
                     // The global `--machine` already decides this; only the
                     // TUI's form sets it per Quest.
@@ -530,7 +534,8 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
             quest,
             force,
             close_epic,
-        } => commands::close::run(ctx, quest, *force, *close_epic).map(|()| 0),
+            summarize,
+        } => commands::close::run(ctx, quest, *force, *close_epic, *summarize).map(|()| 0),
         Command::Resume {
             quest,
             prompt,

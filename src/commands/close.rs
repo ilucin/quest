@@ -38,7 +38,13 @@ impl Closed {
     }
 }
 
-pub fn run(ctx: &Ctx, target: &str, force: bool, close_epic: bool) -> anyhow::Result<()> {
+pub fn run(
+    ctx: &Ctx,
+    target: &str,
+    force: bool,
+    close_epic: bool,
+    summarize: bool,
+) -> anyhow::Result<()> {
     sweep_quiet(ctx)?;
     let quest = ctx.db()?.resolve_quest(target)?;
 
@@ -49,6 +55,14 @@ pub fn run(ctx: &Ctx, target: &str, force: bool, close_epic: bool) -> anyhow::Re
     // Before the payload, exactly where the `eprintln!`s used to land.
     crate::commands::flush_warnings(ctx);
     let out = out?;
+
+    // SPEC §14: `--summarize` proposes a brain knowledge summary after the
+    // close. Best effort — a missing brain, no session, an unavailable `claude`
+    // or a declined prompt all leave the Quest closed without a summary.
+    if summarize {
+        maybe_summarize(ctx, &out.quest);
+        crate::commands::flush_warnings(ctx);
+    }
 
     if ctx.json || !ctx.quiet {
         output::emit(
@@ -136,7 +150,6 @@ pub fn apply(ctx: &Ctx, quest: &Quest, close_epic: bool) -> anyhow::Result<Close
             &format!("{} ended", session.label),
         );
     }
-    // TODO(M2): `--summarize` (brain).
     let epic_closed = close_epic && close_the_epic(ctx, quest);
     let quest = db.update_quest_state(&quest.id, QuestState::Finished, Some(ts))?;
     db.append_event(
@@ -152,6 +165,70 @@ pub fn apply(ctx: &Ctx, quest: &Quest, close_epic: bool) -> anyhow::Result<Close
         sessions_ended: ending.len(),
         epic_closed,
     })
+}
+
+/// `q close --summarize` (SPEC §14): proposes a brain knowledge summary, then —
+/// if the human confirms — hands the Quest brief to `claude -p`, which writes a
+/// `knowledge/…` note and prints its path; that path is recorded as
+/// `summarized_to:` on the session note.
+///
+/// Best effort throughout: no `brain_session`, no brain root, a declined or
+/// impossible prompt (no terminal, `--json`), or an unavailable `claude` are
+/// each a buffered warning at most — the Quest is already closed.
+fn maybe_summarize(ctx: &Ctx, quest: &Quest) {
+    let Some(slug) = quest.brain_session.as_deref() else {
+        ctx.warn(format!(
+            "warning: --summarize: quest {} has no brain session to summarize into",
+            quest.slug
+        ));
+        return;
+    };
+    let Some(root) = crate::brain::root() else {
+        ctx.warn("warning: --summarize: no brain root; skipping the summary".to_string());
+        return;
+    };
+    // PROPOSES; the human confirms. A refusal, or no terminal to ask, is a
+    // skip — the close itself already happened and must not be undone.
+    if confirm(
+        ctx,
+        &format!("summarize quest {slug} into the brain via claude?"),
+    )
+    .is_err()
+    {
+        ctx.warn(format!(
+            "note: --summarize declined; {slug} left without a summary"
+        ));
+        return;
+    }
+    let brief = match crate::brief::render(
+        ctx.db().expect("db open for close"),
+        quest,
+        &crate::brief::Opts {
+            workflows: ctx.workflows(),
+            ..Default::default()
+        },
+    ) {
+        Ok(brief) => brief,
+        Err(e) => {
+            ctx.warn(format!(
+                "warning: --summarize: could not build the brief ({e:#})"
+            ));
+            return;
+        }
+    };
+    let Some(path) = crate::brain::summarizer().summarize(&brief) else {
+        ctx.warn("warning: --summarize: claude is unavailable; no summary written".to_string());
+        return;
+    };
+    match crate::brain::set_summarized_to(&root, slug, &path) {
+        Ok(true) => ctx.warn(format!("note: summarized {slug} into {path}")),
+        Ok(false) => ctx.warn(format!(
+            "warning: --summarize: session note for {slug} not found; summary at {path}"
+        )),
+        Err(e) => ctx.warn(format!(
+            "warning: --summarize: summary written to {path} but not recorded on {slug}: {e}"
+        )),
+    }
 }
 
 /// ` · epic bd-e closed`, for the one-liner — the epic is the half of what
