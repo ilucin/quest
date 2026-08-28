@@ -20,6 +20,7 @@ use crate::db::Db;
 use crate::model::{Session, now};
 use crate::output;
 use crate::proc;
+use crate::remote;
 use crate::tmux::{self, Tmux};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -696,6 +697,231 @@ fn check_beads() -> Check {
     }
 }
 
+// ------------------------------------------------------------------- remotes
+
+/// What `ssh <alias> q --version` established about one remote (SPEC §19:
+/// *every remote reachable and version compatible*).
+///
+/// The three failures the report has to keep apart, each with its own fix, are
+/// [`Reach::Down`] (ssh itself did not get there), [`Reach::NoQ`] (it did, and
+/// there is no `q` on that machine) and [`Reach::TooOld`] (there is one, and it
+/// is older than the wire this `q` speaks).
+#[derive(Debug, PartialEq, Eq)]
+enum Reach {
+    /// Reachable, and its wire is one this `q` can drive.
+    Ok(remote::RemoteVersion),
+    /// Reachable, and its `q` is older than [`remote::MIN_REMOTE_WIRE`] — the
+    /// case bd-8lz.5.3 left cryptic: such a `q` rejects the hidden `--expect`
+    /// and `--confirmed` globals as unknown arguments, and clap's exit 2 says
+    /// nothing about why.
+    TooOld(remote::RemoteVersion),
+    /// Reachable, and its `q` speaks a wire *newer* than this one's.
+    Newer(remote::RemoteVersion),
+    /// Answered, but not with anything resembling a version.
+    Unreadable(String),
+    /// ssh got there; the shell could not find `q`.
+    NoQ,
+    /// ssh never got there: host down, unroutable, unknown, or refusing the key.
+    Down(String),
+    /// `q --version` ran over there and failed on its own terms.
+    Ran(String),
+}
+
+fn diagnose(outcome: &remote::SshOutcome) -> Reach {
+    use remote::SshOutcome;
+    let (code, stdout, stderr) = match outcome {
+        SshOutcome::TimedOut => {
+            return Reach::Down(format!(
+                "no answer within {}s",
+                remote::PROBE_TIMEOUT.as_secs()
+            ));
+        }
+        SshOutcome::TooLarge => {
+            return Reach::Unreadable(format!(
+                "more than {} MiB of output",
+                remote::MAX_OUTPUT >> 20
+            ));
+        }
+        SshOutcome::Failed(e) => return Reach::Down(e.clone()),
+        SshOutcome::Done {
+            code,
+            stdout,
+            stderr,
+        } => (*code, stdout, stderr),
+    };
+    // ssh reports its own failures as 255 and a signalled command as no code;
+    // anything else came from the far end, so the host is up.
+    match code {
+        Some(remote::SSH_FAILED) | None => {
+            return Reach::Down(
+                said(stderr).unwrap_or_else(|| "ssh could not connect".to_string()),
+            );
+        }
+        Some(remote::NO_COMMAND) => return Reach::NoQ,
+        Some(0) => {}
+        Some(c) => {
+            let said = said(stderr).map_or(String::new(), |s| format!(": {s}"));
+            return Reach::Ran(format!("`q --version` exited {c}{said}"));
+        }
+    }
+    let Some(version) = remote::parse_version(stdout) else {
+        return Reach::Unreadable(
+            said(stdout)
+                .or_else(|| said(stderr))
+                .unwrap_or_else(|| "nothing".to_string()),
+        );
+    };
+    match version.wire {
+        Some(wire) if wire > remote::WIRE => Reach::Newer(version),
+        Some(wire) if wire >= remote::MIN_REMOTE_WIRE => Reach::Ok(version),
+        // No tag at all is how every `q` from before the wire was numbered
+        // identifies itself, so it is the same verdict as a tag below the floor.
+        _ => Reach::TooOld(version),
+    }
+}
+
+/// Another program's output on its way into a report line: one line, bounded.
+fn said(text: &str) -> Option<String> {
+    let line = output::first_line(text, 120);
+    (!line.is_empty()).then_some(line)
+}
+
+/// `wire 1` / `no wire version` — what a remote `q` says it speaks.
+fn spoken(version: &remote::RemoteVersion) -> String {
+    match version.wire {
+        Some(wire) => format!("wire {wire}"),
+        None => "no wire version".to_string(),
+    }
+}
+
+fn remote_check(probe: &remote::Probe, local: &str) -> Check {
+    let name = format!("remote {}", probe.name);
+    let alias = &probe.ssh;
+    // The fix the whole version story exists to be able to print.
+    let upgrade = format!("upgrade `q` on {}", probe.name);
+    match diagnose(&probe.version) {
+        Reach::Ok(v) => check(name, Status::Ok, format!("{} · ssh {alias}", v.label())),
+        Reach::TooOld(v) => with_hint(
+            check(
+                name,
+                Status::Fail,
+                format!(
+                    "{} speaks {} — this `q` needs wire {} or newer",
+                    v.label(),
+                    spoken(&v),
+                    remote::MIN_REMOTE_WIRE
+                ),
+            ),
+            upgrade,
+        ),
+        // Not a failure: the far end knows a wire this one does not, and the
+        // listing parse already ignores fields it has never heard of. The fix
+        // is on this machine, so it is worth saying which one that is.
+        Reach::Newer(v) => with_hint(
+            check(
+                name,
+                Status::Warn,
+                format!(
+                    "{} speaks {}, newer than this `q` (wire {})",
+                    v.label(),
+                    spoken(&v),
+                    remote::WIRE
+                ),
+            ),
+            format!("upgrade `q` on {local}"),
+        ),
+        Reach::NoQ => with_hint(
+            check(
+                name,
+                Status::Fail,
+                format!("`ssh {alias}` works, but there is no `q` on PATH there"),
+            ),
+            format!(
+                "install q on {}, or put it on the PATH its login shell uses",
+                probe.name
+            ),
+        ),
+        Reach::Down(why) => with_hint(
+            check(name, Status::Fail, format!("ssh {alias}: {why}")),
+            format!("check that `ssh {alias}` works — host, network, key, ~/.ssh/config"),
+        ),
+        Reach::Ran(what) => with_hint(check(name, Status::Fail, what), upgrade),
+        // Something answered and it was not a version: a login shell banner, a
+        // wrapper that swallows `--version`, an rc file printing at us. Not
+        // proof of an old `q`, so it warns rather than failing.
+        Reach::Unreadable(said) => with_hint(
+            check(
+                name,
+                Status::Warn,
+                format!("`q --version` on {alias} answered {said}"),
+            ),
+            format!("check what `ssh {alias} q --version` runs"),
+        ),
+    }
+}
+
+/// SPEC §23 #6: ssh multiplexing is recommended, and `q doctor` warns when it
+/// is missing. A warning and never a failure — a remote without it works, it
+/// is merely slow (measured on a real host: a proxied command goes from ~0.9 s
+/// to ~0.35 s once the mux is warm, and the TUI pays that every `tick_remote`).
+///
+/// `q` never edits `~/.ssh/config`; the hint says what to add.
+fn multiplexing_check(probe: &remote::Probe) -> Check {
+    use remote::Multiplexing;
+    let name = format!("ssh multiplexing {}", probe.name);
+    let alias = &probe.ssh;
+    match &probe.multiplexing {
+        Multiplexing::On { persist } => check(
+            name,
+            Status::Ok,
+            format!("ControlMaster for {alias}, ControlPersist {persist}"),
+        ),
+        // A master with no persistence is the trap: `ssh -G` says
+        // `controlmaster auto` and nothing is ever reused, because every mux
+        // dies with the command that opened it.
+        Multiplexing::NotPersisted => with_hint(
+            check(
+                name,
+                Status::Warn,
+                format!(
+                    "{alias} has a ControlMaster but `ControlPersist no` — no connection outlives its command"
+                ),
+            ),
+            format!("add `ControlPersist 10m` for {alias} in ~/.ssh/config"),
+        ),
+        Multiplexing::Off => with_hint(
+            check(
+                name,
+                Status::Warn,
+                format!("not configured for {alias} — every remote command pays a fresh handshake"),
+            ),
+            format!(
+                "add `ControlMaster auto`, `ControlPath ~/.ssh/cm-%r@%h:%p` and \
+                 `ControlPersist 10m` for {alias} in ~/.ssh/config"
+            ),
+        ),
+        Multiplexing::Unknown(why) => with_hint(
+            check(name, Status::Warn, format!("`ssh -G {alias}`: {why}")),
+            format!("check that `ssh -G {alias}` answers"),
+        ),
+    }
+}
+
+/// Two lines per configured remote, and **nothing at all** when there are
+/// none: the common case is `remotes = []`, and it must cost no ssh and no
+/// time (bd-8lz.5.4).
+fn check_remotes(ctx: &Ctx) -> Vec<Check> {
+    remote::probe_all(ctx)
+        .iter()
+        .flat_map(|probe| {
+            [
+                remote_check(probe, ctx.machine()),
+                multiplexing_check(probe),
+            ]
+        })
+        .collect()
+}
+
 // ----------------------------------------------------------------- entry point
 
 fn report(ctx: &Ctx, fix: bool) -> Report {
@@ -721,6 +947,8 @@ fn report(ctx: &Ctx, fix: bool) -> Report {
     ];
     checks.extend(check_hooks(chain));
     checks.push(check_statusline(chain));
+    // SPEC §19's order: the remotes, then the orphans.
+    checks.extend(check_remotes(ctx));
     checks.push(check_orphans(db.as_ref(), ctx.tmux(), fix, &mut fixed));
     Report::new(checks, fixed)
 }
@@ -840,6 +1068,131 @@ mod tests {
         fs::write(other.path().join("claude"), "not executable").unwrap();
         let path = std::env::join_paths([other.path()]).unwrap();
         assert_eq!(which_in("claude", Some(&path)), None);
+    }
+
+    fn answered(code: i32, stdout: &str, stderr: &str) -> remote::SshOutcome {
+        remote::SshOutcome::Done {
+            code: Some(code),
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    /// The three failures SPEC §19 has to keep apart, each with its own fix:
+    /// ssh did not get there, it did and there is no `q`, and there is one and
+    /// it is too old (bd-8lz.5.4).
+    #[test]
+    fn a_probe_tells_a_dead_host_a_missing_q_and_an_old_q_apart() {
+        // ssh's own failure code, and ssh that never started.
+        assert!(matches!(
+            diagnose(&answered(255, "", "ssh: Could not resolve hostname ws")),
+            Reach::Down(why) if why.contains("Could not resolve")
+        ));
+        assert!(matches!(
+            diagnose(&remote::SshOutcome::Failed("ssh not found on PATH".into())),
+            Reach::Down(_)
+        ));
+        assert!(matches!(
+            diagnose(&remote::SshOutcome::TimedOut),
+            Reach::Down(why) if why.contains("no answer within")
+        ));
+
+        // The shell got as far as looking for `q`: the machine is up.
+        assert_eq!(
+            diagnose(&answered(127, "", "zsh: command not found: q")),
+            Reach::NoQ
+        );
+
+        // A `q` that answers, and predates the wire — the bd-8lz.5.3 skew.
+        assert!(
+            matches!(diagnose(&answered(0, "q 0.1.0\n", "")), Reach::TooOld(v) if v.wire.is_none())
+        );
+
+        // A `q` this one can drive, and one from the future.
+        assert!(matches!(
+            diagnose(&answered(0, &format!("q {}\n", remote::VERSION), "")),
+            Reach::Ok(_)
+        ));
+        assert!(matches!(
+            diagnose(&answered(0, "q 9.9.9 (wire 99)\n", "")),
+            Reach::Newer(_)
+        ));
+
+        // Answered, but not with a version — and a `q --version` that failed
+        // on its own terms.
+        assert!(matches!(
+            diagnose(&answered(0, "Welcome to ws!\n", "")),
+            Reach::Unreadable(said) if said.contains("Welcome")
+        ));
+        assert!(matches!(
+            diagnose(&answered(2, "", "error: nope")),
+            Reach::Ran(_)
+        ));
+    }
+
+    fn remote_probe(
+        version: remote::SshOutcome,
+        multiplexing: remote::Multiplexing,
+    ) -> remote::Probe {
+        remote::Probe {
+            name: "ws".to_string(),
+            ssh: "ws-host".to_string(),
+            version,
+            multiplexing,
+        }
+    }
+
+    /// The fix line the whole version story exists to be able to print.
+    #[test]
+    fn a_remote_too_old_for_the_wire_is_told_to_upgrade_its_own_q() {
+        let old = remote_check(
+            &remote_probe(answered(0, "q 0.1.0\n", ""), remote::Multiplexing::Off),
+            "laptop",
+        );
+        assert_eq!(old.status, Status::Fail);
+        assert_eq!(old.fix_hint.as_deref(), Some("upgrade `q` on ws"));
+        assert!(old.detail.contains("no wire version"), "{old:?}");
+
+        // The other direction points at this machine instead.
+        let new = remote_check(
+            &remote_probe(
+                answered(0, "q 9.9.9 (wire 99)\n", ""),
+                remote::Multiplexing::Off,
+            ),
+            "laptop",
+        );
+        assert_eq!(new.status, Status::Warn);
+        assert_eq!(new.fix_hint.as_deref(), Some("upgrade `q` on laptop"));
+    }
+
+    /// SPEC §23 #6: a missing `ControlMaster` is advice, never a failure — and
+    /// the hint says what to add, because `q` never edits `~/.ssh/config`.
+    #[test]
+    fn a_missing_control_master_only_warns() {
+        let off = multiplexing_check(&remote_probe(
+            answered(0, "q 0.1.0 (wire 1)", ""),
+            remote::Multiplexing::Off,
+        ));
+        assert_eq!(off.status, Status::Warn);
+        assert!(off.fix_hint.unwrap().contains("~/.ssh/config"));
+
+        let on = multiplexing_check(&remote_probe(
+            answered(0, "q 0.1.0 (wire 1)", ""),
+            remote::Multiplexing::On {
+                persist: "10m".to_string(),
+            },
+        ));
+        assert_eq!(on.status, Status::Ok);
+        assert!(on.fix_hint.is_none());
+
+        for state in [
+            remote::Multiplexing::NotPersisted,
+            remote::Multiplexing::Unknown("ssh -G said nothing".to_string()),
+        ] {
+            let check =
+                multiplexing_check(&remote_probe(answered(0, "q 0.1.0 (wire 1)", ""), state));
+            assert_eq!(check.status, Status::Warn, "{check:?}");
+        }
     }
 
     #[test]

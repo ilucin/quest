@@ -47,6 +47,66 @@ pub const PROXY_TIMEOUT: Duration = Duration::from_secs(60);
 /// completed a handshake in this long is down, whatever the command's deadline.
 pub const CONNECT_MAX: Duration = Duration::from_secs(5);
 
+/// ssh's own exit code when it could not run the command at all — a refused
+/// connection, an unknown host, a rejected key. `q` never exits with it, so it
+/// is read as *the host did not answer* rather than as the far end's verdict.
+pub const SSH_FAILED: i32 = 255;
+
+/// What a POSIX shell exits when the command it was given is not on `PATH`.
+/// The far end answered, so the machine is up; what is missing is `q`.
+pub const NO_COMMAND: i32 = 127;
+
+/// The **remote wire version** of this build: the contract two `q`s speak to
+/// each other over ssh (SPEC §15). Bumped whenever that contract changes in a
+/// way the other end has to know about — a new hidden global on a proxied
+/// line, a change to the `q list --json` envelope, a change to what a
+/// confirmation means. It is *not* the crate version: several wire-breaking
+/// changes have already shipped inside `0.1.0`, so a semver floor could not
+/// tell any of them apart.
+///
+/// Wire 1 is the contract as of bd-8lz.5.3: the `q list --json` envelope
+/// (`{"quests":…,"machines":…}`) and a proxied command line carrying
+/// `--expect <id>.<created_at>`, `--confirmed` and `--no-remote`. A `q` older
+/// than that prints no wire tag at all, which is exactly how [`check_remotes`]
+/// recognises it.
+///
+/// [`check_remotes`]: crate::doctor
+pub const WIRE: u32 = 1;
+
+/// The oldest far-end wire this `q` can drive. Equal to [`WIRE`] today; a
+/// future bead that can still talk to an older remote lowers it, and one that
+/// cannot raises it — that single constant is the whole compatibility policy.
+pub const MIN_REMOTE_WIRE: u32 = 1;
+
+/// A floor above this build's own wire would make `q` refuse a remote running
+/// the very same binary. Checked at compile time so a bead that bumps one
+/// constant and forgets the other cannot ship.
+const _: () = assert!(MIN_REMOTE_WIRE <= WIRE);
+
+/// What `q --version` prints — `0.1.0 (wire 1)`. The crate version for a
+/// human, the wire tag for the other end of an ssh (SPEC §19: *every remote
+/// reachable and version compatible*).
+///
+/// The wire tag is spelled out because `concat!` takes only literals; the
+/// `the_version_banner_carries_this_builds_wire` test keeps it and [`WIRE`]
+/// from drifting apart.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (wire 1)");
+
+/// SPEC §19's reachability probe. `q` rather than an absolute path for the
+/// same reason [`LIST_ARGV`] uses one: it is whatever that machine's login
+/// shell finds.
+pub const VERSION_ARGV: [&str; 2] = ["q", "--version"];
+
+/// The budget for one `ssh <alias> q --version`. The listing's deadline: a
+/// remote that cannot print its version in five seconds is not a remote this
+/// `q` can list from either.
+pub const PROBE_TIMEOUT: Duration = TIMEOUT;
+
+/// The budget for one `ssh -G <alias>`. Much shorter than [`PROBE_TIMEOUT`]
+/// because `-G` never opens a connection — it only resolves `~/.ssh/config` —
+/// so anything slow there is a DNS lookup, not a host being down.
+pub const OPTIONS_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// What a remote is always asked for. `--no-remote` is the recursion guard:
 /// without it the remote would fan out to *its* remotes, us included; `--all`
 /// is why the cache works — see [`list_argv`].
@@ -119,6 +179,14 @@ pub enum SshOutcome {
 pub trait Ssh: Send + Sync {
     /// `ssh <alias> <argv…>`, given up on after `timeout`.
     fn run(&self, alias: &str, argv: &[&str], timeout: Duration) -> SshOutcome;
+
+    /// `ssh -G <alias>`: the options ssh itself would use for that alias, with
+    /// every `Host` pattern, `Match` block, `Include` and per-host override
+    /// already applied. Asked rather than parsed out of `~/.ssh/config`,
+    /// because only ssh knows which of those actually won (SPEC §23 #6).
+    ///
+    /// It opens no connection, so it answers for a host that is down.
+    fn options(&self, alias: &str, timeout: Duration) -> SshOutcome;
 
     /// `ssh -t <alias> <argv…>`, interactively: SPEC §15's remote `q enter`.
     /// Replaces this process, exactly as a local `tmux attach` does, so on
@@ -236,6 +304,12 @@ impl Ssh for RealSsh {
     fn run(&self, alias: &str, argv: &[&str], timeout: Duration) -> SshOutcome {
         let mut cmd = Command::new("ssh");
         cmd.args(ssh_argv(alias, argv, timeout));
+        run_with_deadline(cmd, timeout)
+    }
+
+    fn options(&self, alias: &str, timeout: Duration) -> SshOutcome {
+        let mut cmd = Command::new("ssh");
+        cmd.args(["-G", alias]);
         run_with_deadline(cmd, timeout)
     }
 
@@ -442,6 +516,18 @@ pub struct SshHost {
     /// happens. Absent, both roles get the same canned answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxied: Option<Box<SshHost>>,
+    /// The answer to `ssh <alias> q --version` — SPEC §19's reachability probe
+    /// (bd-8lz.5.4). A third role for the same host, for the same reason
+    /// [`SshHost::proxied`] is a second one: `q doctor` asks for the version
+    /// and `q list` asks for the listing, and a test needs to script both.
+    /// Absent, the probe gets the base answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<Box<SshHost>>,
+    /// The answer to `ssh -G <alias>`. Absent, the alias resolves to ssh's
+    /// defaults — `controlmaster false`, no multiplexing — which is what a
+    /// `~/.ssh/config` with no `ControlMaster` in it produces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Box<SshHost>>,
 }
 
 impl Ssh for FixtureSsh {
@@ -451,31 +537,34 @@ impl Ssh for FixtureSsh {
         let Some(host) = script.hosts.remove(alias) else {
             return SshOutcome::Failed(format!("no fixture host `{alias}`"));
         };
-        // The listing fan-out and a proxied command are two different questions
-        // to the same host; see [`SshHost::proxied`].
-        let host = match host.proxied {
-            Some(proxied) if argv != LIST_ARGV => *proxied,
-            _ => host,
+        // The listing fan-out, the version probe and a proxied command are
+        // three different questions to the same host; see [`SshHost::proxied`].
+        let host = match (host.version, host.proxied) {
+            (Some(version), _) if argv == VERSION_ARGV => *version,
+            (_, Some(proxied)) if argv != LIST_ARGV => *proxied,
+            _ => SshHost {
+                version: None,
+                proxied: None,
+                ..host
+            },
         };
-        let delay = Duration::from_millis(host.delay_ms);
-        if delay > timeout {
-            std::thread::sleep(timeout);
-            return SshOutcome::TimedOut;
-        }
-        if !delay.is_zero() {
-            std::thread::sleep(delay);
-        }
-        if let Some(msg) = host.fail {
-            return SshOutcome::Failed(msg);
-        }
-        if host.timeout {
-            return SshOutcome::TimedOut;
-        }
-        SshOutcome::Done {
-            code: Some(host.exit),
-            stdout: host.stdout,
-            stderr: host.stderr,
-        }
+        answer(host, timeout)
+    }
+
+    fn options(&self, alias: &str, timeout: Duration) -> SshOutcome {
+        log("options", &[alias]);
+        let host = script()
+            .hosts
+            .remove(alias)
+            .and_then(|h| h.options)
+            .map(|o| *o)
+            // ssh answers `-G` for an alias it has never heard of too: an
+            // unknown host is not an error, it is just the defaults.
+            .unwrap_or_else(|| SshHost {
+                stdout: DEFAULT_SSH_OPTIONS.to_string(),
+                ..SshHost::default()
+            });
+        answer(host, timeout)
     }
 
     /// Recorded, never run: a fixture that `exec`ed would replace the test.
@@ -487,6 +576,37 @@ impl Ssh for FixtureSsh {
     fn attach_child(&self, alias: &str, argv: &[String]) -> anyhow::Result<()> {
         log_attach("attach-child", alias, argv);
         Ok(())
+    }
+}
+
+/// What `ssh -G` prints for an alias with nothing configured: multiplexing
+/// off. macOS's OpenSSH says `false` rather than `no`, and omits
+/// `controlpath` entirely when it is unset — both are what
+/// [`parse_multiplexing`] has to cope with, so the fixture's default says it
+/// the same way.
+const DEFAULT_SSH_OPTIONS: &str = "controlmaster false\ncontrolpersist no\n";
+
+/// One scripted answer, honoured the way the real backend would: a delay
+/// longer than the deadline times out rather than being waited out.
+fn answer(host: SshHost, timeout: Duration) -> SshOutcome {
+    let delay = Duration::from_millis(host.delay_ms);
+    if delay > timeout {
+        std::thread::sleep(timeout);
+        return SshOutcome::TimedOut;
+    }
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
+    if let Some(msg) = host.fail {
+        return SshOutcome::Failed(msg);
+    }
+    if host.timeout {
+        return SshOutcome::TimedOut;
+    }
+    SshOutcome::Done {
+        code: Some(host.exit),
+        stdout: host.stdout,
+        stderr: host.stderr,
     }
 }
 
@@ -635,6 +755,155 @@ impl RemoteResult {
         }
         Some(line)
     }
+}
+
+// ------------------------------------------------------------------- probe
+
+/// What a far end's `q --version` said. `wire` is `None` for a `q` that
+/// predates [`WIRE`] and printed only its crate version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteVersion {
+    /// The crate version, `0.1.0` — for the human reading the report.
+    pub semver: String,
+    /// The remote wire version, when the far end reports one.
+    pub wire: Option<u32>,
+}
+
+impl RemoteVersion {
+    /// `0.1.0 (wire 1)` / `0.1.0`, however the far end said it.
+    pub fn label(&self) -> String {
+        match self.wire {
+            Some(wire) => format!("q {} (wire {wire})", self.semver),
+            None => format!("q {}", self.semver),
+        }
+    }
+}
+
+/// `q --version`, as this `q` prints it and as every `q` before [`WIRE`]
+/// printed it: `q 0.1.0 (wire 1)`, `0.1.0 (wire 1)`, or a bare `q 0.1.0`.
+///
+/// `None` for anything that does not start with a version number — a login
+/// shell's banner, a `command not found`, an ssh notice. Deliberately strict:
+/// guessing a version out of arbitrary text is how a doctor reports a
+/// compatible remote that is not one.
+pub fn parse_version(out: &str) -> Option<RemoteVersion> {
+    let line = out.lines().find(|l| !l.trim().is_empty())?.trim();
+    // clap prints `<bin> <version>`; a wrapper may print the version alone.
+    let word = line
+        .split_whitespace()
+        .find(|w| w.starts_with(|c: char| c.is_ascii_digit()))?;
+    // Only the *first* word may be the binary's name, so a version appearing
+    // later in a sentence ("error: q 1.2.3 is broken") is not read as one.
+    if !line.starts_with(word) && line.split_whitespace().nth(1) != Some(word) {
+        return None;
+    }
+    Some(RemoteVersion {
+        semver: word.to_string(),
+        wire: parse_wire(line),
+    })
+}
+
+/// The `(wire N)` tag, if the far end printed one.
+fn parse_wire(line: &str) -> Option<u32> {
+    let after = line.split("(wire ").nth(1)?;
+    after.split(')').next()?.trim().parse().ok()
+}
+
+/// Whether ssh would multiplex this alias, and why not when it would not
+/// (SPEC §23 #6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Multiplexing {
+    /// A master and a socket to keep it on: a second command reuses the first
+    /// connection.
+    On { persist: String },
+    /// A master, but `ControlPersist no` — the mux lives only as long as the
+    /// command that opened it, so nothing short-lived ever reuses one.
+    NotPersisted,
+    /// No `ControlMaster`, or one with `ControlPath none`.
+    Off,
+    /// `ssh -G` did not answer, so nothing here is known. Reported as such:
+    /// reading silence as "off" would put a fix line under a config that may
+    /// already be right.
+    Unknown(String),
+}
+
+/// Read `ssh -G <alias>`'s answer.
+///
+/// The keys come back lowercased, one per line, already resolved through every
+/// `Host` pattern, `Match` block and `Include` — which is the whole reason
+/// this asks ssh instead of reading `~/.ssh/config`. `controlmaster` is
+/// `false`/`no` when off (OpenSSH on macOS prints `false`), and `controlpath`
+/// is omitted entirely rather than printed as `none` when it was never set.
+pub fn parse_multiplexing(out: &str) -> Multiplexing {
+    let value = |key: &str| -> Option<String> {
+        out.lines().find_map(|line| {
+            let (k, v) = line.trim().split_once(char::is_whitespace)?;
+            k.eq_ignore_ascii_case(key).then(|| v.trim().to_string())
+        })
+    };
+    let master = value("controlmaster").unwrap_or_default();
+    let master_on = !matches!(
+        master.to_ascii_lowercase().as_str(),
+        "" | "no" | "false" | "none"
+    );
+    let path = value("controlpath").unwrap_or_default();
+    let path_on = !matches!(path.to_ascii_lowercase().as_str(), "" | "none");
+    if !master_on || !path_on {
+        return Multiplexing::Off;
+    }
+    let persist = value("controlpersist").unwrap_or_default();
+    match persist.to_ascii_lowercase().as_str() {
+        "" | "no" | "false" | "none" => Multiplexing::NotPersisted,
+        _ => Multiplexing::On { persist },
+    }
+}
+
+/// One remote as SPEC §19 asks about it: what `q --version` said over there,
+/// and what ssh would do for that alias.
+#[derive(Debug)]
+pub struct Probe {
+    pub name: String,
+    pub ssh: String,
+    /// The raw outcome of `ssh <alias> q --version` — a status this `q` can
+    /// diagnose is built from it in [`crate::doctor`], because the diagnosis
+    /// (and its fix line) is doctor's business, not the transport's.
+    pub version: SshOutcome,
+    pub multiplexing: Multiplexing,
+}
+
+/// Ask every remote for its version and its ssh options, all at once — the
+/// same fan-out `q list` uses, so there is one ssh path and one deadline
+/// story (SPEC §19). Empty when there is nothing to ask: no `[[remotes]]`,
+/// `--no-remote`, or a `--machine` naming this machine.
+///
+/// Bounded by `PROBE_TIMEOUT + OPTIONS_TIMEOUT` however many remotes there
+/// are and however dead they all are.
+pub fn probe_all(ctx: &Ctx) -> Vec<Probe> {
+    let targets = targets(ctx);
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let ssh = ctx.ssh();
+    scatter(&targets, |remote| {
+        // `-G` first: it opens no connection, so it costs nothing next to the
+        // probe and still answers when the probe times out.
+        let options = ssh.options(&remote.ssh, OPTIONS_TIMEOUT);
+        Probe {
+            name: remote.name.clone(),
+            ssh: remote.ssh.clone(),
+            version: ssh.run(&remote.ssh, &VERSION_ARGV, PROBE_TIMEOUT),
+            multiplexing: match options {
+                SshOutcome::Done {
+                    code: Some(0),
+                    stdout,
+                    ..
+                } => parse_multiplexing(&stdout),
+                // `ssh -G` that did not answer says nothing about the config;
+                // reading "off" out of silence would be a guess.
+                other => Multiplexing::Unknown(why(&other)),
+            },
+        }
+    })
 }
 
 // ----------------------------------------------------------------- fan-out
@@ -916,9 +1185,59 @@ pub fn warn_unreachable(ctx: &Ctx, results: &[RemoteResult]) {
     }
 }
 
+/// One line on why an ssh call produced no usable answer.
+fn why(outcome: &SshOutcome) -> String {
+    match outcome {
+        SshOutcome::TimedOut => "no answer in time".to_string(),
+        SshOutcome::TooLarge => "the answer was too large".to_string(),
+        SshOutcome::Failed(e) => e.clone(),
+        SshOutcome::Done { code, stderr, .. } => exit_reason(*code, stderr),
+    }
+}
+
 /// One thread per remote, all joined before this returns; the answers come back
-/// in `targets` order. A thread that panics counts as unreachable — a broken
-/// remote must not take the command down with it.
+/// in `targets` order. Every fan-out in `q` goes through here, so "parallel,
+/// bounded, and a panicking remote does not take the command down" is decided
+/// once — `f` must therefore be total.
+fn scatter<T>(targets: &[&Remote], f: impl Fn(&Remote) -> T + Sync) -> Vec<T>
+where
+    T: Send + for<'a> From<PanickedRemote<'a>>,
+{
+    std::thread::scope(|scope| {
+        let f = &f;
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|remote| scope.spawn(move || f(remote)))
+            .collect();
+        handles
+            .into_iter()
+            .zip(targets)
+            .map(|(h, remote)| h.join().unwrap_or_else(|_| T::from(PanickedRemote(remote))))
+            .collect()
+    })
+}
+
+/// What a [`scatter`] worker that panicked leaves behind — a remote and no
+/// answer. Each fan-out says for itself what that means.
+struct PanickedRemote<'a>(&'a Remote);
+
+impl From<PanickedRemote<'_>> for Result<Answer, RemoteStatus> {
+    fn from(_: PanickedRemote<'_>) -> Result<Answer, RemoteStatus> {
+        Err(RemoteStatus::unreachable("the ssh call panicked"))
+    }
+}
+
+impl From<PanickedRemote<'_>> for Probe {
+    fn from(remote: PanickedRemote<'_>) -> Probe {
+        Probe {
+            name: remote.0.name.clone(),
+            ssh: remote.0.ssh.clone(),
+            version: SshOutcome::Failed("the ssh call panicked".to_string()),
+            multiplexing: Multiplexing::Unknown("the ssh call panicked".to_string()),
+        }
+    }
+}
+
 fn fan_out(
     ssh: &dyn Ssh,
     targets: &[&Remote],
@@ -927,24 +1246,8 @@ fn fan_out(
 ) -> Vec<Result<Answer, RemoteStatus>> {
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     let argv = argv.as_slice();
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = targets
-            .iter()
-            .map(|remote| {
-                let alias = remote.ssh.as_str();
-                scope.spawn(move || interpret(ssh.run(alias, argv, timeout), timeout))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join().unwrap_or_else(|_| {
-                    Err(RemoteStatus::unreachable(
-                        "the ssh call panicked".to_string(),
-                    ))
-                })
-            })
-            .collect()
+    scatter(targets, |remote| {
+        interpret(ssh.run(&remote.ssh, argv, timeout), timeout)
     })
 }
 
@@ -989,7 +1292,7 @@ fn interpret(outcome: SshOutcome, timeout: Duration) -> Result<Answer, RemoteSta
             stderr,
         } => {
             if code != Some(0) {
-                return Err(RemoteStatus::unreachable(exit_reason(code, &stderr)));
+                return Err(nonzero(code, &stderr));
             }
             let listing = parse(&stdout).map_err(RemoteStatus::incompatible)?;
             Ok(Answer {
@@ -997,6 +1300,29 @@ fn interpret(outcome: SshOutcome, timeout: Duration) -> Result<Answer, RemoteSta
                 raw: stdout.trim().to_string(),
             })
         }
+    }
+}
+
+/// A remote command that ran and failed, told apart from a connection that
+/// never happened (bd-8lz.5.4).
+///
+/// This is where [`RemoteStatus::Incompatible`] finally diverges from
+/// [`RemoteStatus::Unreachable`]. ssh reports its *own* failures as 255 and a
+/// signalled command as no code at all; anything else is the far end's answer,
+/// which means the host is up and it is that machine's `q` that is the
+/// problem — absent (127, the shell could not find it) or too old to
+/// understand the line it was sent (clap exits 2 on an unknown argument, which
+/// is exactly what a pre-`--no-remote` `q` does with the listing request).
+///
+/// It costs no extra ssh: the exit code was already in hand.
+fn nonzero(code: Option<i32>, stderr: &str) -> RemoteStatus {
+    match code {
+        Some(NO_COMMAND) => RemoteStatus::incompatible(format!(
+            "reachable, but no `q` on PATH there ({})",
+            exit_reason(code, stderr)
+        )),
+        Some(SSH_FAILED) | None => RemoteStatus::unreachable(exit_reason(code, stderr)),
+        Some(_) => RemoteStatus::incompatible(exit_reason(code, stderr)),
     }
 }
 
@@ -1173,6 +1499,10 @@ pub(crate) mod stub {
             SshOutcome::Failed("this test has no ssh (pass one with `Ctx::with_ssh`)".to_string())
         }
 
+        fn options(&self, _: &str, _: Duration) -> SshOutcome {
+            SshOutcome::Failed("this test has no ssh (pass one with `Ctx::with_ssh`)".to_string())
+        }
+
         fn attach(&self, alias: &str, _: &[String]) -> anyhow::Result<()> {
             Err(no_ssh(alias))
         }
@@ -1194,6 +1524,8 @@ pub(crate) mod stub {
     /// one without timing it.
     pub(crate) struct StubSsh {
         answers: BTreeMap<String, SshOutcome>,
+        /// What `ssh -G <alias>` answers; the ssh defaults when unscripted.
+        options: BTreeMap<String, SshOutcome>,
         delay: Duration,
         state: Mutex<StubState>,
     }
@@ -1213,9 +1545,20 @@ pub(crate) mod stub {
                     .iter()
                     .map(|(a, o)| ((*a).to_string(), o.clone()))
                     .collect(),
+                options: BTreeMap::new(),
                 delay: Duration::ZERO,
                 state: Mutex::new(StubState::default()),
             }
+        }
+
+        /// Script `ssh -G` for an alias.
+        #[allow(dead_code)]
+        pub(crate) fn with_options(mut self, options: &[(&str, SshOutcome)]) -> StubSsh {
+            self.options = options
+                .iter()
+                .map(|(a, o)| ((*a).to_string(), o.clone()))
+                .collect();
+            self
         }
 
         /// Every call sleeps this long, so overlap is observable.
@@ -1267,6 +1610,22 @@ pub(crate) mod stub {
                 .get(alias)
                 .cloned()
                 .unwrap_or_else(|| SshOutcome::Failed(format!("no stub host `{alias}`")))
+        }
+
+        fn options(&self, alias: &str, _: Duration) -> SshOutcome {
+            self.state
+                .lock()
+                .unwrap()
+                .calls
+                .push((alias.to_string(), vec!["-G".to_string()]));
+            self.options
+                .get(alias)
+                .cloned()
+                .unwrap_or_else(|| SshOutcome::Done {
+                    code: Some(0),
+                    stdout: super::DEFAULT_SSH_OPTIONS.to_string(),
+                    stderr: String::new(),
+                })
         }
 
         /// Recorded, never run: a stub that `exec`ed would replace the test.
@@ -1465,29 +1824,35 @@ mod tests {
 
     #[test]
     fn a_failed_exit_reports_what_the_far_end_said() {
-        let status = interpret(
-            SshOutcome::Done {
-                code: Some(127),
-                stdout: String::new(),
-                stderr: "bash: q: command not found\n".to_string(),
-            },
-            TIMEOUT,
-        )
-        .unwrap_err();
-        assert_eq!(status.marker(), Some(UNREACHABLE));
-        assert!(status.reason().unwrap().contains("command not found"));
+        let failed = |code, stderr: &str| {
+            interpret(
+                SshOutcome::Done {
+                    code,
+                    stdout: String::new(),
+                    stderr: stderr.to_string(),
+                },
+                TIMEOUT,
+            )
+            .unwrap_err()
+        };
 
-        // Killed by a signal: no code at all.
-        let status = interpret(
-            SshOutcome::Done {
-                code: None,
-                stdout: String::new(),
-                stderr: String::new(),
-            },
-            TIMEOUT,
-        )
-        .unwrap_err();
-        assert_eq!(status.marker(), Some(UNREACHABLE));
+        // The host answered — the shell got as far as looking for `q` — so it
+        // is that machine's `q` that is the problem, not the machine
+        // (bd-8lz.5.4).
+        let status = failed(Some(NO_COMMAND), "bash: q: command not found\n");
+        assert_eq!(status.marker(), Some(INCOMPATIBLE));
+        assert!(status.reason().unwrap().contains("command not found"));
+        assert!(status.reason().unwrap().contains("no `q` on PATH"));
+
+        // Any other exit is the far end's `q` refusing the line it was sent —
+        // clap answers an unknown argument with 2, which is what a `q` from
+        // before `--no-remote` does with the listing request.
+        let status = failed(Some(2), "error: unexpected argument '--no-remote'\n");
+        assert_eq!(status.marker(), Some(INCOMPATIBLE));
+
+        // ssh's own failure code, and a signalled command: nothing got there.
+        assert_eq!(failed(Some(SSH_FAILED), "").marker(), Some(UNREACHABLE));
+        assert_eq!(failed(None, "").marker(), Some(UNREACHABLE));
     }
 
     #[test]
@@ -1607,6 +1972,150 @@ mod tests {
             1,
         );
         assert!(out[0].quests.is_empty());
+    }
+
+    /// [`WIRE`] and the tag `q --version` prints are two spellings of one
+    /// number, and the far end reads the printed one.
+    #[test]
+    fn the_version_banner_carries_this_builds_wire() {
+        assert!(
+            VERSION.ends_with(&format!("(wire {WIRE})")),
+            "`{VERSION}` does not carry wire {WIRE}"
+        );
+        assert!(VERSION.starts_with(env!("CARGO_PKG_VERSION")));
+        // …and this `q` reads its own banner back, so the probe and the
+        // printer can never drift apart.
+        let mine = parse_version(&format!("q {VERSION}")).unwrap();
+        assert_eq!(mine.wire, Some(WIRE));
+        assert_eq!(mine.semver, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn a_remotes_version_is_read_from_however_it_says_it() {
+        let wire = |out: &str| parse_version(out).map(|v| (v.semver, v.wire));
+
+        // clap's own line, and a wrapper printing the version alone.
+        assert_eq!(
+            wire("q 0.4.0 (wire 3)\n"),
+            Some(("0.4.0".to_string(), Some(3)))
+        );
+        assert_eq!(wire("0.4.0 (wire 3)"), Some(("0.4.0".to_string(), Some(3))));
+        // Every `q` from before the wire was numbered.
+        assert_eq!(wire("q 0.1.0"), Some(("0.1.0".to_string(), None)));
+
+        // Nothing that is not a version is read as one.
+        assert_eq!(wire(""), None);
+        assert_eq!(wire("zsh: command not found: q"), None);
+        assert_eq!(wire("Welcome to ws! Have a nice day."), None);
+        assert_eq!(wire("error: q 1.2.3 is broken"), None);
+
+        // A wire tag that is not a number is no tag at all — never a panic,
+        // and never a version this `q` decides it can talk to.
+        assert_eq!(wire("q 0.1.0 (wire next)"), Some(("0.1.0".into(), None)));
+
+        // A banner ahead of the version is a banner, not a version: the far
+        // end's rc files printing at us must not be read as a `q`.
+        assert_eq!(wire("motd\nq 0.4.0 (wire 3)"), None);
+    }
+
+    /// `ssh -G` is the honest way to ask what ssh will do — every `Host`
+    /// pattern, `Match` block and `Include` already resolved (SPEC §23 #6).
+    #[test]
+    fn multiplexing_is_read_out_of_what_ssh_itself_reports() {
+        let on = "controlmaster auto\ncontrolpath /tmp/cm-%r@%h:%p\ncontrolpersist 600\n";
+        assert_eq!(
+            parse_multiplexing(on),
+            Multiplexing::On {
+                persist: "600".to_string()
+            }
+        );
+
+        // OpenSSH on macOS says `false`, not `no`; and `controlpath` is simply
+        // absent when it was never set.
+        assert_eq!(
+            parse_multiplexing("controlmaster false\ncontrolpersist no\n"),
+            Multiplexing::Off
+        );
+        assert_eq!(parse_multiplexing(""), Multiplexing::Off);
+
+        // A master with nowhere to put its socket multiplexes nothing.
+        assert_eq!(
+            parse_multiplexing("controlmaster auto\ncontrolpath none\n"),
+            Multiplexing::Off
+        );
+
+        // Configured, and useless for short commands: the mux dies with the
+        // command that opened it.
+        assert_eq!(
+            parse_multiplexing("controlmaster auto\ncontrolpath /tmp/cm\ncontrolpersist no\n"),
+            Multiplexing::NotPersisted
+        );
+
+        // Other keys are ignored, and the whole line is what is read — a key
+        // that merely contains "controlmaster" is not one.
+        assert_eq!(
+            parse_multiplexing("hostname box\nproxycommand controlmaster auto\n"),
+            Multiplexing::Off
+        );
+    }
+
+    /// The probes fan out exactly as the listing does; a remote that hangs
+    /// costs one round, not one round per remote.
+    #[test]
+    fn every_remote_is_probed_at_once() {
+        let remotes = [remote("ws"), remote("box"), remote("nas")];
+        let answers: Vec<(&str, SshOutcome)> = remotes
+            .iter()
+            .map(|r| (r.ssh.as_str(), ok("q 0.1.0 (wire 1)\n".to_string())))
+            .collect();
+        let ssh = Arc::new(StubSsh::new(&answers).with_delay(Duration::from_millis(60)));
+        let ctx = ctx_with(&remotes, ssh.clone() as Arc<dyn Ssh>);
+
+        let probes = probe_all(&ctx);
+        assert_eq!(
+            probes.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["ws", "box", "nas"]
+        );
+        assert_eq!(ssh.peak(), 3, "the probes did not overlap");
+        // SPEC §19's probe, and nothing else.
+        assert!(
+            ssh.calls()
+                .iter()
+                .filter(|(_, argv)| argv != &vec!["-G".to_string()])
+                .all(|(_, argv)| argv == &VERSION_ARGV),
+            "{:?}",
+            ssh.calls()
+        );
+        // Unscripted `ssh -G` is the ssh defaults: no multiplexing.
+        assert!(
+            probes.iter().all(|p| p.multiplexing == Multiplexing::Off),
+            "{probes:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_probed_without_remotes_or_under_no_remote() {
+        assert!(probe_all(&ctx_with(&[], Arc::new(stub::NoSsh))).is_empty());
+        let ctx = ctx_with(&[remote("ws")], Arc::new(stub::NoSsh)).with_no_remote(true);
+        assert!(probe_all(&ctx).is_empty());
+    }
+
+    /// A `ssh -G` that did not answer is not evidence of a missing
+    /// `ControlMaster`.
+    #[test]
+    fn an_unanswerable_ssh_g_leaves_multiplexing_unknown() {
+        let remotes = [remote("ws")];
+        let ssh = Arc::new(
+            StubSsh::new(&[("ws-host", ok("q 0.1.0 (wire 1)".to_string()))]).with_options(&[(
+                "ws-host",
+                SshOutcome::Failed("ssh not found on PATH".to_string()),
+            )]),
+        );
+        let probes = probe_all(&ctx_with(&remotes, ssh));
+        assert!(
+            matches!(probes[0].multiplexing, Multiplexing::Unknown(_)),
+            "{probes:?}"
+        );
     }
 
     fn ctx_with(remotes: &[Remote], ssh: std::sync::Arc<dyn Ssh>) -> Ctx {

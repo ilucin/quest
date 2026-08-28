@@ -97,7 +97,7 @@ use crate::commands::{confirm, enter, flush_warnings, new};
 use crate::config::Remote;
 use crate::error::QError;
 use crate::output;
-use crate::remote::{self, SshOutcome};
+use crate::remote::{self, SSH_FAILED, SshOutcome};
 
 /// How the far end's `q` is invoked. SPEC §15 spells it as a bare `q`, so it is
 /// whatever that machine's login shell finds on `PATH` — the same assumption
@@ -106,11 +106,6 @@ pub const REMOTE_Q: &str = "q";
 
 /// The recursion breaker (SPEC §15), appended to every proxied invocation.
 pub const NO_REMOTE: &str = "--no-remote";
-
-/// ssh's own exit code when it could not run the command at all. `q` never
-/// exits with it, so it is read as a connection failure rather than relayed as
-/// the far end's answer.
-const SSH_FAILED: i32 = 255;
 
 /// The word a proxied confirmation sends instead of `-f`: the human has
 /// answered the `[y/N]`, and that is all it says. See the module docs.

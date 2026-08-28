@@ -1637,6 +1637,381 @@ fn doctor_says_when_it_created_the_database() {
         "{parsed}"
     );
 }
+// ------------------------------------------- doctor: remotes (bd-8lz.5.4)
+
+/// `[[remotes]]` in this command's config, plus a scripted ssh — SPEC §19's
+/// remote checks, without a host anywhere near them. The ssh log doubles as
+/// the proof that a run made no ssh call at all.
+fn doctor_remotes(
+    cmd: &mut TestCmd,
+    remotes: &[(&str, &str)],
+    hosts: serde_json::Value,
+) -> std::path::PathBuf {
+    let mut config = String::from("[machine]\nname = \"laptop\"\n");
+    for (name, alias) in remotes {
+        config.push_str(&format!(
+            "\n[[remotes]]\nname = \"{name}\"\nssh = \"{alias}\"\n"
+        ));
+    }
+    std::fs::write(cmd.dir.path().join("config.toml"), config).unwrap();
+    let script = cmd.dir.path().join("ssh.json");
+    std::fs::write(&script, serde_json::json!({ "hosts": hosts }).to_string()).unwrap();
+    let log = cmd.dir.path().join("ssh.log");
+    cmd.env("Q_FIXTURE_SSH", &script)
+        .env("Q_FIXTURE_SSH_LOG", &log);
+    log
+}
+
+fn ssh_log_lines(log: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A `q --version` answer for one alias, next to a `ssh -G` answer.
+fn host(version: serde_json::Value, options: &str) -> serde_json::Value {
+    serde_json::json!({
+        "version": version,
+        "options": { "stdout": options },
+    })
+}
+
+const MUX_ON: &str = "controlmaster auto\ncontrolpath /tmp/cm-%r@%h:%p\ncontrolpersist 600\n";
+const MUX_OFF: &str = "controlmaster false\ncontrolpersist no\n";
+
+/// The common case is `remotes = []`, and it must cost nothing: no ssh, no
+/// check lines, no wait.
+#[test]
+fn doctor_without_remotes_makes_no_ssh_call() {
+    let mut cmd = doctor(&["claude"]);
+    let log = doctor_remotes(&mut cmd, &[], serde_json::json!({}));
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+
+    assert!(ssh_log_lines(&log).is_empty(), "{:?}", ssh_log_lines(&log));
+    let names: Vec<&str> = parsed["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(!names.iter().any(|n| n.starts_with("remote ")), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with("ssh multiplexing")),
+        "{names:?}"
+    );
+}
+
+/// SPEC §19's probe, verbatim: `ssh <alias> q --version`.
+#[test]
+fn doctor_probes_every_remote_with_q_version() {
+    let mut cmd = doctor(&["claude"]);
+    let log = doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host"), ("box", "box-host")],
+        serde_json::json!({
+            "ws-host": host(serde_json::json!({ "stdout": "q 0.1.0 (wire 1)" }), MUX_ON),
+            "box-host": host(serde_json::json!({ "stdout": "q 0.1.0 (wire 1)" }), MUX_ON),
+        }),
+    );
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+
+    let mut calls = ssh_log_lines(&log);
+    calls.sort();
+    assert_eq!(
+        calls,
+        [
+            "box-host\tq\t--version",
+            "options\tbox-host",
+            "options\tws-host",
+            "ws-host\tq\t--version",
+        ],
+        "{calls:?}"
+    );
+    for name in ["remote ws", "remote box"] {
+        assert_eq!(check(&parsed, name)["status"], "ok", "{parsed}");
+    }
+    let detail = check(&parsed, "remote ws")["detail"].as_str().unwrap();
+    assert!(detail.contains("q 0.1.0 (wire 1)"), "{detail}");
+    assert!(detail.contains("ssh ws-host"), "{detail}");
+    assert_eq!(parsed["ok"], true);
+}
+
+/// `q --version` is what the far end will be asked, so it is what this `q`
+/// prints — wire tag included, or a remote could never be told apart from an
+/// older one.
+#[test]
+fn the_version_banner_carries_the_wire_version() {
+    q().arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(wire "));
+}
+
+#[test]
+fn doctor_fails_on_an_unreachable_remote() {
+    let mut cmd = doctor(&["claude"]);
+    doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host")],
+        serde_json::json!({
+            "ws-host": host(
+                serde_json::json!({ "exit": 255, "stderr": "ssh: connect to host ws-host port 22: No route to host" }),
+                MUX_OFF,
+            ),
+        }),
+    );
+    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    let parsed = json_of(&assert);
+    let remote = check(&parsed, "remote ws");
+    assert_eq!(remote["status"], "fail");
+    assert!(
+        remote["detail"].as_str().unwrap().contains("No route"),
+        "{parsed}"
+    );
+    // The fix is about the connection, not about `q`.
+    let hint = remote["fix_hint"].as_str().unwrap();
+    assert!(hint.contains("ssh ws-host"), "{hint}");
+    assert!(!hint.contains("upgrade"), "{hint}");
+}
+
+/// A remote that never answers must cost the deadline and not a second more —
+/// the whole point of bd-8lz.5.1's hard deadline.
+#[test]
+fn doctor_gives_up_on_a_silent_remote_at_the_deadline() {
+    let mut cmd = doctor(&["claude"]);
+    doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host")],
+        serde_json::json!({
+            // Far longer than the 5 s deadline: the fixture waits the deadline
+            // out and answers `TimedOut`, exactly as the real backend does.
+            "ws-host": host(serde_json::json!({ "delay_ms": 600_000 }), MUX_OFF),
+        }),
+    );
+    let started = std::time::Instant::now();
+    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "doctor waited {elapsed:?} on one dead remote"
+    );
+    let parsed = json_of(&assert);
+    let remote = check(&parsed, "remote ws");
+    assert_eq!(remote["status"], "fail");
+    assert!(
+        remote["detail"].as_str().unwrap().contains("no answer"),
+        "{parsed}"
+    );
+}
+
+/// The case the real `ws` is: up, ssh fine, and no `q` on it. Before the probe
+/// this read `unreachable`, which sent the user looking at the network.
+#[test]
+fn doctor_tells_a_reachable_host_without_q_apart_from_a_dead_one() {
+    let mut cmd = doctor(&["claude"]);
+    doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host")],
+        serde_json::json!({
+            "ws-host": host(
+                serde_json::json!({ "exit": 127, "stderr": "zsh: command not found: q" }),
+                MUX_ON,
+            ),
+        }),
+    );
+    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    let parsed = json_of(&assert);
+    let remote = check(&parsed, "remote ws");
+    assert_eq!(remote["status"], "fail");
+    assert!(
+        remote["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no `q` on PATH"),
+        "{parsed}"
+    );
+    assert!(
+        remote["fix_hint"]
+            .as_str()
+            .unwrap()
+            .contains("install q on ws"),
+        "{parsed}"
+    );
+}
+
+/// The debt bd-8lz.5.3 left: a `q` too old to understand `--expect` answers
+/// with clap's exit 2 and no explanation. Its `--version` has no wire tag, and
+/// that is what doctor turns into "upgrade `q` on ws".
+#[test]
+fn doctor_reports_a_q_too_old_for_the_wire() {
+    let mut cmd = doctor(&["claude"]);
+    doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host")],
+        serde_json::json!({
+            "ws-host": host(serde_json::json!({ "stdout": "q 0.1.0" }), MUX_ON),
+        }),
+    );
+    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    let parsed = json_of(&assert);
+    let remote = check(&parsed, "remote ws");
+    assert_eq!(remote["status"], "fail");
+    let detail = remote["detail"].as_str().unwrap();
+    assert!(detail.contains("q 0.1.0"), "{detail}");
+    assert!(detail.contains("no wire version"), "{detail}");
+    assert_eq!(remote["fix_hint"], "upgrade `q` on ws");
+}
+
+/// The other direction: the far end is newer than this `q`. Not a failure —
+/// the listing parse ignores fields it has never heard of — and the fix is on
+/// this machine.
+#[test]
+fn doctor_warns_when_the_remote_q_is_newer_than_this_one() {
+    let mut cmd = doctor(&["claude"]);
+    doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host")],
+        serde_json::json!({
+            "ws-host": host(serde_json::json!({ "stdout": "q 9.9.9 (wire 99)" }), MUX_ON),
+        }),
+    );
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    let remote = check(&parsed, "remote ws");
+    assert_eq!(remote["status"], "warn");
+    assert!(
+        remote["detail"].as_str().unwrap().contains("wire 99"),
+        "{parsed}"
+    );
+    assert!(
+        remote["fix_hint"].as_str().unwrap().contains("laptop"),
+        "{parsed}"
+    );
+}
+
+/// A login shell that prints a banner, a wrapper that swallows `--version`: an
+/// answer that is not a version is not proof of an old `q`, so it warns.
+#[test]
+fn doctor_warns_about_an_unreadable_version_answer() {
+    let mut cmd = doctor(&["claude"]);
+    doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host")],
+        serde_json::json!({
+            "ws-host": host(
+                serde_json::json!({ "stdout": "Welcome to ws! Have a nice day.\n" }),
+                MUX_ON,
+            ),
+        }),
+    );
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    let remote = check(&parsed, "remote ws");
+    assert_eq!(remote["status"], "warn");
+    assert!(
+        remote["detail"].as_str().unwrap().contains("Welcome to ws"),
+        "{parsed}"
+    );
+}
+
+/// SPEC §23 #6. A warning, never a failure, and `q` never touches the file.
+#[test]
+fn doctor_warns_when_ssh_multiplexing_is_missing() {
+    let mut cmd = doctor(&["claude"]);
+    doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host")],
+        serde_json::json!({
+            "ws-host": host(serde_json::json!({ "stdout": "q 0.1.0 (wire 1)" }), MUX_OFF),
+        }),
+    );
+    // Warn only: the whole report still passes.
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    let mux = check(&parsed, "ssh multiplexing ws");
+    assert_eq!(mux["status"], "warn");
+    let hint = mux["fix_hint"].as_str().unwrap();
+    assert!(hint.contains("ControlMaster auto"), "{hint}");
+    assert!(hint.contains("ControlPersist"), "{hint}");
+    assert!(hint.contains("ws-host"), "{hint}");
+}
+
+#[test]
+fn doctor_is_happy_with_a_multiplexed_remote() {
+    let mut cmd = doctor(&["claude"]);
+    doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host")],
+        serde_json::json!({
+            "ws-host": host(serde_json::json!({ "stdout": "q 0.1.0 (wire 1)" }), MUX_ON),
+        }),
+    );
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    let mux = check(&parsed, "ssh multiplexing ws");
+    assert_eq!(mux["status"], "ok");
+    assert!(
+        mux["detail"]
+            .as_str()
+            .unwrap()
+            .contains("ControlPersist 600"),
+        "{parsed}"
+    );
+    assert!(mux["fix_hint"].is_null(), "{parsed}");
+}
+
+/// A `ControlMaster` with `ControlPersist no` looks configured and reuses
+/// nothing: every mux dies with the command that opened it.
+#[test]
+fn doctor_warns_about_a_control_master_that_never_persists() {
+    let mut cmd = doctor(&["claude"]);
+    doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host")],
+        serde_json::json!({
+            "ws-host": host(
+                serde_json::json!({ "stdout": "q 0.1.0 (wire 1)" }),
+                "controlmaster auto\ncontrolpath /tmp/cm\ncontrolpersist no\n",
+            ),
+        }),
+    );
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    let mux = check(&parsed, "ssh multiplexing ws");
+    assert_eq!(mux["status"], "warn");
+    assert!(
+        mux["fix_hint"]
+            .as_str()
+            .unwrap()
+            .contains("ControlPersist 10m"),
+        "{parsed}"
+    );
+}
+
+/// The human report keeps doctor's ✓/✗ shape for the remote lines too.
+#[test]
+fn doctor_human_output_marks_the_remote_checks() {
+    let mut cmd = doctor(&["claude"]);
+    doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host")],
+        serde_json::json!({
+            "ws-host": host(serde_json::json!({ "stdout": "q 0.1.0 (wire 1)" }), MUX_OFF),
+        }),
+    );
+    cmd.arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "✓ remote ws q 0.1.0 (wire 1) · ssh ws-host",
+        ))
+        .stdout(predicate::str::contains("⚠ ssh multiplexing ws"));
+}
+
 // ------------------------------------------- doctor: hooks, statusline, login
 
 /// Every hook check, in report order.
@@ -7291,8 +7666,11 @@ fn a_remote_answering_with_something_unreadable_is_incompatible() {
     }
 }
 
+/// A host that answers is not unreachable, whatever it answers: the shell got
+/// as far as looking for `q`, so what is wrong is that machine's `q`
+/// (bd-8lz.5.4). `q doctor` is where that becomes a fix line.
 #[test]
-fn a_remote_without_q_installed_is_unreachable_with_its_own_message() {
+fn a_remote_without_q_installed_is_incompatible_with_its_own_message() {
     let env = Env::new();
     env.with_remotes(&[("ws", "ws-host")]);
     let assert = env
@@ -7301,8 +7679,24 @@ fn a_remote_without_q_installed_is_unreachable_with_its_own_message() {
         }))
         .success();
     let stderr = stderr_of(&assert);
-    assert!(stderr.contains("⚠ unreachable"), "{stderr}");
+    assert!(stderr.contains("⚠ incompatible"), "{stderr}");
+    assert!(stderr.contains("no `q` on PATH"), "{stderr}");
     assert!(stderr.contains("command not found"), "{stderr}");
+}
+
+/// ssh's own failure code, on the other hand, says nothing came back at all.
+#[test]
+fn a_host_ssh_could_not_reach_is_unreachable() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let assert = env
+        .list(serde_json::json!({
+            "ws-host": { "exit": 255, "stderr": "ssh: Could not resolve hostname ws-host" }
+        }))
+        .success();
+    let stderr = stderr_of(&assert);
+    assert!(stderr.contains("⚠ unreachable"), "{stderr}");
+    assert!(stderr.contains("Could not resolve"), "{stderr}");
 }
 
 /// SPEC §16's listing filters deliberately do NOT travel: there is one cache
