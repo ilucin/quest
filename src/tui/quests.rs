@@ -483,10 +483,9 @@ pub fn handle(app: &mut App, input: Input) -> Action {
         return search_key(app, input);
     }
     if let Input::Char(c) = input
-        && LOCAL_ONLY.contains(&c)
-        && refuse_remote(app, c)
+        && let Some(action) = remote_proxy_key(app, c)
     {
-        return Action::None;
+        return action;
     }
     let page = viewport(app);
     match input {
@@ -567,55 +566,38 @@ pub fn handle(app: &mut App, input: Input) -> Action {
     }
 }
 
-/// The keys that read or write *this* machine's database: sessions, events,
-/// brief, links, rename, close, resume. SPEC §15 keeps every machine's
-/// registry, hooks and database to itself, so on a remote row they would all
-/// run against the wrong one — and not harmlessly: a Quest id is 16 bits and
-/// unique only per machine, so `c` on a remote row could close a local Quest
-/// that happens to share it.
+/// The `q` subcommand a proxied Quests key stands for, and whether its output
+/// is **paged** (a read) rather than handed the terminal (a write, whose confirm
+/// or attach needs the keyboard).
 ///
-/// bd-8lz.5.3 taught the **CLI** to proxy every one of these over ssh; the TUI
-/// is not wired to that path yet, because each of these keys opens a form, a
-/// pager or a confirm that reads and writes local rows, and routing them
-/// through the proxy is a screen's worth of work per key rather than a shared
-/// gate. So they stay refused here — and the refusal names the command that
-/// does work, instead of claiming the operation needs that machine when a
-/// shell on this one can now do it.
-///
-/// `o` is deliberately not in here: entering a remote Quest is SPEC §15's one
-/// remote action, and it goes over ssh rather than through the database.
-const LOCAL_ONLY: [char; 7] = ['s', 'e', 'r', 'c', 'R', 'b', 'l'];
-
-/// The `q` command each refused key stands for, so the message hands over
-/// something to run rather than a dead end.
-fn cli_equivalent(key: char) -> &'static str {
-    match key {
-        's' => "q sessions",
-        'e' => "q events",
-        'r' => "q rename",
-        'c' => "q close",
-        'R' => "q resume",
-        'b' => "q brief",
-        'l' => "q links",
-        _ => "q show",
-    }
+/// These keys read or write a Quest's own machine, and a Quest id is 16 bits and
+/// unique only per machine — so `c` on a remote row could otherwise close a
+/// local Quest sharing the id. bd-8lz.5.3 taught the CLI to proxy them over ssh;
+/// bd-8lz.5.8 routes the TUI to that same path (see [`remote_proxy_key`]) rather
+/// than reimplementing ssh, pinning and confirmation here. `r` (rename) and `o`
+/// (attach) are not proxied here — `r` proxies at submit, `o` hands over the
+/// terminal.
+pub fn proxied(key: char) -> Option<(&'static str, bool)> {
+    Some(match key {
+        's' => ("sessions", true),
+        'e' => ("events", true),
+        'b' => ("brief", true),
+        'l' => ("links", true),
+        'c' => ("close", false),
+        'R' => ("resume", false),
+        _ => return None,
+    })
 }
 
-/// Whether `key` was refused because the selection lives on another machine.
-fn refuse_remote(app: &mut App, key: char) -> bool {
-    let Some(row) = app.quests.selected_row() else {
-        return false;
-    };
+/// `Some(Action::Proxy)` when `key` is one the loop proxies and the selection
+/// lives on another machine; `None` otherwise — including every key on a local
+/// row, and `r` anywhere (it opens a form, and its submit proxies instead).
+fn remote_proxy_key(app: &App, key: char) -> Option<Action> {
+    let row = app.quests.selected_row()?;
     if !row.origin.is_remote() {
-        return false;
+        return None;
     }
-    let (slug, machine) = (row.view.quest.slug.clone(), row.view.quest.machine.clone());
-    app.say(format!(
-        "{slug} runs on {machine}; the TUI does not proxy `{key}` yet \u{b7} \
-         run `{} {slug}` in a shell, or o to enter",
-        cli_equivalent(key)
-    ));
-    true
+    proxied(key).map(|_| Action::Proxy(key))
 }
 
 /// The machine a remote selection lives on, or `None` when the selection is
@@ -856,6 +838,11 @@ fn target_of(row: &QuestRow) -> Target {
         created_at: row.view.quest.created_at,
         finished: row.view.display_state == DisplayState::Finished,
         epic: row.view.quest.beads_epic.clone(),
+        // Set only for a remote row, so its submit proxies (SPEC §15).
+        machine: row
+            .origin
+            .is_remote()
+            .then(|| row.view.quest.machine.clone()),
     }
 }
 
@@ -1128,12 +1115,44 @@ fn expand(template: Template) -> anyhow::Result<Template> {
 }
 
 fn rename_quest(ctx: &Ctx, app: &mut App, target: &Target, form: &Form) -> anyhow::Result<()> {
+    let new_slug = form.trimmed(F_SLUG);
+    // SPEC §15: a remote Quest is renamed *there*. Nothing to confirm, so it
+    // runs captured rather than through the terminal (see `rename_remote`).
+    if let Some(machine) = &target.machine {
+        rename_remote(app, target, machine, new_slug)?;
+        return Ok(());
+    }
     let quest = quest_for(ctx, target)?;
-    let renamed = rename::apply(ctx, &quest, form.trimmed(F_SLUG), NameSource::Manual, None)?;
+    let renamed = rename::apply(ctx, &quest, new_slug, NameSource::Manual, None)?;
     // Same Quest, so `resync` would keep it anyway; said out loud because the
     // slug it is keyed on is not the one the selection was made under.
     app.quests.focus_on(Anchor::local(&renamed.quest));
     app.say(renamed.describe());
+    Ok(())
+}
+
+/// `q rename <slug> <new> --machine <m>` as a child of *this* `q` (SPEC §15):
+/// the CLI proxy resolves, pins and sends it over ssh. A non-zero exit returns
+/// an error, so the form stays up with the far end's message like a local one.
+fn rename_remote(
+    app: &mut App,
+    target: &Target,
+    machine: &str,
+    new_slug: &str,
+) -> anyhow::Result<()> {
+    let out = super::spawn_q(&["rename", &target.slug, new_slug, "--machine", machine])?;
+    if !out.status.success() {
+        return Err(QError::Other(format!(
+            "rename {} on {machine}: {}",
+            target.slug,
+            super::child_said(&out)
+        ))
+        .into());
+    }
+    app.say(format!(
+        "renamed {} to {new_slug} on {machine} \u{b7} it updates at the next remote tick",
+        target.slug
+    ));
     Ok(())
 }
 
@@ -2748,48 +2767,74 @@ mod tests {
         assert_eq!(app.quests.visible().len(), 1);
     }
 
-    /// Every key but `o` runs against *this* machine's database, and a Quest
-    /// id is unique only per machine — so `c` on a remote row could otherwise
-    /// close a local Quest that happens to share the id.
+    /// SPEC §15, bd-8lz.5.8: the keys that read or write a Quest's own machine
+    /// are proxied on a remote row rather than run against this database — a
+    /// Quest id is 16 bits and unique only per machine, so `c` on a remote row
+    /// could otherwise close a local Quest that happens to share the id. The
+    /// six read/write keys hand off to the loop as `Action::Proxy`; `r` opens
+    /// the ordinary rename form, whose submit proxies instead (see
+    /// [`rename_remote`]).
     #[test]
-    fn the_local_only_keys_are_refused_on_a_remote_row() {
+    fn the_local_only_keys_are_proxied_on_a_remote_row() {
         let mut app = app_with(vec![remote_row(
             "ws",
             "over-there",
             QuestState::Active,
             false,
         )]);
-        for key in ['s', 'e', 'r', 'c', 'R', 'b', 'l'] {
+        for key in ['s', 'e', 'c', 'R', 'b', 'l'] {
             app.status.clear();
             let action = handle(&mut app, Input::Char(key));
-            assert_eq!(action, Action::None, "`{key}` acted on a remote row");
+            assert_eq!(
+                action,
+                Action::Proxy(key),
+                "`{key}` did not proxy on a remote row"
+            );
             assert!(app.modal.is_none(), "`{key}` opened a form");
             assert_eq!(app.tab, Tab::Quests, "`{key}` switched tabs");
-            assert!(
-                app.status.contains("runs on ws"),
-                "`{key}` said nothing: {}",
-                app.status
-            );
-            // D2: the CLI proxies every one of these now, so the refusal must
-            // not claim the operation needs that machine — it points at the
-            // command that does work from here.
-            assert!(
-                app.status.contains(cli_equivalent(key)) && app.status.contains("in a shell"),
-                "`{key}` did not name what does work: {}",
-                app.status
-            );
-            assert!(
-                !app.status.contains("needs that machine"),
-                "`{key}` still claims the CLI cannot do this: {}",
-                app.status
-            );
         }
-        // `o` is the one remote action SPEC §15 defines.
+        // `r` opens the rename form even on a remote row: the new slug is typed
+        // here, and the submit is what travels — carrying the machine so it
+        // proxies rather than resolving an id this database does not have.
+        app.status.clear();
+        assert_eq!(handle(&mut app, Input::Char('r')), Action::None);
+        let modal = app.modal.as_ref().expect("the rename form did not open");
+        match &modal.prompt {
+            Prompt::Rename(target) => {
+                assert_eq!(
+                    target.machine.as_deref(),
+                    Some("ws"),
+                    "rename lost the machine"
+                )
+            }
+            other => panic!("`r` opened {other:?}, not a rename"),
+        }
+        app.modal = None;
+        // `o` is the other remote action SPEC §15 defines.
         assert_eq!(handle(&mut app, Input::Char('o')), Action::Attach);
-        // And a local row still answers all of them.
+        // And a local row keeps every key local: `r` opens a form with no
+        // machine, and `b`/`c` are the tab's own actions, never a proxy.
         let mut app = app_with(vec![row(quest("here", QuestState::Active, 9), Vec::new())]);
         assert_eq!(handle(&mut app, Input::Char('r')), Action::None);
-        assert!(app.modal.is_some(), "the rename form did not open");
+        let modal = app.modal.as_ref().expect("the rename form did not open");
+        assert!(
+            matches!(&modal.prompt, Prompt::Rename(t) if t.machine.is_none()),
+            "a local rename carried a machine"
+        );
+        assert_eq!(handle(&mut app, Input::Char('b')), Action::Brief);
+    }
+
+    /// The proxied-key table and the gate agree on exactly which keys travel:
+    /// the six read/write keys, and nothing else (`r` opens a form, `o`
+    /// attaches, `n`/`f`/`m` are the tab's own).
+    #[test]
+    fn only_the_six_read_write_keys_proxy() {
+        for key in ['s', 'e', 'c', 'R', 'b', 'l'] {
+            assert!(proxied(key).is_some(), "`{key}` is not proxied");
+        }
+        for key in ['r', 'o', 'n', 'f', 'm', 'q', 'x'] {
+            assert!(proxied(key).is_none(), "`{key}` should not proxy");
+        }
     }
 
     #[test]

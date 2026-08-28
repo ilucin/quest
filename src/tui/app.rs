@@ -84,6 +84,11 @@ pub enum Action {
     /// Carries nothing: the loop reads the form — and the Quest id the prompt
     /// was opened against — out of `App::modal`.
     Submit,
+    /// Proxy a Quests-tab key against the machine the selection lives on
+    /// (SPEC §15, bd-8lz.5.8): `s`/`e`/`b`/`l` page a captured `q <cmd>`,
+    /// `c`/`R` hand over the terminal for the CLI's confirm/attach. Carries
+    /// only the key; the loop reads the selection out of the tab.
+    Proxy(char),
     Quit,
 }
 
@@ -113,6 +118,10 @@ pub struct Target {
     /// another terminal would otherwise leave the box saying `bd-e1` while the
     /// refetched Quest closes `bd-e2` (N-6).
     pub epic: Option<String>,
+    /// The machine the Quest lives on, when that is not this one (SPEC §15).
+    /// `Some` routes a submit through the proxy — this database has no row under
+    /// that id, and a 16-bit id could collide with a local Quest's.
+    pub machine: Option<String>,
 }
 
 /// The session a Sessions-tab prompt was opened against, and enough of what
