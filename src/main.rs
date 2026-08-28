@@ -358,10 +358,8 @@ fn parse_cli() -> Cli {
 
 /// The process exit code, or an error `main` renders and exits 1 on.
 fn run(args: &Cli) -> anyhow::Result<u8> {
-    // `--version` short-circuits everything, subcommand or not — the flag `q`
-    // owns in clap's place (bd-8lz.9), so it honours `--json`. The plain banner
-    // is what `ssh <alias> q --version` reads, so it stays byte-for-byte what
-    // clap used to print: `q <semver> (wire N)`.
+    // `--version` short-circuits, subcommand or not (bd-8lz.9). The plain
+    // banner stays what clap used to print — `ssh <alias> q --version` reads it.
     if args.version {
         let version = env!("CARGO_PKG_VERSION");
         output::emit(

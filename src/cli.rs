@@ -8,13 +8,9 @@ use clap::{Parser, Subcommand, ValueEnum};
     disable_help_subcommand = true
 )]
 pub struct Cli {
-    /// Print the version banner and exit.
-    ///
-    /// Owned by `q`, not clap: clap prints and exits before any `q` code runs,
-    /// so its `--version` could never honour `--json` (bd-8lz.9). The far end
-    /// of an ssh reads this line to decide whether the two `q`s speak the same
-    /// remote protocol (SPEC §19, `q doctor`), so it carries the wire version
-    /// as well as the crate one.
+    /// Print the version banner and exit. Owned by `q`, not clap, so it can
+    /// honour `--json` (bd-8lz.9). The banner carries the wire version too:
+    /// the far end of an ssh reads it (SPEC §19, `q doctor`).
     #[arg(long, global = true)]
     pub version: bool,
 
