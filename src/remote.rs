@@ -245,8 +245,31 @@ fn ssh_argv(alias: &str, argv: &[&str], timeout: Duration) -> Vec<String> {
         ),
         alias.to_string(),
     ];
-    out.extend(remote_command(argv.iter().map(|a| (*a).to_string())));
+    out.extend(remote_command(
+        self_bounded(argv, timeout.as_secs().max(1)).into_iter(),
+    ));
     out
+}
+
+/// The remote command, wrapped so it reaps itself on the far end. Killing the
+/// local ssh client cannot reach the far side — under ssh multiplexing (SPEC
+/// §23 #6) the mux master keeps the channel open — so a hung command there
+/// would run forever, one orphan per tick. A watchdog beside it SIGTERMs it at
+/// `secs` (the client's deadline) and exits early once it finishes on its own.
+/// POSIX `sh` only: bash 3.2 / dash, no `wait -n`, no `timeout`/`setsid`.
+fn self_bounded(argv: &[&str], secs: u64) -> [String; 3] {
+    let cmd = argv
+        .iter()
+        .map(|a| sh_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let script = format!(
+        "{cmd} & p=$!; \
+         (i={secs}; while [ \"$i\" -gt 0 ] && kill -0 \"$p\" 2>/dev/null; do sleep 1; i=$((i-1)); done; \
+         kill \"$p\" 2>/dev/null) & w=$!; \
+         wait \"$p\"; r=$?; kill \"$w\" 2>/dev/null; exit \"$r\""
+    );
+    ["sh".to_string(), "-c".to_string(), script]
 }
 
 /// The argv of an interactive `ssh`. No `BatchMode` and no `ConnectTimeout`,
@@ -1730,7 +1753,7 @@ mod tests {
     fn the_argv_is_the_spec_command_and_never_prompts() {
         let argv = ssh_argv("ws", &LIST_ARGV, TIMEOUT);
         assert_eq!(
-            argv,
+            &argv[..5],
             [
                 "-o",
                 "BatchMode=yes",
@@ -1738,13 +1761,11 @@ mod tests {
                 // Half the deadline, so an unroutable host gives up inside it.
                 "ConnectTimeout=2",
                 "ws",
-                "q",
-                "list",
-                "--json",
-                "--no-remote",
-                "--all"
             ]
         );
+        // Wrapped in a self-bounding `sh -c`, not bare argv (see `self_bounded`).
+        assert_eq!(&argv[5..7], ["sh", "-c"]);
+        assert!(argv[7].contains("q list --json --no-remote --all"));
         // However short the deadline, ssh is never told to wait zero seconds.
         assert!(
             ssh_argv("ws", &LIST_ARGV, Duration::from_millis(1))
@@ -2303,6 +2324,35 @@ mod tests {
     /// below live for, so a deadline that is not enforced cannot pass them.
     const PATIENCE: Duration = Duration::from_secs(10);
 
+    /// Run `self_bounded`'s script through a local shell, as the far end's
+    /// login shell would, and report the code and how long it took.
+    fn run_self_bounded(argv: &[&str], secs: u64) -> (Option<i32>, Duration) {
+        let wrapped = self_bounded(argv, secs);
+        let started = Instant::now();
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&wrapped[2])
+            .status()
+            .unwrap();
+        (status.code(), started.elapsed())
+    }
+
+    #[test]
+    fn a_hung_far_end_command_kills_itself_at_the_deadline() {
+        // The inner `sleep 30` must be gone in ~1 s, reported non-zero.
+        let (code, elapsed) = run_self_bounded(&["sleep", "30"], 1);
+        assert!(elapsed < PATIENCE, "took {elapsed:?}");
+        assert_ne!(code, Some(0));
+    }
+
+    #[test]
+    fn a_healthy_far_end_command_returns_at_once_with_its_own_code() {
+        // No delay, and its exit code survives the wrapper.
+        let (code, elapsed) = run_self_bounded(&["sh", "-c", "exit 7"], 30);
+        assert_eq!(code, Some(7));
+        assert!(elapsed < PATIENCE, "took {elapsed:?}");
+    }
+
     #[test]
     fn a_command_that_finishes_is_reported_with_both_its_streams() {
         let outcome = run_with_deadline(sh("printf hello; printf oops >&2; exit 3"), TIMEOUT);
@@ -2514,7 +2564,9 @@ mod tests {
         // ssh's own options are ours to exec, never the far end's to read.
         let argv = ssh_argv("ws", &LIST_ARGV, TIMEOUT);
         assert_eq!(argv[1], "BatchMode=yes");
-        assert_eq!(&argv[5..], LIST_ARGV);
+        // Inside the wrapper, but every word of the command is still there.
+        assert_eq!(&argv[5..7], ["sh", "-c"]);
+        assert!(argv[7].contains(&LIST_ARGV.join(" ")));
     }
 
     #[test]
