@@ -74,6 +74,12 @@ pub enum Action {
     Brief,
     /// Leave TUI mode and page the selected session's pane (SPEC §17 `p`).
     Peek,
+    /// Instantiate the selected template and land in the master it makes
+    /// (SPEC §11 `⏎`/`r`). Carries nothing, like the other hand-overs: the
+    /// loop asks the tab which row it is on.
+    Run,
+    /// Leave TUI mode and page the selected template's TOML (SPEC §11 `X`).
+    Export,
     /// Run the open modal's [`Prompt`] (SPEC §17 `n` / `r` / `c` / `R`).
     /// Carries nothing: the loop reads the form — and the Quest id the prompt
     /// was opened against — out of `App::modal`.
@@ -137,6 +143,21 @@ pub struct SessionTarget {
     pub ended: bool,
 }
 
+/// The template a prompt was opened against, and enough of it to notice if it
+/// stopped being the one the box named.
+///
+/// The same shape, and the same reasoning, as [`Target`]: a tick reloads the
+/// listing while a prompt is up, `id` is 16 bits and can be minted twice after
+/// a delete, and `created_at` is the column nothing can change. The name is
+/// carried because the box put it in its title — an edit from another terminal
+/// would otherwise leave a "delete weekly-hygiene?" box deleting `deps-audit`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateTarget {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+}
+
 /// What an open form will do when it is submitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Prompt {
@@ -150,6 +171,15 @@ pub enum Prompt {
     Kill(SessionTarget),
     /// SPEC §17 `Z` — hand a session a fresh context window (SPEC §8).
     Reset(SessionTarget),
+    /// SPEC §11 `a` — a new template.
+    AddTemplate,
+    /// SPEC §11 `e` — the same form over an existing one.
+    EditTemplate(TemplateTarget),
+    /// SPEC §11 `d` — the delete confirm.
+    DeleteTemplate(TemplateTarget),
+    /// SPEC §11 `⏎`/`r` on a template that wants `{{arg.k}}`: the CLI takes
+    /// them as `--arg k=v`, and this is the form that stands in for it.
+    RunTemplate(TemplateTarget),
 }
 
 impl Prompt {
@@ -159,7 +189,25 @@ impl Prompt {
             Prompt::NewQuest => None,
             Prompt::Rename(t) | Prompt::Close(t) | Prompt::Resume(t) => Some(t.quest.as_str()),
             Prompt::Send(t) | Prompt::Kill(t) | Prompt::Reset(t) => Some(t.quest.as_str()),
+            // A template is a definition; the Quest a run makes does not
+            // exist yet, and the other three never make one.
+            Prompt::AddTemplate
+            | Prompt::EditTemplate(_)
+            | Prompt::DeleteTemplate(_)
+            | Prompt::RunTemplate(_) => None,
         }
+    }
+
+    /// Whether this prompt is the Templates tab's, so [`super::submit`] knows
+    /// which module to hand it to.
+    pub fn is_template(&self) -> bool {
+        matches!(
+            self,
+            Prompt::AddTemplate
+                | Prompt::EditTemplate(_)
+                | Prompt::DeleteTemplate(_)
+                | Prompt::RunTemplate(_)
+        )
     }
 
     pub fn target(&self) -> Option<&Target> {
@@ -204,7 +252,7 @@ pub fn help_rows(tab: Tab) -> Vec<(&'static str, &'static str)> {
         Tab::Quests => quests::HELP,
         Tab::Sessions => sessions::HELP,
         Tab::Events => events::HELP,
-        Tab::Templates => &[],
+        Tab::Templates => templates::HELP,
     };
     if !own.is_empty() {
         rows.push(("", ""));
@@ -591,6 +639,7 @@ impl App {
         match self.tab {
             Tab::Events => !self.events.loaded() || self.events.stale(),
             Tab::Sessions => !self.sessions.loaded(),
+            Tab::Templates => !self.templates.loaded(),
             _ => false,
         }
     }
@@ -687,8 +736,8 @@ mod tests {
         assert_eq!(a.tab, Tab::Quests);
         for want in [Tab::Sessions, Tab::Templates, Tab::Events, Tab::Quests] {
             // A data tab that has never loaded asks for its rows on the way
-            // in; Quests (already loaded by the shell) and Templates do not.
-            let asks = if matches!(want, Tab::Sessions | Tab::Events) {
+            // in; Quests is already loaded by the shell before the loop runs.
+            let asks = if matches!(want, Tab::Sessions | Tab::Templates | Tab::Events) {
                 Action::Refresh
             } else {
                 Action::None

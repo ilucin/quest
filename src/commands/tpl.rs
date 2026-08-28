@@ -106,22 +106,44 @@ fn show(ctx: &Ctx, target: &str) -> anyhow::Result<()> {
 }
 
 fn add(ctx: &Ctx, name: &str, fields: &TplFields) -> anyhow::Result<()> {
-    let db = ctx.db()?;
-    let mut definition = patched(&Definition::default(), name, fields)?;
-    pin_cwd(&mut definition, None)?;
-    let stored = insert(db, &definition)?;
+    let definition = patched(&Definition::default(), name, fields)?;
+    let stored = create(ctx, &definition)?;
     report(ctx, &stored, "created")
+}
+
+/// `q tpl add`'s store step as a library call — the same `cwd` pinning, the
+/// same name validation, the same field checks.
+///
+/// The TUI's add form goes through here rather than through a second copy of
+/// them (SPEC §17), so a name the CLI refuses is a name the form refuses, with
+/// the same message.
+pub fn create(ctx: &Ctx, definition: &Definition) -> anyhow::Result<Template> {
+    let mut definition = definition.clone();
+    pin_cwd(&mut definition, None)?;
+    insert(ctx.db()?, &definition)
 }
 
 /// `q tpl edit`: a patch when any field flag is given, the editor otherwise.
 fn edit(ctx: &Ctx, target: &str, fields: &TplFields) -> anyhow::Result<()> {
     let db = ctx.db()?;
     let current = db.resolve_template(target)?;
-    let mut definition = if fields.any() {
+    let definition = if fields.any() {
         patched(&Definition::of(&current), &current.name, fields)?
     } else {
         from_editor(&current)?
     };
+    let stored = save(ctx, &current, &definition)?;
+    report(ctx, &stored, "updated")
+}
+
+/// `q tpl edit`'s store step as a library call — the TUI's edit form
+/// (SPEC §17), which fills every field rather than patching a few.
+///
+/// `current` is the row being written over; its id and its run stats survive,
+/// which is what makes an edit an edit rather than a delete and an add.
+pub fn save(ctx: &Ctx, current: &Template, definition: &Definition) -> anyhow::Result<Template> {
+    let db = ctx.db()?;
+    let mut definition = definition.clone();
     // Trimmed here as `insert` and `import` trim: a hand-edited TOML is
     // exactly where a stray space around a rename happens.
     definition.name = definition.name.trim().to_string();
@@ -133,8 +155,7 @@ fn edit(ctx: &Ctx, target: &str, fields: &TplFields) -> anyhow::Result<()> {
     let mut row = current.clone();
     definition.apply(&mut row);
     check(&row)?;
-    let stored = db.update_template(&current.id, &row)?;
-    report(ctx, &stored, "updated")
+    db.update_template(&current.id, &row)
 }
 
 /// The template's TOML, through `$EDITOR` and back (SPEC §11). Never launched
@@ -163,7 +184,7 @@ fn rm(ctx: &Ctx, target: &str, force: bool) -> anyhow::Result<()> {
     if !force {
         confirm(ctx, &format!("remove template {}?", template.name))?;
     }
-    let unlinked = db.delete_template(&template.id)?;
+    let unlinked = remove(ctx, &template)?;
     if ctx.json || !ctx.quiet {
         output::emit(
             ctx.json,
@@ -181,6 +202,32 @@ fn rm(ctx: &Ctx, target: &str, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `q tpl rm`'s delete as a library call, returning how many Quests were
+/// unlinked — see [`crate::db::Db::delete_template`] for why they survive it.
+pub fn remove(ctx: &Ctx, template: &Template) -> anyhow::Result<usize> {
+    ctx.db()?.delete_template(&template.id)
+}
+
+/// How many Quests a delete *would* unlink, per template and index-aligned
+/// with `templates`.
+///
+/// The CLI learns the number from the delete itself and prints it afterwards;
+/// a confirm box has to say it *beforehand*, which is the whole difference
+/// (SPEC §17 `d`). One pass over the Quests rather than a query per template:
+/// the Templates tab reloads this on every tick.
+pub fn linked_counts(ctx: &Ctx, templates: &[Template]) -> anyhow::Result<Vec<usize>> {
+    let quests = ctx.db()?.list_quests(true)?;
+    Ok(templates
+        .iter()
+        .map(|t| {
+            quests
+                .iter()
+                .filter(|q| q.template_id.as_deref() == Some(t.id.as_str()))
+                .count()
+        })
+        .collect())
+}
+
 /// `q tpl run` — SPEC §11's instantiation, through the one `q new` code path so
 /// a Quest from a template is a Quest in every other respect.
 ///
@@ -188,29 +235,9 @@ fn rm(ctx: &Ctx, target: &str, force: bool) -> anyhow::Result<()> {
 /// `exec`s and this process is gone, so anything left until afterwards would
 /// only ever be recorded for `-d`.
 fn instantiate(ctx: &Ctx, target: &str, raw_args: &[String], detach: bool) -> anyhow::Result<()> {
-    let db = ctx.db()?;
-    let template = db.resolve_template(target)?;
+    let template = ctx.db()?.resolve_template(target)?;
     let args = templates::parse_args(raw_args)?;
-    let (goal, prompt) = expand_fields(&template, &templates::today(), &args)?;
-    // NULL cwd is SPEC §11's "wherever `q tpl run` was called"; a stored one
-    // has to be here *now*, which is the check `check` deliberately does not
-    // do at store time.
-    let cwd = run_cwd(&template)?;
-    warn_unused_args(ctx, &template, &args);
-
-    let created = new::create(
-        ctx,
-        &new::Args {
-            goal: goal.as_deref(),
-            dir: cwd.as_deref(),
-            workflow: template.workflow.as_deref(),
-            repo: template.beads_repo.as_deref(),
-            prompt: prompt.as_deref(),
-            detach,
-            template: Some(&template),
-            ..new::Args::default()
-        },
-    );
+    let created = instantiate_with(ctx, &template, &args, detach);
     flush_warnings(ctx);
     let created = created?;
 
@@ -247,6 +274,41 @@ fn instantiate(ctx: &Ctx, target: &str, raw_args: &[String], detach: bool) -> an
             .attach(&created.tmux_session, Some(&created.session.tmux_pane))?;
     }
     Ok(())
+}
+
+/// The Quest `q tpl run` makes, as a library call that stops at the attach.
+///
+/// The TUI's Templates tab lands in the master its own way (SPEC §17: out of
+/// TUI mode, through `handoff`, back again unless `[ui] return_after_detach`
+/// is off), so it cannot use `instantiate`, which `exec`s tmux over this
+/// process. Everything *before* that is identical, and shared from here:
+/// the expansion, the `cwd` check, the unused-`--arg` warning, and the one
+/// `new::create` that also counts the run.
+pub fn instantiate_with(
+    ctx: &Ctx,
+    template: &Template,
+    args: &BTreeMap<String, String>,
+    detach: bool,
+) -> anyhow::Result<new::Created> {
+    let (goal, prompt) = expand_fields(template, &templates::today(), args)?;
+    // NULL cwd is SPEC §11's "wherever `q tpl run` was called"; a stored one
+    // has to be here *now*, which is the check `check` deliberately does not
+    // do at store time.
+    let cwd = run_cwd(template)?;
+    warn_unused_args(ctx, template, args);
+    new::create(
+        ctx,
+        &new::Args {
+            goal: goal.as_deref(),
+            dir: cwd.as_deref(),
+            workflow: template.workflow.as_deref(),
+            repo: template.beads_repo.as_deref(),
+            prompt: prompt.as_deref(),
+            detach,
+            template: Some(template),
+            ..new::Args::default()
+        },
+    )
 }
 
 /// A template with `{{date}}` filled in and **no** `--arg` to give — what the
@@ -300,10 +362,7 @@ fn expand_fields(
 /// complete, and refusing it would make an extra argument fatal in a routine
 /// that a template edit has just stopped using.
 fn warn_unused_args(ctx: &Ctx, template: &Template, args: &BTreeMap<String, String>) {
-    let mut used: Vec<String> = Vec::new();
-    for text in [template.goal.as_deref(), template.master_prompt.as_deref()] {
-        used.extend(templates::arg_keys(text.unwrap_or_default()));
-    }
+    let used = wanted_args(template);
     let unused: Vec<&str> = args
         .keys()
         .filter(|k| !used.iter().any(|u| u == *k))
@@ -326,6 +385,23 @@ fn warn_unused_args(ctx: &Ctx, template: &Template, args: &BTreeMap<String, Stri
             .collect::<Vec<_>>()
             .join(", ")
     ));
+}
+
+/// Every `{{arg.k}}` key this template needs, in the order it first uses them.
+///
+/// `--arg` is how the CLI supplies them; the TUI has no command line, so this
+/// is also what its run form asks for before a routine with arguments can run
+/// at all (SPEC §17).
+pub fn wanted_args(template: &Template) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for text in [template.goal.as_deref(), template.master_prompt.as_deref()] {
+        for key in templates::arg_keys(text.unwrap_or_default()) {
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+    }
+    out
 }
 
 fn export(ctx: &Ctx, target: Option<&str>) -> anyhow::Result<()> {

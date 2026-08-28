@@ -915,9 +915,10 @@ pub fn submit(ctx: &Ctx, app: &mut App, prompt: &Prompt, form: &Form) -> anyhow:
         Prompt::Rename(target) => rename_quest(ctx, app, target, form),
         Prompt::Close(target) => close_quest(ctx, app, target, form),
         Prompt::Resume(target) => resume_quest(ctx, app, target, form),
-        // A Sessions prompt never reaches here; `tui::submit` dispatches on
-        // the variant and this arm exists only so the match is total.
-        Prompt::Send(_) | Prompt::Kill(_) | Prompt::Reset(_) => Ok(()),
+        // A Sessions or Templates prompt never reaches here; `tui::submit`
+        // dispatches on the variant and this arm exists only so the match is
+        // total.
+        _ => Ok(()),
     }
 }
 
