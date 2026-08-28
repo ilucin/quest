@@ -541,11 +541,34 @@ pub fn handle(app: &mut App, input: Input) -> Action {
 /// registry, hooks and database to itself, so on a remote row they would all
 /// run against the wrong one — and not harmlessly: a Quest id is 16 bits and
 /// unique only per machine, so `c` on a remote row could close a local Quest
-/// that happens to share it. Refused until bd-8lz.5.3 proxies them over ssh.
+/// that happens to share it.
+///
+/// bd-8lz.5.3 taught the **CLI** to proxy every one of these over ssh; the TUI
+/// is not wired to that path yet, because each of these keys opens a form, a
+/// pager or a confirm that reads and writes local rows, and routing them
+/// through the proxy is a screen's worth of work per key rather than a shared
+/// gate. So they stay refused here — and the refusal names the command that
+/// does work, instead of claiming the operation needs that machine when a
+/// shell on this one can now do it.
 ///
 /// `o` is deliberately not in here: entering a remote Quest is SPEC §15's one
 /// remote action, and it goes over ssh rather than through the database.
 const LOCAL_ONLY: [char; 7] = ['s', 'e', 'r', 'c', 'R', 'b', 'l'];
+
+/// The `q` command each refused key stands for, so the message hands over
+/// something to run rather than a dead end.
+fn cli_equivalent(key: char) -> &'static str {
+    match key {
+        's' => "q sessions",
+        'e' => "q events",
+        'r' => "q rename",
+        'c' => "q close",
+        'R' => "q resume",
+        'b' => "q brief",
+        'l' => "q links",
+        _ => "q show",
+    }
+}
 
 /// Whether `key` was refused because the selection lives on another machine.
 fn refuse_remote(app: &mut App, key: char) -> bool {
@@ -557,7 +580,9 @@ fn refuse_remote(app: &mut App, key: char) -> bool {
     }
     let (slug, machine) = (row.view.quest.slug.clone(), row.view.quest.machine.clone());
     app.say(format!(
-        "{slug} runs on {machine}; `{key}` needs that machine \u{b7} o enters it over ssh"
+        "{slug} runs on {machine}; the TUI does not proxy `{key}` yet \u{b7} \
+         run `{} {slug}` in a shell, or o to enter",
+        cli_equivalent(key)
     ));
     true
 }
@@ -2664,6 +2689,19 @@ mod tests {
             assert!(
                 app.status.contains("runs on ws"),
                 "`{key}` said nothing: {}",
+                app.status
+            );
+            // D2: the CLI proxies every one of these now, so the refusal must
+            // not claim the operation needs that machine — it points at the
+            // command that does work from here.
+            assert!(
+                app.status.contains(cli_equivalent(key)) && app.status.contains("in a shell"),
+                "`{key}` did not name what does work: {}",
+                app.status
+            );
+            assert!(
+                !app.status.contains("needs that machine"),
+                "`{key}` still claims the CLI cannot do this: {}",
                 app.status
             );
         }

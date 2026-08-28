@@ -21,13 +21,23 @@
 //!
 //! Two things about that line are not "the same arguments":
 //!
-//! * **The target is pinned to what it resolved to here** ([`pin`]). The
+//! * **The target is pinned to what it resolved to here** ([`pin`]), and the
+//!   far end is told which Quest that was ([`identity`], `--expect`). The
 //!   fragment the user typed is resolved on *this* machine, against a listing
 //!   that may be a cached one; sending the fragment on would have the far end
 //!   resolve it a second time, against different data, with nothing checking
 //!   that the two agreed. What travels is the Quest id — exact, and unique on
-//!   the machine that is about to act on it — so the Quest the user was shown
-//!   is the Quest that is acted on.
+//!   the machine that is about to act on it.
+//!
+//!   The id alone is not enough. It is 16 bits and it is **freed on delete**,
+//!   so a later `q new` over there can draw the id of a Quest this end still
+//!   has in its cache, and the two ends then agree on a string while meaning
+//!   different Quests. So the identity carries the id *and* the Quest's
+//!   creation time, and the far end [`verify`]s it before doing anything: a
+//!   mismatch is refused, not acted on. Creation time rather than the slug
+//!   because it is immutable — a Quest renamed between the two resolutions is
+//!   still the Quest the user pointed at, and the far end's own output names
+//!   it — while a reused id never has the same one.
 //! * **The guard is inserted where the far end will read it as a flag**
 //!   ([`forward`]), not blindly appended: a line with a `--` in it makes
 //!   everything after the separator positional over there, and an appended
@@ -68,6 +78,12 @@
 //! the far end would otherwise never get to ask. `--confirmed` answers the
 //! `[y/N]` and buys nothing else, so a proxied command is exactly as
 //! destructive as the same command typed on that machine, and no more.
+//!
+//! "Exactly as" cuts both ways. `q kill` asks nothing at all on the machine
+//! that runs it once the session has ended, so a proxied one asks the far end
+//! first ([`nothing_to_kill`]) rather than putting a question to a human about
+//! work that is not going to happen — and the question it does ask carries what
+//! the local one carries, as far as the listing can tell it ([`confirm_note`]).
 
 use std::io::{ErrorKind, Write};
 
@@ -75,6 +91,7 @@ use clap::Parser;
 
 use crate::Ctx;
 use crate::cli::{ArtifactAction, Cli, Command, LinkAction};
+use crate::commands::fmt;
 use crate::commands::locate::{self, Located};
 use crate::commands::{confirm, enter, flush_warnings, new};
 use crate::config::Remote;
@@ -98,6 +115,31 @@ const SSH_FAILED: i32 = 255;
 /// The word a proxied confirmation sends instead of `-f`: the human has
 /// answered the `[y/N]`, and that is all it says. See the module docs.
 pub const CONFIRMED: &str = "--confirmed";
+
+/// The flag that carries [`identity`] to the far end, where [`verify`] reads
+/// it.
+pub const EXPECT: &str = "--expect";
+
+/// Which Quest a proxied command was resolved — and confirmed — against:
+/// `<id>.<created_at>`.
+///
+/// Both halves are needed and neither is decoration. The id is exact and
+/// unique on the machine that is about to act; the creation time is what says
+/// *which* Quest ever held it, because ids are 16 bits and are freed on delete
+/// (`model::new_id` only retries against ids that are live *now*). See the
+/// module docs for why it is not the slug.
+///
+/// `.` keeps the token out of [`crate::remote::sh_quote`]'s quoting: an id is
+/// `q-` plus hex and a timestamp is digits, so nothing here needs a shell to
+/// think about it.
+pub fn identity(quest: &crate::model::Quest) -> String {
+    format!("{}.{}", quest.id, quest.created_at)
+}
+
+/// [`identity`], as the two argv words that carry it.
+fn expect_flag(identity: &str) -> Vec<String> {
+    vec![EXPECT.to_string(), identity.to_string()]
+}
 
 /// Why a command is not proxied at all. The reason is rendered with the
 /// machine and Quest that were actually asked for, so an escape hatch it
@@ -340,48 +382,60 @@ pub fn dispatch(ctx: &Ctx, command: &Command) -> anyhow::Result<Option<u8>> {
     };
     let remote = remote::find(&ctx.config.remotes, &machine)?;
 
-    // What the far end is told to act on: the identity this resolved to here,
-    // not the fragment that was typed. See [`pin`].
-    let raw = raw_args();
-    let pinned = pin(&raw, aim, &found.quest.id);
-    let deadline = deadline(command);
-
-    match passage {
-        Passage::Refuse(why) => Err(QError::Other(format!(
+    // Nothing about a refusal depends on the line that would have travelled.
+    if let Passage::Refuse(why) = passage {
+        return Err(QError::Other(format!(
             "{} runs on {machine}: {}",
             found.quest.slug,
             why.why(&remote.ssh, &found.quest.slug)
         ))
-        .into()),
-        Passage::Proxy => send(
-            ctx,
-            remote,
-            pinned.as_ref().unwrap_or(&raw),
-            &[],
-            false,
-            deadline,
-        )
-        .map(|(code, _)| Some(code)),
+        .into());
+    }
+
+    // What the far end is told to act on: the identity this resolved to here,
+    // not the fragment that was typed. See [`pin`]. A line this process cannot
+    // restate as an identity is refused for *every* passage rather than sent
+    // as the fragment — the far end would then resolve it against its own
+    // database with nothing checking that the two agreed, which is the whole
+    // of B2.
+    let raw = raw_args();
+    let Some(pinned) = pin(&raw, aim, &found.quest.id) else {
+        return Err(unpinnable(&found.quest.slug, &machine));
+    };
+    // …and the far end is told *which* Quest that id was, so a reused id is
+    // refused over there instead of acted on. See [`identity`] and [`verify`].
+    let expect = expect_flag(&identity(&found.quest));
+    let deadline = deadline(command);
+
+    match passage {
+        // Handled above; `Refuse` never reaches a wire.
+        Passage::Refuse(_) => unreachable!("refused before the line is built"),
+        Passage::Proxy => {
+            send(ctx, remote, &pinned, &expect, false, deadline).map(|(code, _)| Some(code))
+        }
         Passage::Confirm(verb) => {
-            // A subject the far end could re-read differently is the whole of
-            // B2: a confirmation that names one Quest while the command
-            // destroys another is worse than no confirmation at all.
-            let Some(pinned) = pinned else {
-                return Err(unpinnable(&found.quest.slug, &machine));
-            };
             let subject = subject(&found, aim);
             // The master is refused *before* the question, exactly as
             // `kill::guard_master` refuses it before `q kill`'s own prompt:
             // asking a human to authorise something that cannot happen is not
             // a confirmation, it is a trap.
             guard_remote_master(&found, aim)?;
-            confirm(ctx, &format!("{verb} {subject} on {machine}?"))?;
-            let extra: &[&str] = if raw.iter().any(|a| a == CONFIRMED) {
-                &[]
-            } else {
-                &[CONFIRMED]
-            };
-            send(ctx, remote, &pinned, extra, false, deadline).map(|(code, _)| Some(code))
+            // …and so is a question about work that is not going to happen:
+            // `kill.rs` skips its prompt for a session the sweep already
+            // ended, and this end can only match that by asking. See
+            // [`nothing_to_kill`].
+            if nothing_to_kill(ctx, remote, &found, aim, &expect, deadline) {
+                return send(ctx, remote, &pinned, &expect, false, deadline)
+                    .map(|(code, _)| Some(code));
+            }
+            let note = confirm_note(command, &found.quest);
+            confirm(ctx, &format!("{verb} {subject} on {machine}{note}?"))?;
+            let mut extra = Vec::new();
+            if !raw.iter().any(|a| a == CONFIRMED) {
+                extra.push(CONFIRMED.to_string());
+            }
+            extra.extend(expect);
+            send(ctx, remote, &pinned, &extra, false, deadline).map(|(code, _)| Some(code))
         }
         // `-d` because there is no terminal at the far end to attach to; the
         // attach is this machine's, once the Quest is back up over there.
@@ -389,14 +443,9 @@ pub fn dispatch(ctx: &Ctx, command: &Command) -> anyhow::Result<Option<u8>> {
             // Under `--json` the far end's document is held back rather than
             // relayed: the attach is part of the same answer, and two JSON
             // documents on one stdout is not `--json`.
-            let (code, held) = send(
-                ctx,
-                remote,
-                pinned.as_ref().unwrap_or(&raw),
-                &["-d"],
-                ctx.json,
-                deadline,
-            )?;
+            let mut extra = vec!["-d".to_string()];
+            extra.extend(expect);
+            let (code, held) = send(ctx, remote, &pinned, &extra, ctx.json, deadline)?;
             if code != 0 {
                 write_out(std::io::stdout(), &held)?;
                 return Ok(Some(code));
@@ -433,6 +482,80 @@ fn guard_remote_master(found: &Located, aim: Aim<'_>) -> anyhow::Result<()> {
         found.quest.slug, found.quest.slug, found.quest.slug
     ))
     .into())
+}
+
+/// The parenthetical a local confirmation carries and a generic one cannot
+/// derive from the verb alone.
+///
+/// Only `q rm`'s, and only because it is not detail: deleting a Quest leaves
+/// its beads epic open in a tracker other people share, and the local prompt
+/// says so *before* the answer. The epic is a column of the Quest row, so it
+/// arrives in the listing like every other field and nothing has to be asked
+/// over ssh for it. (The rest of N2's lost parentheticals name tmux sessions
+/// and epics this end cannot see; they stay in the far end's own output.)
+fn confirm_note(command: &Command, quest: &crate::model::Quest) -> String {
+    match command {
+        Command::Rm { .. } => crate::beads::epic_of(quest)
+            .map(|epic| format!(" (beads epic {epic} stays open)"))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Has the session a proxied `q kill` names already ended — so that, as on the
+/// machine that runs it, there is nothing to confirm?
+///
+/// `kill.rs` asks nothing for a session the sweep has already ended: the
+/// question would be about work that is not going to happen. This end cannot
+/// know that from the listing (it carries Quests, not session rows), so it
+/// asks — one read-only `q sessions` on the connection the kill is about to
+/// use anyway, which is cheap next to an interactive destructive command and
+/// is the only way a proxied `q kill` is *exactly* the command typed there.
+///
+/// Anything less than a clear "already over" is `false`: an unreachable host,
+/// an answer this `q` cannot read, or a live session all leave the question
+/// where it was. And when it does say so, the command travels **without**
+/// [`CONFIRMED`] — if this end read the far end wrong and the session is in
+/// fact live, the far end asks, finds no terminal, and aborts. Wrong here
+/// costs a retry, never a kill nobody authorised.
+fn nothing_to_kill(
+    ctx: &Ctx,
+    remote: &Remote,
+    found: &Located,
+    aim: Aim<'_>,
+    expect: &[String],
+    deadline: std::time::Duration,
+) -> bool {
+    let Some(label) = aim.session_label() else {
+        return false;
+    };
+    let mut argv = vec![
+        REMOTE_Q.to_string(),
+        "sessions".to_string(),
+        found.quest.id.clone(),
+        "--all".to_string(),
+        "--json".to_string(),
+        NO_REMOTE.to_string(),
+    ];
+    argv.extend(expect.iter().cloned());
+    let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let SshOutcome::Done {
+        code: Some(0),
+        stdout,
+        ..
+    } = ctx.ssh().run(&remote.ssh, &borrowed, deadline)
+    else {
+        return false;
+    };
+    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim()) else {
+        return false;
+    };
+    match rows.iter().find(|row| row["label"] == label) {
+        // A label that is not there is `target::resolve`'s not-found, which
+        // the far end reports without a question of its own.
+        None => true,
+        Some(row) => row["status"] == "ended",
+    }
 }
 
 /// A target this process cannot restate as an identity is refused rather than
@@ -473,7 +596,7 @@ fn enter_after(ctx: &Ctx, found: &Located, machine: &str, held: String) -> anyho
     let target = enter::remote_target(
         ctx,
         remote,
-        &found.quest.slug,
+        &found.quest,
         found.tmux_prefix.as_deref(),
         None,
     );
@@ -516,7 +639,7 @@ fn send(
     ctx: &Ctx,
     remote: &Remote,
     raw: &[String],
-    extra: &[&str],
+    extra: &[String],
     hold_stdout: bool,
     deadline: std::time::Duration,
 ) -> anyhow::Result<(u8, String)> {
@@ -633,9 +756,9 @@ fn raw_args() -> Vec<String> {
 /// rather than by guessing: the last position whose parse still sees the guard
 /// as the flag it is wins, and the end of the line is tried first so an
 /// ordinary command travels exactly as it always did.
-pub fn forward(raw: &[String], machine: Option<&str>, extra: &[&str]) -> Vec<String> {
+pub fn forward(raw: &[String], machine: Option<&str>, extra: &[String]) -> Vec<String> {
     let kept = without_machine(raw, machine);
-    let mut flags: Vec<String> = extra.iter().map(|e| (*e).to_string()).collect();
+    let mut flags: Vec<String> = extra.to_vec();
     flags.push(NO_REMOTE.to_string());
     for at in (0..=kept.len()).rev() {
         let candidate = splice(&kept, at, &flags);
@@ -762,6 +885,80 @@ fn names(raw: &[String], want: &str) -> bool {
         route(&command),
         Some((Aim::Quest(target) | Aim::Session(target), _)) if target == want
     )
+}
+
+// ------------------------------------------------------------------ verify
+
+/// The receiving half of [`pin`]: refuse a proxied command whose target does
+/// not still name the Quest it was resolved — and confirmed — against.
+///
+/// The sending machine pins the target to a Quest id, which is exact *there*
+/// and exact here. What it cannot know is whether the id still means the same
+/// Quest: `model::new_id` draws 16 bits and only retries against ids that are
+/// live at that moment, so an id freed by a `q rm` here can be handed to a
+/// later `q new` here, while a listing over there still has the old Quest
+/// under it. Both ends then agree on the string and mean different Quests —
+/// and a confirmed `q rm` destroys one the human never saw named.
+///
+/// So the identity travels with the command ([`identity`]) and this is where
+/// it is checked, once, before the command runs. It fails **closed**: a
+/// mismatch, an unparseable value, or a command that resolves no Quest at all
+/// is an error, never a fallback to acting on whatever the target found.
+pub fn verify(ctx: &Ctx, command: &Command) -> anyhow::Result<()> {
+    let Some(want) = ctx.expected() else {
+        return Ok(());
+    };
+    let Some((id, created_at)) = want
+        .rsplit_once('.')
+        .and_then(|(id, at)| at.parse::<i64>().ok().map(|at| (id, at)))
+    else {
+        return Err(QError::Invalid(format!(
+            "`{EXPECT} {want}` is not a quest identity (`<id>.<created_at>`)"
+        ))
+        .into());
+    };
+    let Some(target) = expected_target(command) else {
+        return Err(QError::Invalid(format!(
+            "`{EXPECT}` names the quest a command acts on, and this command resolves none"
+        ))
+        .into());
+    };
+    // Resolution failing is the far end's own not-found, which is the honest
+    // answer to an id this machine no longer has.
+    let quest = ctx.db()?.resolve_quest(target)?;
+    if quest.id == id && quest.created_at == created_at {
+        return Ok(());
+    }
+    // Second precision and UTC: the two Quests can be seconds apart, and the
+    // two machines need not agree on a time zone.
+    Err(QError::Other(format!(
+        "refusing: {} here is `{}`, created {} \u{2014} not the quest this command was \
+         confirmed against (created {}). An id is reused after the quest that held it is \
+         deleted, so the machine that sent this is reading a stale listing: run `q list` \
+         there and try again",
+        quest.id,
+        quest.slug,
+        fmt::stamp_utc(quest.created_at),
+        fmt::stamp_utc(created_at)
+    ))
+    .into())
+}
+
+/// The `<quest>` a command acts on, for [`verify`].
+///
+/// [`route`]'s table for everything it covers — one reading of what a command
+/// aims at, shared by the end that pins and the end that checks — plus
+/// `q enter`, which is proxied by handing over the terminal rather than by
+/// [`dispatch`] (see [`enter::remote_target`]) and is pinned all the same.
+fn expected_target(command: &Command) -> Option<&str> {
+    if let Command::Enter { quest, .. } = command {
+        return Some(quest);
+    }
+    match route(command)? {
+        (Aim::Quest(target), _) => Some(target),
+        (Aim::Session(target), _) => session_quest(target),
+        (Aim::Create, _) => None,
+    }
 }
 
 // ------------------------------------------------------------------ create
@@ -1005,7 +1202,7 @@ mod tests {
             ["q", "show", "alpha", "--json", "--no-remote"]
         );
         assert_eq!(
-            forward(&args("close alpha"), None, &["-f"]),
+            forward(&args("close alpha"), None, &["-f".to_string()]),
             ["q", "close", "alpha", "-f", "--no-remote"]
         );
     }
@@ -1248,6 +1445,60 @@ mod tests {
             !said.contains("<alias>") && !said.contains("<quest>"),
             "{said}"
         );
+    }
+
+    /// The identity a proxied line carries: the id, and what tells a *reused*
+    /// id apart from the Quest that held it before (bd-8lz.5.3 D1).
+    #[test]
+    fn the_identity_is_the_id_and_the_creation_time() {
+        let mut quest = crate::model::Quest::new("alpha", "/tmp", "ws");
+        quest.id = "q-1234".to_string();
+        quest.created_at = 1_700_000_000;
+        assert_eq!(identity(&quest), "q-1234.1700000000");
+        // Plain enough that the shell at the far end never sees a quoting
+        // decision — see [`crate::remote::sh_quote`].
+        assert_eq!(remote::sh_quote(&identity(&quest)), "q-1234.1700000000");
+        // A rename does not change it: the Quest the user pointed at is still
+        // that Quest, and the far end's own output names it.
+        quest.slug = "renamed-mid-prompt".to_string();
+        assert_eq!(identity(&quest), "q-1234.1700000000");
+    }
+
+    /// Every command the far end could be told to run names the Quest it acts
+    /// on, so [`verify`] always has something to check — and a command that
+    /// names none is refused rather than run unchecked.
+    #[test]
+    fn every_pinnable_command_says_which_quest_it_acts_on() {
+        for (line, want) in [
+            ("show alpha", Some("alpha")),
+            ("rm alpha", Some("alpha")),
+            ("kill alpha/tests", Some("alpha")),
+            ("note hi --quest alpha", Some("alpha")),
+            // Proxied by handing over the terminal, pinned all the same.
+            ("enter alpha --session tests", Some("alpha")),
+            // Nothing is resolved: there is no Quest yet.
+            ("new --name alpha", None),
+            ("list", None),
+        ] {
+            let cli = parse(line);
+            let got = expected_target(cli.command.as_ref().expect(line));
+            assert_eq!(got, want, "{line}");
+        }
+    }
+
+    /// The one parenthetical the proxy can carry: `q rm` orphans a beads epic,
+    /// and the local prompt says so before the answer, not after the delete.
+    #[test]
+    fn the_rm_question_names_the_epic_it_will_orphan() {
+        let mut quest = crate::model::Quest::new("alpha", "/tmp", "ws");
+        let rm = parse("rm alpha").command.expect("rm");
+        assert_eq!(confirm_note(&rm, &quest), "");
+        quest.beads_epic = Some("bd-7".to_string());
+        assert_eq!(confirm_note(&rm, &quest), " (beads epic bd-7 stays open)");
+        // Not the others: the detail their local prompts carry is about tmux
+        // sessions and rows this machine cannot see.
+        let close = parse("close alpha").command.expect("close");
+        assert_eq!(confirm_note(&close, &quest), "");
     }
 
     /// Only `<quest>/<label>` can name a session on another machine.

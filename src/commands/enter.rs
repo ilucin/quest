@@ -132,27 +132,37 @@ pub struct RemoteTarget {
 /// someone sitting at that machine. `--no-remote` goes with it, so the far end
 /// cannot bounce the attach onwards.
 ///
+/// That line is pinned exactly as [`crate::commands::proxy`] pins the ones it
+/// forwards, and for the same reason: the target travels as the Quest **id**
+/// this machine resolved, and the identity it resolved to travels with it
+/// (`--expect`), so a far end whose picture has moved on — a rename, or an id
+/// drawn again after a delete — refuses rather than handing the terminal to an
+/// agent in some other Quest.
+///
 /// The trade is that `[tmux] iterm_cc` is then *that* machine's setting rather
 /// than this one's, which is the honest reading of it: the `q` that runs the
 /// attach is the one whose config decides how it attaches.
 pub fn remote_target(
     ctx: &Ctx,
     remote: &Remote,
-    slug: &str,
+    quest: &Quest,
     tmux_prefix: Option<&str>,
     label: Option<&str>,
 ) -> RemoteTarget {
+    use crate::commands::proxy;
     let prefix = tmux_prefix.unwrap_or(remote::DEFAULT_TMUX_PREFIX);
-    let tmux_session = format!("{prefix}{slug}");
+    let tmux_session = format!("{prefix}{}", quest.slug);
     let argv = match label {
         None => attach_command(ctx, &tmux_session),
         Some(label) => vec![
-            crate::commands::proxy::REMOTE_Q.to_string(),
+            proxy::REMOTE_Q.to_string(),
             "enter".to_string(),
-            slug.to_string(),
+            quest.id.clone(),
             "--session".to_string(),
             label.to_string(),
-            crate::commands::proxy::NO_REMOTE.to_string(),
+            proxy::EXPECT.to_string(),
+            proxy::identity(quest),
+            proxy::NO_REMOTE.to_string(),
         ],
     };
     RemoteTarget {
@@ -194,13 +204,7 @@ fn enter_remote(
         .into());
     }
     let remote = remote::find(&ctx.config.remotes, machine)?;
-    let target = remote_target(
-        ctx,
-        remote,
-        &quest.slug,
-        found.tmux_prefix.as_deref(),
-        label,
-    );
+    let target = remote_target(ctx, remote, quest, found.tmux_prefix.as_deref(), label);
 
     if ctx.json || !ctx.quiet {
         output::emit(
@@ -305,11 +309,15 @@ mod tests {
         }
     }
 
+    fn alpha() -> Quest {
+        Quest::new("alpha", "/tmp", "ws")
+    }
+
     /// SPEC §15: `ssh -t <alias> tmux attach -t q-<slug>`.
     #[test]
     fn the_remote_attach_is_the_spec_command() {
         let (ctx, _dir) = with_tmux(false, false);
-        let target = remote_target(&ctx, &ws(), "alpha", None, None);
+        let target = remote_target(&ctx, &ws(), &alpha(), None, None);
         assert_eq!(target.machine, "ws");
         assert_eq!(target.alias, "ws-host");
         assert_eq!(target.tmux_session, "q-alpha");
@@ -332,10 +340,10 @@ mod tests {
         let (mut ctx, _dir) = with_tmux(false, false);
         ctx.config.tmux.session_prefix = "quest-".to_string();
         // This machine's prefix does not reach across the wire.
-        let target = remote_target(&ctx, &ws(), "alpha", None, None);
+        let target = remote_target(&ctx, &ws(), &alpha(), None, None);
         assert_eq!(target.tmux_session, "q-alpha");
         // What the far end reported does.
-        let target = remote_target(&ctx, &ws(), "alpha", Some("work_"), None);
+        let target = remote_target(&ctx, &ws(), &alpha(), Some("work_"), None);
         assert_eq!(target.tmux_session, "work_alpha");
         assert_eq!(target.argv.last().unwrap(), "=work_alpha");
     }
@@ -346,13 +354,13 @@ mod tests {
     fn iterm_control_mode_is_asked_for_only_outside_tmux() {
         let (ctx, _dir) = with_tmux(true, false);
         assert_eq!(
-            remote_target(&ctx, &ws(), "alpha", None, None).argv,
+            remote_target(&ctx, &ws(), &alpha(), None, None).argv,
             ["tmux", "-CC", "attach", "-t", "=q-alpha"]
         );
 
         let (ctx, _dir) = with_tmux(true, true);
         assert_eq!(
-            remote_target(&ctx, &ws(), "alpha", None, None).argv,
+            remote_target(&ctx, &ws(), &alpha(), None, None).argv,
             ["tmux", "attach", "-t", "=q-alpha"]
         );
     }
@@ -362,7 +370,7 @@ mod tests {
     #[test]
     fn a_session_prefix_with_a_space_still_arrives_as_one_argument() {
         let (ctx, _dir) = with_tmux(false, false);
-        let target = remote_target(&ctx, &ws(), "alpha", Some("my quests/"), None);
+        let target = remote_target(&ctx, &ws(), &alpha(), Some("my quests/"), None);
         assert_eq!(target.argv.last().unwrap(), "=my quests/alpha");
         assert_eq!(
             crate::remote::attach_argv(&target.alias, &target.argv)

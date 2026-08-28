@@ -41,6 +41,9 @@ pub struct Ctx {
     /// A human already answered this command's confirmation, on the machine
     /// that had the terminal — see [`cli::Cli::confirmed`].
     confirmed: bool,
+    /// The Quest identity this command was pinned to before it crossed the
+    /// wire — see [`cli::Cli::expect`] and [`commands::proxy::verify`].
+    expect: Option<String>,
     /// Absent only for `q config`, which has to work before — and in order to
     /// fix — a broken environment.
     db: Option<Db>,
@@ -90,6 +93,12 @@ impl Ctx {
         self.confirmed
     }
 
+    /// `--expect`'s value: the Quest identity the sending machine resolved and
+    /// the human confirmed. `None` for a command nobody proxied.
+    pub fn expected(&self) -> Option<&str> {
+        self.expect.as_deref()
+    }
+
     fn new(args: &Cli, config: Config, db: Option<Db>) -> anyhow::Result<Ctx> {
         let machine_override = match &args.machine {
             Some(m) => {
@@ -117,6 +126,7 @@ impl Ctx {
             machine_override,
             no_remote: args.no_remote,
             confirmed: args.confirmed,
+            expect: args.expect.clone(),
             db,
             tmux: tmux::tmux(),
             ssh: remote::ssh().into(),
@@ -160,6 +170,7 @@ impl Ctx {
             machine_override: None,
             no_remote: args.no_remote,
             confirmed: args.confirmed,
+            expect: args.expect.clone(),
             db: None,
             tmux: tmux::tmux(),
             ssh: remote::ssh().into(),
@@ -225,6 +236,7 @@ impl Ctx {
             machine_override: None,
             no_remote: false,
             confirmed: false,
+            expect: None,
             db: Some(db),
             tmux,
             ssh: Arc::new(remote::stub::NoSsh),
@@ -377,6 +389,10 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
     if let Some(code) = commands::proxy::dispatch(&ctx, command)? {
         return Ok(code);
     }
+    // The receiving half of that same gate: a command that arrived over ssh
+    // carries the identity it was resolved against, and this machine refuses
+    // it unless the target still names that Quest here (SPEC §15).
+    commands::proxy::verify(&ctx, command)?;
     local(&ctx, command)
 }
 

@@ -8191,10 +8191,10 @@ fn a_session_label_on_a_remote_quest_runs_that_machines_own_enter() {
     let env = Env::new();
     env.with_remotes(&[("ws", "ws-host")]);
     let mut cmd = env.cmd();
-    env.with_ssh(
-        &mut cmd,
-        serde_json::json!({ "ws-host": { "stdout": remote_listing("ws", "over-there") } }),
-    );
+    let hosts = serde_json::json!({ "ws-host": { "stdout": remote_listing("ws", "over-there") } });
+    let id = far_id(&hosts, "ws-host");
+    let expect = far_expect(&hosts, "ws-host");
+    env.with_ssh(&mut cmd, hosts);
     let out = json_of(
         &cmd.args(["enter", "over-there", "--session", "tests", "--json"])
             .assert()
@@ -8202,21 +8202,28 @@ fn a_session_label_on_a_remote_quest_runs_that_machines_own_enter() {
     );
     assert_eq!(out["machine"], "ws", "{out}");
     assert_eq!(out["session"], "tests", "{out}");
+    // D3: pinned like every other proxied line — the id this end resolved, and
+    // the identity it resolved to, never the fragment or the slug.
     assert_eq!(
         out["argv"],
         serde_json::json!([
             "q",
             "enter",
-            "over-there",
+            id,
             "--session",
             "tests",
+            "--expect",
+            expect,
             "--no-remote"
         ]),
         "{out}"
     );
     assert_eq!(
         attach_calls(&env),
-        ["attach\tws-host\tq\tenter\tover-there\t--session\ttests\t--no-remote"]
+        [format!(
+            "attach\tws-host\tq\tenter\t{id}\t--session\ttests\
+             \t--expect\t{expect}\t--no-remote"
+        )]
     );
 }
 
@@ -8291,6 +8298,25 @@ fn far_id(hosts: &serde_json::Value, alias: &str) -> String {
         .to_string()
 }
 
+/// The identity that travels beside the pinned target: `<id>.<created_at>`.
+///
+/// The id alone is not an identity across time — it is 16 bits and it is freed
+/// on delete, so a later `q new` over there can draw the id of a Quest this
+/// end still has in its cache. The creation time is what tells the two apart,
+/// and the far end refuses a command whose id no longer means the Quest that
+/// was confirmed (bd-8lz.5.3 D1).
+fn far_expect(hosts: &serde_json::Value, alias: &str) -> String {
+    let listing: serde_json::Value =
+        serde_json::from_str(hosts[alias]["stdout"].as_str().expect("a listing")).expect("json");
+    format!(
+        "{}.{}",
+        listing["quests"][0]["id"].as_str().expect("an id"),
+        listing["quests"][0]["created_at"]
+            .as_i64()
+            .expect("a created_at"),
+    )
+}
+
 /// Every command SPEC §16 gives a `<quest>` (or a `<quest>/<label>`) reaches
 /// the machine that runs it, with its own arguments and the recursion guard.
 #[test]
@@ -8341,11 +8367,12 @@ fn every_command_that_resolves_a_remote_quest_is_proxied_with_the_guard() {
         env.with_remotes(&[("ws", "ws-host")]);
         let hosts = env.two_faced("over-there", ok_reply());
         let id = far_id(&hosts, "ws-host");
+        let expect = far_expect(&hosts, "ws-host");
         env.over_ssh(hosts, &args).success();
         assert_eq!(
             env.proxy_calls(),
             [format!(
-                "ws-host\t{}\t--no-remote",
+                "ws-host\t{}\t--expect\t{expect}\t--no-remote",
                 sent.replace("{id}", &id)
             )],
             "{args:?}"
@@ -8382,6 +8409,7 @@ fn a_proxied_json_command_is_still_valid_json_on_stdout() {
     let reply = serde_json::json!({ "stdout": "{\"quest\":{\"slug\":\"over-there\"}}\n" });
     let hosts = env.two_faced("over-there", reply);
     let id = far_id(&hosts, "ws-host");
+    let expect = far_expect(&hosts, "ws-host");
     let assert = env
         .over_ssh(hosts, &["show", "over-there", "--json"])
         .success();
@@ -8390,7 +8418,9 @@ fn a_proxied_json_command_is_still_valid_json_on_stdout() {
     // `--json` travelled: the far end has to know to answer in kind.
     assert_eq!(
         env.proxy_calls(),
-        [format!("ws-host\tq\tshow\t{id}\t--json\t--no-remote")]
+        [format!(
+            "ws-host\tq\tshow\t{id}\t--json\t--expect\t{expect}\t--no-remote"
+        )]
     );
 }
 
@@ -8505,10 +8535,13 @@ fn a_command_that_cannot_travel_is_refused_with_a_reason() {
     env.with_remotes(&[("ws", "ws-host")]);
     let hosts = env.two_faced("over-there", ok_reply());
     let id = far_id(&hosts, "ws-host");
+    let expect = far_expect(&hosts, "ws-host");
     env.over_ssh(hosts, &["events", "over-there"]).success();
     assert_eq!(
         env.proxy_calls(),
-        [format!("ws-host\tq\tevents\t{id}\t--no-remote")]
+        [format!(
+            "ws-host\tq\tevents\t{id}\t--expect\t{expect}\t--no-remote"
+        )]
     );
 }
 
@@ -8542,6 +8575,9 @@ fn a_destructive_command_is_confirmed_here_and_travels_as_confirmed() {
     assert!(env.proxy_calls().is_empty(), "{:?}", env.proxy_calls());
 
     // Answered "yes" — it travels, once, with `--confirmed` and never `-f`.
+    // `q kill` asks the far end first whether its session is still live (see
+    // `nothing_to_kill`); a canned answer it cannot read leaves the question
+    // exactly where it was, which is what the second line here is.
     for (args, sent) in [
         (vec!["close", "over-there"], "q\tclose\t{id}\t--confirmed"),
         (vec!["rm", "over-there"], "q\trm\t{id}\t--confirmed"),
@@ -8554,17 +8590,25 @@ fn a_destructive_command_is_confirmed_here_and_travels_as_confirmed() {
         env.with_remotes(&[("ws", "ws-host")]);
         let hosts = env.two_faced("over-there", ok_reply());
         let id = far_id(&hosts, "ws-host");
+        let expect = far_expect(&hosts, "ws-host");
+        let killing = args[0] == "kill";
         env.answering(hosts, "y", &args).success();
         let calls = env.proxy_calls();
+        let ran = calls.last().expect("the command travelled");
         assert_eq!(
-            calls,
-            [format!(
-                "ws-host\t{}\t--no-remote",
+            *ran,
+            format!(
+                "ws-host\t{}\t--expect\t{expect}\t--no-remote",
                 sent.replace("{id}", &id)
-            )],
+            ),
             "{args:?}"
         );
-        assert!(!calls[0].contains("\t-f"), "{args:?}: {calls:?}");
+        assert_eq!(
+            calls.len(),
+            if killing { 2 } else { 1 },
+            "{args:?}: {calls:?}"
+        );
+        assert!(!ran.contains("\t-f"), "{args:?}: {calls:?}");
     }
 
     // `-f` given by the user is the user's own word and still travels as `-f`:
@@ -8574,11 +8618,14 @@ fn a_destructive_command_is_confirmed_here_and_travels_as_confirmed() {
     env.with_remotes(&[("ws", "ws-host")]);
     let hosts = env.two_faced("over-there", ok_reply());
     let id = far_id(&hosts, "ws-host");
+    let expect = far_expect(&hosts, "ws-host");
     env.over_ssh(hosts, &["close", "over-there", "-f"])
         .success();
     assert_eq!(
         env.proxy_calls(),
-        [format!("ws-host\tq\tclose\t{id}\t-f\t--no-remote")]
+        [format!(
+            "ws-host\tq\tclose\t{id}\t-f\t--expect\t{expect}\t--no-remote"
+        )]
     );
 }
 
@@ -8628,6 +8675,7 @@ fn a_destructive_command_names_the_quest_it_destroys() {
     env.with_remotes(&[("ws", "ws-host")]);
     let hosts = env.two_faced("over-there", ok_reply());
     let id = far_id(&hosts, "ws-host");
+    let expect = far_expect(&hosts, "ws-host");
     // A fragment, not the slug — the shape that resolves differently on two
     // databases.
     env.answering(hosts, "y", &["rm", "over"])
@@ -8638,9 +8686,267 @@ fn a_destructive_command_names_the_quest_it_destroys() {
     let calls = env.proxy_calls();
     assert_eq!(
         calls,
-        [format!("ws-host\tq\trm\t{id}\t--confirmed\t--no-remote")]
+        [format!(
+            "ws-host\tq\trm\t{id}\t--confirmed\t--expect\t{expect}\t--no-remote"
+        )]
     );
     assert!(!calls[0].contains("\tover\t"), "{calls:?}");
+}
+
+/// A far end, as it really is: its own `q`, its own database, one Quest.
+/// Returned with the Quest's real identity, so a test can hand it a line that
+/// was pinned to a *different* one.
+fn far_end(slug: &str) -> (Env, String, i64) {
+    let far = Env::new();
+    far.write_config("[machine]\nname = \"ws\"\n");
+    let work = far.work("repo");
+    far.cmd()
+        .args(["new", "--name", slug, "--no-beads", "-d", "--json"])
+        .args(["--dir", work.to_str().unwrap()])
+        .assert()
+        .success();
+    let listing = far.json(&["list"]);
+    let id = listing["quests"][0]["id"]
+        .as_str()
+        .expect("an id")
+        .to_string();
+    let created = listing["quests"][0]["created_at"]
+        .as_i64()
+        .expect("a stamp");
+    (far, id, created)
+}
+
+/// D1. A Quest id is 16 bits and is **freed on delete**, so a `q new` over
+/// there can draw the id of a Quest this end still has in its cache. Both ends
+/// then agree on the id and mean different Quests — and pinning the id alone
+/// is what let a confirmed `q rm` destroy the one the human never saw named.
+///
+/// So the identity that travels is the id *and* the Quest's creation time, and
+/// the far end refuses a command whose id no longer means the Quest it was
+/// confirmed against. Fail closed: nothing is deleted, and the fragment is
+/// never fallen back to.
+#[test]
+fn a_reused_id_is_refused_by_the_far_end_instead_of_acted_on() {
+    let (far, id, created) = far_end("innocent");
+    // No live pane over there, so the only thing between `q rm` and the row is
+    // the question — and the identity.
+    far.write_fixture(serde_json::json!({ "next_pane": 1, "panes": [] }));
+
+    // This machine's picture: the same id, under the Quest that held it before
+    // it was freed and drawn again.
+    let stale_created = created - 3600;
+    let mut stale = far.json(&["list"]);
+    stale["quests"][0]["slug"] = serde_json::json!("victim");
+    stale["quests"][0]["created_at"] = serde_json::json!(stale_created);
+    let hosts = serde_json::json!({
+        "ws-host": { "stdout": stale.to_string(), "proxied": ok_reply() },
+    });
+
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.answering(hosts, "y", &["rm", "victim"])
+        .success()
+        .stderr(predicate::str::contains(
+            "remove quest (and all of its history) victim on ws?",
+        ));
+    let expect = format!("{id}.{stale_created}");
+    assert_eq!(
+        env.proxy_calls(),
+        [format!(
+            "ws-host\tq\trm\t{id}\t--confirmed\t--expect\t{expect}\t--no-remote"
+        )]
+    );
+
+    // Now run that exact line where it was headed. The id resolves — to a
+    // Quest nobody confirmed — and the far end says so instead of deleting it.
+    far.cmd()
+        .args(["rm", &id, "--confirmed", "--no-remote"])
+        .args(["--expect", &expect])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("refusing"))
+        .stderr(predicate::str::contains("innocent"));
+    assert_eq!(far.count("SELECT count(*) FROM quest"), 1);
+
+    // …and the same line, pinned to the Quest that is really there, goes
+    // through: the check refuses a mismatch, not the command.
+    far.cmd()
+        .args(["rm", &id, "--confirmed", "--no-remote"])
+        .args(["--expect", &format!("{id}.{created}")])
+        .assert()
+        .success();
+    assert_eq!(far.count("SELECT count(*) FROM quest"), 0);
+}
+
+/// The identity is checked on **every** proxied command, not only the ones
+/// that destroy something: `q send` typed into an agent in the wrong Quest is
+/// its own kind of damage, and a read is a lie about which machine holds what.
+#[test]
+fn a_reused_id_is_refused_for_a_command_that_only_reads() {
+    let (far, id, created) = far_end("innocent");
+    let wrong = format!("{id}.{}", created - 3600);
+    far.cmd()
+        .args(["show", &id, "--no-remote", "--expect", &wrong])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("refusing"));
+    // The same command with the right identity is just `q show`.
+    far.cmd()
+        .args(["show", &id, "--no-remote"])
+        .args(["--expect", &format!("{id}.{created}")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("innocent"));
+}
+
+/// An id the far end no longer has at all is its own plain not-found — the
+/// answer it would have given anyway, not a second kind of error.
+#[test]
+fn an_identity_for_an_id_that_is_gone_is_a_not_found() {
+    let (far, id, created) = far_end("innocent");
+    far.write_fixture(serde_json::json!({ "next_pane": 1, "panes": [] }));
+    far.cmd()
+        .args(["rm", &id, "-f", "--no-remote"])
+        .assert()
+        .success();
+    far.cmd()
+        .args(["show", &id, "--no-remote"])
+        .args(["--expect", &format!("{id}.{created}")])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not found"));
+}
+
+/// Fail closed. An identity this `q` cannot read, or one on a command that
+/// resolves no Quest at all, is an error — never a command that quietly runs
+/// unchecked.
+#[test]
+fn an_identity_that_cannot_be_checked_is_refused() {
+    let (far, id, _created) = far_end("innocent");
+    far.cmd()
+        .args(["show", &id, "--no-remote", "--expect", "nonsense"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not a quest identity"));
+    far.cmd()
+        .args(["list", "--no-remote", "--expect", "q-1234.1"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("resolves none"));
+}
+
+/// D3. `q enter <remote> --session <label>` runs the far end's own `q enter`
+/// over ssh, so it is a proxied command like any other: it travels pinned to
+/// the id, and the far end checks the identity before it hands over a
+/// terminal. Before this it sent the resolved *slug*, and a stale listing put
+/// the user in a different Quest's agent.
+#[test]
+fn a_remote_enter_by_label_is_checked_on_the_far_end() {
+    let (far, id, created) = far_end("attach2");
+    far.cmd()
+        .args(["enter", &id, "--session", "w1", "--no-remote"])
+        .args(["--expect", &format!("{id}.{}", created - 60)])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("refusing"));
+    // With the identity it really has, the check is silent and the far end
+    // gets on with resolving the label.
+    far.cmd()
+        .args(["enter", &id, "--session", "w1", "--no-remote"])
+        .args(["--expect", &format!("{id}.{created}")])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not found: session `w1`"));
+}
+
+/// D4. Deleting a Quest leaves its beads epic open in a tracker other people
+/// share, and the local prompt says so **before** the answer. The epic is a
+/// column of the Quest row, so it rides in with the listing and the proxied
+/// question can say it too.
+#[test]
+fn a_proxied_rm_warns_about_the_epic_it_will_orphan() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let mut listing: serde_json::Value =
+        serde_json::from_str(&remote_listing("ws", "over-there")).unwrap();
+    listing["quests"][0]["beads_epic"] = serde_json::json!("bd-7");
+    let hosts = serde_json::json!({
+        "ws-host": { "stdout": listing.to_string(), "proxied": ok_reply() },
+    });
+    env.answering(hosts, "n", &["rm", "over-there"])
+        .code(1)
+        .stderr(predicate::str::contains(
+            "over-there on ws (beads epic bd-7 stays open)?",
+        ));
+    // No epic, no parenthetical.
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.answering(
+        env.two_faced("over-there", ok_reply()),
+        "n",
+        &["rm", "over-there"],
+    )
+    .code(1)
+    .stderr(predicate::str::contains(
+        "remove quest (and all of its history) over-there on ws?",
+    ));
+}
+
+/// D5. `q kill` on a session the sweep has already ended asks nothing on the
+/// machine that runs it — the question would be about work that is not going
+/// to happen. This end cannot see the far end's session rows, so it asks the
+/// far end, on the connection the kill is about to use anyway.
+#[test]
+fn a_proxied_kill_asks_nothing_about_a_session_that_is_already_over() {
+    let ended = serde_json::json!([
+        { "label": "master", "status": "idle" },
+        { "label": "w1", "status": "ended" },
+    ]);
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let hosts = env.two_faced(
+        "over-there",
+        serde_json::json!({ "stdout": ended.to_string() }),
+    );
+    let id = far_id(&hosts, "ws-host");
+    let expect = far_expect(&hosts, "ws-host");
+    // No `Q_FIXTURE_CONFIRM`: a question here would abort, and this succeeds.
+    env.over_ssh(hosts, &["kill", "over-there/w1"])
+        .success()
+        .stderr(predicate::str::contains("kill session").not());
+    assert_eq!(
+        env.proxy_calls(),
+        [
+            format!(
+                "ws-host\tq\tsessions\t{id}\t--all\t--json\t--no-remote\
+                 \t--expect\t{expect}"
+            ),
+            format!("ws-host\tq\tkill\t{id}/w1\t--expect\t{expect}\t--no-remote"),
+        ]
+    );
+    // …and nothing was answered on the human's behalf: the far end still gets
+    // to ask, and to abort, if this end read it wrong.
+    assert!(!env.proxy_calls()[1].contains("--confirmed"));
+
+    // A session that is still live is still confirmed here, exactly as before.
+    let live = serde_json::json!([{ "label": "w1", "status": "busy" }]);
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let hosts = env.two_faced(
+        "over-there",
+        serde_json::json!({ "stdout": live.to_string() }),
+    );
+    let id = far_id(&hosts, "ws-host");
+    let expect = far_expect(&hosts, "ws-host");
+    env.answering(hosts, "y", &["kill", "over-there/w1"])
+        .success()
+        .stderr(predicate::str::contains(
+            "kill session over-there/w1 on ws?",
+        ));
+    assert_eq!(
+        env.proxy_calls().last().unwrap(),
+        &format!("ws-host\tq\tkill\t{id}/w1\t--confirmed\t--expect\t{expect}\t--no-remote")
+    );
 }
 
 /// A `q kill` prompt names the session, which is the only thing that dies —
@@ -8687,6 +8993,7 @@ fn a_separator_in_the_line_does_not_swallow_the_guard() {
     env.with_remotes(&[("ws", "ws-host")]);
     let hosts = env.two_faced("over-there", ok_reply());
     let id = far_id(&hosts, "ws-host");
+    let expect = far_expect(&hosts, "ws-host");
     env.over_ssh(
         hosts,
         &["note", "--quest", "over-there", "--", "-- a dashed note"],
@@ -8697,7 +9004,8 @@ fn a_separator_in_the_line_does_not_swallow_the_guard() {
     assert_eq!(
         env.proxy_calls(),
         [format!(
-            "ws-host\tq\tnote\t--quest\t{id}\t--no-remote\t--\t'-- a dashed note'"
+            "ws-host\tq\tnote\t--quest\t{id}\t--expect\t{expect}\t--no-remote\
+             \t--\t'-- a dashed note'"
         )]
     );
 }
@@ -8838,10 +9146,13 @@ fn resume_on_a_remote_runs_detached_there_and_attaches_from_here() {
     env.with_remotes(&[("ws", "ws-host")]);
     let hosts = env.two_faced("over-there", ok_reply());
     let id = far_id(&hosts, "ws-host");
+    let expect = far_expect(&hosts, "ws-host");
     env.over_ssh(hosts, &["resume", "over-there"]).success();
     assert_eq!(
         env.proxy_calls(),
-        [format!("ws-host\tq\tresume\t{id}\t-d\t--no-remote")]
+        [format!(
+            "ws-host\tq\tresume\t{id}\t-d\t--expect\t{expect}\t--no-remote"
+        )]
     );
     assert_eq!(
         attach_calls(&env),
@@ -8950,13 +9261,15 @@ fn free_text_reaches_the_far_end_as_one_shell_word() {
     let text = "run `make test` for $USER 'now' FOO=1 ~x";
     let hosts = env.two_faced("over-there", ok_reply());
     let id = far_id(&hosts, "ws-host");
+    let expect = far_expect(&hosts, "ws-host");
     env.over_ssh(hosts, &["send", "over-there/master", text])
         .success();
     assert_eq!(
         env.proxy_calls(),
         [format!(
             "ws-host\tq\tsend\t{id}/master\t\
-             'run `make test` for $USER '\\''now'\\'' FOO=1 ~x'\t--no-remote"
+             'run `make test` for $USER '\\''now'\\'' FOO=1 ~x'\
+             \t--expect\t{expect}\t--no-remote"
         )]
     );
 }

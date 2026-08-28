@@ -37,6 +37,20 @@ pub struct Cli {
     #[arg(long, global = true, hide = true)]
     pub confirmed: bool,
 
+    /// The Quest this command was resolved — and confirmed — against, on the
+    /// machine that had the terminal (SPEC §15's proxy): `<id>.<created_at>`.
+    ///
+    /// A Quest id is 16 bits and is freed when the Quest is deleted, so it can
+    /// be drawn again by a later `q new`: the id alone does not say *which*
+    /// Quest, only which row is there now. The creation time is what tells a
+    /// reused id apart, and it is immutable, so a rename between the two
+    /// resolutions is still the same Quest and still goes through. If this does
+    /// not name the Quest the target resolves to here, the command refuses
+    /// rather than acting on the wrong one. Hidden because it is the wire's
+    /// word, not a spelling anyone needs to type.
+    #[arg(long, global = true, hide = true, value_name = "IDENTITY")]
+    pub expect: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

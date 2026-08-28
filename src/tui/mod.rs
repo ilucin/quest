@@ -504,7 +504,7 @@ where
     let target = enter::remote_target(
         ctx,
         remote,
-        &want.quest.slug,
+        &want.quest,
         app.remote_tmux.get(machine).map(String::as_str),
         // The Quests tab's `o` is the master (SPEC §17); the Sessions tab is
         // still this machine's fleet only.
