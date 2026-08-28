@@ -260,10 +260,6 @@ pub fn route(command: &Command) -> Option<(Aim<'_>, Passage)> {
     use Passage::{Proxy, Refuse, ThenEnter};
     Some(match command {
         Command::New { .. } => (Aim::Create, Proxy),
-        // The one `q tpl` subcommand that reaches another machine. `--machine
-        // ws` names no `<quest>` to resolve — it is a create-on-a-named-machine
-        // exactly like `q new --machine ws`, so it takes the same [`Aim::Create`]
-        // path and the far end instantiates *its own* template of that name.
         Command::Tpl {
             action: crate::cli::TplAction::Run { .. },
         } => (Aim::Create, Proxy),
@@ -1085,18 +1081,12 @@ fn create(ctx: &Ctx, command: &Command) -> anyhow::Result<Option<u8>> {
         return Ok(None);
     };
     // `targets` being non-empty already proved this, but `find` is what turns
-    // the name into an alias. A `--machine` naming this machine (never a remote)
-    // fails `find`, which is the local path — `q new`/`q tpl run` on the machine
-    // that typed it, exactly as with no `--machine` at all.
+    // the name into an alias.
     let Ok(remote) = remote::find(&ctx.config.remotes, machine) else {
         return Ok(None);
     };
     match command {
         Command::New { .. } => create_new(ctx, remote, machine, command),
-        // `q tpl run <name> --machine ws`: the far end reads *its* template of
-        // that name (the definition `--machine ws` asked for), instantiates it,
-        // and this machine attaches to the master it created — the same shape as
-        // `q new --machine`, differing only in how the far end makes the Quest.
         Command::Tpl {
             action: crate::cli::TplAction::Run { detach, .. },
         } => run_template(ctx, remote, command, *detach),
