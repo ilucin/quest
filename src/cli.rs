@@ -3,7 +3,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[derive(Parser, Debug)]
 #[command(
     name = "q",
-    version,
+    // Not clap's plain `version`: the far end of an ssh reads this line to
+    // decide whether the two `q`s speak the same remote protocol (SPEC §19,
+    // `q doctor`), so it carries the wire version as well as the crate one.
+    version = crate::remote::VERSION,
     about = "Quest orchestrator for Claude Code agents",
     long_about = None,
     disable_help_subcommand = true
