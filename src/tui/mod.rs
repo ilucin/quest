@@ -663,6 +663,101 @@ where
     Ok(())
 }
 
+/// This `q`'s own binary, for a proxied Quests key (SPEC §15, bd-8lz.5.8). The
+/// current exe so `Q_DB`/`Q_CONFIG` and the version match what is running;
+/// a bare `q` on `PATH` only if the exe cannot be found, which never happens in
+/// practice but is not worth aborting a keypress over.
+fn q_exe() -> std::path::PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("q"))
+}
+
+/// Run `q <args>` to completion with its output captured — the shape a paged
+/// remote read wants. `Q_DB`/`Q_CONFIG` and every other var are inherited, so
+/// the child resolves remotes exactly as this process would.
+pub(super) fn spawn_q(args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new(q_exe()).args(args).output()
+}
+
+/// What a captured `q` child had to say when it failed: its stderr as one line,
+/// the `error: ` prefix `output::emit_error` writes stripped back off. Falls
+/// back to stdout for a command that failed without a word on stderr.
+pub(super) fn child_said(out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let said = crate::output::first_line(stderr.trim(), 200);
+    let said = said.strip_prefix("error: ").unwrap_or(&said).to_string();
+    if said.is_empty() {
+        crate::output::first_line(String::from_utf8_lossy(&out.stdout).trim(), 200)
+    } else {
+        said
+    }
+}
+
+/// Proxy a Quests-tab key against the machine the selection lives on (SPEC §15,
+/// bd-8lz.5.8) by running the real `q` binary, which carries the whole proxy
+/// stack — target-pinning, the identity check, and a destructive command's
+/// confirmation — rather than restating any of it here.
+///
+/// The selection is read now, not carried on the `Action`: a tick can have
+/// reordered the listing between the keypress and here, and the loop reads
+/// every hand-over the same way.
+fn proxy_remote<B, T>(
+    io: &mut T,
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    key: char,
+) -> anyhow::Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+    T: TermIo,
+{
+    let (Some(machine), Some(quest), Some((sub, paged))) = (
+        quests::selected_remote(app),
+        quests::selected_quest(app),
+        quests::proxied(key),
+    ) else {
+        return Ok(());
+    };
+    let slug = quest.slug;
+    let args = [sub, slug.as_str(), "--machine", machine.as_str()];
+    if paged {
+        // A read: captured, then paged — the far end's human output scrolls in
+        // the same pager the local brief and peek use.
+        let out = spawn_q(&args)?;
+        if !out.status.success() {
+            app.say(format!("q {sub} {slug} on {machine}: {}", child_said(&out)));
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        if text.trim().is_empty() {
+            app.say(format!("{sub} of {slug} on {machine}: nothing to show"));
+            return Ok(());
+        }
+        let paged = handoff(io, terminal, app.mouse, || pager::show(&text))?;
+        if let Err(e) = paged {
+            app.say(format!("cannot page {sub}: {e:#}"));
+        }
+    } else {
+        // A write: the terminal is handed to the child so `q close`'s `[y/N]`
+        // and `q resume`'s attach run against the real keyboard, exactly as
+        // they would from a shell.
+        let status = handoff(io, terminal, app.mouse, || {
+            std::process::Command::new(q_exe()).args(args).status()
+        })?;
+        match status {
+            Ok(s) if s.success() => app.say(format!(
+                "{sub} {slug} on {machine} \u{b7} it updates at the next remote tick"
+            )),
+            Ok(s) => app.say(match s.code() {
+                Some(code) => format!("q {sub} {slug} on {machine} exited {code}"),
+                None => format!("q {sub} {slug} on {machine} was killed by a signal"),
+            }),
+            Err(e) => app.say(format!("cannot run q {sub}: {e}")),
+        }
+    }
+    Ok(())
+}
+
 /// Land in the master a template run just made (SPEC §11: a routine runs from
 /// the TUI in one keypress).
 ///
@@ -905,6 +1000,18 @@ fn event_loop(
                     drop(away);
                     out?;
                     dirty = true;
+                }
+                // SPEC §15, bd-8lz.5.8: a Quests key on a remote row runs the
+                // real `q` against the owning machine — a read is paged, a
+                // write hands over the terminal. Both take the terminal away
+                // and (for a write) can change the listing, so the row is
+                // reloaded afterwards exactly as an attach is.
+                Action::Proxy(key) => {
+                    let away = Away::new(poller);
+                    let out = proxy_remote(&mut Stdio, terminal, app, key);
+                    drop(away);
+                    out?;
+                    refresh_due = true;
                 }
                 Action::None => {}
             }
