@@ -1068,9 +1068,10 @@ fn create(ctx: &Ctx, app: &mut App, form: &Form) -> anyhow::Result<()> {
         prompt: merged.prompt.as_deref(),
         prompt_file: None,
         no_auto_reset: false,
-        // A template's `create_brain` maps onto this in a later milestone
-        // (7.9); the TUI form has no brain toggle of its own yet.
-        brain: false,
+        // SPEC §14: the chosen template's `create_brain` decides this; the
+        // TUI form has no brain toggle of its own, so a template is the only
+        // way it is set here.
+        brain: template.as_ref().is_some_and(|t| t.create_brain),
         // The TUI never attaches on its own: `q new` ends at a tmux pane,
         // but the TUI is the fleet view and blanking it the instant a
         // Quest exists is not what `n` asks for. `o` is one key away.

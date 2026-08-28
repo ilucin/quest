@@ -12901,6 +12901,63 @@ fn new_without_brain_writes_no_note() {
     assert!(!brain_note(&root, "nb").exists());
 }
 
+/// A template stored with `create_brain` (`q tpl add --brain`) creates the
+/// brain session when instantiated through `q tpl run` (bd-8lz.7.9): the note
+/// is written under the brain root and recorded as the Quest's session. This
+/// is the one construction the TUI Templates tab shares too (`instantiate_with`).
+#[test]
+fn tpl_run_creates_the_brain_session_when_the_template_asks() {
+    let env = Env::new();
+    let work = env.work("repo");
+    let root = env.dir.path().join("brain");
+    env.cmd()
+        .args(["tpl", "add", "brainy", "--cwd", work.to_str().unwrap()])
+        .arg("--brain")
+        .assert()
+        .success();
+
+    let assert = env
+        .cmd()
+        .env("Q_BRAIN_ROOT", &root)
+        .args(["tpl", "run", "brainy", "-d", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    let slug = out["quest"]["slug"].as_str().unwrap().to_string();
+    assert_eq!(out["quest"]["brain_session"], slug, "{out}");
+    assert!(
+        brain_note(&root, &slug).exists(),
+        "no session note for {slug}"
+    );
+}
+
+/// A template without `create_brain` writes no note and leaves the Quest
+/// without a brain session, even with a brain root configured.
+#[test]
+fn tpl_run_without_create_brain_writes_no_note() {
+    let env = Env::new();
+    let work = env.work("repo");
+    let root = env.dir.path().join("brain");
+    env.cmd()
+        .args(["tpl", "add", "plainy", "--cwd", work.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let assert = env
+        .cmd()
+        .env("Q_BRAIN_ROOT", &root)
+        .args(["tpl", "run", "plainy", "-d", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    let slug = out["quest"]["slug"].as_str().unwrap().to_string();
+    assert!(out["quest"]["brain_session"].is_null(), "{out}");
+    assert!(
+        !brain_note(&root, &slug).exists(),
+        "unexpected note for {slug}"
+    );
+}
+
 /// `q link add` appends the reference into the session note's YAML block when
 /// `[brain] sync_links` is on (the default) and the Quest has a brain session.
 #[test]

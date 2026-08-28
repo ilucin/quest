@@ -310,6 +310,10 @@ pub fn instantiate_with(
             prompt: prompt.as_deref(),
             detach,
             template: Some(template),
+            // SPEC §14: a template's stored `create_brain` decides whether the
+            // Quest it instantiates gets a brain session — shared by `q tpl
+            // run` and the TUI Templates tab, which both land here.
+            brain: template.create_brain,
             ..new::Args::default()
         },
     )
