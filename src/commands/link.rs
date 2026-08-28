@@ -50,9 +50,62 @@ pub fn add(ctx: &Ctx, args: &AddArgs) -> anyhow::Result<()> {
         LinkKind::Task => normalize_productive_task_url(&reference),
         _ => reference,
     };
+    // `--kind brain <slug>` enables an existing brain session on this Quest
+    // (SPEC §14): the slug becomes `quest.brain_session`, so the brief reads it
+    // and later links sync into its note. The link row is still stored below.
+    if kind == LinkKind::Brain {
+        enable_brain_session(ctx, &target, &reference)?;
+    }
     let mut link = Link::new(&target.quest.id, kind.as_str(), &reference);
     link.title = args.title.map(str::to_string);
-    insert(ctx, &target, link, "link.added", None, args.title, None)
+    let created = insert(ctx, &target, link, "link.added", None, args.title, None)?;
+    // SPEC §14: a freshly linked reference is appended into the brain note when
+    // `[brain] sync_links` is on and this Quest has a session — never the brain
+    // link itself, which would only point the note back at itself.
+    if created && kind != LinkKind::Brain {
+        sync_link_to_brain(ctx, &target, kind.as_str(), &reference);
+    }
+    Ok(())
+}
+
+/// Points `quest.brain_session` at an existing brain session `slug`. The row is
+/// the point of the command, so a database failure is reported; the brain note
+/// itself is assumed to exist (this enables a session, it does not create one).
+fn enable_brain_session(ctx: &Ctx, target: &Target, slug: &str) -> anyhow::Result<()> {
+    let db = ctx.db()?;
+    let patch = crate::db::quest::QuestPatch {
+        brain_session: Some(Some(slug.to_string())),
+        ..Default::default()
+    };
+    db.update_quest(&target.quest.id, &patch)?;
+    db.append_event(
+        &target.quest.id,
+        target.session_id(),
+        "brain.session",
+        &serde_json::json!({ "slug": slug }),
+    )?;
+    Ok(())
+}
+
+/// Appends a link into the Quest's brain note (SPEC §14, `[brain] sync_links`).
+/// Best effort in every part: `sync_links` off, no `brain_session`, no brain
+/// root, or an unwritable note all leave the link stored and the note as it was
+/// — a buffered warning at worst, never a failed `q link add`.
+fn sync_link_to_brain(ctx: &Ctx, target: &Target, kind: &str, reference: &str) {
+    if !ctx.config.brain.sync_links {
+        return;
+    }
+    let Some(slug) = target.quest.brain_session.as_deref() else {
+        return;
+    };
+    let Some(root) = crate::brain::root() else {
+        return;
+    };
+    if let Err(e) = crate::brain::append_link(&root, slug, kind, reference) {
+        ctx.warn(format!(
+            "warning: link stored but not synced into brain session {slug}: {e}"
+        ));
+    }
 }
 
 pub fn add_artifact(
@@ -72,11 +125,14 @@ pub fn add_artifact(
     if let Some(n) = note {
         link.meta = Some(serde_json::json!({ "note": n }));
     }
-    insert(ctx, &target, link, "artifact.added", note, None, note)
+    insert(ctx, &target, link, "artifact.added", note, None, note).map(|_| ())
 }
 
 /// Idempotent on `UNIQUE(quest_id, kind, ref)`: an existing row is returned as
 /// is and no event is written. `title`/`note` fill blanks on the existing row.
+/// `Ok(true)` when a new row was stored, `Ok(false)` when the reference was
+/// already linked — the caller's cue for the one-time side effects (a brain
+/// sync) that must not repeat on a re-add.
 #[allow(clippy::too_many_arguments)]
 fn insert(
     ctx: &Ctx,
@@ -86,14 +142,16 @@ fn insert(
     event_note: Option<&str>,
     title: Option<&str>,
     note: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let db = ctx.db()?;
     if let Some(existing) = db.find_link(&target.quest.id, &link.kind, &link.r#ref)? {
-        return report_existing(ctx, existing, title, note);
+        report_existing(ctx, existing, title, note)?;
+        return Ok(false);
     }
     link.session_id = target.session_id().map(str::to_string);
     let stored = store(db, link, event_kind, event_note, false)?;
-    emit_link(ctx, &stored, true, "")
+    emit_link(ctx, &stored, true, "")?;
+    Ok(true)
 }
 
 /// Inserts `link` (its `quest_id`/`session_id` already set) and appends the

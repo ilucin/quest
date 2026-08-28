@@ -38,6 +38,9 @@ pub struct Args<'a> {
     pub prompt: Option<&'a str>,
     pub prompt_file: Option<&'a str>,
     pub no_auto_reset: bool,
+    /// Create a brain session note for this Quest (SPEC §14, `--brain`). A
+    /// template's `create_brain` maps onto this in a later milestone (7.9).
+    pub brain: bool,
     pub detach: bool,
     /// The machine the Quest is recorded against. `None` is `ctx.machine()`,
     /// which is what the global `--machine` already decides for the CLI; the
@@ -138,7 +141,6 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
         None => ctx.machine(),
     };
 
-    // TODO(M2): brain session (`--brain`).
     let mut row = Quest::new(&slug, &cwd.to_string_lossy(), machine);
     row.name_source = name_source;
     row.goal = args.goal.map(str::to_string);
@@ -187,6 +189,10 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
         Some(template) => Some(db.bump_template_run(&template.id, now())?),
         None => None,
     };
+    // SPEC §5 step 3: the brain session note. Best effort — a missing brain or
+    // an unwritable note is a buffered warning, never a failed `q new` — and it
+    // runs only after the master is up, so a rollback never leaves a stray note.
+    let quest = maybe_create_brain(ctx, quest, args);
     Ok(Created {
         quest,
         session: master.session,
@@ -234,6 +240,9 @@ pub fn remote_argv(args: &Args) -> Vec<String> {
     }
     if args.no_auto_reset {
         argv.push("--no-auto-reset".to_string());
+    }
+    if args.brain {
+        argv.push("--brain".to_string());
     }
     argv.push("-d".to_string());
     argv.push("--json".to_string());
@@ -327,6 +336,65 @@ fn store_epic(ctx: &Ctx, quest: Quest, epic: &str, repo: &str) -> Quest {
         Err(e) => {
             ctx.warn(format!(
                 "warning: beads epic {epic} could not be stored: {e:#}"
+            ));
+            quest
+        }
+    }
+}
+
+/// SPEC §14: writes `sessions/<slug>/<slug>.md` under the brain root and stores
+/// the slug as `quest.brain_session`, so the brief and `q link add`'s
+/// `sync_links` can find the note. A no-op unless `--brain` was given.
+///
+/// Best effort in both halves: no brain root (no `~/.brainrc`, no
+/// `$Q_BRAIN_ROOT`) or an unwritable note leaves the Quest without a session,
+/// and a stored slug the database then refuses is warned about — the Quest
+/// still stands either way. The note write is idempotent (see [`crate::brain`]).
+fn maybe_create_brain(ctx: &Ctx, quest: Quest, args: &Args) -> Quest {
+    if !args.brain {
+        return quest;
+    }
+    let Some(root) = crate::brain::root() else {
+        ctx.warn(format!(
+            "warning: --brain: no brain root (set [brain] in ~/.brainrc or $Q_BRAIN_ROOT); \
+             quest {} created without a brain session",
+            quest.slug
+        ));
+        return quest;
+    };
+    let note = crate::brain::SessionNote {
+        quest_id: &quest.id,
+        machine: &quest.machine,
+        cwd: &quest.cwd,
+        beads_epic: quest.beads_epic.as_deref(),
+        created: &crate::commands::fmt::stamp_utc(quest.created_at),
+    };
+    if let Err(e) = crate::brain::write_session_note(&root, &quest.slug, &note) {
+        ctx.warn(format!(
+            "warning: --brain: could not write the session note for {} ({e})",
+            quest.slug
+        ));
+        return quest;
+    }
+    let patch = QuestPatch {
+        brain_session: Some(Some(quest.slug.clone())),
+        ..QuestPatch::default()
+    };
+    match ctx.db().and_then(|db| {
+        let stored = db.update_quest(&quest.id, &patch)?;
+        db.append_event(
+            &quest.id,
+            None,
+            "brain.session",
+            &serde_json::json!({ "slug": quest.slug }),
+        )?;
+        Ok(stored)
+    }) {
+        Ok(stored) => stored,
+        Err(e) => {
+            ctx.warn(format!(
+                "warning: brain session note written but not recorded on {}: {e:#}",
+                quest.slug
             ));
             quest
         }

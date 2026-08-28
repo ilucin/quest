@@ -1244,18 +1244,17 @@ fn new_help_only_lists_the_implemented_flags() {
         "--prompt-file",
         "--detach",
         "--template",
+        "--brain",
     ] {
         assert!(
             out.contains(flag),
             "`{flag}` missing from `q new --help`:\n{out}"
         );
     }
-    for later in ["--brain", "--from-brief"] {
-        assert!(
-            !out.contains(later),
-            "`{later}` is not implemented yet:\n{out}"
-        );
-    }
+    assert!(
+        !out.contains("--from-brief"),
+        "`--from-brief` is not implemented yet:\n{out}"
+    );
 }
 
 // ------------------------------------------------------------------- q doctor
@@ -12835,4 +12834,265 @@ fn main_restores_the_default_sigpipe_disposition() {
         src.contains("libc::signal(libc::SIGPIPE, libc::SIG_DFL)"),
         "main() no longer restores SIG_DFL for SIGPIPE"
     );
+}
+
+// ----------------------------------------------------------- brain integration
+
+/// `<root>/sessions/<slug>/<slug>.md`, the session-note path convention.
+fn brain_note(root: &std::path::Path, slug: &str) -> std::path::PathBuf {
+    root.join("sessions").join(slug).join(format!("{slug}.md"))
+}
+
+/// `q new --brain` writes the session note with `tags: [session]` and the YAML
+/// block, and records the slug as the Quest's `brain_session`.
+#[test]
+fn new_brain_writes_the_session_note_and_records_the_session() {
+    let env = Env::new();
+    let work = env.work("bq");
+    let root = env.dir.path().join("brain");
+    let assert = env
+        .cmd()
+        .env("Q_BRAIN_ROOT", &root)
+        .args(["new", "--name", "bq", "--dir", work.to_str().unwrap()])
+        .args(["--brain", "-d", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    assert_eq!(out["quest"]["brain_session"], "bq");
+    let id = out["quest"]["id"].as_str().unwrap();
+
+    let body = std::fs::read_to_string(brain_note(&root, "bq")).unwrap();
+    assert!(body.starts_with("---\ntags: [session]\n"), "{body}");
+    assert!(body.contains(&format!("quest: {id}\n")), "{body}");
+    assert!(body.contains("machine: "), "{body}");
+    assert!(
+        body.contains(&format!("cwd: {}\n", work.to_str().unwrap())),
+        "{body}"
+    );
+    assert!(body.contains("created: "), "{body}");
+    assert!(body.contains("# bq\n"), "{body}");
+
+    // The event is recorded too.
+    let kinds = event_kinds(&env, id);
+    assert!(kinds.iter().any(|k| k == "brain.session"), "{kinds:?}");
+}
+
+/// Neither the default nor `--no-brain` writes a note or sets a session, even
+/// with a brain root configured.
+#[test]
+fn new_without_brain_writes_no_note() {
+    let env = Env::new();
+    let root = env.dir.path().join("brain");
+
+    let plain = env.new_quest("plain");
+    assert!(plain["quest"]["brain_session"].is_null());
+    assert!(!brain_note(&root, "plain").exists());
+
+    let work = env.work("nb");
+    let assert = env
+        .cmd()
+        .env("Q_BRAIN_ROOT", &root)
+        .args(["new", "--name", "nb", "--dir", work.to_str().unwrap()])
+        .args(["--no-brain", "-d", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    assert!(out["quest"]["brain_session"].is_null());
+    assert!(!brain_note(&root, "nb").exists());
+}
+
+/// `q link add` appends the reference into the session note's YAML block when
+/// `[brain] sync_links` is on (the default) and the Quest has a brain session.
+#[test]
+fn link_add_syncs_into_the_brain_note_when_enabled() {
+    let env = Env::new();
+    let work = env.work("lq");
+    let root = env.dir.path().join("brain");
+    env.cmd()
+        .env("Q_BRAIN_ROOT", &root)
+        .args(["new", "--name", "lq", "--dir", work.to_str().unwrap()])
+        .args(["--brain", "-d", "--json"])
+        .assert()
+        .success();
+
+    env.cmd()
+        .env("Q_BRAIN_ROOT", &root)
+        .args([
+            "link",
+            "add",
+            "https://example.com/x",
+            "--quest",
+            "lq",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let body = std::fs::read_to_string(brain_note(&root, "lq")).unwrap();
+    let fm_end = body.find("\n---\n\n").unwrap();
+    assert!(
+        body[..fm_end].contains("url: https://example.com/x"),
+        "link not synced into the YAML block:\n{body}"
+    );
+}
+
+/// `[brain] sync_links = false` leaves the note untouched on `q link add`.
+#[test]
+fn link_add_does_not_sync_when_sync_links_is_off() {
+    let env = Env::new();
+    let work = env.work("lq");
+    let root = env.dir.path().join("brain");
+    env.cmd()
+        .args(["config", "set", "brain.sync_links", "false"])
+        .assert()
+        .success();
+    env.cmd()
+        .env("Q_BRAIN_ROOT", &root)
+        .args(["new", "--name", "lq", "--dir", work.to_str().unwrap()])
+        .args(["--brain", "-d", "--json"])
+        .assert()
+        .success();
+
+    env.cmd()
+        .env("Q_BRAIN_ROOT", &root)
+        .args([
+            "link",
+            "add",
+            "https://example.com/x",
+            "--quest",
+            "lq",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let body = std::fs::read_to_string(brain_note(&root, "lq")).unwrap();
+    assert!(!body.contains("example.com"), "synced despite off:\n{body}");
+}
+
+/// With no brain session on the Quest, `q link add` never touches the brain —
+/// no note is created.
+#[test]
+fn link_add_does_not_sync_without_a_brain_session() {
+    let env = Env::new();
+    let root = env.dir.path().join("brain");
+    env.new_quest("plain");
+    env.cmd()
+        .env("Q_BRAIN_ROOT", &root)
+        .args([
+            "link",
+            "add",
+            "https://example.com/x",
+            "--quest",
+            "plain",
+            "--json",
+        ])
+        .assert()
+        .success();
+    assert!(!root.join("sessions").exists());
+}
+
+/// `q link add --kind brain <slug>` enables an existing session on a Quest that
+/// had none: the slug becomes its `brain_session`.
+#[test]
+fn link_add_kind_brain_enables_an_existing_session() {
+    let env = Env::new();
+    env.new_quest("plain");
+    let out = env.json(&[
+        "link",
+        "add",
+        "my-session",
+        "--kind",
+        "brain",
+        "--quest",
+        "plain",
+    ]);
+    assert_eq!(out["link"]["kind"], "brain");
+
+    let bs: Option<String> = env
+        .conn()
+        .query_row(
+            "SELECT brain_session FROM quest WHERE slug = ?1",
+            ["plain"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(bs.as_deref(), Some("my-session"));
+}
+
+/// `q close --summarize` hands the brief to the stubbed `claude`, then records
+/// the path it returns as `summarized_to:` on the session note.
+#[test]
+fn close_summarize_invokes_claude_and_records_summarized_to() {
+    let env = Env::new();
+    let work = env.work("cq");
+    let root = env.dir.path().join("brain");
+    // The stub `claude` "wrote" this note and prints its path.
+    let claude_out = env.dir.path().join("claude.out");
+    std::fs::write(&claude_out, "knowledge/cq-lessons.md\n").unwrap();
+    let claude_log = env.dir.path().join("claude.log");
+
+    env.cmd()
+        .env("Q_BRAIN_ROOT", &root)
+        .args(["new", "--name", "cq", "--dir", work.to_str().unwrap()])
+        .args(["--brain", "-d", "--json"])
+        .assert()
+        .success();
+
+    env.cmd()
+        .env("Q_BRAIN_ROOT", &root)
+        .env("Q_FIXTURE_CLAUDE", &claude_out)
+        .env("Q_FIXTURE_CLAUDE_LOG", &claude_log)
+        .env("Q_FIXTURE_CONFIRM", "y")
+        .args(["close", "cq", "--force", "--summarize"])
+        .assert()
+        .success();
+
+    // The brief reached claude.
+    let logged = std::fs::read_to_string(&claude_log).unwrap();
+    assert!(
+        logged.contains("# Quest"),
+        "brief not sent to claude:\n{logged}"
+    );
+    assert!(logged.contains("`cq`"), "{logged}");
+
+    // The note records where the summary landed.
+    let body = std::fs::read_to_string(brain_note(&root, "cq")).unwrap();
+    assert!(
+        body.contains("summarized_to: knowledge/cq-lessons.md"),
+        "{body}"
+    );
+}
+
+/// `q close --summarize` degrades gracefully when `claude` is unavailable: the
+/// Quest still closes and the note carries no `summarized_to`.
+#[test]
+fn close_summarize_skips_gracefully_when_claude_is_unavailable() {
+    let env = Env::new();
+    let work = env.work("cq");
+    let root = env.dir.path().join("brain");
+    env.cmd()
+        .env("Q_BRAIN_ROOT", &root)
+        .args(["new", "--name", "cq", "--dir", work.to_str().unwrap()])
+        .args(["--brain", "-d", "--json"])
+        .assert()
+        .success();
+
+    // No Q_FIXTURE_CLAUDE → the stub reports claude unavailable.
+    env.cmd()
+        .env("Q_BRAIN_ROOT", &root)
+        .env("Q_FIXTURE_CONFIRM", "y")
+        .args(["close", "cq", "--force", "--summarize"])
+        .assert()
+        .success();
+
+    let closed: String = env
+        .conn()
+        .query_row("SELECT state FROM quest WHERE slug = ?1", ["cq"], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(closed, "finished");
+    let body = std::fs::read_to_string(brain_note(&root, "cq")).unwrap();
+    assert!(!body.contains("summarized_to"), "{body}");
 }
