@@ -35,6 +35,9 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     if prompt.is_empty() {
         return Err(QError::Invalid("a worker needs a prompt".to_string()).into());
     }
+    // Checked and normalized in one, so the row stores the name that was
+    // validated; see `crate::workflows::Registry::check_opt`.
+    let workflow = ctx.workflows().check_opt(args.workflow)?;
 
     let quest = db.resolve_quest(args.quest)?;
     if quest.state == QuestState::Finished {
@@ -82,12 +85,10 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     );
     row.id = session_id.clone();
     row.status = SessionStatus::Starting;
-    // Without `--workflow` a worker runs the Quest's, as the master does.
-    // TODO(M5): validate `--workflow` against the workflow registry.
-    row.workflow = args
-        .workflow
-        .map(str::to_string)
-        .or_else(|| quest.workflow.clone());
+    // Without `--workflow` a worker runs the Quest's, as the master does. The
+    // Quest's own was checked when it was set, so only the flag is checked
+    // here — see `crate::workflows`.
+    row.workflow = workflow.or_else(|| quest.workflow.clone());
     row.first_prompt = Some(prompt.to_string());
     // The name `claude -n` is given below (SPEC §6), recorded so the registry's
     // identity check has something true to compare against.

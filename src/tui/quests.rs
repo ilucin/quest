@@ -70,6 +70,9 @@ const F_PROMPT: &str = "prompt";
 /// The template select's "no template" option. Parenthesised, so no template
 /// name can collide with it: a name is a slug (`^[a-z0-9]+(-[a-z0-9]+)*$`).
 const NO_TEMPLATE: &str = "(none)";
+/// The new-Quest form's "leave it unset" workflow choice — a Quest may have
+/// none, and a template's own workflow fills the blank when one is picked.
+const NO_WORKFLOW: &str = "(none)";
 
 /// Per-tab state, owned by `App`.
 #[derive(Default)]
@@ -109,6 +112,14 @@ pub struct State {
     /// Every template, for the new-Quest form's select (SPEC §11, §17).
     /// Loaded by `refresh` like everything else this tab draws.
     templates: Vec<Template>,
+    /// Every workflow name, for the new-Quest form's select (SPEC §11).
+    ///
+    /// A select rather than a text field: the set is small, closed and known,
+    /// and `q new --workflow` refuses a name that is not in it — so free text
+    /// here could only ever produce a form that fails on submit. The Templates
+    /// tab's workflow field stays free text on purpose; see
+    /// `crate::tui::templates`.
+    workflows: Vec<String>,
 }
 
 /// Which Quest the selection (or a loaded set of events) is on.
@@ -150,6 +161,21 @@ impl Anchor {
 }
 
 impl State {
+    /// The workflow names the new-Quest form offers (SPEC §11).
+    ///
+    /// A directory that cannot be read falls back to the built-in names and
+    /// keeps the last good list out of it: a tick must not be able to fail, and
+    /// a form that silently offered *nothing* would be worse than one that
+    /// offers the five that are compiled in and always exist.
+    fn workflows_or_builtins(&self, ctx: &Ctx) -> Vec<String> {
+        ctx.workflows().names().unwrap_or_else(|_| {
+            crate::workflows::BUILTIN
+                .iter()
+                .map(|(name, _)| (*name).to_string())
+                .collect()
+        })
+    }
+
     /// Whether `/` has the keyboard. The shell asks before claiming its own
     /// bare-letter keys, so typing `q` into the box does not quit.
     pub fn capturing(&self) -> bool {
@@ -379,10 +405,15 @@ pub fn refresh(ctx: &Ctx, app: &mut App) -> anyhow::Result<()> {
     }
 
     let templates = db.list_templates()?;
+    // Never fatal: a workflows directory that cannot be read must not stop the
+    // Quests tab from drawing. The built-ins are always there, and `q workflow
+    // list` is where the real error is reported.
+    let workflows = app.quests.workflows_or_builtins(ctx);
 
     app.quests.rows = rows;
     app.quests.links = links;
     app.quests.templates = templates;
+    app.quests.workflows = workflows;
     app.quests.resync();
     // A reload can reorder the list under the selection, so the viewport is
     // re-settled rather than only clamped: `resync` alone can scroll up but
@@ -785,6 +816,9 @@ fn show_links(app: &mut App) -> Action {
 /// machine / template, plus the beads epic §5 step 2 creates by default.
 fn open_new(app: &mut App) -> Action {
     let machines = app.machines.clone();
+    let workflows: Vec<String> = std::iter::once(NO_WORKFLOW.to_string())
+        .chain(app.quests.workflows.iter().cloned())
+        .collect();
     let templates: Vec<String> = std::iter::once(NO_TEMPLATE.to_string())
         .chain(app.quests.templates.iter().map(|t| t.name.clone()))
         .collect();
@@ -794,7 +828,7 @@ fn open_new(app: &mut App) -> Action {
         .text(F_NAME, "", "(auto)")
         .text(F_GOAL, "", "(none)")
         .text(F_DIR, "", "(where q was started)")
-        .text(F_WORKFLOW, "", "(default)")
+        .select(F_WORKFLOW, workflows, 0)
         .select(F_MACHINE, machines, 0)
         .select(F_TEMPLATE, templates, 0)
         .toggle(F_BEADS, true);
@@ -988,6 +1022,13 @@ fn quest_for_state(ctx: &Ctx, target: &Target) -> anyhow::Result<Quest> {
     Ok(quest)
 }
 
+/// The new-Quest form's workflow, or `None` for the sentinel that means "left
+/// blank" — which is what lets a chosen template's own workflow fill it in
+/// (`tpl::Merge`), exactly as an empty text field used to.
+fn chosen_workflow(form: &Form) -> Option<&str> {
+    Some(form.choice(F_WORKFLOW)).filter(|w| !w.is_empty() && *w != NO_WORKFLOW)
+}
+
 fn create(ctx: &Ctx, app: &mut App, form: &Form) -> anyhow::Result<()> {
     // The chosen template supplies whatever the form was left blank for; it
     // never overrides something typed — so only the template's own text is
@@ -1007,7 +1048,7 @@ fn create(ctx: &Ctx, app: &mut App, form: &Form) -> anyhow::Result<()> {
         &tpl::Given {
             goal: form.optional(F_GOAL),
             dir: form.optional(F_DIR),
-            workflow: form.optional(F_WORKFLOW),
+            workflow: chosen_workflow(form),
             no_beads,
             ..tpl::Given::default()
         },
@@ -2948,6 +2989,27 @@ mod form_tests {
         type_text(app, value);
     }
 
+    /// Move a select onto a named option, wherever it sits in the list — the
+    /// select equivalent of [`set`]. The options wrap, so one direction reaches
+    /// every one of them.
+    fn choose(app: &mut App, label: &str, value: &str) {
+        focus(app, label);
+        for _ in 0..32 {
+            if app
+                .modal
+                .as_ref()
+                .expect("no form is open")
+                .form
+                .choice(label)
+                == value
+            {
+                return;
+            }
+            app.handle(Input::Right);
+        }
+        panic!("no option `{value}` on the {label} row");
+    }
+
     /// Beads is on by default (SPEC §5 step 2). The rig's `bd` is
     /// `stub::NoBd` unless a test asked for another one (`Ctx::for_tests`), so
     /// leaving it on would only earn a refusal and a warning — every
@@ -3025,7 +3087,9 @@ mod form_tests {
         set(&mut app, F_NAME, "cdc-backfill");
         set(&mut app, F_GOAL, "make the backfill idempotent");
         set(&mut app, F_DIR, &rig.dir());
-        set(&mut app, F_WORKFLOW, "orchestrator");
+        // A select, not free text: `q new --workflow` refuses a name the
+        // registry does not have, so the form offers the names it does.
+        choose(&mut app, F_WORKFLOW, "orchestrator");
         no_beads(&mut app);
         submit(&rig, &mut app);
 
@@ -3261,6 +3325,76 @@ mod form_tests {
         assert_eq!(app.modal.as_ref().unwrap().form.choice(F_MACHINE), "laptop");
     }
 
+    /// SPEC §11's workflow names, as a select rather than free text: `q new
+    /// --workflow` refuses a name the registry does not have, so a text field
+    /// here could only ever build a form that fails on submit.
+    #[test]
+    fn the_workflow_field_is_a_select_over_the_registry() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        app.handle(Input::Char('n'));
+        let form = &app.modal.as_ref().unwrap().form;
+        // The rig's registry has no user directory, so this is the built-ins.
+        assert_eq!(form.choice(F_WORKFLOW), NO_WORKFLOW, "unset by default");
+        let offered: Vec<String> = (0..6)
+            .map(|_| {
+                let at = app
+                    .modal
+                    .as_ref()
+                    .unwrap()
+                    .form
+                    .choice(F_WORKFLOW)
+                    .to_string();
+                focus(&mut app, F_WORKFLOW);
+                app.handle(Input::Right);
+                at
+            })
+            .collect();
+        assert_eq!(
+            offered,
+            [
+                NO_WORKFLOW,
+                "orchestrator",
+                "research",
+                "review",
+                "routine",
+                "solo",
+            ]
+        );
+
+        // `(none)` means no workflow, not a Quest whose workflow is `(none)`.
+        set(&mut app, F_NAME, "unset");
+        set(&mut app, F_DIR, &rig.dir());
+        choose(&mut app, F_WORKFLOW, NO_WORKFLOW);
+        no_beads(&mut app);
+        submit(&rig, &mut app);
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+        assert_eq!(rig.quests()[0].workflow, None);
+    }
+
+    /// A user file joins the select, and the whole set comes off the `Ctx`'s
+    /// registry rather than the developer's own config directory.
+    #[test]
+    fn a_user_workflow_file_joins_the_new_quest_form() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::workflows::Registry::new(dir.path())
+            .write("triage", "# triage\n\nmine.\n")
+            .unwrap();
+        let mut rig = Rig::new();
+        rig.ctx = rig.ctx.with_workflows(dir.path());
+        let mut app = rig.app();
+
+        app.handle(Input::Char('n'));
+        set(&mut app, F_NAME, "picked");
+        set(&mut app, F_DIR, &rig.dir());
+        choose(&mut app, F_WORKFLOW, "triage");
+        no_beads(&mut app);
+        submit(&rig, &mut app);
+
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+        assert_eq!(rig.quests()[0].workflow.as_deref(), Some("triage"));
+    }
+
     /// The template select is what SPEC §17 asks for; with an empty table it
     /// still has to be a legal field with a legal value.
     #[test]
@@ -3279,8 +3413,8 @@ mod form_tests {
             NO_TEMPLATE
         );
         set(&mut app, F_NAME, "from-template");
-        // Typed values win; the blanks come from the template.
-        set(&mut app, F_WORKFLOW, "solo");
+        // Chosen values win; the blanks come from the template.
+        choose(&mut app, F_WORKFLOW, "solo");
         focus(&mut app, F_TEMPLATE);
         app.handle(Input::Right);
         assert_eq!(

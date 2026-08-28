@@ -360,6 +360,78 @@ pub enum Command {
         #[command(subcommand)]
         action: TplAction,
     },
+
+    /// Workflows: the markdown prompt that tells a master how to work (SPEC §11)
+    ///
+    /// Workflows are files, not rows: five are built into the binary
+    /// (`orchestrator`, `solo`, `review`, `research`, `routine`) and the rest
+    /// live in `<config dir>/workflows/<name>.md`, where a file shadows the
+    /// built-in of the same name. The whole file goes into the master's brief;
+    /// a worker gets the file's `## worker` section when it defines one.
+    ///
+    /// Every subcommand but `set` is about files on *this* machine, so a
+    /// global `--machine <other>` is refused rather than ignored.
+    /// `q workflow set` targets a Quest and travels like `q set` does.
+    Workflow {
+        #[command(subcommand)]
+        action: WorkflowAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WorkflowAction {
+    /// List every workflow, saying which are built in and which are yours
+    List,
+    /// Print a workflow's markdown
+    Show {
+        /// Name of the workflow to print (built-in or one of yours)
+        name: String,
+        /// Only the `## worker` section, as a worker's brief would get it
+        #[arg(long)]
+        worker: bool,
+    },
+    /// Create a workflow: with no `--file`, its buffer opens in $EDITOR
+    ///
+    /// `--file <path>` reads the body from a file (`-` reads stdin) instead.
+    /// The name follows the slug grammar — it becomes `<name>.md`.
+    Add {
+        /// Name: lowercase kebab-case, at most 40 characters
+        name: String,
+        /// Read the body from a file instead of opening an editor (`-` is stdin)
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+    },
+    /// Change a workflow; editing a built-in copies it to your config first
+    ///
+    /// The copy is what shadows the built-in from then on. `q workflow rm`
+    /// deletes the copy and the built-in comes back, so a built-in is never
+    /// lost by editing it.
+    Edit {
+        /// Name of the workflow to change (a built-in is copied to your config first)
+        name: String,
+        /// Replace the body from a file instead of opening an editor (`-` is stdin)
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+    },
+    /// Delete one of your workflow files; a built-in it shadowed comes back
+    Rm {
+        /// Name of the workflow file to delete (a built-in cannot be removed)
+        name: String,
+        /// Do not ask for confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Set a Quest's workflow (SPEC §11: the master may change its own)
+    ///
+    /// The same write as `q set <quest> workflow <name>`, with the same
+    /// `quest.updated` event — spelled the way SPEC §11 spells it. A blank
+    /// name clears the Quest's workflow.
+    Set {
+        /// Quest to change: slug, id, or an unambiguous fragment
+        quest: String,
+        /// Workflow to set; a blank name clears it
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

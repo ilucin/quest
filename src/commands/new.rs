@@ -115,6 +115,16 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
     // Both before anything is written: a bad label or a contradictory pair of
     // flags is the user's typo, not a half-created Quest.
     let repo = repo_flag(args)?;
+    // SPEC §11: the workflow is a file, and a Quest whose workflow does not
+    // resolve gives its master a brief with a hole where its instructions
+    // should be. Checked here, before the row, the epic or the tmux session —
+    // and this is also where `q tpl run`'s stored workflow is checked, the way
+    // `run_cwd` checks its `cwd`.
+    // Checked *and* normalized: the column stores the trimmed name that was
+    // validated, so ` solo ` cannot become a Quest whose every brief reports a
+    // workflow it "could not read", and `   ` means unset rather than a broken
+    // name no later filter catches.
+    let workflow = ctx.workflows().check_opt(args.workflow)?;
     let cwd = resolve_dir(args.dir)?;
     let prompt = resolve_prompt(args.prompt, args.prompt_file)?;
     let (base, name_source) = resolve_slug(args.name, args.template, &cwd)?;
@@ -132,8 +142,8 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
     let mut row = Quest::new(&slug, &cwd.to_string_lossy(), machine);
     row.name_source = name_source;
     row.goal = args.goal.map(str::to_string);
-    // TODO(M5): validate `--workflow` against the workflow registry.
-    row.workflow = args.workflow.map(str::to_string);
+    // Already checked above, with the other flags, before anything was written.
+    row.workflow = workflow;
     row.template_id = args.template.map(|t| t.id.clone());
     // Only the opt-out is stored; NULL keeps following `[context] auto_reset`.
     row.auto_reset = args.no_auto_reset.then_some(false);
@@ -472,7 +482,12 @@ pub fn spawn_master(ctx: &Ctx, quest: &Quest, prompt: Option<String>) -> anyhow:
     );
     row.id = session_id.clone();
     row.status = SessionStatus::Starting;
-    row.workflow = quest.workflow.clone();
+    // The master's workflow *is* the Quest's, by definition (SPEC §11: "master
+    // može promijeniti"). Leaving its session column unset — rather than
+    // snapshotting the Quest's value at `q new` time — is what lets a later
+    // `q workflow set` reach the master's own brief (D5): `effective_workflow`
+    // falls through to the Quest's. A worker still gets its own via
+    // `q spawn --workflow`, which is why the session column exists at all.
     row.first_prompt = prompt;
     // The name `claude -n` was just given, so the registry's identity check has
     // something true to compare against before any rename (SPEC §6).
@@ -573,6 +588,14 @@ pub fn validate_label(label: &str) -> anyhow::Result<()> {
 /// remember.
 pub fn validate_template_name(name: &str) -> anyhow::Result<()> {
     validate_kebab("template name", name)
+}
+
+/// A workflow name follows it too (SPEC §11), and here the grammar is load
+/// bearing rather than only tidy: the name becomes `<name>.md` under the config
+/// directory, so a spelling with a `/` or a `..` in it would address a file
+/// somewhere else entirely.
+pub fn validate_workflow_name(name: &str) -> anyhow::Result<()> {
+    validate_kebab("workflow name", name)
 }
 
 fn validate_kebab(what: &str, value: &str) -> anyhow::Result<()> {
@@ -839,6 +862,34 @@ mod tests {
         assert!(warnings[0].contains("bd close bd-7fx"), "{warnings:?}");
         // Drained: nothing is carried into the next command.
         assert!(ctx.take_warnings().is_empty());
+    }
+
+    /// D5: `q new` must not snapshot the Quest's workflow onto the *master*
+    /// session row. If it did, a later `q workflow set` would change the Quest's
+    /// column but never the master's own brief — which reads the session's over
+    /// the Quest's. Left unset, the master falls through to the Quest's, so the
+    /// value the master reads is always the current one.
+    #[test]
+    fn the_master_session_does_not_snapshot_the_quests_workflow() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ctx = Ctx::for_tests(
+            crate::config::Config::default(),
+            crate::db::Db::open_in_memory().unwrap(),
+            Box::new(crate::tmux::FixtureTmux::new(
+                fixture.path().join("tmux.json"),
+            )),
+        );
+        let mut quest = Quest::new("wq", "/tmp", "laptop");
+        quest.workflow = Some("orchestrator".to_string());
+        let quest = ctx.db().unwrap().insert_quest(&quest).unwrap();
+
+        let master = spawn_master(&ctx, &quest, None).unwrap();
+        assert_eq!(
+            master.session.workflow, None,
+            "the master inherits the Quest's workflow at read time, never a snapshot"
+        );
+        // The Quest still carries it, so the master's brief resolves it.
+        assert_eq!(quest.workflow.as_deref(), Some("orchestrator"));
     }
 
     #[test]

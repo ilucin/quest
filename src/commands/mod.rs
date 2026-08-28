@@ -25,6 +25,7 @@ pub mod show;
 pub mod spawn;
 pub mod target;
 pub mod tpl;
+pub mod workflow;
 
 // Agent self-report (bd-8lz.2.5).
 pub mod link;

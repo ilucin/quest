@@ -168,11 +168,13 @@ fn q_command(override_cmd: Option<&str>) -> anyhow::Result<String> {
             c.to_string()
         }
         None => {
-            let exe = std::env::current_exe().map_err(QError::Io)?;
+            let exe = std::env::current_exe().map_err(|e| QError::Io(e.to_string()))?;
             let exe = if exe.is_absolute() {
                 exe
             } else {
-                std::env::current_dir().map_err(QError::Io)?.join(exe)
+                std::env::current_dir()
+                    .map_err(|e| QError::Io(e.to_string()))?
+                    .join(exe)
             };
             shell_quote(&exe.to_string_lossy())
         }

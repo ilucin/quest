@@ -661,6 +661,21 @@ impl Env {
     fn conn(&self) -> rusqlite::Connection {
         rusqlite::Connection::open(self.dir.path().join("q.db")).unwrap()
     }
+
+    /// A user workflow file (SPEC §11), written straight into the sandboxed
+    /// config directory — `Q_CONFIG` points at `config.toml` in here, so
+    /// `workflows/` beside it is the directory `q` reads. Returns its path.
+    fn workflow(&self, name: &str, body: &str) -> std::path::PathBuf {
+        let dir = self.dir.path().join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.md"));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn workflow_dir(&self) -> std::path::PathBuf {
+        self.dir.path().join("workflows")
+    }
 }
 
 /// The one pane of `session`, from the fixture.
@@ -678,6 +693,9 @@ fn pane_of(fixture: &serde_json::Value, session: &str) -> serde_json::Value {
 fn new_creates_the_quest_the_tmux_session_and_the_master_window() {
     let env = Env::new();
     let work = env.work("repo");
+    // `--workflow` is checked against the registry (SPEC §11), so the name has
+    // to be one that exists; a user file is the half a built-in cannot prove.
+    env.workflow("tdd", "# tdd\n\nred, green, refactor.\n");
     let assert = env
         .cmd()
         .args(["new", "--name", "foo", "--goal", "ship it"])
@@ -3403,7 +3421,7 @@ fn set_clears_goal_and_workflow_with_an_empty_value() {
     let env = Env::new();
     env.new_quest("foo");
     env.json(&["set", "foo", "goal", "ship it"]);
-    env.json(&["set", "foo", "workflow", "tdd"]);
+    env.json(&["set", "foo", "workflow", "solo"]);
 
     assert_eq!(
         env.json(&["set", "foo", "goal", ""])["quest"]["goal"],
@@ -11754,4 +11772,904 @@ fn new_template_is_refused_for_a_remote_machine() {
         .failure()
         .stderr(predicate::str::contains("q tpl export starter | ssh ws"));
     assert!(env.proxy_calls().is_empty(), "{:?}", env.proxy_calls());
+}
+
+// ---------------------------------------------------------------- q workflow
+//
+// SPEC §11's workflow files. `Q_CONFIG` points at `config.toml` inside the
+// sandbox, so `workflows/` beside it is the directory every one of these
+// reads and writes — no test touches the real `~/.config/q`, and none of them
+// launches a real editor (`Q_FIXTURE` gates that; see `src/editor.rs`).
+
+const BUILTINS: [&str; 5] = ["orchestrator", "research", "review", "routine", "solo"];
+
+/// `Env::cmd` with an "editor" that saves `body`, and optionally records the
+/// buffer it was handed.
+fn with_editor(env: &Env, body: &str, seen: Option<&std::path::Path>) -> Command {
+    let reply = write_file(env, "editor-reply.md", body);
+    let mut cmd = env.cmd();
+    cmd.env("Q_FIXTURE_EDITOR", &reply);
+    if let Some(seen) = seen {
+        cmd.env("Q_FIXTURE_EDITOR_SEEN", seen);
+    }
+    cmd
+}
+
+#[test]
+fn workflow_list_reports_the_five_builtins() {
+    let env = Env::new();
+    let assert = env.cmd().args(["workflow", "list"]).assert().success();
+    let text = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(text.starts_with("NAME"), "{text}");
+    for name in BUILTINS {
+        assert!(text.contains(name), "`{name}` missing:\n{text}");
+    }
+    assert!(text.contains("builtin"), "{text}");
+
+    let rows = env.json(&["workflow", "list"]);
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 5, "{rows:#?}");
+    let names: Vec<&str> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, BUILTINS, "sorted, and exactly the five");
+    for row in rows {
+        assert_eq!(row["source"], "builtin");
+        assert_eq!(row["path"], serde_json::Value::Null);
+        assert!(row["chars"].as_u64().unwrap() > 500);
+    }
+    // Only `solo` has no worker section — it is the one master, no workers.
+    let worker: Vec<(&str, bool)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r["name"].as_str().unwrap(),
+                r["has_worker_section"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        worker,
+        [
+            ("orchestrator", true),
+            ("research", true),
+            ("review", true),
+            ("routine", true),
+            ("solo", false),
+        ]
+    );
+}
+
+#[test]
+fn workflow_show_prints_the_markdown_and_its_worker_half() {
+    let env = Env::new();
+    let assert = env
+        .cmd()
+        .args(["workflow", "show", "orchestrator"])
+        .assert()
+        .success();
+    let text = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(text.starts_with("# orchestrator"), "{text}");
+    assert!(text.contains("q spawn"), "{text}");
+    assert!(text.contains("## worker"), "{text}");
+
+    let out = env.json(&["workflow", "show", "orchestrator"]);
+    assert_eq!(out["name"], "orchestrator");
+    assert_eq!(out["source"], "builtin");
+    assert_eq!(out["for"], "master");
+    assert_eq!(out["has_worker_section"], true);
+    assert_eq!(out["whole_file"], true);
+    // stdout is the body with `emit`'s newline; the payload carries the file.
+    assert_eq!(out["body"].as_str().unwrap().trim_end(), text.trim_end());
+
+    // `--worker` is what a worker's brief would actually be handed.
+    let out = env.json(&["workflow", "show", "orchestrator", "--worker"]);
+    assert_eq!(out["for"], "worker");
+    assert_eq!(out["whole_file"], false);
+    let body = out["body"].as_str().unwrap();
+    assert!(
+        body.contains("Do **only** the stage you were given"),
+        "{body}"
+    );
+    assert!(!body.contains("## worker"), "{body}");
+    assert!(!body.contains("Choosing the pipeline"), "{body}");
+
+    // A workflow with no worker section hands a worker the whole file, and
+    // says so out loud — `whole_file` in `--json` is not visible to a human.
+    let out = env.json(&["workflow", "show", "solo", "--worker"]);
+    assert_eq!(out["has_worker_section"], false);
+    assert_eq!(out["whole_file"], true);
+    assert!(out["body"].as_str().unwrap().starts_with("# solo"));
+    let assert = env
+        .cmd()
+        .args(["workflow", "show", "solo", "--worker"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("defines no `## worker` section"),
+        "{stderr}"
+    );
+    // The note is on stderr, so the body still pipes clean.
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.starts_with("# solo"), "{stdout}");
+    // A workflow that *does* define one says nothing.
+    let assert = env
+        .cmd()
+        .args(["workflow", "show", "orchestrator", "--worker"])
+        .assert()
+        .success();
+    assert!(assert.get_output().stderr.is_empty());
+
+    // `show` gates on `--quiet` the way `q tpl show` does.
+    env.cmd()
+        .args(["workflow", "show", "solo", "-q"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// `q workflow rm <builtin>` used to ask "remove workflow review?" and only
+/// then refuse. Nothing is going to be removed, so nothing is asked.
+#[test]
+fn removing_a_builtin_or_an_unknown_workflow_is_refused_without_asking() {
+    let env = Env::new();
+    for (name, code, needle) in [
+        ("review", "invalid", "is a built-in workflow"),
+        ("ghost", "not_found", "unknown workflow `ghost`"),
+    ] {
+        let assert = env
+            .cmd()
+            .args(["workflow", "rm", name, "--json"])
+            .assert()
+            .code(1);
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert_eq!(parsed["code"], code, "{parsed}");
+        assert!(
+            parsed["error"].as_str().unwrap().contains(needle),
+            "{parsed}"
+        );
+        // Not "aborted": the confirm never happened.
+        let assert = env.cmd().args(["workflow", "rm", name]).assert().code(1);
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        assert!(
+            !stderr.contains("[y/N]"),
+            "{name} was asked about: {stderr}"
+        );
+        assert!(stderr.contains(needle), "{name}: {stderr}");
+    }
+}
+
+/// `require_opt` trimmed before it checked; the row stored the raw flag. A
+/// Quest could be created whose every brief then reported a workflow that
+/// "could not be read", and `"   "` set a column no `is_empty()` filter caught.
+#[test]
+fn a_padded_workflow_flag_is_stored_exactly_as_it_was_checked() {
+    let env = Env::new();
+    let work = env.work("repo");
+
+    let out = env.json(&[
+        "new",
+        "--name",
+        "padded",
+        "--workflow",
+        " solo ",
+        "--dir",
+        work.to_str().unwrap(),
+        "-d",
+    ]);
+    assert_eq!(out["quest"]["workflow"], "solo");
+    let md = env.json(&["brief", "padded"])["markdown"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(md.contains("Workflow **`solo`** (builtin)"), "{md}");
+    assert!(!md.contains("could not be read"), "{md}");
+    assert!(md.contains("- **workflow**: solo"), "{md}");
+
+    // Whitespace-only is "unset" to the check, so it must be unset in the row.
+    let out = env.json(&[
+        "new",
+        "--name",
+        "blank",
+        "--workflow",
+        "   ",
+        "--dir",
+        work.to_str().unwrap(),
+        "-d",
+    ]);
+    assert_eq!(out["quest"]["workflow"], serde_json::Value::Null);
+    let md = env.json(&["brief", "blank"])["markdown"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(md.contains("No workflow set"), "{md}");
+    assert!(md.contains("- **workflow**: -"), "{md}");
+
+    // The three doors agree: `q set` already trimmed, and `q spawn` now does.
+    assert_eq!(
+        env.json(&["set", "blank", "workflow", " solo "])["quest"]["workflow"],
+        "solo"
+    );
+    let out = env.json(&[
+        "spawn",
+        "blank",
+        "go",
+        "--label",
+        "w",
+        "--workflow",
+        " routine ",
+    ]);
+    assert_eq!(out["session"]["workflow"], "routine");
+}
+
+/// `q spawn --workflow`'s help promises "default: the Quest's". The flag was
+/// validated and stored, and then section 3 read the Quest's anyway.
+#[test]
+fn a_worker_spawned_with_its_own_workflow_is_briefed_with_it() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.cmd()
+        .args(["new", "--name", "split", "--dir", work.to_str().unwrap()])
+        .args(["--workflow", "orchestrator", "-d", "-q"])
+        .assert()
+        .success();
+
+    env.json(&[
+        "spawn",
+        "split",
+        "go",
+        "--label",
+        "own",
+        "--workflow",
+        "research",
+    ]);
+    let md = env.json(&["brief", "split", "--session", "own"])["markdown"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(md.contains("Workflow **`research`** (builtin)"), "{md}");
+    assert!(!md.contains("Workflow **`orchestrator`**"), "{md}");
+
+    // A worker with no `--workflow` still reads the Quest's.
+    env.json(&["spawn", "split", "go", "--label", "plain"]);
+    let md = env.json(&["brief", "split", "--session", "plain"])["markdown"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(md.contains("Workflow **`orchestrator`** (builtin)"), "{md}");
+
+    // And the master's own brief is the Quest's, as it always was.
+    let md = env.json(&["brief", "split"])["markdown"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(md.contains("Workflow **`orchestrator`** (builtin)"), "{md}");
+}
+
+/// A `## worker` inside a fenced code block is a workflow documenting the
+/// convention. It used to carve the section — leaking master-only prose to the
+/// worker and losing the real section.
+#[test]
+fn a_worker_heading_inside_a_fence_does_not_carve_the_worker_section() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.workflow(
+        "fence",
+        "# fence\n\nMaster-only: DO-NOT-LEAK\n\n```markdown\n## worker\ndocumentation of the convention\n```\n\nMore master-only: SECOND-SECRET\n\n## worker\n\nreal worker text\n",
+    );
+
+    let out = env.json(&["workflow", "show", "fence", "--worker"]);
+    let body = out["body"].as_str().unwrap();
+    assert_eq!(body.trim(), "real worker text", "{body}");
+    assert!(!body.contains("SECOND-SECRET"), "{body}");
+
+    // `has_worker_section` is the same question, asked by `list` and `show`.
+    env.workflow(
+        "faux",
+        "# faux\n\n```md\n## worker\nnot a heading\n```\n\ntail\n",
+    );
+    let rows = env.json(&["workflow", "list"]);
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "faux")
+        .unwrap();
+    assert_eq!(row["has_worker_section"], false, "{row}");
+
+    // And the worker's brief is the section, not the master's copy.
+    env.cmd()
+        .args(["new", "--name", "fenced", "--dir", work.to_str().unwrap()])
+        .args(["--workflow", "fence", "-d", "-q"])
+        .assert()
+        .success();
+    env.json(&["spawn", "fenced", "go", "--label", "w"]);
+    let md = env.json(&["brief", "fenced", "--session", "w"])["markdown"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(md.contains("real worker text"), "{md}");
+    assert!(!md.contains("SECOND-SECRET"), "{md}");
+    assert!(!md.contains("DO-NOT-LEAK"), "{md}");
+}
+
+#[test]
+fn workflow_show_of_an_unknown_name_lists_the_known_ones() {
+    let env = Env::new();
+    let assert = env
+        .cmd()
+        .args(["workflow", "show", "orchestartor", "--json"])
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "not_found");
+    let msg = parsed["error"].as_str().unwrap();
+    assert!(msg.contains("orchestartor"), "{msg}");
+    for name in BUILTINS {
+        assert!(msg.contains(name), "`{name}` missing from `{msg}`");
+    }
+
+    // A malformed name is a different failure: the grammar, not the shelf.
+    let assert = env
+        .cmd()
+        .args(["workflow", "show", "Not A Name", "--json"])
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "invalid");
+    assert!(
+        parsed["error"].as_str().unwrap().contains("workflow name"),
+        "{parsed}"
+    );
+}
+
+#[test]
+fn workflow_add_writes_a_file_next_to_the_config_and_lists_as_user() {
+    let env = Env::new();
+    let body = write_file(&env, "body.md", "# triage\n\nlook at the queue.\n");
+
+    let out = env.json(&[
+        "workflow",
+        "add",
+        "triage",
+        "--file",
+        body.to_str().unwrap(),
+    ]);
+    assert_eq!(out["name"], "triage");
+    assert_eq!(out["source"], "user");
+    assert_eq!(out["action"], "created");
+    assert_eq!(out["has_worker_section"], false);
+    let path = env.workflow_dir().join("triage.md");
+    assert_eq!(out["path"], path.to_str().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# triage\n\nlook at the queue.\n"
+    );
+
+    let rows = env.json(&["workflow", "list"]);
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "triage")
+        .unwrap();
+    assert_eq!(row["source"], "user");
+    assert_eq!(row["summary"], "look at the queue.");
+    assert_eq!(rows.as_array().unwrap().len(), 6);
+
+    // Adding it twice is a conflict, and it points at the command that works.
+    let assert = env
+        .cmd()
+        .args([
+            "workflow",
+            "add",
+            "triage",
+            "--file",
+            body.to_str().unwrap(),
+        ])
+        .args(["--json"])
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "conflict");
+    assert!(
+        parsed["error"]
+            .as_str()
+            .unwrap()
+            .contains("q workflow edit triage"),
+        "{parsed}"
+    );
+}
+
+#[test]
+fn workflow_add_reads_stdin_and_refuses_an_empty_body() {
+    let env = Env::new();
+    env.cmd()
+        .args(["workflow", "add", "piped", "--file", "-"])
+        .write_stdin("# piped\n\nfrom a pipe.\n")
+        .assert()
+        .success();
+    let out = env.json(&["workflow", "show", "piped"]);
+    assert_eq!(out["source"], "user");
+    assert!(out["body"].as_str().unwrap().contains("from a pipe."));
+
+    let blank = write_file(&env, "blank.md", "   \n\n");
+    env.cmd()
+        .args([
+            "workflow",
+            "add",
+            "empty",
+            "--file",
+            blank.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("would be empty"));
+    assert!(!env.workflow_dir().join("empty.md").exists());
+}
+
+/// `q workflow add` with no `--file` opens `$EDITOR` on a skeleton that shows
+/// both halves of the SPEC §11 split.
+#[test]
+fn workflow_add_opens_an_editor_on_a_skeleton() {
+    let env = Env::new();
+    let seen = env.dir.path().join("seen.md");
+    with_editor(
+        &env,
+        "# triage\n\nmine.\n\n## worker\n\nyours.\n",
+        Some(&seen),
+    )
+    .args(["workflow", "add", "triage"])
+    .assert()
+    .success();
+
+    let buffer = std::fs::read_to_string(&seen).unwrap();
+    assert!(buffer.starts_with("# triage\n"), "{buffer}");
+    assert!(buffer.contains("## worker"), "{buffer}");
+
+    let out = env.json(&["workflow", "show", "triage"]);
+    assert_eq!(out["has_worker_section"], true);
+    assert!(out["body"].as_str().unwrap().contains("yours."));
+
+    // An editor that failed writes nothing.
+    env.cmd()
+        .env("Q_FIXTURE_EDITOR_FAIL", "1")
+        .args(["workflow", "add", "other"])
+        .assert()
+        .failure();
+    assert!(!env.workflow_dir().join("other.md").exists());
+}
+
+#[test]
+fn workflow_add_refuses_a_builtin_name_and_points_at_edit() {
+    let env = Env::new();
+    let assert = env
+        .cmd()
+        .args(["workflow", "add", "orchestrator", "--json"])
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "conflict");
+    assert!(
+        parsed["error"]
+            .as_str()
+            .unwrap()
+            .contains("q workflow edit orchestrator"),
+        "{parsed}"
+    );
+    assert!(!env.workflow_dir().join("orchestrator.md").exists());
+
+    for bad in ["Not A Name", "double--dash", "../escape"] {
+        env.cmd()
+            .args(["workflow", "add", bad])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("workflow name"));
+    }
+}
+
+/// SPEC §11: editing a built-in copies it into the config directory first, and
+/// the copy shadows it from then on.
+#[test]
+fn workflow_edit_of_a_builtin_copies_it_and_rm_reveals_it_again() {
+    let env = Env::new();
+    let seen = env.dir.path().join("seen.md");
+    let out = json_of(
+        &with_editor(&env, "# solo\n\nMY OWN SOLO.\n", Some(&seen))
+            .args(["workflow", "edit", "solo", "--json"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(out["source"], "shadow");
+    assert_eq!(out["action"], "copied and updated");
+
+    // The editor opened on the built-in's own text, not an empty buffer.
+    let buffer = std::fs::read_to_string(&seen).unwrap();
+    assert!(buffer.starts_with("# solo\n"), "{buffer}");
+    assert!(buffer.contains("One master, no workers"), "{buffer}");
+
+    let shown = env.json(&["workflow", "show", "solo"]);
+    assert_eq!(shown["source"], "shadow");
+    assert!(shown["body"].as_str().unwrap().contains("MY OWN SOLO."));
+    let rows = env.json(&["workflow", "list"]);
+    assert_eq!(rows.as_array().unwrap().len(), 5, "still five names");
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "solo")
+        .unwrap();
+    assert_eq!(row["source"], "shadow");
+
+    // Removing the copy brings the built-in back, untouched.
+    let out = env.json(&["workflow", "rm", "solo", "-f"]);
+    assert_eq!(out["reveals_builtin"], true);
+    assert!(!env.workflow_dir().join("solo.md").exists());
+    let shown = env.json(&["workflow", "show", "solo"]);
+    assert_eq!(shown["source"], "builtin");
+    assert!(
+        shown["body"]
+            .as_str()
+            .unwrap()
+            .contains("One master, no workers")
+    );
+}
+
+#[test]
+fn workflow_edit_replaces_a_user_file_from_a_file() {
+    let env = Env::new();
+    env.workflow("triage", "# triage\n\nold.\n");
+    let next = write_file(&env, "next.md", "# triage\n\nnew.\n");
+    let out = env.json(&[
+        "workflow",
+        "edit",
+        "triage",
+        "--file",
+        next.to_str().unwrap(),
+    ]);
+    assert_eq!(out["action"], "updated");
+    assert_eq!(out["source"], "user");
+    assert!(
+        env.json(&["workflow", "show", "triage"])["body"]
+            .as_str()
+            .unwrap()
+            .contains("new.")
+    );
+
+    env.cmd()
+        .args(["workflow", "edit", "nope", "--file", next.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown workflow `nope`"));
+}
+
+#[test]
+fn workflow_rm_asks_first_and_refuses_a_builtin_that_is_not_shadowed() {
+    let env = Env::new();
+    env.workflow("triage", "# triage\n\nx.\n");
+
+    // No terminal and no scripted answer: refused, and the file survives.
+    env.cmd()
+        .args(["workflow", "rm", "triage"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("aborted (use -f)"));
+    assert!(env.workflow_dir().join("triage.md").exists());
+
+    // The scripted `yes` is the half that actually deletes.
+    env.cmd()
+        .env("Q_FIXTURE_CONFIRM", "y")
+        .args(["workflow", "rm", "triage"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("remove workflow triage?"));
+    assert!(!env.workflow_dir().join("triage.md").exists());
+
+    // A built-in with no file behind it is not a delete at all.
+    let assert = env
+        .cmd()
+        .args(["workflow", "rm", "solo", "-f", "--json"])
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "invalid");
+    assert!(
+        parsed["error"].as_str().unwrap().contains("built-in"),
+        "{parsed}"
+    );
+
+    let assert = env
+        .cmd()
+        .args(["workflow", "rm", "nope", "-f", "--json"])
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "not_found");
+}
+
+/// SPEC §11: the master may change its own workflow mid-Quest, and it is an
+/// event — the same write `q set <quest> workflow` makes.
+#[test]
+fn workflow_set_changes_the_quest_and_emits_an_event() {
+    let env = Env::new();
+    let quest = env.new_quest("foo");
+    let id = quest["quest"]["id"].as_str().unwrap().to_string();
+
+    let out = env.json(&["workflow", "set", "foo", "orchestrator"]);
+    assert_eq!(out["key"], "workflow");
+    assert_eq!(out["value"], "orchestrator");
+    assert_eq!(out["quest"]["workflow"], "orchestrator");
+
+    let payloads: Vec<String> = env
+        .conn()
+        .prepare("SELECT payload FROM event WHERE quest_id = ?1 AND kind = 'quest.updated'")
+        .unwrap()
+        .query_map([&id], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(payloads.len(), 1, "{payloads:?}");
+    assert!(payloads[0].contains("orchestrator"), "{payloads:?}");
+
+    // A blank name clears it, exactly as `q set` does.
+    assert_eq!(
+        env.json(&["workflow", "set", "foo", ""])["quest"]["workflow"],
+        serde_json::Value::Null
+    );
+
+    // And an unknown one is refused before anything is written.
+    let assert = env
+        .cmd()
+        .args(["workflow", "set", "foo", "nope", "--json"])
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "not_found");
+    assert_eq!(
+        env.json(&["show", "foo"])["workflow"],
+        serde_json::Value::Null
+    );
+}
+
+/// The four places a workflow name is accepted, each refusing an unknown one
+/// with the list — and each accepting a user file (SPEC §11).
+#[test]
+fn every_command_that_takes_a_workflow_checks_it_against_the_registry() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.workflow("triage", "# triage\n\nmine.\n");
+
+    for args in [
+        vec!["new", "--name", "a", "--workflow", "nope", "-d"],
+        vec!["tpl", "add", "t", "--workflow", "nope"],
+    ] {
+        let assert = env.cmd().args(&args).args(["--json"]).assert().code(1);
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert_eq!(parsed["code"], "not_found", "{args:?}: {parsed}");
+        assert!(
+            parsed["error"].as_str().unwrap().contains("triage"),
+            "{args:?}: the list is offered: {parsed}"
+        );
+    }
+    // The refused `q new` created nothing at all.
+    assert_eq!(env.count("SELECT count(*) FROM quest"), 0);
+    assert_eq!(env.count("SELECT count(*) FROM template"), 0);
+
+    // A user file is accepted everywhere a built-in is.
+    let out = env.json(&[
+        "new",
+        "--name",
+        "a",
+        "--workflow",
+        "triage",
+        "--dir",
+        work.to_str().unwrap(),
+        "-d",
+    ]);
+    assert_eq!(out["quest"]["workflow"], "triage");
+    env.json(&["tpl", "add", "t", "--workflow", "triage"]);
+    env.json(&["set", "a", "workflow", "solo"]);
+
+    let assert = env
+        .cmd()
+        .args(["spawn", "a", "go", "--label", "w", "--workflow", "nope"])
+        .args(["--no-attach", "--json"])
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "not_found");
+    assert_eq!(
+        env.count("SELECT count(*) FROM session"),
+        1,
+        "no worker row"
+    );
+
+    let out = env.json(&[
+        "spawn",
+        "a",
+        "go",
+        "--label",
+        "w",
+        "--workflow",
+        "review",
+        "--no-attach",
+    ]);
+    assert_eq!(out["session"]["workflow"], "review");
+}
+
+/// A template's workflow is checked when it is **set**, never on an unrelated
+/// write — the rule `cwd` already follows — and again when the template is
+/// **run**, which goes through `q new`.
+#[test]
+fn a_templates_workflow_is_checked_when_set_and_when_run() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.workflow("triage", "# triage\n\nmine.\n");
+    env.json(&[
+        "tpl",
+        "add",
+        "weekly",
+        "--workflow",
+        "triage",
+        "--cwd",
+        work.to_str().unwrap(),
+    ]);
+
+    // The file goes away; an edit that never touches `workflow` still works.
+    std::fs::remove_file(env.workflow_dir().join("triage.md")).unwrap();
+    let out = env.json(&["tpl", "edit", "weekly", "--description", "the routine"]);
+    assert_eq!(out["description"], "the routine");
+    assert_eq!(out["workflow"], "triage");
+
+    // Running it is where it has to exist.
+    let assert = env
+        .cmd()
+        .args(["tpl", "run", "weekly", "-d", "--json"])
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "not_found");
+    assert!(
+        parsed["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown workflow `triage`"),
+        "{parsed}"
+    );
+    assert_eq!(env.count("SELECT count(*) FROM quest"), 0);
+    assert_eq!(
+        env.json(&["tpl", "show", "weekly"])["run_count"],
+        0,
+        "a run that did not happen is not counted"
+    );
+
+    // Put it back and the routine runs.
+    env.workflow("triage", "# triage\n\nmine.\n");
+    let out = env.json(&["tpl", "run", "weekly", "-d"]);
+    assert_eq!(out["quest"]["workflow"], "triage");
+}
+
+/// SPEC §9 section 3 end to end: the brief carries the workflow's **markdown**,
+/// and a worker's carries only its `## worker` half.
+#[test]
+fn the_brief_renders_the_workflow_markdown_for_each_role() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.json(&[
+        "new",
+        "--name",
+        "foo",
+        "--workflow",
+        "orchestrator",
+        "--dir",
+        work.to_str().unwrap(),
+        "-d",
+    ]);
+
+    let assert = env.cmd().args(["brief", "foo"]).assert().success();
+    let master = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        master.contains("Workflow **`orchestrator`** (builtin)"),
+        "{master}"
+    );
+    assert!(master.contains("Choosing the pipeline"), "{master}");
+    assert!(
+        master.contains("Do **only** the stage you were given"),
+        "{master}"
+    );
+    // The workflow's own headings never pose as the brief's.
+    assert!(!master.contains("\n## worker\n"), "{master}");
+    assert!(master.contains("\n#### worker\n"), "{master}");
+
+    let assert = env
+        .cmd()
+        .args(["brief", "foo", "--for", "worker"])
+        .assert()
+        .success();
+    let worker = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        worker.contains("Do **only** the stage you were given"),
+        "{worker}"
+    );
+    assert!(!worker.contains("Choosing the pipeline"), "{worker}");
+
+    // A user file shadows the built-in here too.
+    env.workflow("orchestrator", "# orchestrator\n\nMY OWN.\n");
+    let assert = env.cmd().args(["brief", "foo"]).assert().success();
+    let shadowed = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(shadowed.contains("MY OWN."), "{shadowed}");
+    assert!(!shadowed.contains("Choosing the pipeline"), "{shadowed}");
+    assert!(shadowed.contains("(user (shadows builtin))"), "{shadowed}");
+}
+
+/// A workflow file that vanished under a Quest is stated in the brief, never
+/// silently dropped: a master cannot tell "no workflow" from "yours is gone".
+#[test]
+fn a_brief_says_when_the_quests_workflow_cannot_be_read() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.workflow("triage", "# triage\n\nmine.\n");
+    env.json(&[
+        "new",
+        "--name",
+        "foo",
+        "--workflow",
+        "triage",
+        "--dir",
+        work.to_str().unwrap(),
+        "-d",
+    ]);
+    std::fs::remove_file(env.workflow_dir().join("triage.md")).unwrap();
+
+    let assert = env.cmd().args(["brief", "foo"]).assert().success();
+    let text = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(text.contains("could not be read"), "{text}");
+    assert!(text.contains("unknown workflow `triage`"), "{text}");
+    assert!(
+        text.contains("## 4. Beads"),
+        "the brief is still whole:\n{text}"
+    );
+}
+
+/// Workflows are files in *this* machine's config directory, so `--machine`
+/// cannot mean another one — the shape `q tpl` already refuses.
+#[test]
+fn workflow_files_are_refused_for_a_remote_machine_but_set_travels() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    for args in [
+        vec!["workflow", "list"],
+        vec!["workflow", "show", "solo"],
+        vec!["workflow", "rm", "solo", "-f"],
+    ] {
+        env.cmd()
+            .args(["--machine", "ws"])
+            .args(&args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("q workflow add <name> --file -"));
+    }
+}
+
+#[test]
+fn help_lists_the_workflow_command() {
+    let assert = q().arg("--help").assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.contains("workflow"), "{out}");
+
+    let assert = q().args(["workflow", "--help"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    for sub in ["list", "show", "add", "edit", "rm", "set"] {
+        assert!(out.contains(sub), "`{sub}` missing:\n{out}");
+    }
 }

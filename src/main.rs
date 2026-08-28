@@ -17,6 +17,7 @@ mod remote;
 mod templates;
 mod tmux;
 mod tui;
+mod workflows;
 
 use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
@@ -58,6 +59,11 @@ pub struct Ctx {
     /// a test drives the beads paths without the process environment and the
     /// TUI can hand `bd` a client that does not chatter at the screen.
     bd: Box<dyn beads::Bd>,
+    /// The `<config dir>/workflows` directory (SPEC §11), owned rather than
+    /// discovered for the same reason `tmux` and `bd` are: an in-crate test
+    /// gets a directory that does not exist — the built-ins and nothing else —
+    /// instead of whatever the developer keeps in their own `~/.config/q`.
+    workflows_dir: std::path::PathBuf,
     /// Diagnostics for the human, buffered instead of written.
     ///
     /// A library call reached from `q new` may print to stderr; the same call
@@ -133,6 +139,7 @@ impl Ctx {
             tmux: tmux::tmux(),
             ssh: remote::ssh().into(),
             bd: beads::client(),
+            workflows_dir: workflows::Registry::user_dir()?,
             warnings: Mutex::new(Vec::new()),
         })
     }
@@ -213,6 +220,12 @@ impl Ctx {
         self.bd.as_ref()
     }
 
+    /// The workflow registry for this invocation (SPEC §11): the built-ins,
+    /// with `<config dir>/workflows` in front of them.
+    pub fn workflows(&self) -> workflows::Registry {
+        workflows::Registry::new(self.workflows_dir.clone())
+    }
+
     /// Buffer one diagnostic for whoever owns the output — see
     /// [`Ctx::warnings`]. Poison is not news: the message is advisory and the
     /// lock is only ever held for a push.
@@ -251,8 +264,18 @@ impl Ctx {
             tmux,
             ssh: Arc::new(remote::stub::NoSsh),
             bd: Box::new(beads::stub::NoBd),
+            // A directory that is not there: the built-ins, and never the
+            // developer's real `~/.config/q/workflows`. A test that means to
+            // exercise user files says so with [`Ctx::with_workflows`].
+            workflows_dir: std::path::PathBuf::from(workflows::NO_DIR),
             warnings: Mutex::new(Vec::new()),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_workflows(mut self, dir: impl Into<std::path::PathBuf>) -> Ctx {
+        self.workflows_dir = dir.into();
+        self
     }
 
     #[cfg(test)]
@@ -634,6 +657,7 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
         }
         .map(|()| 0),
         Command::Tpl { action } => commands::tpl::run(ctx, action).map(|()| 0),
+        Command::Workflow { action } => commands::workflow::run(ctx, action).map(|()| 0),
     }
 }
 
