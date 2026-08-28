@@ -245,6 +245,12 @@ impl Config {
                     remote.name
                 )));
             }
+            if remote.name == self.machine.name {
+                return Err(bad(&format!(
+                    "remote `{}` reuses the local machine.name",
+                    remote.name
+                )));
+            }
             if seen.contains(&remote.name.as_str()) {
                 return Err(bad(&format!("duplicate remote `{}`", remote.name)));
             }
@@ -746,6 +752,16 @@ mod tests {
                 ssh: "ws".into()
             }])
             .contains("name")
+        );
+        assert!(
+            invalid(|c| {
+                c.machine.name = "laptop".into();
+                c.remotes = vec![Remote {
+                    name: "laptop".into(),
+                    ssh: "ws".into(),
+                }];
+            })
+            .contains("local machine.name")
         );
         assert!(
             invalid(|c| c.remotes = vec![Remote {
