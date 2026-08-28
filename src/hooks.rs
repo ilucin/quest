@@ -250,6 +250,10 @@ fn notification(db: &Db, session: &Session, payload: &Value) {
     } else {
         "session.notification"
     };
+    // De-dupe: notify only on the edge INTO waiting. `session.status` is the
+    // pre-transition value (resolved before this handler ran), so a stop that
+    // finds the session already waiting logs the event but stays quiet.
+    let entering_waiting = waiting_for.is_some() && session.status != SessionStatus::Waiting;
     let _ = db.transaction(|db| {
         if let Some(waiting_for) = waiting_for {
             db.update_session_status(&session.id, SessionStatus::Waiting, Some(waiting_for))?;
@@ -261,6 +265,29 @@ fn notification(db: &Db, session: &Session, payload: &Value) {
             json!({ "type": kind, "waiting_for": waiting_for, "message": message }),
         )
     });
+    if entering_waiting {
+        notify_waiting(db, session, waiting_for.unwrap_or("input"));
+    }
+}
+
+/// A `waiting` desktop/push notification (SPEC §20), best effort — a hook has
+/// no `Ctx`, so the config is loaded off `$Q_CONFIG` the same way the CLI would
+/// and a broken one falls back to defaults.
+fn notify_waiting(db: &Db, session: &Session, waiting_for: &str) {
+    let cfg = crate::config::Config::load().unwrap_or_default();
+    let slug = db
+        .get_quest(&session.quest_id)
+        .ok()
+        .flatten()
+        .map(|q| q.slug)
+        .unwrap_or_else(|| session.quest_id.clone());
+    crate::notify::emit(
+        &cfg.notify,
+        crate::notify::runner().as_ref(),
+        crate::notify::Kind::Waiting,
+        &format!("{slug} · waiting"),
+        &format!("{} needs {waiting_for}", session.label),
+    );
 }
 
 /// Claude's `notification_type` mapped onto q's `waiting_for` vocabulary.

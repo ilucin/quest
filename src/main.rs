@@ -11,6 +11,7 @@ mod error;
 mod hooks;
 mod model;
 mod naming;
+mod notify;
 mod output;
 mod proc;
 mod registry;
@@ -562,6 +563,7 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
             },
         )
         .map(|()| 0),
+        Command::Watch { interval } => commands::watch::run(ctx, *interval),
         Command::Peek { session, lines } => commands::peek::run(ctx, session, *lines).map(|()| 0),
         Command::Send {
             session,

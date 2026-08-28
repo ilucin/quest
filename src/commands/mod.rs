@@ -26,6 +26,7 @@ pub mod skill;
 pub mod spawn;
 pub mod target;
 pub mod tpl;
+pub mod watch;
 pub mod workflow;
 
 // Agent self-report (bd-8lz.2.5).
