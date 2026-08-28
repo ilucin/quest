@@ -1816,6 +1816,15 @@ fn the_version_banner_carries_the_wire_version() {
         banner.contains(&format!("(wire {wire})")),
         "{banner} vs {parsed}"
     );
+
+    // `q --version --json` honours `--json` too — clap owned `--version` and
+    // printed the plain banner before any `q` code ran (bd-8lz.9); now `q`
+    // owns it, so the same two facts come back as a document, not a banner.
+    let assert = q().args(["--version", "--json"]).assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(parsed["wire"], wire);
 }
 
 /// A host that is asleep or off the network is not a broken setup and not one
