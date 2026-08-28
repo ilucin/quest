@@ -11872,11 +11872,225 @@ fn workflow_show_prints_the_markdown_and_its_worker_half() {
     assert!(!body.contains("## worker"), "{body}");
     assert!(!body.contains("Choosing the pipeline"), "{body}");
 
-    // A workflow with no worker section hands a worker the whole file.
+    // A workflow with no worker section hands a worker the whole file, and
+    // says so out loud — `whole_file` in `--json` is not visible to a human.
     let out = env.json(&["workflow", "show", "solo", "--worker"]);
     assert_eq!(out["has_worker_section"], false);
     assert_eq!(out["whole_file"], true);
     assert!(out["body"].as_str().unwrap().starts_with("# solo"));
+    let assert = env
+        .cmd()
+        .args(["workflow", "show", "solo", "--worker"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("defines no `## worker` section"),
+        "{stderr}"
+    );
+    // The note is on stderr, so the body still pipes clean.
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.starts_with("# solo"), "{stdout}");
+    // A workflow that *does* define one says nothing.
+    let assert = env
+        .cmd()
+        .args(["workflow", "show", "orchestrator", "--worker"])
+        .assert()
+        .success();
+    assert!(assert.get_output().stderr.is_empty());
+
+    // `show` gates on `--quiet` the way `q tpl show` does.
+    env.cmd()
+        .args(["workflow", "show", "solo", "-q"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// `q workflow rm <builtin>` used to ask "remove workflow review?" and only
+/// then refuse. Nothing is going to be removed, so nothing is asked.
+#[test]
+fn removing_a_builtin_or_an_unknown_workflow_is_refused_without_asking() {
+    let env = Env::new();
+    for (name, code, needle) in [
+        ("review", "invalid", "is a built-in workflow"),
+        ("ghost", "not_found", "unknown workflow `ghost`"),
+    ] {
+        let assert = env
+            .cmd()
+            .args(["workflow", "rm", name, "--json"])
+            .assert()
+            .code(1);
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert_eq!(parsed["code"], code, "{parsed}");
+        assert!(
+            parsed["error"].as_str().unwrap().contains(needle),
+            "{parsed}"
+        );
+        // Not "aborted": the confirm never happened.
+        let assert = env.cmd().args(["workflow", "rm", name]).assert().code(1);
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        assert!(
+            !stderr.contains("[y/N]"),
+            "{name} was asked about: {stderr}"
+        );
+        assert!(stderr.contains(needle), "{name}: {stderr}");
+    }
+}
+
+/// `require_opt` trimmed before it checked; the row stored the raw flag. A
+/// Quest could be created whose every brief then reported a workflow that
+/// "could not be read", and `"   "` set a column no `is_empty()` filter caught.
+#[test]
+fn a_padded_workflow_flag_is_stored_exactly_as_it_was_checked() {
+    let env = Env::new();
+    let work = env.work("repo");
+
+    let out = env.json(&[
+        "new",
+        "--name",
+        "padded",
+        "--workflow",
+        " solo ",
+        "--dir",
+        work.to_str().unwrap(),
+        "-d",
+    ]);
+    assert_eq!(out["quest"]["workflow"], "solo");
+    let md = env.json(&["brief", "padded"])["markdown"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(md.contains("Workflow **`solo`** (builtin)"), "{md}");
+    assert!(!md.contains("could not be read"), "{md}");
+    assert!(md.contains("- **workflow**: solo"), "{md}");
+
+    // Whitespace-only is "unset" to the check, so it must be unset in the row.
+    let out = env.json(&[
+        "new",
+        "--name",
+        "blank",
+        "--workflow",
+        "   ",
+        "--dir",
+        work.to_str().unwrap(),
+        "-d",
+    ]);
+    assert_eq!(out["quest"]["workflow"], serde_json::Value::Null);
+    let md = env.json(&["brief", "blank"])["markdown"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(md.contains("No workflow set"), "{md}");
+    assert!(md.contains("- **workflow**: -"), "{md}");
+
+    // The three doors agree: `q set` already trimmed, and `q spawn` now does.
+    assert_eq!(
+        env.json(&["set", "blank", "workflow", " solo "])["quest"]["workflow"],
+        "solo"
+    );
+    let out = env.json(&[
+        "spawn",
+        "blank",
+        "go",
+        "--label",
+        "w",
+        "--workflow",
+        " routine ",
+    ]);
+    assert_eq!(out["session"]["workflow"], "routine");
+}
+
+/// `q spawn --workflow`'s help promises "default: the Quest's". The flag was
+/// validated and stored, and then section 3 read the Quest's anyway.
+#[test]
+fn a_worker_spawned_with_its_own_workflow_is_briefed_with_it() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.cmd()
+        .args(["new", "--name", "split", "--dir", work.to_str().unwrap()])
+        .args(["--workflow", "orchestrator", "-d", "-q"])
+        .assert()
+        .success();
+
+    env.json(&[
+        "spawn",
+        "split",
+        "go",
+        "--label",
+        "own",
+        "--workflow",
+        "research",
+    ]);
+    let md = env.json(&["brief", "split", "--session", "own"])["markdown"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(md.contains("Workflow **`research`** (builtin)"), "{md}");
+    assert!(!md.contains("Workflow **`orchestrator`**"), "{md}");
+
+    // A worker with no `--workflow` still reads the Quest's.
+    env.json(&["spawn", "split", "go", "--label", "plain"]);
+    let md = env.json(&["brief", "split", "--session", "plain"])["markdown"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(md.contains("Workflow **`orchestrator`** (builtin)"), "{md}");
+
+    // And the master's own brief is the Quest's, as it always was.
+    let md = env.json(&["brief", "split"])["markdown"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(md.contains("Workflow **`orchestrator`** (builtin)"), "{md}");
+}
+
+/// A `## worker` inside a fenced code block is a workflow documenting the
+/// convention. It used to carve the section — leaking master-only prose to the
+/// worker and losing the real section.
+#[test]
+fn a_worker_heading_inside_a_fence_does_not_carve_the_worker_section() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.workflow(
+        "fence",
+        "# fence\n\nMaster-only: DO-NOT-LEAK\n\n```markdown\n## worker\ndocumentation of the convention\n```\n\nMore master-only: SECOND-SECRET\n\n## worker\n\nreal worker text\n",
+    );
+
+    let out = env.json(&["workflow", "show", "fence", "--worker"]);
+    let body = out["body"].as_str().unwrap();
+    assert_eq!(body.trim(), "real worker text", "{body}");
+    assert!(!body.contains("SECOND-SECRET"), "{body}");
+
+    // `has_worker_section` is the same question, asked by `list` and `show`.
+    env.workflow(
+        "faux",
+        "# faux\n\n```md\n## worker\nnot a heading\n```\n\ntail\n",
+    );
+    let rows = env.json(&["workflow", "list"]);
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "faux")
+        .unwrap();
+    assert_eq!(row["has_worker_section"], false, "{row}");
+
+    // And the worker's brief is the section, not the master's copy.
+    env.cmd()
+        .args(["new", "--name", "fenced", "--dir", work.to_str().unwrap()])
+        .args(["--workflow", "fence", "-d", "-q"])
+        .assert()
+        .success();
+    env.json(&["spawn", "fenced", "go", "--label", "w"]);
+    let md = env.json(&["brief", "fenced", "--session", "w"])["markdown"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(md.contains("real worker text"), "{md}");
+    assert!(!md.contains("SECOND-SECRET"), "{md}");
+    assert!(!md.contains("DO-NOT-LEAK"), "{md}");
 }
 
 #[test]

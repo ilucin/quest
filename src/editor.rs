@@ -38,8 +38,7 @@ pub fn edit(initial: &str, suffix: &str) -> anyhow::Result<String> {
         return fixture(initial);
     }
     let path = std::env::temp_dir().join(format!("q-{}{suffix}", new_id("edit")));
-    std::fs::write(&path, initial)
-        .map_err(|e| QError::Io(std::io::Error::other(format!("{}: {e}", path.display()))))?;
+    std::fs::write(&path, initial).map_err(|e| QError::Io(format!("{}: {e}", path.display())))?;
     let out = run(&path);
     let _ = std::fs::remove_file(&path);
     out
@@ -59,8 +58,7 @@ fn run(path: &Path) -> anyhow::Result<String> {
     if !status.success() {
         return Err(QError::Other(format!("editor `{editor}` exited with {status}")).into());
     }
-    std::fs::read_to_string(path)
-        .map_err(|e| QError::Io(std::io::Error::other(format!("{}: {e}", path.display()))).into())
+    std::fs::read_to_string(path).map_err(|e| QError::Io(format!("{}: {e}", path.display())).into())
 }
 
 /// `$Q_EDITOR`, `$VISUAL`, `$EDITOR`, `vi` — the first that is set to
@@ -84,7 +82,7 @@ fn fixture(initial: &str) -> anyhow::Result<String> {
     if let Some(seen) = std::env::var_os("Q_FIXTURE_EDITOR_SEEN") {
         let seen = PathBuf::from(seen);
         std::fs::write(&seen, initial)
-            .map_err(|e| QError::Io(std::io::Error::other(format!("{}: {e}", seen.display()))))?;
+            .map_err(|e| QError::Io(format!("{}: {e}", seen.display())))?;
     }
     if std::env::var_os("Q_FIXTURE_EDITOR_FAIL").is_some() {
         return Err(QError::Other("editor `stub` exited with exit status: 1".to_string()).into());
@@ -98,5 +96,5 @@ fn fixture(initial: &str) -> anyhow::Result<String> {
             )
         })?;
     std::fs::read_to_string(&path)
-        .map_err(|e| QError::Io(std::io::Error::other(format!("{}: {e}", path.display()))).into())
+        .map_err(|e| QError::Io(format!("{}: {e}", path.display())).into())
 }

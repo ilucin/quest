@@ -120,7 +120,11 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
     // should be. Checked here, before the row, the epic or the tmux session —
     // and this is also where `q tpl run`'s stored workflow is checked, the way
     // `run_cwd` checks its `cwd`.
-    ctx.workflows().require_opt(args.workflow)?;
+    // Checked *and* normalized: the column stores the trimmed name that was
+    // validated, so ` solo ` cannot become a Quest whose every brief reports a
+    // workflow it "could not read", and `   ` means unset rather than a broken
+    // name no later filter catches.
+    let workflow = ctx.workflows().check_opt(args.workflow)?;
     let cwd = resolve_dir(args.dir)?;
     let prompt = resolve_prompt(args.prompt, args.prompt_file)?;
     let (base, name_source) = resolve_slug(args.name, args.template, &cwd)?;
@@ -139,7 +143,7 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
     row.name_source = name_source;
     row.goal = args.goal.map(str::to_string);
     // Already checked above, with the other flags, before anything was written.
-    row.workflow = args.workflow.map(str::to_string);
+    row.workflow = workflow;
     row.template_id = args.template.map(|t| t.id.clone());
     // Only the opt-out is stored; NULL keeps following `[context] auto_reset`.
     row.auto_reset = args.no_auto_reset.then_some(false);

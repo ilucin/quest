@@ -37,8 +37,12 @@ pub enum QError {
     #[error("{0}")]
     Settings(String),
 
+    /// A filesystem operation failed, with the path folded into the message.
+    /// A `String` rather than the `io::Error` itself: as a `#[from]`/`#[source]`
+    /// field it was printed a second time by anyhow's `{:#}`, so every path'd
+    /// IO error came out doubled.
     #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    Io(String),
 
     #[error("`q {0}` is not implemented yet")]
     NotImplemented(String),

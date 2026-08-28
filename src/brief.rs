@@ -17,7 +17,7 @@ use crate::db::Db;
 use crate::error::QError;
 use crate::model::{Event, Link, Quest, Session, SessionRole, SessionStatus, display_state};
 use crate::proc;
-use crate::workflows::{Part, Registry};
+use crate::workflows::{Fences, Part, Registry};
 
 /// Default for section 9.
 pub const DEFAULT_EVENTS: usize = 30;
@@ -326,15 +326,16 @@ fn assemble(
     caps: Caps,
 ) -> String {
     let mut out = String::new();
-    section_quest(&mut out, quest, sessions, template);
-    section_how(&mut out, quest, sessions, me, opts);
     // The role the brief is actually written for: a resolved session's own
-    // role wins over `--for`/`$Q_ROLE` here exactly as it does in section 2,
-    // so the two sections can never disagree about who is reading.
+    // role wins over `--for`/`$Q_ROLE`. Computed once and handed to both
+    // sections that obey it, so they cannot disagree about who is reading.
+    let role = effective_role(me, opts.role);
+    section_quest(&mut out, quest, sessions, template);
+    section_how(&mut out, quest, sessions, me, opts, role);
     section_workflow(
         &mut out,
-        quest,
-        effective_role(me, opts.role),
+        effective_workflow(me, quest),
+        role,
         &opts.workflows,
     );
     section_beads(&mut out, quest, beads);
@@ -360,7 +361,17 @@ fn section_quest(out: &mut String, quest: &Quest, sessions: &[Session], template
         ),
         ("machine", quest.machine.clone()),
         ("cwd", quest.cwd.clone()),
-        ("workflow", fmt::or_dash(quest.workflow.as_deref())),
+        (
+            "workflow",
+            // Whitespace-only is unset here too, as it is for section 3.
+            fmt::or_dash(
+                quest
+                    .workflow
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|w| !w.is_empty()),
+            ),
+        ),
         ("created", stamp(quest.created_at)),
         ("template", template.to_string()),
     ];
@@ -375,41 +386,58 @@ fn section_quest(out: &mut String, quest: &Quest, sessions: &[Session], template
 
 /// Whose instructions the brief carries: the resolved session's role when
 /// there is one, else what was asked for. Section 2 says this out loud and
-/// section 3 obeys the same answer.
+/// section 3 obeys the same answer — both are handed this one result.
 fn effective_role(me: Option<&Session>, requested: SessionRole) -> SessionRole {
     me.map_or(requested, |s| s.role)
 }
 
+/// Which workflow section 3 renders: the session's own when the brief is for
+/// one, else the Quest's. `q spawn --workflow`'s help promises "default: the
+/// Quest's", the session row carries it, and this is where that promise is
+/// kept.
+///
+/// A blank or whitespace-only column is no workflow at all — the same thing
+/// `q set <quest> workflow ""` means, and the shape a row written before the
+/// `--workflow` flag trimmed what it stored can still be in.
+fn effective_workflow<'a>(me: Option<&'a Session>, quest: &'a Quest) -> Option<&'a str> {
+    fn set(column: &Option<String>) -> Option<&str> {
+        column.as_deref().map(str::trim).filter(|w| !w.is_empty())
+    }
+    me.and_then(|s| set(&s.workflow))
+        .or_else(|| set(&quest.workflow))
+}
+
+/// `role` is [`effective_role`]'s answer, passed in rather than recomputed:
+/// section 2 and section 3 must never disagree about who is reading, and the
+/// only way to guarantee that is for there to be one call.
 fn section_how(
     out: &mut String,
     quest: &Quest,
     sessions: &[Session],
     me: Option<&Session>,
     opts: &Opts,
+    role: SessionRole,
 ) {
-    let role = opts.role;
     out.push_str("## 2. How you work here\n\n");
     // A resolved session knows its role better than `--for` / `$Q_ROLE`.
-    let role = match me {
+    match me {
         Some(s) => {
-            let note = if s.role == role {
+            let note = if s.role == opts.role {
                 String::new()
             } else {
-                format!("; role `{}` was requested, the session's wins", role)
+                format!("; role `{}` was requested, the session's wins", opts.role)
             };
             out.push_str(&format!(
                 "You are session `{}` ({}, id `{}`{note}).\n\n",
                 s.label, s.role, s.id
             ));
-            s.role
         }
         None => {
             if let Some(target) = opts.session.as_deref() {
                 out.push_str(&format!("_(session not found: {target})_\n\n"));
             }
-            role
         }
-    };
+    }
     match role {
         SessionRole::Master => {
             out.push_str(
@@ -466,12 +494,15 @@ fn section_how(
 /// pasted verbatim those would sit alongside the brief's own `## 1.`…`## 10.`
 /// and break the one structure every reader (and every test) navigates by.
 ///
+/// `name` is [`effective_workflow`]'s answer: a worker spawned with its own
+/// `--workflow` reads that one, not its master's.
+///
 /// A workflow that cannot be read is a **stated** failure, never a silent one:
 /// a master handed a brief with an empty section 3 has no way to tell "no
 /// workflow" from "your workflow is missing", and would improvise.
-fn section_workflow(out: &mut String, quest: &Quest, role: SessionRole, registry: &Registry) {
+fn section_workflow(out: &mut String, name: Option<&str>, role: SessionRole, registry: &Registry) {
     out.push_str("## 3. Workflow\n\n");
-    let Some(name) = quest.workflow.as_deref().filter(|w| !w.is_empty()) else {
+    let Some(name) = name else {
         out.push_str(
             "No workflow set. Ask how the human wants this run, or pick one: \
              `q workflow list`, then `q workflow set <quest> <name>`.\n\n",
@@ -502,12 +533,15 @@ fn section_workflow(out: &mut String, quest: &Quest, role: SessionRole, registry
     }
     let body = part.text().trim();
     if body.is_empty() {
-        out.push_str("_(the workflow's worker section is empty)_\n\n");
+        out.push_str(match part {
+            Part::Worker(_) => "_(the workflow's worker section is empty)_\n\n",
+            _ => "_(the workflow file is empty)_\n\n",
+        });
         return;
     }
     let demoted = demote(body);
     if demoted.chars().count() > WORKFLOW_MAX_CHARS {
-        out.push_str(&demoted.chars().take(WORKFLOW_MAX_CHARS).collect::<String>());
+        out.push_str(&truncate_markdown(&demoted, WORKFLOW_MAX_CHARS));
         out.push_str(&format!(
             "\n\n_(truncated: this workflow is longer than the brief's \
              {WORKFLOW_MAX_CHARS}-character budget; read the rest with \
@@ -519,20 +553,43 @@ fn section_workflow(out: &mut String, quest: &Quest, role: SessionRole, registry
     out.push_str("\n\n");
 }
 
+/// `text` cut to at most `max` characters, at a line boundary, with any code
+/// fence the cut left open closed again.
+///
+/// Both halves matter: a cut mid-line can land inside a fence *delimiter*, and
+/// a fence left open swallows the truncation notice and every brief section
+/// after it into a code block. The "is a fence open" question is [`Fences`]'s,
+/// the same one `demote` and `workflows::worker_section` ask.
+fn truncate_markdown(text: &str, max: usize) -> String {
+    let cut: String = text.chars().take(max).collect();
+    let kept = match cut.rfind('\n') {
+        Some(i) if i > 0 => &cut[..i],
+        _ => cut.as_str(),
+    };
+    let mut fences = Fences::default();
+    for line in kept.lines() {
+        fences.feed(line);
+    }
+    let mut out = kept.trim_end().to_string();
+    if let Some(closer) = fences.closer() {
+        out.push('\n');
+        out.push_str(&closer);
+    }
+    out
+}
+
 /// Every ATX heading pushed down two levels, so a workflow's `#`/`##` become
 /// `###`/`####` and cannot be mistaken for one of the brief's own sections.
 /// Deeper headings are left alone once they reach `######`, which is as far as
 /// markdown goes. Fenced code blocks are skipped: `#` inside one is a comment,
-/// not a heading.
+/// not a heading — and which lines those are is [`Fences`]'s answer, the same
+/// one `workflows::worker_section` reads the file by.
 fn demote(body: &str) -> String {
     let mut out = String::with_capacity(body.len() + 32);
-    let mut fenced = false;
+    let mut fences = Fences::default();
     for line in body.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-        }
-        let hashes = if fenced {
+        let hashes = if fences.feed(line) {
             0
         } else {
             trimmed.bytes().take_while(|b| *b == b'#').count()
@@ -1470,12 +1527,203 @@ mod tests {
     #[test]
     fn every_builtin_fits_the_briefs_workflow_budget() {
         for (name, body) in crate::workflows::BUILTIN {
+            // The *demoted* string is what section 3 truncates — two characters
+            // longer per heading than the raw file — so that is what has to
+            // fit, for the master's whole file and the worker's section alike.
+            for (part, text) in [
+                ("whole", demote(body.trim())),
+                (
+                    "worker",
+                    demote(crate::workflows::worker_section(body).unwrap_or("").trim()),
+                ),
+            ] {
+                assert!(
+                    text.chars().count() <= WORKFLOW_MAX_CHARS,
+                    "{name} ({part}) is {} chars, over the {WORKFLOW_MAX_CHARS} budget",
+                    text.chars().count()
+                );
+            }
+        }
+    }
+
+    /// The brief's outline, read the way a reader does: a `##` inside a code
+    /// fence is content.
+    fn outline(md: &str) -> Vec<&str> {
+        let mut fences = Fences::default();
+        md.lines()
+            .filter(|line| !fences.feed(line) && line.starts_with("## "))
+            .collect()
+    }
+
+    const BRIEF_OUTLINE: [&str; 10] = [
+        "## 1. Quest",
+        "## 2. How you work here",
+        "## 3. Workflow",
+        "## 4. Beads",
+        "## 5. Sessions",
+        "## 6. Links",
+        "## 7. Artifacts",
+        "## 8. Brain session `alpha-session`",
+        "## 9. Recent events",
+        "## 10. Open questions / blockers",
+    ];
+
+    /// `demote` used to toggle a bool on any ``` or `~~~`, so a nested or
+    /// mismatched fence inverted it and every heading after it went in
+    /// verbatim — two `## 4. Beads` in one brief.
+    #[test]
+    fn a_nested_or_mismatched_fence_does_not_let_a_workflows_headings_out() {
+        for (name, body) in [
+            // A ``` nested inside a longer ```` fence.
+            (
+                "nested",
+                "# nested\n\nExample:\n\n````\nq note \"x\"\n```\n````\n\n## 4. Beads\n\nnot a brief section.\n",
+            ),
+            // A ``` inside a ~~~ block.
+            (
+                "tilde",
+                "# tilde\n\n~~~\ncode\n```\nmore code\n~~~\n\n## 4. Beads\n\nnot a brief section.\n",
+            ),
+            // A closing fence carries no info string, so this one stays open.
+            (
+                "info",
+                "# info\n\n```\ncode\n``` rust\ncode\n```\n\n## 4. Beads\n\nnot a brief section.\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            Registry::new(dir.path()).write(name, body).unwrap();
+            let (db, quest, opts) = with_workflow(name, dir.path());
+            let md = render_with(&db, &quest, &opts, &NoExternal).unwrap();
+            assert_eq!(outline(&md), BRIEF_OUTLINE, "{name}:\n{md}");
+            assert_eq!(
+                md.lines().filter(|l| *l == "## 4. Beads").count(),
+                1,
+                "{name}: the workflow's heading posed as a brief section:\n{md}"
+            );
             assert!(
-                body.chars().count() <= WORKFLOW_MAX_CHARS,
-                "{name} is {} chars, over the {WORKFLOW_MAX_CHARS} budget",
-                body.chars().count()
+                section3(&md).contains("#### 4. Beads"),
+                "{name}: demoted, not dropped:\n{md}"
             );
         }
+    }
+
+    /// A cut inside an open fence turned the truncation notice and sections
+    /// 4–10 into code.
+    #[test]
+    fn truncation_never_leaves_a_code_fence_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = String::from("# big\n\nintro\n\n```bash\n");
+        for i in 0..1_200 {
+            body.push_str(&format!("echo line {i}\n"));
+        }
+        body.push_str("```\n\nTAIL\n");
+        assert!(body.chars().count() > WORKFLOW_MAX_CHARS * 2);
+        Registry::new(dir.path()).write("big", &body).unwrap();
+        let (db, quest, opts) = with_workflow("big", dir.path());
+        let md = render_with(&db, &quest, &opts, &NoExternal).unwrap();
+
+        assert!(!md.contains("TAIL"), "the tail survived the cut:\n{md}");
+        let count = md
+            .lines()
+            .filter(|l| l.trim_start().starts_with("```"))
+            .count();
+        assert_eq!(
+            count % 2,
+            0,
+            "an odd number of fence lines ({count}):\n{md}"
+        );
+        let mut fences = Fences::default();
+        for line in md.lines() {
+            fences.feed(line);
+        }
+        assert_eq!(fences.closer(), None, "a fence was left open:\n{md}");
+        // The notice and every section after 3 are prose, not code.
+        assert_eq!(outline(&md), BRIEF_OUTLINE, "{md}");
+        assert!(section3(&md).contains("_(truncated:"), "{md}");
+        // The cut lands on a line boundary, so no half-written line is left.
+        assert!(!md.contains("echo line 1\n```\n\necho"), "{md}");
+    }
+
+    /// SPEC §11 and `q spawn --workflow`'s own help ("default: the Quest's"):
+    /// a worker with its own workflow reads that one, not its master's.
+    #[test]
+    fn a_worker_with_its_own_workflow_reads_that_one_not_the_quests() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::new(dir.path());
+        registry
+            .write("mine", "# mine\n\nMASTERS\n\n## worker\n\nMASTERS-WORKER\n")
+            .unwrap();
+        registry
+            .write("hers", "# hers\n\nHERS\n\n## worker\n\nHERS-WORKER\n")
+            .unwrap();
+        let (db, quest, opts) = with_workflow("mine", dir.path());
+
+        let mut own = Session::new(&quest.id, SessionRole::Worker, "w2-own", "q-alpha", "%4");
+        own.workflow = Some("hers".to_string());
+        db.insert_session(&own).unwrap();
+
+        let by_session = Opts {
+            session: Some("w2-own".to_string()),
+            ..opts.clone()
+        };
+        let body =
+            section3(&render_with(&db, &quest, &by_session, &NoExternal).unwrap()).to_string();
+        assert!(body.contains("`hers`"), "{body}");
+        assert!(body.contains("HERS-WORKER"), "{body}");
+        assert!(!body.contains("MASTERS"), "{body}");
+
+        // A worker with no workflow of its own still reads the Quest's.
+        let inherited = Opts {
+            session: Some("w1-tests".to_string()),
+            ..opts.clone()
+        };
+        let body =
+            section3(&render_with(&db, &quest, &inherited, &NoExternal).unwrap()).to_string();
+        assert!(body.contains("MASTERS-WORKER"), "{body}");
+
+        // And the Quest's own brief is unaffected.
+        let body = section3(&render_with(&db, &quest, &opts, &NoExternal).unwrap()).to_string();
+        assert!(
+            body.contains("`mine`") && body.contains("MASTERS"),
+            "{body}"
+        );
+    }
+
+    /// A whitespace-only column is unset, not a workflow whose name is spaces —
+    /// the shape a row written before `--workflow` trimmed can still be in.
+    #[test]
+    fn a_whitespace_only_workflow_column_is_no_workflow_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, quest, opts) = with_workflow("   ", dir.path());
+        let md = render_with(&db, &quest, &opts, &NoExternal).unwrap();
+        assert!(section3(&md).contains("No workflow set"), "{md}");
+        assert!(md.contains("- **workflow**: -"), "{md}");
+    }
+
+    #[test]
+    fn an_empty_workflow_says_which_half_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        // `write` refuses an empty body, so this is a file put there by hand.
+        std::fs::write(dir.path().join("blank.md"), "\n\n").unwrap();
+        let (db, quest, opts) = with_workflow("blank", dir.path());
+        let md = render_with(&db, &quest, &opts, &NoExternal).unwrap();
+        assert!(section3(&md).contains("the workflow file is empty"), "{md}");
+
+        std::fs::write(
+            dir.path().join("half.md"),
+            "# half\n\nmaster text\n\n## worker\n",
+        )
+        .unwrap();
+        let (db, quest, opts) = with_workflow("half", dir.path());
+        let worker = Opts {
+            role: SessionRole::Worker,
+            ..opts
+        };
+        let md = render_with(&db, &quest, &worker, &NoExternal).unwrap();
+        assert!(
+            section3(&md).contains("the workflow's worker section is empty"),
+            "{md}"
+        );
     }
 
     #[test]

@@ -76,6 +76,10 @@ fn list(ctx: &Ctx, registry: &Registry) -> anyhow::Result<()> {
 
 fn show(ctx: &Ctx, registry: &Registry, name: &str, worker: bool) -> anyhow::Result<()> {
     let workflow = registry.get(name)?;
+    // `q tpl show`'s gate, which the module docs say this follows.
+    if !ctx.json && ctx.quiet {
+        return Ok(());
+    }
     // `--worker` answers "what would a worker actually be handed", which is the
     // question a workflow author has while writing the `## worker` section.
     let part = workflow.for_role(if worker {
@@ -85,6 +89,15 @@ fn show(ctx: &Ctx, registry: &Registry, name: &str, worker: bool) -> anyhow::Res
     });
     let text = part.text().to_string();
     let whole_for_worker = matches!(part, crate::workflows::Part::WholeForWorker(_));
+    // The brief says this out loud, and `--worker` asks the same question the
+    // brief answers. On stderr so `q workflow show x --worker | …` still pipes
+    // the workflow and nothing else.
+    if whole_for_worker && !ctx.json {
+        eprintln!(
+            "note: `{name}` defines no `## worker` section, so this is the whole file — \
+             the master's copy, which is what a worker would be handed"
+        );
+    }
     output::emit(
         ctx.json,
         &serde_json::json!({
@@ -102,7 +115,7 @@ fn show(ctx: &Ctx, registry: &Registry, name: &str, worker: bool) -> anyhow::Res
 
 fn add(ctx: &Ctx, registry: &Registry, name: &str, file: Option<&str>) -> anyhow::Result<()> {
     crate::workflows::validate_name(name)?;
-    if registry.path_of(name).is_file() {
+    if registry.file(name)?.is_some() {
         return Err(QError::Conflict(format!(
             "workflow `{name}` already exists; change it with `q workflow edit {name}`"
         ))
@@ -146,9 +159,13 @@ fn edit(ctx: &Ctx, registry: &Registry, name: &str, file: Option<&str>) -> anyho
 }
 
 fn rm(ctx: &Ctx, registry: &Registry, name: &str, force: bool) -> anyhow::Result<()> {
-    crate::workflows::validate_name(name)?;
-    let reveals = crate::workflows::is_builtin(name) && registry.path_of(name).is_file();
-    if !force {
+    // Whether there is a file at all decides both questions: a built-in with
+    // no file is about to be refused, and asking "remove workflow review?"
+    // before saying "there is nothing to remove" is a confirm for a delete
+    // that was never going to happen.
+    let file = registry.file(name)?;
+    let reveals = crate::workflows::is_builtin(name) && file.is_some();
+    if !force && file.is_some() {
         let note = if reveals {
             format!("remove your workflow {name}? (the built-in comes back)")
         } else {

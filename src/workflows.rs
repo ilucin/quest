@@ -244,9 +244,7 @@ impl Registry {
 
     /// One workflow, body included. A user file wins over the built-in.
     pub fn get(&self, name: &str) -> anyhow::Result<Workflow> {
-        validate_name(name)?;
-        let path = self.path_of(name);
-        if path.is_file() {
+        if let Some(path) = self.file(name)? {
             return Ok(Workflow {
                 name: name.to_string(),
                 source: if is_builtin(name) {
@@ -276,19 +274,50 @@ impl Registry {
     /// workflow ""` clears the column, so callers strip it before they get
     /// here and it is refused rather than silently accepted.
     pub fn require(&self, name: &str) -> anyhow::Result<()> {
-        validate_name(name)?;
-        if self.path_of(name).is_file() || is_builtin(name) {
+        if self.file(name)?.is_some() || is_builtin(name) {
             return Ok(());
         }
         Err(self.unknown(name))
     }
 
-    /// `Some(())` when the name is set and unknown; `Ok(())` for a blank one.
-    /// The spelling every caller with an `Option<&str>` flag uses.
+    /// `Ok(())` when the name is set and known, or blank. The spelling a
+    /// caller with an `Option<&str>` flag that stores nothing uses; a caller
+    /// that stores the name wants [`Registry::check_opt`].
     pub fn require_opt(&self, name: Option<&str>) -> anyhow::Result<()> {
-        match name.map(str::trim).filter(|n| !n.is_empty()) {
-            Some(name) => self.require(name),
-            None => Ok(()),
+        self.check_opt(name).map(|_| ())
+    }
+
+    /// The workflow a `--workflow` flag names — checked, and **returned**, so
+    /// the caller stores exactly the string that was validated.
+    ///
+    /// `q new`, `q spawn` and `q set <quest> workflow` all trim before they
+    /// check; returning the trimmed name is what stops one of them from
+    /// storing `" solo "` in a column whose every later read then reports a
+    /// workflow that "could not be read". Whitespace-only is no workflow at
+    /// all — the same "unset" `q set <quest> workflow ""` means.
+    pub fn check_opt(&self, name: Option<&str>) -> anyhow::Result<Option<String>> {
+        let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
+            return Ok(None);
+        };
+        self.require(name)?;
+        Ok(Some(name.to_string()))
+    }
+
+    /// The user file backing `name`, if there is one.
+    ///
+    /// `Ok(None)` means "not there"; an unreadable directory is an error, not
+    /// an absence. `path_of(name).is_file()` answered `false` to both, so a
+    /// `chmod 000` on the workflows directory used to make `q new --workflow
+    /// triage` refuse a Quest for a workflow that exists — see
+    /// [`Registry::list`]'s note about hiding a whole shelf of them.
+    pub fn file(&self, name: &str) -> anyhow::Result<Option<PathBuf>> {
+        validate_name(name)?;
+        let path = self.path_of(name);
+        match std::fs::metadata(&path) {
+            Ok(md) if md.is_file() => Ok(Some(path)),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_error(&path, e)),
         }
     }
 
@@ -312,9 +341,7 @@ impl Registry {
     /// the binary and cannot be removed, and saying so is more use than a
     /// `not_found` about a workflow that plainly exists.
     pub fn remove(&self, name: &str) -> anyhow::Result<PathBuf> {
-        validate_name(name)?;
-        let path = self.path_of(name);
-        if !path.is_file() {
+        let Some(path) = self.file(name)? else {
             if is_builtin(name) {
                 return Err(QError::Invalid(format!(
                     "`{name}` is a built-in workflow and is embedded in the binary; \
@@ -323,19 +350,20 @@ impl Registry {
                 .into());
             }
             return Err(self.unknown(name));
-        }
-        std::fs::remove_file(&path)
-            .map_err(|e| QError::Io(std::io::Error::other(format!("{}: {e}", path.display()))))?;
+        };
+        std::fs::remove_file(&path).map_err(|e| io_error(&path, e))?;
         Ok(path)
     }
 
     /// `not found: unknown workflow `x`; known: a, b, c` — the list, because
     /// that is the only useful reply to a typo.
+    /// A directory that cannot be listed is reported as itself: offering the
+    /// built-ins as "known" would be a wrong list under a wrong verdict.
     pub fn unknown(&self, name: &str) -> anyhow::Error {
-        let known = self
-            .names()
-            .map(|names| names.join(", "))
-            .unwrap_or_else(|_| BUILTIN.map(|(n, _)| n).join(", "));
+        let known = match self.names() {
+            Ok(names) => names.join(", "),
+            Err(e) => return e,
+        };
         QError::NotFound(format!(
             "unknown workflow `{name}`; known: {known} (add one with `q workflow add {name}`)"
         ))
@@ -349,22 +377,11 @@ impl Registry {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => {
-                return Err(QError::Io(std::io::Error::other(format!(
-                    "{}: {e}",
-                    self.dir.display()
-                )))
-                .into());
-            }
+            Err(e) => return Err(io_error(&self.dir, e)),
         };
         let mut out = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|e| {
-                QError::Io(std::io::Error::other(format!(
-                    "{}: {e}",
-                    self.dir.display()
-                )))
-            })?;
+            let entry = entry.map_err(|e| io_error(&self.dir, e))?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some(EXT) {
                 continue;
@@ -383,8 +400,17 @@ impl Registry {
 }
 
 fn read(path: &Path) -> anyhow::Result<String> {
-    std::fs::read_to_string(path)
-        .map_err(|e| QError::Io(std::io::Error::other(format!("{}: {e}", path.display()))).into())
+    std::fs::read_to_string(path).map_err(|e| io_error(path, e))
+}
+
+/// `io: <path>: <reason>`, once.
+///
+/// The path goes in the message and nothing is nested: `QError::Io` used to
+/// carry an `io::Error` that thiserror also exposed as the error's `source`, so
+/// folding the path into a nested `io::Error` printed the whole thing twice
+/// under anyhow's `{:#}`.
+fn io_error(path: &Path, e: std::io::Error) -> anyhow::Error {
+    QError::Io(format!("{}: {e}", path.display())).into()
 }
 
 /// Trailing whitespace off every line and exactly one trailing newline — a
@@ -451,10 +477,18 @@ pub fn worker_section(body: &str) -> Option<&str> {
     // Byte offsets rather than collected lines, so the section borrows `body`.
     let mut offset = 0usize;
     let mut start: Option<usize> = None;
+    let mut fences = Fences::default();
     for line in body.split_inclusive('\n') {
         let line_start = offset;
         offset += line.len();
         let text = line.trim_end_matches('\n');
+        // A `## worker` inside a fence is a workflow documenting the
+        // convention, not the heading that carves the section out — and the
+        // real heading further down must not be mistaken for the break that
+        // ends it. Same scan as the brief's `demote`; see [`Fences`].
+        if fences.feed(text) {
+            continue;
+        }
         match start {
             None if is_worker_heading(text) => start = Some(offset),
             None => {}
@@ -472,11 +506,90 @@ fn is_worker_heading(line: &str) -> bool {
 }
 
 /// A `#` or `##` heading — what ends the worker section. A deeper heading
-/// (`###`) is part of it.
+/// (`###`) is part of it. Callers feed only lines [`Fences`] says are outside
+/// a code block.
 fn is_section_break(line: &str) -> bool {
     let line = line.trim_start();
     (line.starts_with("## ") && !line.starts_with("### "))
         || (line.starts_with("# ") && !line.starts_with("## "))
+}
+
+/// Fenced-code-block state, line by line — the one answer in the codebase to
+/// "is this line inside a code fence".
+///
+/// Both places that read markdown structurally need it and used to disagree:
+/// [`worker_section`] had no fence state at all (a `## worker` in a fence
+/// carved the section, and the real heading then ended it), and
+/// `brief::demote` toggled a bool on any line starting with ``` or `~~~` (a
+/// nested or mismatched fence inverted it and let a workflow's own `##`
+/// headings into the brief's outline). So the CommonMark rules that actually
+/// matter here, once:
+///
+/// * a fence opens with three or more ``` or `~~~`, indented at most three
+///   spaces;
+/// * it closes only on the **same character**, **at least as long**, and with
+///   nothing but spaces after it — a closing fence carries no info string;
+/// * a backtick fence's info string may not contain a backtick;
+/// * anything else — a shorter fence, the other character, a nested one — is
+///   content.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Fences {
+    /// The open fence's character and length, if one is open.
+    open: Option<(u8, usize)>,
+}
+
+impl Fences {
+    /// Feeds one line (no trailing newline) and answers whether it belongs to
+    /// a fenced code block — the delimiters included, since neither caller
+    /// treats a delimiter as prose.
+    pub fn feed(&mut self, line: &str) -> bool {
+        match self.open {
+            Some((ch, len)) => {
+                if let Some((c, n, info)) = fence_marker(line)
+                    && c == ch
+                    && n >= len
+                    && info.is_empty()
+                {
+                    self.open = None;
+                }
+                true
+            }
+            None => match fence_marker(line) {
+                Some((ch, n, info)) if !(ch == b'`' && info.contains('`')) => {
+                    self.open = Some((ch, n));
+                    true
+                }
+                _ => false,
+            },
+        }
+    }
+
+    /// The delimiter that would close the fence still open, if any — what a
+    /// truncated body has to end with so the text after it is not swallowed.
+    pub fn closer(&self) -> Option<String> {
+        self.open.map(|(ch, n)| (ch as char).to_string().repeat(n))
+    }
+}
+
+/// `(fence char, run length, info string)` for a line that could be a fence
+/// delimiter. Four or more leading spaces is an indented code block, not a
+/// fence.
+fn fence_marker(line: &str) -> Option<(u8, usize, &str)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let ch = match rest.as_bytes().first() {
+        Some(b'`') => b'`',
+        Some(b'~') => b'~',
+        _ => return None,
+    };
+    let n = rest.bytes().take_while(|b| *b == ch).count();
+    if n < 3 {
+        return None;
+    }
+    Some((ch, n, rest[n..].trim()))
 }
 
 #[cfg(test)]
@@ -542,6 +655,131 @@ mod tests {
         // An empty section is a section — the file said workers get nothing
         // extra, which is not the same as saying nothing.
         assert_eq!(worker_section("## worker\n\n## next\n").unwrap(), "");
+    }
+
+    /// A workflow that documents its own `## worker` convention inside a fence
+    /// used to hand the worker the master's prose *and* lose the real section.
+    #[test]
+    fn a_worker_heading_inside_a_fence_is_documentation_not_the_section() {
+        let body = concat!(
+            "# fence\n\n",
+            "Master-only secret: DO-NOT-LEAK\n\n",
+            "```markdown\n",
+            "## worker\n",
+            "this is documentation about how the worker heading works\n",
+            "```\n\n",
+            "More master-only text: SECOND-SECRET\n\n",
+            "## worker\n\n",
+            "real worker text\n",
+        );
+        let section = worker_section(body).expect("the real heading is still found");
+        assert_eq!(section, "real worker text", "the loss half: {section:?}");
+        assert!(
+            !section.contains("SECOND-SECRET") && !section.contains("documentation about"),
+            "the leak half: {section:?}"
+        );
+
+        // With no real heading there is no section at all — `has_worker_section`
+        // in `q workflow list`/`show` and the write payloads says so.
+        let only_in_a_fence = "# f\n\n```md\n## worker\nnot a heading\n```\n\ntail\n";
+        assert!(worker_section(only_in_a_fence).is_none());
+        assert!(!entry("f", Source::User, None, only_in_a_fence).has_worker_section);
+
+        // The fence rules apply to the *break* too: a `## after` inside a fence
+        // does not end the section.
+        let fenced_break = "## worker\n\nyours\n\n~~~\n## after\n~~~\n\nstill yours\n";
+        let section = worker_section(fenced_break).unwrap();
+        assert!(section.contains("still yours"), "{section:?}");
+    }
+
+    #[test]
+    fn fences_follow_the_commonmark_rules_that_matter() {
+        let inside = |body: &str| -> Vec<bool> {
+            let mut fences = Fences::default();
+            body.lines().map(|l| fences.feed(l)).collect()
+        };
+
+        // A shorter fence nested in a longer one is content, and the longer one
+        // still closes.
+        assert_eq!(
+            inside("````\ncode\n```\ncode\n````\nout\n"),
+            [true, true, true, true, true, false]
+        );
+        // A backtick fence cannot close a tilde one.
+        assert_eq!(
+            inside("~~~\ncode\n```\ncode\n~~~\nout\n"),
+            [true, true, true, true, true, false]
+        );
+        // A closing fence carries no info string, and must be at least as long.
+        assert_eq!(
+            inside("```\ncode\n``` rust\ncode\n``\n```\nout\n"),
+            [true, true, true, true, true, true, false]
+        );
+        // Four spaces of indent is an indented code block, not a fence.
+        assert_eq!(inside("    ```\nout\n"), [false, false]);
+        // A backtick fence's info string may not contain a backtick.
+        assert_eq!(inside("``` a`b\nout\n"), [false, false]);
+
+        // What it takes to close whatever is still open.
+        let closer = |body: &str| {
+            let mut fences = Fences::default();
+            for line in body.lines() {
+                fences.feed(line);
+            }
+            fences.closer()
+        };
+        assert_eq!(closer("````js\ncode\n").as_deref(), Some("````"));
+        assert_eq!(closer("~~~\ncode\n").as_deref(), Some("~~~"));
+        assert_eq!(closer("```\ncode\n```\n"), None);
+    }
+
+    /// A directory that cannot be read is an IO error, not "that workflow does
+    /// not exist" with a list that has silently fallen back to the built-ins.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_workflows_directory_is_an_io_error_not_a_missing_workflow() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = dir();
+        let registry = Registry::new(dir.path().join("workflows"));
+        std::fs::create_dir_all(registry.dir()).unwrap();
+        registry.write("triage", "# triage\n\nmine.\n").unwrap();
+        std::fs::set_permissions(registry.dir(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root ignores the mode; there is nothing to assert then.
+        let readable = std::fs::metadata(registry.path_of("triage")).is_ok();
+        if !readable {
+            for e in [
+                registry.get("triage").unwrap_err(),
+                registry.require("triage").unwrap_err(),
+                registry.check_opt(Some("triage")).unwrap_err(),
+                registry.file("triage").unwrap_err(),
+                registry.list().unwrap_err(),
+            ] {
+                assert_eq!(
+                    e.downcast_ref::<QError>().map(QError::code),
+                    Some("io"),
+                    "{e:#}"
+                );
+                let printed = format!("{e:#}");
+                assert!(!printed.contains("unknown workflow"), "{printed}");
+                // Once, not twice: `QError::Io` no longer nests the io error.
+                assert_eq!(printed.matches("os error").count(), 1, "{printed}");
+            }
+        }
+        std::fs::set_permissions(registry.dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_workflow_flag_is_stored_exactly_as_it_was_checked() {
+        let dir = dir();
+        let registry = Registry::new(dir.path());
+        assert_eq!(
+            registry.check_opt(Some(" solo ")).unwrap().as_deref(),
+            Some("solo")
+        );
+        assert_eq!(registry.check_opt(Some("   ")).unwrap(), None);
+        assert_eq!(registry.check_opt(Some("")).unwrap(), None);
+        assert_eq!(registry.check_opt(None).unwrap(), None);
+        assert!(registry.check_opt(Some(" nope ")).is_err());
     }
 
     #[test]
