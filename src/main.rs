@@ -311,6 +311,16 @@ impl Ctx {
 }
 
 fn main() {
+    // Rust's std installs SIG_IGN for SIGPIPE at startup, which turns a closed
+    // downstream pipe (`q … | head`) into an EPIPE the writer has to handle.
+    // `output::emit` handles it, but the many direct `println!`/`print!` paths
+    // panic on that write error instead. Restoring the default disposition
+    // makes any write to a closed pipe terminate the process via SIGPIPE (exit
+    // 141), like every normal Unix tool — no error noise, no panic, and it
+    // covers every stdout path at once rather than one funnel at a time.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let args = parse_cli();
     match run(&args) {
         Ok(0) => {}
@@ -640,8 +650,10 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
         Command::Note {
             text,
             blocker,
+            resolve,
             quest,
-        } => commands::note::run(ctx, text, *blocker, quest.as_deref()).map(|()| 0),
+        } => commands::note::run(ctx, text.as_deref(), *blocker, *resolve, quest.as_deref())
+            .map(|()| 0),
         Command::Link { action } => match action {
             LinkAction::Add {
                 r#ref,

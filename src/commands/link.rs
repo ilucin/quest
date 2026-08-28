@@ -47,6 +47,7 @@ pub fn add(ctx: &Ctx, args: &AddArgs) -> anyhow::Result<()> {
     let reference = match kind {
         LinkKind::Worktree | LinkKind::Artifact => absolute(&cwd, &reference),
         LinkKind::Pr => normalize_pr_url(&reference),
+        LinkKind::Task => normalize_productive_task_url(&reference),
         _ => reference,
     };
     let mut link = Link::new(&target.quest.id, kind.as_str(), &reference);
@@ -360,6 +361,36 @@ pub(crate) fn normalize_pr_url(reference: &str) -> String {
     )
 }
 
+/// `https://app.productive.io/<org>/tasks/<id>` — https scheme, `tasks`
+/// (plural), the numeric task id, no query string and no trailing path. A
+/// deep link (`.../tasks?filter=1&task/123`) and the plain form
+/// (`.../tasks/123`) collapse to one canonical ref so the same task dedupes
+/// on UNIQUE(quest_id, kind, ref). The `<org>` segment is preserved verbatim.
+/// A URL that is not a recognisable Productive task is returned unchanged.
+pub(crate) fn normalize_productive_task_url(reference: &str) -> String {
+    let Some(rest) = strip_scheme(reference) else {
+        return reference.to_string();
+    };
+    if !is_productive_task(rest) {
+        return reference.to_string();
+    }
+    let path = rest.strip_prefix("app.productive.io/").unwrap_or(rest);
+    let mut segments = path.split(['/', '?', '&', '=']).peekable();
+    // Org is the first token of the same stream the id is read from, so a
+    // malformed `<org>?tasks/<id>` cannot leak `?tasks` into the org segment.
+    let org = segments.peek().copied().unwrap_or("");
+    while let Some(seg) = segments.next() {
+        if (seg == "task" || seg == "tasks")
+            && let Some(id) = segments.peek()
+            && !id.is_empty()
+            && id.chars().all(|c| c.is_ascii_digit())
+        {
+            return format!("https://app.productive.io/{org}/tasks/{id}");
+        }
+    }
+    reference.to_string()
+}
+
 // ------------------------------------------------------------ kind detection
 
 /// What a reference looks like on disk, as seen by `detect_kind`.
@@ -602,6 +633,66 @@ mod tests {
             ("bd-1", "bd-1"),
         ] {
             assert_eq!(normalize_pr_url(input), want, "{input}");
+        }
+    }
+
+    #[test]
+    fn productive_task_urls_are_canonicalised_others_untouched() {
+        for (input, want) in [
+            // Plain form is already canonical.
+            (
+                "https://app.productive.io/1-acme/tasks/123",
+                "https://app.productive.io/1-acme/tasks/123",
+            ),
+            // Deep link with query → query stripped, singular collapsed.
+            (
+                "https://app.productive.io/1-acme/tasks?filter=1&task/123",
+                "https://app.productive.io/1-acme/tasks/123",
+            ),
+            // Singular `task` → plural `tasks`.
+            (
+                "https://app.productive.io/1-acme/task/9",
+                "https://app.productive.io/1-acme/tasks/9",
+            ),
+            // http → https.
+            (
+                "http://app.productive.io/1-acme/tasks/123",
+                "https://app.productive.io/1-acme/tasks/123",
+            ),
+            // Trailing slash and extra path segments after the id are dropped.
+            (
+                "https://app.productive.io/1-acme/tasks/123/",
+                "https://app.productive.io/1-acme/tasks/123",
+            ),
+            (
+                "https://app.productive.io/1-acme/tasks/123/comments?x=1",
+                "https://app.productive.io/1-acme/tasks/123",
+            ),
+            // Numeric-only org preserved exactly.
+            (
+                "https://app.productive.io/1/task/9",
+                "https://app.productive.io/1/tasks/9",
+            ),
+            // Non-task Productive URL is left untouched.
+            (
+                "https://app.productive.io/1-acme/projects/9",
+                "https://app.productive.io/1-acme/projects/9",
+            ),
+            // Non-numeric task id is not a task → passed through unchanged.
+            (
+                "https://app.productive.io/1-acme/tasks/abc",
+                "https://app.productive.io/1-acme/tasks/abc",
+            ),
+            // Malformed `<org>?tasks/<id>` still yields a clean org segment.
+            (
+                "https://app.productive.io/1-acme?tasks/123",
+                "https://app.productive.io/1-acme/tasks/123",
+            ),
+            // Non-Productive URLs and non-URLs pass through unchanged.
+            ("https://example.com/x", "https://example.com/x"),
+            ("bd-1", "bd-1"),
+        ] {
+            assert_eq!(normalize_productive_task_url(input), want, "{input}");
         }
     }
 

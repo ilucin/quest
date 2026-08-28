@@ -122,6 +122,22 @@ impl Db {
         })
     }
 
+    /// One event by id, scoped to a Quest so a foreign id cannot be reached.
+    /// `None` when no such event exists in this Quest.
+    pub fn event_in_quest(&self, quest_id: &str, id: i64) -> anyhow::Result<Option<Event>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM event WHERE quest_id = ?1 AND id = ?2"),
+                params![quest_id, id],
+                row_to_event,
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(db_err(other)),
+            })
+    }
+
     /// Most recent first, capped at `limit`.
     pub fn list_events_by_quest(&self, quest_id: &str, limit: usize) -> anyhow::Result<Vec<Event>> {
         let mut stmt = self

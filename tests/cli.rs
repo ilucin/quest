@@ -3550,9 +3550,12 @@ fn brief_resolves_quest_and_role_from_env() {
 
 #[test]
 fn brief_survives_a_closed_pipe() {
+    use std::os::unix::process::ExitStatusExt;
     let env = Env::new();
     env.new_quest("piped");
-    // The read end is closed before `q` writes, so the write hits EPIPE.
+    // The read end is closed before `q` writes, so the write hits a gone
+    // reader. `main` restores SIG_DFL for SIGPIPE, so that terminates `q` by
+    // signal (the Unix norm) rather than surfacing as an error.
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("q"))
         .env("Q_DB", env.dir.path().join("q.db"))
         .env("Q_CONFIG", env.dir.path().join("config.toml"))
@@ -3564,9 +3567,13 @@ fn brief_survives_a_closed_pipe() {
         .unwrap();
     drop(child.stdout.take());
     let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
+    // Killed by SIGPIPE (signal 13 on Linux and macOS), not an error exit,
+    // and — the point — nothing on stderr: no "Broken pipe", no panic.
+    assert_eq!(
+        out.status.signal(),
+        Some(13),
+        "expected termination by SIGPIPE, got {:?}; stderr:\n{}",
+        out.status,
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
@@ -3884,8 +3891,10 @@ fn events_follow_with_an_empty_first_page_tails_from_the_end() {
 
 #[test]
 fn events_follow_survives_a_closed_pipe() {
+    use std::os::unix::process::ExitStatusExt;
     // The initial page is empty, so the first write happens on the second
-    // poll — after the reader has gone away — and must hit EPIPE, not fail.
+    // poll — after the reader has gone away. `main` restores SIG_DFL for
+    // SIGPIPE, so that write terminates `q` by signal rather than failing.
     let (env, id, _master) = events_env("evt");
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("q"))
         .env("Q_DB", env.dir.path().join("q.db"))
@@ -3902,9 +3911,13 @@ fn events_follow_survives_a_closed_pipe() {
     std::thread::sleep(std::time::Duration::from_millis(300));
     env.seed_event(&id, None, "note", r#"{"text":"into the void"}"#);
     let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
+    // Killed by SIGPIPE (signal 13 on Linux and macOS), not an error exit,
+    // and nothing on stderr: no "Broken pipe", no panic.
+    assert_eq!(
+        out.status.signal(),
+        Some(13),
+        "expected termination by SIGPIPE, got {:?}; stderr:\n{}",
+        out.status,
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
@@ -4192,6 +4205,33 @@ fn links_degrades_to_the_bare_ref_when_enrichment_is_unavailable() {
     assert_eq!(out[0]["ref"], url);
     assert!(out[0]["title"].is_null(), "no title without a fetch: {out}");
     assert!(out[0]["enriched_at"].is_null(), "no cache stamp: {out}");
+}
+
+#[test]
+fn link_add_collapses_task_deep_link_and_plain_form_to_one_row() {
+    let pane = Pane::new();
+    let deep = "https://app.productive.io/1-acme/tasks?filter=1&task/123";
+    let plain = "https://app.productive.io/1-acme/tasks/123";
+    let canonical = plain;
+
+    let out = pane.json(&["link", "add", deep]);
+    assert_eq!(out["created"], true);
+    assert_eq!(out["link"]["kind"], "task");
+    assert_eq!(out["link"]["ref"], canonical);
+
+    // The plain form of the same task is the existing row, not a new one.
+    let out = pane.json(&["link", "add", plain]);
+    assert_eq!(out["created"], false);
+    assert_eq!(out["link"]["ref"], canonical);
+
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 1);
+    assert_eq!(
+        pane.events()
+            .iter()
+            .filter(|(k, _, _)| k == "link.added")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -12739,4 +12779,60 @@ fn help_lists_the_workflow_command() {
     for sub in ["list", "show", "add", "edit", "rm", "set"] {
         assert!(out.contains(sub), "`{sub}` missing:\n{out}");
     }
+}
+
+/// A closed downstream reader (`q … | head`) must stay silent on stdout paths:
+/// no "error: Broken pipe" on stderr and no Rust panic. Restoring the default
+/// SIGPIPE disposition at the top of `main` (see `src/main.rs`) makes a write
+/// to a gone reader terminate the process the way every Unix tool does, so a
+/// large `workflow show` cut short by `head` unwinds nothing and prints no
+/// error. `head` closes the pipe after one line, and the body is far past any
+/// pipe buffer, so the closure lands mid-write.
+#[test]
+fn a_closed_downstream_pipe_prints_no_error_and_does_not_panic() {
+    let env = Env::new();
+    let big = "lorem ipsum dolor sit amet, consectetur adipiscing elit\n".repeat(30_000);
+    env.workflow("big", &big);
+
+    let q = assert_cmd::cargo::cargo_bin("q");
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("'{}' workflow show big | head -1", q.display()))
+        .env("Q_DB", env.dir.path().join("q.db"))
+        .env("Q_CONFIG", env.dir.path().join("config.toml"))
+        .env("Q_FIXTURE", env.dir.path().join("tmux.json"))
+        .env("Q_CLAUDE_SESSIONS_DIR", env.dir.path().join("registry"))
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env_remove("Q_QUEST")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.to_lowercase().contains("broken pipe"),
+        "a closed pipe surfaced as an error:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "a closed pipe unwound the process:\n{stderr}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("lorem ipsum"),
+        "`head` never saw the first line:\n{stdout}"
+    );
+}
+
+/// Guards the fix itself: the default SIGPIPE disposition must be restored in
+/// `main`, since every stdout path — including any future direct `println!` —
+/// relies on it rather than on a per-call BrokenPipe check.
+#[test]
+fn main_restores_the_default_sigpipe_disposition() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+    assert!(
+        src.contains("libc::signal(libc::SIGPIPE, libc::SIG_DFL)"),
+        "main() no longer restores SIG_DFL for SIGPIPE"
+    );
 }

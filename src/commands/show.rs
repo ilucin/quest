@@ -65,7 +65,7 @@ fn human(view: &QuestView, tmux_session: &str, sessions: &[Session], events: &[E
             "created",
             format!(
                 "{} ({} ago)",
-                fmt::stamp(quest.created_at),
+                fmt::stamp_utc(quest.created_at),
                 fmt::age(quest.created_at)
             ),
         ),
@@ -73,7 +73,7 @@ fn human(view: &QuestView, tmux_session: &str, sessions: &[Session], events: &[E
             "updated",
             format!(
                 "{} ({} ago)",
-                fmt::stamp(quest.updated_at),
+                fmt::stamp_utc(quest.updated_at),
                 fmt::age(quest.updated_at)
             ),
         ),
@@ -81,7 +81,11 @@ fn human(view: &QuestView, tmux_session: &str, sessions: &[Session], events: &[E
         out.push_str(&format!("\n  {label:<9}{value}"));
     }
     if let Some(finished_at) = quest.finished_at {
-        out.push_str(&format!("\n  {:<9}{}", "finished", fmt::stamp(finished_at)));
+        out.push_str(&format!(
+            "\n  {:<9}{}",
+            "finished",
+            fmt::stamp_utc(finished_at)
+        ));
     }
 
     out.push_str("\n\nsessions:\n");

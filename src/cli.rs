@@ -326,12 +326,15 @@ pub enum Command {
 
     /// Leave a note on the Quest's timeline
     Note {
-        /// Free text; a leading `-` is text, not a flag
+        /// Free text; a leading `-` is text, not a flag. Optional with `--resolve`.
         #[arg(allow_hyphen_values = true)]
-        text: String,
+        text: Option<String>,
         /// Mark the note as a blocker the master must resolve
         #[arg(long)]
         blocker: bool,
+        /// Resolve the blocker note with this event id, clearing it from brief §10
+        #[arg(long, value_name = "EVENT_ID", conflicts_with = "blocker")]
+        resolve: Option<i64>,
         #[arg(long, value_name = "QUEST")]
         quest: Option<String>,
     },

@@ -282,11 +282,12 @@ fn extract_bash(
                     push(Capture::new(LinkKind::Pr, link::normalize_pr_url(url)));
                 }
             } else if link::is_productive_task(rest) {
+                let canonical = link::normalize_productive_task_url(url);
                 if from_command {
-                    push(Capture::new(LinkKind::Task, url));
+                    push(Capture::new(LinkKind::Task, canonical));
                 } else if output_tasks
                     && tasks_from_output < MAX_OUTPUT_TASKS
-                    && push(Capture::new(LinkKind::Task, url))
+                    && push(Capture::new(LinkKind::Task, canonical))
                 {
                     tasks_from_output += 1;
                 }
@@ -481,12 +482,20 @@ mod tests {
                     "",
                 ),
                 vec![
-                    cap(
-                        K::Task,
-                        "https://app.productive.io/1-acme/tasks?filter=1&task/123",
-                    ),
+                    cap(K::Task, "https://app.productive.io/1-acme/tasks/123"),
                     cap(K::Task, "https://app.productive.io/1-acme/tasks/456"),
                 ],
+            ),
+            (
+                "same task as deep link and plain url in one command → one row",
+                "Bash",
+                bash(
+                    "curl 'https://app.productive.io/1-acme/tasks?filter=1&task/123' \
+                     'https://app.productive.io/1-acme/tasks/123'",
+                    "",
+                    "",
+                ),
+                vec![cap(K::Task, "https://app.productive.io/1-acme/tasks/123")],
             ),
             (
                 "task url in output of an unrelated command → none",
