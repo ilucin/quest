@@ -79,9 +79,11 @@ pub const NO_COMMAND: i32 = 127;
 pub const WIRE: u32 = 1;
 
 /// The oldest far-end wire `q doctor` calls compatible. Raise it and doctor
-/// *fails* a remote whose tag is below it; lower it and doctor accepts one.
-/// It changes nothing else: see [`WIRE`] — no command consults the wire before
-/// talking to a remote.
+/// *warns* about a remote whose tag is below it; lower it and doctor stops.
+/// It changes nothing else — not even the report's exit code: see [`WIRE`], no
+/// command consults the wire before talking to a remote, so a wire verdict is
+/// a prediction about a command doctor never ran and cannot be a failure
+/// without contradicting the listing about the same host (bd-8lz.5.4 D2).
 ///
 /// A far end that reports **no** tag is outside this comparison entirely, and
 /// no value here can bring it in. No tag means "older than wire tagging",

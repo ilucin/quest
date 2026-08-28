@@ -97,7 +97,7 @@ use crate::commands::{confirm, enter, flush_warnings, new};
 use crate::config::Remote;
 use crate::error::QError;
 use crate::output;
-use crate::remote::{self, SSH_FAILED, SshOutcome};
+use crate::remote::{self, NO_COMMAND, SSH_FAILED, SshOutcome};
 
 /// How the far end's `q` is invoked. SPEC §15 spells it as a bare `q`, so it is
 /// whatever that machine's login shell finds on `PATH` — the same assumption
@@ -670,6 +670,22 @@ fn relay(
                 Some(SSH_FAILED) | None => {
                     return Err(unreachable_remote(&remote.name, code, &stderr));
                 }
+                // The far end's shell never found a `q`. The listing has
+                // already said so on its own line; relaying `zsh:1: command
+                // not found: q` and exit 127 two lines later says it again in
+                // a language that is not this program's (bd-8lz.5.4 D6).
+                Some(NO_COMMAND) => return Err(no_q_there(&remote.name, &stderr)),
+                // A `q` too old for the hidden globals every proxied line
+                // carries rejects them as unknown arguments with clap's exit
+                // 2 — naming an argument the user never typed and the far-end
+                // binary's own usage. This end knows exactly what happened, so
+                // it says it, without a version round trip on the happy path
+                // (bd-8lz.5.4 D5).
+                Some(CLAP_USAGE) => {
+                    if let Some(flag) = rejected_pin(argv, &stderr) {
+                        return Err(too_old_there(&remote.name, flag, &stderr));
+                    }
+                }
                 Some(_) => {}
             }
             if !hold_stdout {
@@ -702,6 +718,72 @@ fn relay(
             Err(QError::Other(format!("cannot reach {}: {e}", remote.name)).into())
         }
     }
+}
+
+/// clap's exit code for a command line it would not parse. A `q` that ran
+/// exits 0 or 1; a 2 from the far end is its clap, not its code.
+const CLAP_USAGE: i32 = 2;
+
+/// Which of the words *this* end put on the line the far end's clap refused —
+/// `None` when it refused something the user typed, which is their own usage
+/// error and must be relayed unchanged.
+///
+/// Two shapes were seen against a real pre-bd-8lz.5.3 `q`: clap names the
+/// unknown flag (`unexpected argument '--expect' found`), and — where a
+/// subcommand's positionals are already full — it names the *value* that
+/// followed it (`unexpected argument 'q-e85c.1787879708' found`). Both are
+/// arguments the user never typed, so both are matched.
+fn rejected_pin(argv: &[String], stderr: &str) -> Option<&'static str> {
+    if !stderr.contains("unexpected argument") && !stderr.contains("unrecognized") {
+        return None;
+    }
+    let named = |word: &str| stderr.contains(&format!("'{word}'"));
+    let value_of = |flag: &str| {
+        argv.iter()
+            .position(|a| a == flag)
+            .and_then(|at| argv.get(at + 1))
+    };
+    [EXPECT, CONFIRMED, NO_REMOTE]
+        .into_iter()
+        .find(|flag| named(flag) || value_of(flag).is_some_and(|v| named(v)))
+}
+
+/// What the far end said, as one line. A `q` run with `--json` puts a
+/// `{"error": …}` document there rather than a sentence, so the sentence is
+/// taken back out — embedding the document would quote a truncated half of it.
+fn far_said(stderr: &str) -> String {
+    let text = serde_json::from_str::<serde_json::Value>(stderr.trim())
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or_else(|| stderr.to_string());
+    output::first_line(&text, 200)
+}
+
+/// The far end is older than the wire this `q` speaks — said here, where the
+/// user meets the failure, in the words `q doctor` already uses for it.
+fn too_old_there(machine: &str, flag: &str, stderr: &str) -> anyhow::Error {
+    QError::Other(format!(
+        "`q` on {machine} is too old for this command: it rejected `{flag}`, which every \
+         proxied command carries ({}); run `q doctor`, then upgrade `q` on {machine}",
+        far_said(stderr)
+    ))
+    .into()
+}
+
+/// ssh got there and the shell found no `q` — the same fact `q list` reports
+/// as `incompatible (reachable, but no `q` on PATH there …)`.
+fn no_q_there(machine: &str, stderr: &str) -> anyhow::Error {
+    let said = far_said(stderr);
+    let detail = if said.is_empty() {
+        String::new()
+    } else {
+        format!(" ({said})")
+    };
+    QError::Other(format!(
+        "{machine} is reachable, but there is no `q` on PATH there{detail}; \
+         install q on {machine}, or put it on the PATH its login shell uses"
+    ))
+    .into()
 }
 
 fn unreachable_remote(machine: &str, code: Option<i32>, stderr: &str) -> anyhow::Error {
@@ -1130,6 +1212,10 @@ const MAY_EXIST: &str = "; the quest may already have been created there — che
                          before retrying";
 
 fn create_failed(machine: &str, code: Option<i32>, stderr: &str) -> anyhow::Error {
+    // No `q` ran, so nothing was created and `MAY_EXIST` would be a lie.
+    if code == Some(NO_COMMAND) {
+        return no_q_there(machine, stderr);
+    }
     if code == Some(SSH_FAILED) || code.is_none() {
         // The command ran; only the answer was lost.
         return QError::Other(format!(
@@ -1186,6 +1272,48 @@ mod tests {
         let mut argv = vec!["q".to_string()];
         argv.extend(args(line));
         Cli::try_parse_from(argv).expect(line)
+    }
+
+    /// Version skew, recognised at the point the user meets it: clap's exit 2
+    /// naming one of the words *this* end put on the line (bd-8lz.5.4 D5).
+    /// Both shapes a real pre-`--expect` `q` produced are matched, and a usage
+    /// error the user made is not.
+    #[test]
+    fn only_a_rejected_pin_reads_as_version_skew() {
+        let line = args("q brief q-e85c --expect q-e85c.1787879708 --no-remote");
+
+        assert_eq!(
+            rejected_pin(&line, "error: unexpected argument '--expect' found"),
+            Some(EXPECT)
+        );
+        // clap names the *value* when the subcommand's positionals are full.
+        assert_eq!(
+            rejected_pin(
+                &line,
+                "error: unexpected argument 'q-e85c.1787879708' found\nUsage: q-active spawn …"
+            ),
+            Some(EXPECT)
+        );
+        assert_eq!(
+            rejected_pin(&line, "error: unexpected argument '--no-remote' found"),
+            Some(NO_REMOTE)
+        );
+        assert_eq!(
+            rejected_pin(
+                &args("q rm q-e85c --confirmed --no-remote"),
+                "error: unexpected argument '--confirmed' found"
+            ),
+            Some(CONFIRMED)
+        );
+
+        // The user's own bad flag stays the user's.
+        assert_eq!(
+            rejected_pin(&line, "error: unexpected argument '--bogus' found"),
+            None
+        );
+        // A far end that exited 2 for some other reason entirely.
+        assert_eq!(rejected_pin(&line, "error: not found: quest `nope`"), None);
+        assert_eq!(rejected_pin(&line, ""), None);
     }
 
     /// SPEC §15: the same arguments, plus the recursion guard, with `q` at the
