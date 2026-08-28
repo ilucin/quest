@@ -566,28 +566,17 @@ pub fn handle(app: &mut App, input: Input) -> Action {
     }
 }
 
-/// The keys that read or write *this* machine's database: sessions, events,
-/// brief, links, rename, close, resume. SPEC §15 keeps every machine's
-/// registry, hooks and database to itself, so on a remote row they must not run
-/// against the local one — and not harmlessly: a Quest id is 16 bits and unique
-/// only per machine, so `c` on a remote row could close a local Quest that
-/// happens to share it.
+/// The `q` subcommand a proxied Quests key stands for, and whether its output
+/// is **paged** (a read) rather than handed the terminal (a write, whose confirm
+/// or attach needs the keyboard).
 ///
-/// bd-8lz.5.3 taught the **CLI** to proxy every one of these over ssh (SPEC
-/// §15); bd-8lz.5.8 wires the TUI to that same path rather than reimplementing
-/// ssh, target-pinning and confirmation here. On a remote row the six keys in
-/// [`proxied`] hand off to the loop, which runs the real `q` binary against the
-/// owning machine — the CLI proxy does the rest. `r` is the exception: it opens
-/// the ordinary rename form (so the new slug can be typed) and its submit is
-/// what proxies, keyed on [`app::Target::machine`].
-///
-/// `o` is not in here either: entering a remote Quest is SPEC §15's other
-/// remote action, and it goes over ssh by handing over the terminal rather than
-/// through the database.
-///
-/// The `q` subcommand a proxied key stands for, and whether its output is
-/// **paged** (a read) rather than handed the terminal (a write, whose own
-/// confirm or attach needs the keyboard).
+/// These keys read or write a Quest's own machine, and a Quest id is 16 bits and
+/// unique only per machine — so `c` on a remote row could otherwise close a
+/// local Quest sharing the id. bd-8lz.5.3 taught the CLI to proxy them over ssh;
+/// bd-8lz.5.8 routes the TUI to that same path (see [`remote_proxy_key`]) rather
+/// than reimplementing ssh, pinning and confirmation here. `r` (rename) and `o`
+/// (attach) are not proxied here — `r` proxies at submit, `o` hands over the
+/// terminal.
 pub fn proxied(key: char) -> Option<(&'static str, bool)> {
     Some(match key {
         's' => ("sessions", true),
@@ -849,8 +838,7 @@ fn target_of(row: &QuestRow) -> Target {
         created_at: row.view.quest.created_at,
         finished: row.view.display_state == DisplayState::Finished,
         epic: row.view.quest.beads_epic.clone(),
-        // A remote row carries the machine that owns it, so a submit proxies
-        // instead of resolving an id this database does not have (SPEC §15).
+        // Set only for a remote row, so its submit proxies (SPEC §15).
         machine: row
             .origin
             .is_remote()
@@ -1128,10 +1116,8 @@ fn expand(template: Template) -> anyhow::Result<Template> {
 
 fn rename_quest(ctx: &Ctx, app: &mut App, target: &Target, form: &Form) -> anyhow::Result<()> {
     let new_slug = form.trimmed(F_SLUG);
-    // SPEC §15: a Quest on another machine is renamed *there*, over ssh — the
-    // same `q rename` the CLI proxies, with the new slug the form collected.
-    // There is nothing to confirm, so it runs captured rather than through the
-    // terminal; the row updates at the next remote tick.
+    // SPEC §15: a remote Quest is renamed *there*. Nothing to confirm, so it
+    // runs captured rather than through the terminal (see `rename_remote`).
     if let Some(machine) = &target.machine {
         rename_remote(app, target, machine, new_slug)?;
         return Ok(());
@@ -1145,11 +1131,9 @@ fn rename_quest(ctx: &Ctx, app: &mut App, target: &Target, form: &Form) -> anyho
     Ok(())
 }
 
-/// `q rename <slug> <new> --machine <m>` as a child of *this* `q` (SPEC §15,
-/// bd-8lz.5.8): the CLI proxy resolves the slug on `machine`, pins it and sends
-/// the rename over ssh. A non-zero exit is returned as an error so the form
-/// stays up with the far end's own message in it, exactly as a local rename
-/// that clap or the database refused does.
+/// `q rename <slug> <new> --machine <m>` as a child of *this* `q` (SPEC §15):
+/// the CLI proxy resolves, pins and sends it over ssh. A non-zero exit returns
+/// an error, so the form stays up with the far end's message like a local one.
 fn rename_remote(
     app: &mut App,
     target: &Target,

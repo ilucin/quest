@@ -663,24 +663,20 @@ where
     Ok(())
 }
 
-/// This `q`'s own binary, for a proxied Quests key (SPEC §15, bd-8lz.5.8). The
-/// current exe so `Q_DB`/`Q_CONFIG` and the version match what is running;
-/// a bare `q` on `PATH` only if the exe cannot be found, which never happens in
-/// practice but is not worth aborting a keypress over.
+/// This `q`'s own binary, so a proxied key inherits `Q_DB`/`Q_CONFIG` and the
+/// running version; a bare `q` on `PATH` only if the exe cannot be found.
 fn q_exe() -> std::path::PathBuf {
     std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("q"))
 }
 
-/// Run `q <args>` to completion with its output captured — the shape a paged
-/// remote read wants. `Q_DB`/`Q_CONFIG` and every other var are inherited, so
-/// the child resolves remotes exactly as this process would.
+/// Run `q <args>` with its output captured — the shape a paged remote read
+/// wants. Every var is inherited, so the child resolves remotes as we would.
 pub(super) fn spawn_q(args: &[&str]) -> std::io::Result<std::process::Output> {
     std::process::Command::new(q_exe()).args(args).output()
 }
 
-/// What a captured `q` child had to say when it failed: its stderr as one line,
-/// the `error: ` prefix `output::emit_error` writes stripped back off. Falls
-/// back to stdout for a command that failed without a word on stderr.
+/// What a failed `q` child said: its stderr as one line, `output::emit_error`'s
+/// `error: ` prefix stripped; stdout when it failed without a word on stderr.
 pub(super) fn child_said(out: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let said = crate::output::first_line(stderr.trim(), 200);
@@ -693,13 +689,10 @@ pub(super) fn child_said(out: &std::process::Output) -> String {
 }
 
 /// Proxy a Quests-tab key against the machine the selection lives on (SPEC §15,
-/// bd-8lz.5.8) by running the real `q` binary, which carries the whole proxy
-/// stack — target-pinning, the identity check, and a destructive command's
-/// confirmation — rather than restating any of it here.
-///
-/// The selection is read now, not carried on the `Action`: a tick can have
-/// reordered the listing between the keypress and here, and the loop reads
-/// every hand-over the same way.
+/// bd-8lz.5.8) by running the real `q`, which carries the whole proxy stack —
+/// target-pinning, the identity check, a destructive command's confirmation.
+/// The selection is re-read here, not carried on the `Action`, like every other
+/// hand-over: a tick can have reordered the listing since the keypress.
 fn proxy_remote<B, T>(
     io: &mut T,
     terminal: &mut Terminal<B>,
@@ -721,8 +714,7 @@ where
     let slug = quest.slug;
     let args = [sub, slug.as_str(), "--machine", machine.as_str()];
     if paged {
-        // A read: captured, then paged — the far end's human output scrolls in
-        // the same pager the local brief and peek use.
+        // A read: captured, then shown in the local brief/peek pager.
         let out = spawn_q(&args)?;
         if !out.status.success() {
             app.say(format!("q {sub} {slug} on {machine}: {}", child_said(&out)));
@@ -738,9 +730,8 @@ where
             app.say(format!("cannot page {sub}: {e:#}"));
         }
     } else {
-        // A write: the terminal is handed to the child so `q close`'s `[y/N]`
-        // and `q resume`'s attach run against the real keyboard, exactly as
-        // they would from a shell.
+        // A write: the child gets the terminal, so `q close`'s `[y/N]` and
+        // `q resume`'s attach run against the real keyboard.
         let status = handoff(io, terminal, app.mouse, || {
             std::process::Command::new(q_exe()).args(args).status()
         })?;
@@ -1002,10 +993,8 @@ fn event_loop(
                     dirty = true;
                 }
                 // SPEC §15, bd-8lz.5.8: a Quests key on a remote row runs the
-                // real `q` against the owning machine — a read is paged, a
-                // write hands over the terminal. Both take the terminal away
-                // and (for a write) can change the listing, so the row is
-                // reloaded afterwards exactly as an attach is.
+                // real `q` against the owning machine — reloaded afterwards
+                // like an attach, since a write can change the listing.
                 Action::Proxy(key) => {
                     let away = Away::new(poller);
                     let out = proxy_remote(&mut Stdio, terminal, app, key);
