@@ -20,6 +20,9 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     let opts = Opts {
         role: brief::default_role(args.role),
         session: brief::default_session(args.session),
+        // SPEC §11's section 3: the workflow's own markdown, from this
+        // machine's registry rather than a discovered one.
+        workflows: ctx.workflows(),
         ..Opts::default()
     };
     let markdown = brief::render(db, &quest, &opts)?;

@@ -245,6 +245,11 @@ pub enum Passage {
 ///   rather than the definition the user just listed. `q tpl from <quest>`
 ///   reads a Quest, but writes a template here, so it stays here too;
 ///   `q tpl export | ssh <alias> q tpl import -` is how a definition travels.
+/// * `q workflow list`/`show`/`add`/`edit`/`rm`: a workflow is a file in *this*
+///   machine's config directory (SPEC §11 — files, not rows), for the same
+///   reason `q tpl` stays. `q workflow set <quest>` is the exception: it names a
+///   Quest and is the same write as `q set <quest> workflow`, so it is proxied
+///   exactly as that is.
 /// * `q brief`/`q links`/`q note`/`q link` with no `--quest` fall back to
 ///   `$Q_QUEST`, which is this machine's pane environment.
 pub fn route(command: &Command) -> Option<(Aim<'_>, Passage)> {
@@ -256,6 +261,13 @@ pub fn route(command: &Command) -> Option<(Aim<'_>, Passage)> {
         Command::Rename { quest, .. } => (Aim::Quest(quest), Proxy),
         Command::Name { quest, .. } => (Aim::Quest(quest), Proxy),
         Command::Set { quest, .. } => (Aim::Quest(quest), Proxy),
+        // The one `q workflow` subcommand that names a Quest rather than a
+        // file. It is the same write as `q set <quest> workflow`, so it
+        // travels the same way — and the far end validates the name against
+        // *its* workflows, which are the ones its agents will read.
+        Command::Workflow {
+            action: crate::cli::WorkflowAction::Set { quest, .. },
+        } => (Aim::Quest(quest), Proxy),
         Command::Spawn { quest, .. } => (Aim::Quest(quest), Proxy),
         Command::Sessions {
             quest: Some(quest), ..

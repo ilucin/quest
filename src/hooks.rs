@@ -174,6 +174,10 @@ fn session_start(db: &Db, session: &Session, payload: &Value) -> Option<String> 
     let opts = Opts {
         role: session.role,
         session: Some(session.id.clone()),
+        // A hook has no `Ctx`, so the registry comes off the environment — the
+        // pane carries `Q_CONFIG` (`tmux::config_override`), so this is the
+        // same directory the CLI would read.
+        workflows: crate::workflows::Registry::discover(),
         ..Opts::default()
     };
     // Rendering the brief shells out to `bd`/`brain`, so it can take seconds —

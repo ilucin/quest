@@ -33,9 +33,11 @@ pub fn run(ctx: &Ctx, target: &str, key: SetKey, value: &str) -> anyhow::Result<
             stored = dir.to_string_lossy().into_owned();
             patch.cwd = Some(stored.clone());
         }
-        // TODO(M5): validate against the workflow registry.
+        // SPEC §11: a workflow is a file, so this is where the name is
+        // checked — a blank one clears the column and is not a name at all.
         SetKey::Workflow => {
             stored = value.trim().to_string();
+            ctx.workflows().require_opt(Some(&stored))?;
             patch.workflow = Some(blank_to_null(&stored));
         }
         SetKey::BeadsEpic => {

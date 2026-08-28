@@ -352,6 +352,12 @@ fn fields(form: Form, d: &Definition) -> Form {
     .text(F_NAME, &d.name, "")
     .text(F_DESCRIPTION, &d.description, "(none)")
     .text(F_CWD, &d.cwd, "(the directory the run starts in)")
+    // Free text, unlike the new-Quest form's select (`crate::tui::quests`): a
+    // stored definition may name a workflow whose file is not here — it can
+    // travel ahead of its files, and `q tpl edit` only re-checks the field when
+    // it *changes* (`tpl::check_workflow`). A select cannot hold a value that
+    // is not in its list, so opening this form over such a template would
+    // silently rewrite its workflow on the way to editing something else.
     .text(F_WORKFLOW, &d.workflow, "(default)")
     .text(F_GOAL, &d.goal, "(none)")
     .text(F_PROMPT, &d.master_prompt, "(none)")
@@ -1334,6 +1340,36 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("unknown placeholder"), "{error}");
+        app.handle(Input::Esc);
+
+        // A workflow that is not in the registry, likewise (SPEC §11). The
+        // field is free text here on purpose — see `fields` — so the refusal
+        // is what stops a definition naming a workflow nothing can read.
+        app.handle(Input::Char('a'));
+        set(&mut app, F_NAME, "typo");
+        set(&mut app, F_WORKFLOW, "orchestartor");
+        submit_form(&rig, &mut app);
+        let error = app
+            .modal
+            .as_ref()
+            .unwrap()
+            .form
+            .error()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("unknown workflow `orchestartor`"), "{error}");
+        assert!(
+            error.contains("orchestrator"),
+            "the list is offered: {error}"
+        );
+        app.handle(Input::Esc);
+
+        // A built-in goes through.
+        app.handle(Input::Char('a'));
+        set(&mut app, F_NAME, "fine");
+        set(&mut app, F_WORKFLOW, "routine");
+        submit_form(&rig, &mut app);
+        assert!(app.modal.is_none(), "{:?}", app.status);
         app.handle(Input::Esc);
 
         // And a name that is taken.

@@ -115,6 +115,12 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
     // Both before anything is written: a bad label or a contradictory pair of
     // flags is the user's typo, not a half-created Quest.
     let repo = repo_flag(args)?;
+    // SPEC §11: the workflow is a file, and a Quest whose workflow does not
+    // resolve gives its master a brief with a hole where its instructions
+    // should be. Checked here, before the row, the epic or the tmux session —
+    // and this is also where `q tpl run`'s stored workflow is checked, the way
+    // `run_cwd` checks its `cwd`.
+    ctx.workflows().require_opt(args.workflow)?;
     let cwd = resolve_dir(args.dir)?;
     let prompt = resolve_prompt(args.prompt, args.prompt_file)?;
     let (base, name_source) = resolve_slug(args.name, args.template, &cwd)?;
@@ -132,7 +138,7 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
     let mut row = Quest::new(&slug, &cwd.to_string_lossy(), machine);
     row.name_source = name_source;
     row.goal = args.goal.map(str::to_string);
-    // TODO(M5): validate `--workflow` against the workflow registry.
+    // Already checked above, with the other flags, before anything was written.
     row.workflow = args.workflow.map(str::to_string);
     row.template_id = args.template.map(|t| t.id.clone());
     // Only the opt-out is stored; NULL keeps following `[context] auto_reset`.
@@ -573,6 +579,14 @@ pub fn validate_label(label: &str) -> anyhow::Result<()> {
 /// remember.
 pub fn validate_template_name(name: &str) -> anyhow::Result<()> {
     validate_kebab("template name", name)
+}
+
+/// A workflow name follows it too (SPEC §11), and here the grammar is load
+/// bearing rather than only tidy: the name becomes `<name>.md` under the config
+/// directory, so a spelling with a `/` or a `..` in it would address a file
+/// somewhere else entirely.
+pub fn validate_workflow_name(name: &str) -> anyhow::Result<()> {
+    validate_kebab("workflow name", name)
 }
 
 fn validate_kebab(what: &str, value: &str) -> anyhow::Result<()> {

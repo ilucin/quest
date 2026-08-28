@@ -582,9 +582,19 @@ pub fn submit(ctx: &Ctx, app: &mut App, prompt: &Prompt, form: &Form) -> anyhow:
         Prompt::Send(target) => send_text(ctx, app, target, form),
         Prompt::Kill(target) => kill_session(ctx, app, target),
         Prompt::Reset(target) => reset_session(ctx, app, target),
-        // A Quest prompt never reaches here; `tui::submit` dispatches on the
-        // variant and this arm exists only so the match is total.
-        _ => Ok(()),
+        // A Quests or Templates prompt never reaches here; `tui::submit`
+        // dispatches on the variant first. Listed rather than `_` so a new
+        // Sessions prompt added without wiring fails to compile here instead
+        // of silently doing nothing — the tripwire `quests.rs` and
+        // `templates.rs` already carry.
+        Prompt::NewQuest
+        | Prompt::Rename(_)
+        | Prompt::Close(_)
+        | Prompt::Resume(_)
+        | Prompt::AddTemplate
+        | Prompt::EditTemplate(_)
+        | Prompt::DeleteTemplate(_)
+        | Prompt::RunTemplate(_) => Ok(()),
     }
 }
 

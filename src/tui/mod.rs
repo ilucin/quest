@@ -611,7 +611,10 @@ where
         brief::render_with(
             db,
             &quest,
-            &brief::Opts::default(),
+            &brief::Opts {
+                workflows: ctx.workflows(),
+                ..brief::Opts::default()
+            },
             &brief::WithBd::new(ctx.bd()),
         )
     }) {

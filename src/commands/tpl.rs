@@ -122,6 +122,7 @@ fn add(ctx: &Ctx, name: &str, fields: &TplFields) -> anyhow::Result<()> {
 pub fn create(ctx: &Ctx, definition: &Definition) -> anyhow::Result<Template> {
     let mut definition = definition.clone();
     pin_cwd(&mut definition, None)?;
+    check_workflow(ctx, &definition, None)?;
     insert(ctx.db()?, &definition)
 }
 
@@ -154,6 +155,7 @@ pub fn save(ctx: &Ctx, current: &Template, definition: &Definition) -> anyhow::R
         taken(db, &definition.name)?;
     }
     pin_cwd(&mut definition, current.cwd.as_deref())?;
+    check_workflow(ctx, &definition, current.workflow.as_deref())?;
     let mut row = current.clone();
     definition.apply(&mut row);
     check(&row)?;
@@ -582,9 +584,29 @@ fn check(row: &Template) -> anyhow::Result<()> {
     if let Some(repo) = &row.beads_repo {
         crate::beads::validate_repo_label(repo)?;
     }
-    // TODO(bd-8lz.6.3): validate `workflow` against the workflow registry; it
-    // is a stored string until the registry exists.
+    // `workflow` is deliberately not among them either, and for the same
+    // reason as `cwd`: it names a file in the config directory, which is not
+    // part of a portable definition. It is checked when it is *set*
+    // ([`check_workflow`]) and required to exist when it is *used* — at
+    // `q tpl run`, inside `new::create`. See the module docs.
     Ok(())
+}
+
+/// The `workflow` a caller is **setting** (`q tpl add --workflow`, `q tpl edit
+/// --workflow`, an editor or a TUI form that changed it), checked against the
+/// registry (SPEC §11).
+///
+/// `was` is what the row already held, so a write that did not touch the field
+/// is not a set: `q tpl edit weekly --description "…"` must not fail because
+/// the workflow file that template names was deleted last week. That is
+/// [`pin_cwd`]'s rule, applied to the other field a definition carries that
+/// points outside the database.
+fn check_workflow(ctx: &Ctx, definition: &Definition, was: Option<&str>) -> anyhow::Result<()> {
+    let workflow = definition.workflow.trim();
+    if workflow.is_empty() || Some(workflow) == was {
+        return Ok(());
+    }
+    ctx.workflows().require(workflow)
 }
 
 /// The `cwd` a caller is **setting** (`q tpl add --cwd`, `q tpl edit --cwd`,
