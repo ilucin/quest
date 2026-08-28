@@ -67,7 +67,7 @@ fn help_lists_subcommands() {
     for sub in [
         "new", "list", "show", "enter", "close", "resume", "rename", "name", "set", "rm", "brief",
         "events", "doctor", "config", "phase", "note", "link", "links", "artifact", "spawn",
-        "sessions", "peek", "send", "reset", "kill",
+        "sessions", "peek", "send", "reset", "kill", "tpl",
     ] {
         assert!(out.contains(sub), "`{sub}` missing from --help:\n{out}");
     }
@@ -10205,4 +10205,910 @@ fn a_remote_resume_reports_both_halves_as_one_json_document() {
         serde_json::json!(["tmux", "attach", "-t", "=q-over-there"]),
         "{out}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `q tpl` — template CRUD (SPEC §11, bd-8lz.6.1)
+// ---------------------------------------------------------------------------
+
+/// One `q tpl add` with every field set, so the tests below have something
+/// whose round trip is worth checking.
+fn add_full_template(env: &Env, name: &str, work: &std::path::Path) {
+    env.cmd()
+        .args(["tpl", "add", name])
+        .args(["--description", "the Monday routine"])
+        .args(["--goal", "tidy {{arg.repo}} on {{date}}"])
+        .args(["--prompt", "start with the lint report"])
+        .args(["--workflow", "routine", "--repo", "work"])
+        .args(["--cwd", work.to_str().unwrap()])
+        .args(["--tag", "routine", "--tag", "weekly", "--brain"])
+        .assert()
+        .success();
+}
+
+/// A file inside the sandbox, for the import and editor fixtures.
+fn write_file(env: &Env, name: &str, body: &str) -> std::path::PathBuf {
+    let path = env.dir.path().join(name);
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn tpl_add_then_show_round_trips_every_field() {
+    let env = Env::new();
+    let work = env.work("repo");
+    add_full_template(&env, "weekly-hygiene", &work);
+
+    let assert = env
+        .cmd()
+        .args(["tpl", "show", "weekly-hygiene", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    assert_eq!(out["name"], "weekly-hygiene");
+    assert_eq!(out["description"], "the Monday routine");
+    assert_eq!(out["goal"], "tidy {{arg.repo}} on {{date}}");
+    assert_eq!(out["master_prompt"], "start with the lint report");
+    assert_eq!(out["workflow"], "routine");
+    assert_eq!(out["beads_repo"], "work");
+    assert_eq!(out["cwd"], work.to_str().unwrap());
+    assert_eq!(out["create_brain"], true);
+    assert_eq!(out["tags"], serde_json::json!(["routine", "weekly"]));
+    assert_eq!(out["run_count"], 0);
+    assert_eq!(out["last_run_at"], serde_json::Value::Null);
+    assert!(out["id"].as_str().unwrap().starts_with("t-"), "{out}");
+}
+
+#[test]
+fn tpl_list_is_empty_before_anything_is_added() {
+    let env = Env::new();
+    env.cmd()
+        .args(["tpl", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no templates"));
+    let assert = env.cmd().args(["tpl", "list", "--json"]).assert().success();
+    assert_eq!(json_of(&assert), serde_json::json!([]));
+}
+
+#[test]
+fn tpl_list_names_every_template_alphabetically() {
+    let env = Env::new();
+    for name in ["weekly-hygiene", "deps-audit"] {
+        env.cmd().args(["tpl", "add", name]).assert().success();
+    }
+    let assert = env.cmd().args(["tpl", "list", "--json"]).assert().success();
+    let listed = json_of(&assert);
+    let names: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["deps-audit", "weekly-hygiene"]);
+
+    env.cmd()
+        .args(["tpl", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("NAME"))
+        .stdout(predicate::str::contains("deps-audit"))
+        .stdout(predicate::str::contains("RUNS"));
+}
+
+#[test]
+fn tpl_add_rejects_a_name_that_is_not_kebab_case() {
+    let env = Env::new();
+    for bad in ["Weekly", "weekly_hygiene", "weekly-", "weekly--x"] {
+        let assert = env
+            .cmd()
+            .args(["tpl", "add", bad, "--json"])
+            .assert()
+            .failure();
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert_eq!(parsed["code"], "invalid", "{bad}: {parsed}");
+        assert!(
+            parsed["error"].as_str().unwrap().contains("template name"),
+            "{bad}: {parsed}"
+        );
+    }
+}
+
+#[test]
+fn tpl_add_refuses_a_name_that_is_already_taken() {
+    let env = Env::new();
+    env.cmd().args(["tpl", "add", "routine"]).assert().success();
+    let assert = env
+        .cmd()
+        .args(["tpl", "add", "routine", "--json"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "conflict", "{parsed}");
+    assert!(
+        parsed["error"].as_str().unwrap().contains("q tpl edit"),
+        "{parsed}"
+    );
+}
+
+/// A placeholder no `--arg` could ever fill is a typo, and the moment to say so
+/// is when it is written, not when a routine is halfway through starting.
+#[test]
+fn tpl_add_refuses_a_placeholder_nothing_can_fill() {
+    let env = Env::new();
+    env.cmd()
+        .args(["tpl", "add", "bad", "--goal", "{{today}}"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown placeholder `{{today}}`"))
+        .stderr(predicate::str::contains("{{arg.<key>}}"));
+    env.cmd()
+        .args(["tpl", "add", "bad", "--prompt", "{{arg.}}"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("master_prompt"));
+    // Nothing was stored on the way to either failure.
+    let assert = env.cmd().args(["tpl", "list", "--json"]).assert().success();
+    assert_eq!(json_of(&assert), serde_json::json!([]));
+}
+
+#[test]
+fn tpl_add_refuses_a_cwd_that_is_not_a_directory() {
+    let env = Env::new();
+    env.cmd()
+        .args(["tpl", "add", "routine", "--cwd", "/definitely/not/here"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no such directory"));
+}
+
+#[test]
+fn tpl_show_resolves_a_fragment_and_lists_the_candidates_when_it_cannot() {
+    let env = Env::new();
+    for name in ["weekly-hygiene", "weekly-report", "deps-audit"] {
+        env.cmd().args(["tpl", "add", name]).assert().success();
+    }
+    let assert = env
+        .cmd()
+        .args(["tpl", "show", "audit", "--json"])
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["name"], "deps-audit");
+
+    let assert = env
+        .cmd()
+        .args(["tpl", "show", "weekly", "--json"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "ambiguous", "{parsed}");
+    let message = parsed["error"].as_str().unwrap();
+    assert!(message.contains("weekly-hygiene"), "{message}");
+    assert!(message.contains("weekly-report"), "{message}");
+}
+
+#[test]
+fn tpl_show_of_an_unknown_name_says_what_there_is_instead() {
+    let env = Env::new();
+    env.cmd()
+        .args(["tpl", "add", "deps-audit"])
+        .assert()
+        .success();
+    let assert = env
+        .cmd()
+        .args(["tpl", "show", "nope", "--json"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "not_found", "{parsed}");
+    assert!(
+        parsed["error"].as_str().unwrap().contains("deps-audit"),
+        "{parsed}"
+    );
+}
+
+#[test]
+fn tpl_edit_with_flags_patches_only_what_was_given() {
+    let env = Env::new();
+    let work = env.work("repo");
+    add_full_template(&env, "weekly-hygiene", &work);
+
+    env.cmd()
+        .args(["tpl", "edit", "weekly", "--description", "changed"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("updated template weekly-hygiene"));
+
+    let assert = env
+        .cmd()
+        .args(["tpl", "show", "weekly", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    assert_eq!(out["description"], "changed");
+    // Untouched by a flag nobody gave.
+    assert_eq!(out["goal"], "tidy {{arg.repo}} on {{date}}");
+    assert_eq!(out["workflow"], "routine");
+    assert_eq!(out["create_brain"], true);
+}
+
+#[test]
+fn tpl_edit_with_a_blank_flag_clears_the_field() {
+    let env = Env::new();
+    let work = env.work("repo");
+    add_full_template(&env, "weekly-hygiene", &work);
+
+    env.cmd()
+        .args(["tpl", "edit", "weekly"])
+        .args(["--goal", "", "--workflow", "", "--tag", ""])
+        .arg("--no-brain")
+        .assert()
+        .success();
+
+    let assert = env
+        .cmd()
+        .args(["tpl", "show", "weekly", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    for field in ["goal", "workflow", "tags"] {
+        assert_eq!(out[field], serde_json::Value::Null, "{field}: {out}");
+    }
+    assert_eq!(out["create_brain"], false);
+    assert_eq!(out["description"], "the Monday routine");
+}
+
+/// The editor is stubbed, exactly like tmux and `bd`: no test may launch one.
+#[test]
+fn tpl_edit_without_flags_round_trips_the_toml_through_the_editor() {
+    let env = Env::new();
+    let work = env.work("repo");
+    add_full_template(&env, "weekly-hygiene", &work);
+
+    let edited = write_file(
+        &env,
+        "edited.toml",
+        "[[template]]\nname = \"weekly-hygiene\"\ndescription = \"edited\"\n\
+         goal = \"tidy up on {{date}}\"\ntags = [\"weekly\"]\n",
+    );
+    env.cmd()
+        .env("Q_FIXTURE_EDITOR", &edited)
+        .args(["tpl", "edit", "weekly-hygiene"])
+        .assert()
+        .success();
+
+    let assert = env
+        .cmd()
+        .args(["tpl", "show", "weekly-hygiene", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    assert_eq!(out["description"], "edited");
+    assert_eq!(out["goal"], "tidy up on {{date}}");
+    // Everything the edited file left out is now blank — the file is the whole
+    // definition, not a patch.
+    assert_eq!(out["workflow"], serde_json::Value::Null);
+    assert_eq!(out["master_prompt"], serde_json::Value::Null);
+    assert_eq!(out["create_brain"], false);
+    assert_eq!(out["tags"], serde_json::json!(["weekly"]));
+}
+
+#[test]
+fn tpl_edit_reports_what_the_editor_saved_and_changes_nothing_when_it_is_broken() {
+    let env = Env::new();
+    env.cmd().args(["tpl", "add", "routine"]).assert().success();
+
+    let broken = write_file(&env, "broken.toml", "[[template]\nname = ?\n");
+    env.cmd()
+        .env("Q_FIXTURE_EDITOR", &broken)
+        .args(["tpl", "edit", "routine"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid TOML"));
+
+    let empty = write_file(&env, "empty.toml", "# nothing here\n");
+    env.cmd()
+        .env("Q_FIXTURE_EDITOR", &empty)
+        .args(["tpl", "edit", "routine"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no [[template]]"));
+
+    let two = write_file(
+        &env,
+        "two.toml",
+        "[[template]]\nname = \"a\"\n\n[[template]]\nname = \"b\"\n",
+    );
+    env.cmd()
+        .env("Q_FIXTURE_EDITOR", &two)
+        .args(["tpl", "edit", "routine"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("q tpl import"));
+
+    env.cmd()
+        .env("Q_FIXTURE_EDITOR_FAIL", "1")
+        .args(["tpl", "edit", "routine"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("editor"));
+
+    // Still exactly the one template it was.
+    let assert = env.cmd().args(["tpl", "list", "--json"]).assert().success();
+    let rows = json_of(&assert);
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+    assert_eq!(rows[0]["name"], "routine");
+}
+
+#[test]
+fn tpl_edit_can_rename_but_not_onto_a_name_that_exists() {
+    let env = Env::new();
+    for name in ["routine", "other"] {
+        env.cmd().args(["tpl", "add", name]).assert().success();
+    }
+    let clash = write_file(&env, "clash.toml", "[[template]]\nname = \"other\"\n");
+    env.cmd()
+        .env("Q_FIXTURE_EDITOR", &clash)
+        .args(["tpl", "edit", "routine"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"));
+
+    let renamed = write_file(&env, "renamed.toml", "[[template]]\nname = \"renamed\"\n");
+    env.cmd()
+        .env("Q_FIXTURE_EDITOR", &renamed)
+        .args(["tpl", "edit", "routine"])
+        .assert()
+        .success();
+    env.cmd()
+        .args(["tpl", "show", "renamed"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn tpl_rm_asks_first_and_removes_on_yes() {
+    let env = Env::new();
+    env.cmd().args(["tpl", "add", "routine"]).assert().success();
+
+    // No scripted answer: the question is refused, and nothing is removed.
+    env.cmd()
+        .args(["tpl", "rm", "routine"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("aborted"));
+    env.cmd()
+        .args(["tpl", "show", "routine"])
+        .assert()
+        .success();
+
+    env.cmd()
+        .env("Q_FIXTURE_CONFIRM", "y")
+        .args(["tpl", "rm", "routine"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("remove template routine?"))
+        .stdout(predicate::str::contains("removed template routine"));
+    env.cmd()
+        .args(["tpl", "show", "routine"])
+        .assert()
+        .failure();
+}
+
+/// A template is a definition; the Quests made from it are history and outlive
+/// it, with only their `template_id` cleared.
+#[test]
+fn tpl_rm_unlinks_the_quests_that_came_from_the_template() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.cmd()
+        .args(["tpl", "add", "routine", "--cwd", work.to_str().unwrap()])
+        .assert()
+        .success();
+    let assert = env
+        .cmd()
+        .args(["tpl", "run", "routine", "-d", "--json"])
+        .assert()
+        .success();
+    let quest_id = json_of(&assert)["quest"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let assert = env
+        .cmd()
+        .args(["tpl", "rm", "routine", "-f", "--json"])
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["unlinked_quests"], 1);
+
+    let template_id: Option<String> = env
+        .conn()
+        .query_row(
+            "SELECT template_id FROM quest WHERE id = ?1",
+            [&quest_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(template_id, None);
+}
+
+#[test]
+fn tpl_run_creates_a_quest_from_the_template_and_counts_the_run() {
+    let env = Env::new();
+    let work = env.work("repo");
+    add_full_template(&env, "weekly-hygiene", &work);
+
+    let assert = env
+        .cmd()
+        .args(["tpl", "run", "weekly", "--arg", "repo=work", "-d", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(out["quest"]["goal"], format!("tidy work on {today}"));
+    assert_eq!(out["quest"]["cwd"], work.to_str().unwrap());
+    assert_eq!(out["quest"]["workflow"], "routine");
+    assert_eq!(out["quest"]["template_id"], out["template"]["id"]);
+    assert_eq!(out["session"]["first_prompt"], "start with the lint report");
+    assert_eq!(out["attach"], "none");
+    assert_eq!(out["template"]["run_count"], 1);
+    assert!(out["template"]["last_run_at"].is_i64(), "{out}");
+
+    // Every run counts.
+    let assert = env
+        .cmd()
+        .args(["tpl", "run", "weekly", "--arg", "repo=work", "-d", "--json"])
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["template"]["run_count"], 2);
+}
+
+#[test]
+fn tpl_run_prints_a_human_one_liner_naming_the_template() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.cmd()
+        .args(["tpl", "add", "routine", "--cwd", work.to_str().unwrap()])
+        .assert()
+        .success();
+    env.cmd()
+        .args(["tpl", "run", "routine", "-d"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("from template routine"))
+        .stdout(predicate::str::contains("q enter "));
+}
+
+/// A NULL `cwd` means "wherever the run happens" (SPEC §11).
+#[test]
+fn tpl_run_without_a_template_cwd_uses_the_current_directory() {
+    let env = Env::new();
+    let work = env.work("elsewhere");
+    env.cmd().args(["tpl", "add", "routine"]).assert().success();
+    let assert = env
+        .cmd()
+        .current_dir(&work)
+        .args(["tpl", "run", "routine", "-d", "--json"])
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["quest"]["cwd"], work.to_str().unwrap());
+}
+
+#[test]
+fn tpl_run_refuses_to_start_with_an_unfilled_placeholder() {
+    let env = Env::new();
+    let work = env.work("repo");
+    add_full_template(&env, "weekly-hygiene", &work);
+
+    let assert = env
+        .cmd()
+        .args(["tpl", "run", "weekly", "-d", "--json"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "invalid", "{parsed}");
+    let message = parsed["error"].as_str().unwrap();
+    assert!(message.contains("goal"), "{message}");
+    assert!(message.contains("no --arg for `repo`"), "{message}");
+
+    // Nothing was created, and the run was not counted.
+    let quests = quests_of(&env.cmd().args(["list", "--json"]).assert().success());
+    assert_eq!(quests.as_array().unwrap().len(), 0, "{quests}");
+    let assert = env
+        .cmd()
+        .args(["tpl", "show", "weekly", "--json"])
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["run_count"], 0);
+}
+
+#[test]
+fn tpl_run_rejects_an_arg_that_is_not_a_pair() {
+    let env = Env::new();
+    env.cmd().args(["tpl", "add", "routine"]).assert().success();
+    for bad in ["nope", "=1"] {
+        env.cmd()
+            .args(["tpl", "run", "routine", "--arg", bad, "-d"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--arg"));
+    }
+    env.cmd()
+        .args([
+            "tpl", "run", "routine", "--arg", "a=1", "--arg", "a=2", "-d",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("twice"));
+}
+
+#[test]
+fn tpl_export_and_import_round_trip_a_template() {
+    let env = Env::new();
+    let work = env.work("repo");
+    add_full_template(&env, "weekly-hygiene", &work);
+
+    let assert = env.cmd().args(["tpl", "export"]).assert().success();
+    let toml = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(toml.contains("[[template]]"), "{toml}");
+    assert!(toml.contains("name = \"weekly-hygiene\""), "{toml}");
+    // The history is the database's; a file must not be able to rewrite it.
+    assert!(!toml.contains("run_count"), "{toml}");
+    assert!(!toml.contains("last_run_at"), "{toml}");
+
+    // Into a second, empty q.
+    let other = Env::new();
+    let file = write_file(&other, "in.toml", &toml);
+    other
+        .cmd()
+        .args(["tpl", "import", file.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("weekly-hygiene"));
+
+    let before = json_of(
+        &env.cmd()
+            .args(["tpl", "show", "weekly", "--json"])
+            .assert()
+            .success(),
+    );
+    let after = json_of(
+        &other
+            .cmd()
+            .args(["tpl", "show", "weekly", "--json"])
+            .assert()
+            .success(),
+    );
+    for field in [
+        "name",
+        "description",
+        "cwd",
+        "workflow",
+        "goal",
+        "master_prompt",
+        "beads_repo",
+        "create_brain",
+        "tags",
+    ] {
+        assert_eq!(before[field], after[field], "{field}");
+    }
+}
+
+#[test]
+fn tpl_export_of_one_name_is_the_same_document_as_all_of_them() {
+    let env = Env::new();
+    for name in ["deps-audit", "routine"] {
+        env.cmd().args(["tpl", "add", name]).assert().success();
+    }
+    let assert = env
+        .cmd()
+        .args(["tpl", "export", "deps-audit"])
+        .assert()
+        .success();
+    let toml = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(toml.contains("deps-audit"), "{toml}");
+    assert!(!toml.contains("routine"), "{toml}");
+
+    let assert = env
+        .cmd()
+        .args(["tpl", "export", "--json"])
+        .assert()
+        .success();
+    let doc = json_of(&assert);
+    let names: Vec<&str> = doc["template"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["deps-audit", "routine"]);
+}
+
+#[test]
+fn tpl_import_refuses_an_existing_name_unless_replace_is_given() {
+    let env = Env::new();
+    env.cmd()
+        .args(["tpl", "add", "routine", "--goal", "the old goal"])
+        .assert()
+        .success();
+    let file = write_file(
+        &env,
+        "in.toml",
+        "[[template]]\nname = \"routine\"\ngoal = \"the new goal\"\n",
+    );
+
+    let assert = env
+        .cmd()
+        .args(["tpl", "import", file.to_str().unwrap(), "--json"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(parsed["code"], "conflict", "{parsed}");
+    assert!(
+        parsed["error"].as_str().unwrap().contains("--replace"),
+        "{parsed}"
+    );
+    let assert = env
+        .cmd()
+        .args(["tpl", "show", "routine", "--json"])
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["goal"], "the old goal");
+
+    let assert = env
+        .cmd()
+        .args([
+            "tpl",
+            "import",
+            file.to_str().unwrap(),
+            "--replace",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    assert_eq!(out["replaced"], serde_json::json!(["routine"]));
+    assert_eq!(out["added"], serde_json::json!([]));
+    let assert = env
+        .cmd()
+        .args(["tpl", "show", "routine", "--json"])
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["goal"], "the new goal");
+}
+
+/// Run stats are history, not definition: `--replace` overwrites what the
+/// template *is* and keeps the record of how often it has been used.
+#[test]
+fn tpl_import_replace_keeps_the_run_stats_and_the_id() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.cmd()
+        .args(["tpl", "add", "routine", "--cwd", work.to_str().unwrap()])
+        .assert()
+        .success();
+    env.cmd()
+        .args(["tpl", "run", "routine", "-d"])
+        .assert()
+        .success();
+    let before = json_of(
+        &env.cmd()
+            .args(["tpl", "show", "routine", "--json"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(before["run_count"], 1);
+
+    let file = write_file(
+        &env,
+        "in.toml",
+        "[[template]]\nname = \"routine\"\ngoal = \"replaced\"\n",
+    );
+    env.cmd()
+        .args(["tpl", "import", file.to_str().unwrap(), "--replace"])
+        .assert()
+        .success();
+
+    let after = json_of(
+        &env.cmd()
+            .args(["tpl", "show", "routine", "--json"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(after["goal"], "replaced");
+    assert_eq!(after["run_count"], before["run_count"]);
+    assert_eq!(after["last_run_at"], before["last_run_at"]);
+    assert_eq!(after["id"], before["id"]);
+    // The definition really was replaced, not merged.
+    assert_eq!(after["cwd"], serde_json::Value::Null);
+}
+
+#[test]
+fn tpl_import_is_all_or_nothing() {
+    let env = Env::new();
+    let file = write_file(
+        &env,
+        "in.toml",
+        "[[template]]\nname = \"good\"\n\n[[template]]\nname = \"Bad Name\"\n",
+    );
+    env.cmd()
+        .args(["tpl", "import", file.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("template name"));
+    let assert = env.cmd().args(["tpl", "list", "--json"]).assert().success();
+    assert_eq!(
+        json_of(&assert),
+        serde_json::json!([]),
+        "a half import landed"
+    );
+
+    let twice = write_file(
+        &env,
+        "twice.toml",
+        "[[template]]\nname = \"same\"\n\n[[template]]\nname = \"same\"\n",
+    );
+    env.cmd()
+        .args(["tpl", "import", twice.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("twice"));
+    let assert = env.cmd().args(["tpl", "list", "--json"]).assert().success();
+    assert_eq!(json_of(&assert), serde_json::json!([]));
+}
+
+#[test]
+fn tpl_import_reports_a_file_it_cannot_use() {
+    let env = Env::new();
+    env.cmd()
+        .args(["tpl", "import", "/definitely/not/here.toml"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot read"));
+
+    let empty = write_file(&env, "empty.toml", "# nothing\n");
+    env.cmd()
+        .args(["tpl", "import", empty.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no [[template]]"));
+
+    let unknown = write_file(
+        &env,
+        "unknown.toml",
+        "[[template]]\nname = \"a\"\nrun_count = 9\n",
+    );
+    env.cmd()
+        .args(["tpl", "import", unknown.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("run_count"));
+}
+
+#[test]
+fn tpl_import_reads_stdin_for_a_dash() {
+    let env = Env::new();
+    env.cmd()
+        .args(["tpl", "import", "-", "--json"])
+        .write_stdin("[[template]]\nname = \"piped\"\n")
+        .assert()
+        .success();
+    let assert = env
+        .cmd()
+        .args(["tpl", "show", "piped", "--json"])
+        .assert()
+        .success();
+    assert_eq!(json_of(&assert)["name"], "piped");
+}
+
+#[test]
+fn tpl_from_builds_a_template_out_of_a_quest() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.cmd()
+        .args([
+            "new",
+            "--name",
+            "cdc-backfill",
+            "--goal",
+            "make it idempotent",
+        ])
+        .args([
+            "--workflow",
+            "orchestrator",
+            "--dir",
+            work.to_str().unwrap(),
+        ])
+        .args(["--prompt", "read the CDC docs first", "-d"])
+        .assert()
+        .success();
+
+    env.cmd()
+        .args(["tpl", "from", "cdc-backfill", "cdc-routine"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("created template cdc-routine"));
+
+    let assert = env
+        .cmd()
+        .args(["tpl", "show", "cdc-routine", "--json"])
+        .assert()
+        .success();
+    let out = json_of(&assert);
+    assert_eq!(out["goal"], "make it idempotent");
+    assert_eq!(out["cwd"], work.to_str().unwrap());
+    assert_eq!(out["workflow"], "orchestrator");
+    assert_eq!(out["master_prompt"], "read the CDC docs first");
+    assert_eq!(out["run_count"], 0);
+}
+
+#[test]
+fn tpl_from_reports_a_quest_and_a_name_it_cannot_use() {
+    let env = Env::new();
+    let work = env.work("repo");
+    env.cmd()
+        .args([
+            "new",
+            "--name",
+            "alpha",
+            "--dir",
+            work.to_str().unwrap(),
+            "-d",
+        ])
+        .assert()
+        .success();
+    env.cmd()
+        .args(["tpl", "from", "nope", "routine"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("quest `nope`"));
+
+    env.cmd().args(["tpl", "add", "routine"]).assert().success();
+    env.cmd()
+        .args(["tpl", "from", "alpha", "routine"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"));
+}
+
+/// A template is a row in this machine's database, so nothing about `q tpl`
+/// reaches for ssh even with a remote configured (SPEC §15, `proxy::route`).
+#[test]
+fn tpl_is_never_proxied_to_a_remote() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    env.cmd().args(["tpl", "add", "routine"]).assert().success();
+    env.cmd().args(["tpl", "list"]).assert().success();
+    assert!(env.proxy_calls().is_empty(), "{:?}", env.proxy_calls());
+}
+
+#[test]
+fn tpl_is_silent_under_quiet() {
+    let env = Env::new();
+    env.cmd()
+        .args(["--quiet", "tpl", "add", "routine"])
+        .assert()
+        .success()
+        .stdout("");
+    env.cmd()
+        .args(["--quiet", "tpl", "list"])
+        .assert()
+        .success()
+        .stdout("");
+    env.cmd()
+        .args(["--quiet", "tpl", "show", "routine"])
+        .assert()
+        .success()
+        .stdout("");
 }

@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod db;
 mod doctor;
+mod editor;
 mod error;
 mod hooks;
 mod model;
@@ -13,6 +14,7 @@ mod output;
 mod proc;
 mod registry;
 mod remote;
+mod templates;
 mod tmux;
 mod tui;
 
@@ -445,8 +447,8 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
                     // The global `--machine` already decides this; only the
                     // TUI's form sets it per Quest.
                     machine: None,
-                    // `q tpl run` (bd-8lz.5) is what will set this from the
-                    // CLI; `q new` has no template.
+                    // `q tpl run` is what sets this from the CLI
+                    // (`commands::tpl`); `q new` has no template.
                     template: None,
                 },
             )
@@ -611,6 +613,7 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
             }
         }
         .map(|()| 0),
+        Command::Tpl { action } => commands::tpl::run(ctx, action).map(|()| 0),
     }
 }
 

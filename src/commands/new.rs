@@ -541,6 +541,14 @@ pub fn validate_label(label: &str) -> anyhow::Result<()> {
     validate_kebab("label", label)
 }
 
+/// A template name follows the same grammar (SPEC §11). It is not a slug — no
+/// Quest is named after it — but it is typed as a target, matched by prefix,
+/// and written into TOML by hand, and one grammar for all three is one rule to
+/// remember.
+pub fn validate_template_name(name: &str) -> anyhow::Result<()> {
+    validate_kebab("template name", name)
+}
+
 fn validate_kebab(what: &str, value: &str) -> anyhow::Result<()> {
     if value.len() > SLUG_MAX || !is_slug(value) {
         return Err(QError::Invalid(format!("invalid {what} `{value}`: it {SLUG_RULE}")).into());

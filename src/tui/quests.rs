@@ -15,12 +15,12 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::Ctx;
 use crate::commands::{
-    QuestRow, close, fill_progress, fmt, load_quests, new, proxy, rename, resume,
+    QuestRow, close, fill_progress, fmt, load_quests, new, proxy, rename, resume, tpl,
 };
 use crate::error::QError;
 use crate::model::{
     DisplayState, Event, Link, NameSource, Quest, QuestState, Session, SessionRole, SessionStatus,
-    Template,
+    Template, now,
 };
 
 use super::app::{Action, App, Prompt, Tab, Target};
@@ -982,14 +982,15 @@ fn quest_for_state(ctx: &Ctx, target: &Target) -> anyhow::Result<Quest> {
 
 fn create(ctx: &Ctx, app: &mut App, form: &Form) -> anyhow::Result<()> {
     // The chosen template supplies whatever the form was left blank for; it
-    // never overrides something typed. Placeholder expansion and the run
-    // bookkeeping of `q tpl run` are bd-8lz.5's.
-    let template: Option<Template> = app
+    // never overrides something typed — so only the template's own text is
+    // placeholder-expanded, and a goal typed into the form is taken literally.
+    let chosen: Option<Template> = app
         .quests
         .templates
         .iter()
         .find(|t| t.name == form.choice(F_TEMPLATE))
         .cloned();
+    let template = chosen.map(expand).transpose()?;
     let from = |field: &str, of: fn(&Template) -> Option<String>| -> Option<String> {
         form.optional(field)
             .map(str::to_string)
@@ -1033,6 +1034,9 @@ fn create(ctx: &Ctx, app: &mut App, form: &Form) -> anyhow::Result<()> {
     // with a remote's name, which made it indistinguishable from a real one.
     if let Some(remote) = ctx.config.remotes.iter().find(|r| r.name == machine) {
         let created = proxy::create_remote(ctx, remote, &args)?;
+        // The definition was used, wherever the Quest ended up: the template is
+        // this machine's row (SPEC §11) and so is its run count.
+        count_run(ctx, template.as_ref())?;
         // No anchor: the row lives in that machine's database and arrives with
         // the next remote tick (SPEC §17's `[ui] tick_remote`).
         app.say(format!(
@@ -1043,8 +1047,33 @@ fn create(ctx: &Ctx, app: &mut App, form: &Form) -> anyhow::Result<()> {
     }
 
     let created = new::create(ctx, &args)?;
+    count_run(ctx, template.as_ref())?;
     app.quests.focus_on(Anchor::local(&created.quest));
     app.say(format!("created {} · o enters it", created.quest.slug));
+    Ok(())
+}
+
+/// The form's half of `q tpl run`'s expansion: `{{date}}` is filled in, and a
+/// template that wants a `{{arg.k}}` is refused with the command that can give
+/// it one.
+fn expand(template: Template) -> anyhow::Result<Template> {
+    tpl::expanded_for_form(&template).map_err(|e| {
+        // The command first: the form's error line is one row wide and
+        // ellipsises, and the actionable half is the one that has to survive.
+        QError::Invalid(format!(
+            "run it from the CLI: q tpl run {} --arg k=v — {e:#}",
+            template.name
+        ))
+        .into()
+    })
+}
+
+/// SPEC §11's `run_count` / `last_run_at`, for the form's own instantiation —
+/// the same bookkeeping `q tpl run` does.
+fn count_run(ctx: &Ctx, template: Option<&Template>) -> anyhow::Result<()> {
+    if let Some(template) = template {
+        ctx.db()?.bump_template_run(&template.id, now())?;
+    }
     Ok(())
 }
 
@@ -4422,6 +4451,73 @@ mod form_tests {
             "{:?}",
             pane.command
         );
+    }
+
+    /// bd-8lz.6.1: the form does the run bookkeeping `q tpl run` does, and
+    /// expands the one placeholder it can — `{{date}}`.
+    #[test]
+    fn a_templated_quest_expands_the_date_and_counts_the_run() {
+        let rig = Rig::new();
+        let mut template = crate::model::Template::new("weekly-hygiene");
+        template.goal = Some("tidy up on {{date}}".to_string());
+        template.cwd = Some(rig.dir());
+        rig.ctx.db().unwrap().insert_template(&template).unwrap();
+
+        let mut app = rig.app();
+        app.handle(Input::Char('n'));
+        set(&mut app, F_NAME, "from-template");
+        focus(&mut app, F_TEMPLATE);
+        app.handle(Input::Right);
+        no_beads(&mut app);
+        submit(&rig, &mut app);
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+
+        let today = crate::templates::today();
+        assert_eq!(
+            rig.quests()[0].goal.as_deref(),
+            Some(format!("tidy up on {today}").as_str())
+        );
+        let stored = rig
+            .ctx
+            .db()
+            .unwrap()
+            .get_template(&template.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.run_count, 1);
+        assert!(stored.last_run_at.is_some());
+    }
+
+    /// A form has nowhere to type `--arg`, so a template that wants one is
+    /// refused rather than instantiated with the braces still in it.
+    #[test]
+    fn a_template_that_needs_an_argument_is_refused_by_the_form() {
+        let rig = Rig::new();
+        let mut template = crate::model::Template::new("weekly-hygiene");
+        template.goal = Some("tidy {{arg.repo}}".to_string());
+        template.cwd = Some(rig.dir());
+        rig.ctx.db().unwrap().insert_template(&template).unwrap();
+
+        let mut app = rig.app();
+        app.handle(Input::Char('n'));
+        set(&mut app, F_NAME, "from-template");
+        focus(&mut app, F_TEMPLATE);
+        app.handle(Input::Right);
+        no_beads(&mut app);
+        submit(&rig, &mut app);
+
+        let text = screen(&mut app);
+        assert!(app.modal.is_some(), "the form closed: {text}");
+        assert!(text.contains("q tpl run"), "{text}");
+        assert!(rig.quests().is_empty(), "a quest was created: {text}");
+        let stored = rig
+            .ctx
+            .db()
+            .unwrap()
+            .get_template(&template.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.run_count, 0);
     }
 
     // ----------------------------------------------------------- the mouse
