@@ -66,16 +66,28 @@ pub const NO_COMMAND: i32 = 127;
 ///
 /// Wire 1 is the contract as of bd-8lz.5.3: the `q list --json` envelope
 /// (`{"quests":…,"machines":…}`) and a proxied command line carrying
-/// `--expect <id>.<created_at>`, `--confirmed` and `--no-remote`. A `q` older
-/// than that prints no wire tag at all, which is exactly how [`check_remotes`]
-/// recognises it.
+/// `--expect <id>.<created_at>`, `--confirmed` and `--no-remote`.
 ///
-/// [`check_remotes`]: crate::doctor
+/// **This number is a diagnostic signal, not a gate.** Nothing in `q` refuses
+/// to talk to a remote over it: [`fetch_all`], [`interpret`] and
+/// [`crate::commands::proxy::dispatch`] never read it, and its only reader is
+/// [`crate::doctor`], which puts it in a report line. Enforcing it would mean
+/// a `q --version` round trip in front of every proxied command *and* refusing
+/// remotes that demonstrably work, so it is deliberately left advisory. A bead
+/// that wants a real compatibility gate has to build one — raising
+/// [`MIN_REMOTE_WIRE`] on its own changes only what `q doctor` prints.
 pub const WIRE: u32 = 1;
 
-/// The oldest far-end wire this `q` can drive. Equal to [`WIRE`] today; a
-/// future bead that can still talk to an older remote lowers it, and one that
-/// cannot raises it — that single constant is the whole compatibility policy.
+/// The oldest far-end wire `q doctor` calls compatible. Raise it and doctor
+/// *fails* a remote whose tag is below it; lower it and doctor accepts one.
+/// It changes nothing else: see [`WIRE`] — no command consults the wire before
+/// talking to a remote.
+///
+/// A far end that reports **no** tag is outside this comparison entirely, and
+/// no value here can bring it in. No tag means "older than wire tagging",
+/// which covers every `q` up to and including bd-8lz.5.3 — a range holding
+/// both binaries this one drives perfectly and binaries that reject
+/// `--expect`. `q doctor` warns about those rather than judging them.
 pub const MIN_REMOTE_WIRE: u32 = 1;
 
 /// A floor above this build's own wire would make `q` refuse a remote running
@@ -759,22 +771,43 @@ impl RemoteResult {
 
 // ------------------------------------------------------------------- probe
 
-/// What a far end's `q --version` said. `wire` is `None` for a `q` that
-/// predates [`WIRE`] and printed only its crate version.
+/// What a far end's `q --version` said about the wire it speaks.
+///
+/// Three states, not two: a tag that reads as a number, no tag at all, and a
+/// tag that is there and is not a number. The last two are kept apart because
+/// they mean opposite things — one is an old `q`, the other is a broken answer
+/// — and collapsing them once made `q doctor` tell a remote claiming
+/// `(wire 4294967296)` that it was too old (bd-8lz.5.4 review F5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wire {
+    /// A `(wire N)` tag this `q` could read.
+    Speaks(u32),
+    /// No tag at all — how every `q` from before the wire was numbered
+    /// identifies itself. It means "older than wire tagging" and nothing more
+    /// precise: the range covers both a `q` this one drives end to end and a
+    /// `q` that answers `--expect` with clap's exit 2.
+    Untagged,
+    /// A tag is present and is not a `u32`: negative, overflowing, or not a
+    /// number. Carries it verbatim so the report can quote it.
+    Unreadable(String),
+}
+
+/// What a far end's `q --version` said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteVersion {
     /// The crate version, `0.1.0` — for the human reading the report.
     pub semver: String,
-    /// The remote wire version, when the far end reports one.
-    pub wire: Option<u32>,
+    /// The wire the far end claims, as far as it can be read.
+    pub wire: Wire,
 }
 
 impl RemoteVersion {
     /// `0.1.0 (wire 1)` / `0.1.0`, however the far end said it.
     pub fn label(&self) -> String {
-        match self.wire {
-            Some(wire) => format!("q {} (wire {wire})", self.semver),
-            None => format!("q {}", self.semver),
+        match &self.wire {
+            Wire::Speaks(wire) => format!("q {} (wire {wire})", self.semver),
+            Wire::Untagged => format!("q {}", self.semver),
+            Wire::Unreadable(tag) => format!("q {} (wire {tag})", self.semver),
         }
     }
 }
@@ -797,16 +830,26 @@ pub fn parse_version(out: &str) -> Option<RemoteVersion> {
     if !line.starts_with(word) && line.split_whitespace().nth(1) != Some(word) {
         return None;
     }
+    // `q 0.1.0(wire 1)`: a tag with no space before it is still a tag, and the
+    // version is what precedes it — splitting on whitespace alone once left
+    // `0.1.0(wire` as the version (bd-8lz.5.4 review F6).
+    let semver = word.split('(').next().unwrap_or(word);
     Some(RemoteVersion {
-        semver: word.to_string(),
+        semver: semver.to_string(),
         wire: parse_wire(line),
     })
 }
 
-/// The `(wire N)` tag, if the far end printed one.
-fn parse_wire(line: &str) -> Option<u32> {
-    let after = line.split("(wire ").nth(1)?;
-    after.split(')').next()?.trim().parse().ok()
+/// The `(wire N)` tag, read into its three states — see [`Wire`].
+fn parse_wire(line: &str) -> Wire {
+    let Some(after) = line.split("(wire ").nth(1) else {
+        return Wire::Untagged;
+    };
+    let tag = after.split(')').next().unwrap_or(after).trim();
+    match tag.parse::<u32>() {
+        Ok(wire) => Wire::Speaks(wire),
+        Err(_) => Wire::Unreadable(output::first_line(tag, 32)),
+    }
 }
 
 /// Whether ssh would multiplex this alias, and why not when it would not
@@ -1974,6 +2017,36 @@ mod tests {
         assert!(out[0].quests.is_empty());
     }
 
+    /// A tag that is there and is not a number is not an old `q` — reading it
+    /// as one told a far end claiming `(wire 4294967296)` to upgrade
+    /// (bd-8lz.5.4 review F5).
+    #[test]
+    fn a_wire_tag_that_is_not_a_number_is_kept_apart_from_no_tag_at_all() {
+        let wire = |out: &str| parse_version(out).unwrap().wire;
+
+        assert_eq!(
+            wire("q 0.1.0 (wire 4294967296)"),
+            Wire::Unreadable("4294967296".to_string())
+        );
+        assert_eq!(
+            wire("q 0.1.0 (wire 99999999999999999999)"),
+            Wire::Unreadable("99999999999999999999".to_string())
+        );
+        assert_eq!(
+            wire("q 0.1.0 (wire -1)"),
+            Wire::Unreadable("-1".to_string())
+        );
+        assert_eq!(wire("q 0.1.0 (wire x)"), Wire::Unreadable("x".to_string()));
+        // …and none of them is `Untagged`, which is the whole point.
+        assert_ne!(wire("q 0.1.0 (wire -1)"), Wire::Untagged);
+        assert_eq!(wire("q 0.1.0"), Wire::Untagged);
+        // The report quotes it back verbatim rather than dropping it.
+        assert_eq!(
+            parse_version("q 0.1.0 (wire -1)").unwrap().label(),
+            "q 0.1.0 (wire -1)"
+        );
+    }
+
     /// [`WIRE`] and the tag `q --version` prints are two spellings of one
     /// number, and the far end reads the printed one.
     #[test]
@@ -1986,7 +2059,7 @@ mod tests {
         // …and this `q` reads its own banner back, so the probe and the
         // printer can never drift apart.
         let mine = parse_version(&format!("q {VERSION}")).unwrap();
-        assert_eq!(mine.wire, Some(WIRE));
+        assert_eq!(mine.wire, Wire::Speaks(WIRE));
         assert_eq!(mine.semver, env!("CARGO_PKG_VERSION"));
     }
 
@@ -1997,11 +2070,24 @@ mod tests {
         // clap's own line, and a wrapper printing the version alone.
         assert_eq!(
             wire("q 0.4.0 (wire 3)\n"),
-            Some(("0.4.0".to_string(), Some(3)))
+            Some(("0.4.0".to_string(), Wire::Speaks(3)))
         );
-        assert_eq!(wire("0.4.0 (wire 3)"), Some(("0.4.0".to_string(), Some(3))));
+        assert_eq!(
+            wire("0.4.0 (wire 3)"),
+            Some(("0.4.0".to_string(), Wire::Speaks(3)))
+        );
         // Every `q` from before the wire was numbered.
-        assert_eq!(wire("q 0.1.0"), Some(("0.1.0".to_string(), None)));
+        assert_eq!(wire("q 0.1.0"), Some(("0.1.0".to_string(), Wire::Untagged)));
+        // A tag with no space in front of it is still a tag, and the version
+        // in front of it is still a version (review F6).
+        assert_eq!(
+            wire("q 0.1.0(wire 1)"),
+            Some(("0.1.0".to_string(), Wire::Speaks(1)))
+        );
+        assert_eq!(
+            parse_version("q 0.1.0(wire 1)").unwrap().label(),
+            "q 0.1.0 (wire 1)"
+        );
 
         // Nothing that is not a version is read as one.
         assert_eq!(wire(""), None);
@@ -2009,9 +2095,12 @@ mod tests {
         assert_eq!(wire("Welcome to ws! Have a nice day."), None);
         assert_eq!(wire("error: q 1.2.3 is broken"), None);
 
-        // A wire tag that is not a number is no tag at all — never a panic,
-        // and never a version this `q` decides it can talk to.
-        assert_eq!(wire("q 0.1.0 (wire next)"), Some(("0.1.0".into(), None)));
+        // A wire tag that is not a number is read as unreadable — never a
+        // panic, and never confused with a `q` that printed no tag at all.
+        assert_eq!(
+            wire("q 0.1.0 (wire next)"),
+            Some(("0.1.0".into(), Wire::Unreadable("next".to_string())))
+        );
 
         // A banner ahead of the version is a banner, not a version: the far
         // end's rc files printing at us must not be read as a `q`.

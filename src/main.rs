@@ -159,24 +159,32 @@ impl Ctx {
         Ok(ctx)
     }
 
-    /// For commands that must work while the file is broken — that is the
-    /// state `q config path` and `q config edit` exist to get out of.
-    fn lenient(args: &Cli) -> Ctx {
-        let config = Config::load().unwrap_or_default();
-        Ctx::new(args, config, None).unwrap_or_else(|_| Ctx {
-            json: args.json,
-            quiet: args.quiet,
-            config: Config::default(),
-            machine_override: None,
-            no_remote: args.no_remote,
-            confirmed: args.confirmed,
-            expect: args.expect.clone(),
-            db: None,
-            tmux: tmux::tmux(),
-            ssh: remote::ssh().into(),
-            bd: beads::client(),
-            warnings: Mutex::new(Vec::new()),
-        })
+    /// For commands that must work while the config file is broken — that is
+    /// the state `q config path`, `q config edit` and `q doctor` exist to get
+    /// out of.
+    ///
+    /// Lenient about the **config**, strict about the **invocation**. An
+    /// earlier version swallowed every `Ctx::new` error into a default `Ctx`,
+    /// which silently dropped `--machine`. That was harmless while `--machine`
+    /// did nothing for doctor; now it picks which remotes get probed, so
+    /// `q --machine bogus doctor` would print a green report about a machine
+    /// that does not exist while `q list --machine bogus` errors (bd-8lz.5.4
+    /// review F2). `--machine` is a user error either way, and user errors are
+    /// not what doctor is lenient about.
+    fn lenient(args: &Cli) -> anyhow::Result<Ctx> {
+        match Config::load() {
+            Ok(config) => Ctx::new(args, config, None),
+            // `--machine` names something only the config can define, so an
+            // unreadable config cannot resolve it — and quietly ignoring it
+            // would answer about the wrong machine. Say so; the same command
+            // without `--machine` is the one that diagnoses the config.
+            Err(e) if args.machine.is_some() => Err(QError::Other(format!(
+                "--machine cannot be resolved while the config is unreadable ({e:#}) \
+                 — run the same command without --machine"
+            ))
+            .into()),
+            Err(_) => Ctx::new(args, Config::default(), None),
+        }
     }
 
     pub fn db(&self) -> anyhow::Result<&Db> {
@@ -325,7 +333,14 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
         if args.json || !args.quiet {
             output::emit(
                 args.json,
-                &serde_json::json!({ "version": version, "tui": false }),
+                // The same two facts `q --version` prints, each in its own
+                // field: `version` stays a bare semver a script can parse,
+                // and the wire tag rides beside it rather than inside it.
+                &serde_json::json!({
+                    "version": version,
+                    "wire": remote::WIRE,
+                    "tui": false,
+                }),
                 || format!("q {version} — run `q --help` for commands"),
             )?;
         }
@@ -340,7 +355,7 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             let ctx = if needs_valid_config(action.as_ref()) {
                 Ctx::config_only(args)?
             } else {
-                Ctx::lenient(args)
+                Ctx::lenient(args)?
             };
             return config::run(&ctx, action.as_ref()).map(|()| 0);
         }
@@ -348,7 +363,7 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             // Diagnosing a broken environment must not require a working one:
             // doctor opens the config and the database itself, and reports
             // whatever it finds.
-            return doctor::run(&Ctx::lenient(args), *fix);
+            return doctor::run(&Ctx::lenient(args)?, *fix);
         }
         Command::Hook { action } => {
             return match action {
@@ -366,7 +381,7 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
                 // is the last line of that defence.
                 _ if naming::suppressed() => Ok(0),
                 // Lenient: a broken config must never break the statusline.
-                HookAction::Statusline => commands::hook::statusline(&Ctx::lenient(args)),
+                HookAction::Statusline => commands::hook::statusline(&Ctx::lenient(args)?),
                 HookAction::SessionStart => hooks::run(hooks::Event::SessionStart),
                 HookAction::UserPromptSubmit => hooks::run(hooks::Event::UserPromptSubmit),
                 HookAction::Stop => hooks::run(hooks::Event::Stop),

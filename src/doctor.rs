@@ -698,25 +698,57 @@ fn check_beads() -> Check {
 }
 
 // ------------------------------------------------------------------- remotes
+//
+// **How the remote block assigns severity** (settled in bd-8lz.5.4's review):
+//
+// * `Fail` — the far end is *definitively* unable to serve this `q`, and will
+//   be just as unable on the next run: no `q` over there ([`Reach::NoQ`]), a
+//   `q` that cannot print its own version ([`Reach::Ran`]), or a wire tag that
+//   is present, readable and below the floor ([`Reach::TooOld`]).
+// * `Warn` — anything a probe cannot be sure of, or cannot fix from here: a
+//   host that is asleep or off the network ([`Reach::Down`] — transient, and a
+//   scripted `q doctor` must not go red every time a laptop sleeps), a `q`
+//   newer than this one, a missing or unreadable wire tag, an answer that is
+//   not a version, a missing `ControlMaster`.
+// * `Ok` — reachable, and it reports a wire this `q` calls compatible.
+//
+// The guiding rule is that `Fail` is a *claim*, so doctor only makes one when
+// the probe proves it. A guess is a warning. That is also why doctor can never
+// contradict `q list` about a host: the only remote states doctor fails are
+// ones `q list` also refuses to use.
+//
+// A missing **local** `q` on PATH is a `Warn` while a missing **remote** one
+// is a `Fail`, deliberately: locally a `q` is provably running and the check
+// is only about which one a shell would pick, whereas remotely there is none
+// at all and every remote feature for that machine is dead.
 
 /// What `ssh <alias> q --version` established about one remote (SPEC §19:
 /// *every remote reachable and version compatible*).
 ///
-/// The three failures the report has to keep apart, each with its own fix, are
+/// The failures the report has to keep apart, each with its own fix, are
 /// [`Reach::Down`] (ssh itself did not get there), [`Reach::NoQ`] (it did, and
 /// there is no `q` on that machine) and [`Reach::TooOld`] (there is one, and it
-/// is older than the wire this `q` speaks).
+/// says it speaks a wire this `q` cannot drive).
 #[derive(Debug, PartialEq, Eq)]
 enum Reach {
     /// Reachable, and its wire is one this `q` can drive.
     Ok(remote::RemoteVersion),
-    /// Reachable, and its `q` is older than [`remote::MIN_REMOTE_WIRE`] — the
-    /// case bd-8lz.5.3 left cryptic: such a `q` rejects the hidden `--expect`
-    /// and `--confirmed` globals as unknown arguments, and clap's exit 2 says
-    /// nothing about why.
+    /// Reachable, and its tag is readable and below [`remote::MIN_REMOTE_WIRE`]
+    /// — the only *positive* statement of incompatibility a version banner can
+    /// make, and so the only wire verdict that fails the report.
     TooOld(remote::RemoteVersion),
     /// Reachable, and its `q` speaks a wire *newer* than this one's.
     Newer(remote::RemoteVersion),
+    /// Reachable, and its `q` reports no wire at all: every `q` from before
+    /// the wire was numbered. That range holds both a `q` this one drives end
+    /// to end (`main` as of bd-8lz.5.3, which `q list` talks to happily) and a
+    /// `q` that rejects the hidden `--expect` with clap's exit 2 — the case
+    /// bd-8lz.5.3 left cryptic. A banner cannot tell those apart, so this is
+    /// *unknown*, not *too old*.
+    Untagged(remote::RemoteVersion),
+    /// Reachable, and its wire tag is not a number this `q` can read. A broken
+    /// answer, not an old `q`.
+    BadWire(remote::RemoteVersion),
     /// Answered, but not with anything resembling a version.
     Unreadable(String),
     /// ssh got there; the shell could not find `q`.
@@ -771,13 +803,16 @@ fn diagnose(outcome: &remote::SshOutcome) -> Reach {
                 .unwrap_or_else(|| "nothing".to_string()),
         );
     };
-    match version.wire {
-        Some(wire) if wire > remote::WIRE => Reach::Newer(version),
-        Some(wire) if wire >= remote::MIN_REMOTE_WIRE => Reach::Ok(version),
-        // No tag at all is how every `q` from before the wire was numbered
-        // identifies itself, so it is the same verdict as a tag below the floor.
-        _ => Reach::TooOld(version),
-    }
+    // Every wire verdict carries the same payload, so the class is chosen
+    // first and the version moved into it after.
+    let verdict: fn(remote::RemoteVersion) -> Reach = match &version.wire {
+        remote::Wire::Speaks(wire) if *wire > remote::WIRE => Reach::Newer,
+        remote::Wire::Speaks(wire) if *wire < remote::MIN_REMOTE_WIRE => Reach::TooOld,
+        remote::Wire::Speaks(_) => Reach::Ok,
+        remote::Wire::Untagged => Reach::Untagged,
+        remote::Wire::Unreadable(_) => Reach::BadWire,
+    };
+    verdict(version)
 }
 
 /// Another program's output on its way into a report line: one line, bounded.
@@ -788,9 +823,10 @@ fn said(text: &str) -> Option<String> {
 
 /// `wire 1` / `no wire version` — what a remote `q` says it speaks.
 fn spoken(version: &remote::RemoteVersion) -> String {
-    match version.wire {
-        Some(wire) => format!("wire {wire}"),
-        None => "no wire version".to_string(),
+    match &version.wire {
+        remote::Wire::Speaks(wire) => format!("wire {wire}"),
+        remote::Wire::Untagged => "no wire version".to_string(),
+        remote::Wire::Unreadable(tag) => format!("`wire {tag}`"),
     }
 }
 
@@ -801,6 +837,8 @@ fn remote_check(probe: &remote::Probe, local: &str) -> Check {
     let upgrade = format!("upgrade `q` on {}", probe.name);
     match diagnose(&probe.version) {
         Reach::Ok(v) => check(name, Status::Ok, format!("{} · ssh {alias}", v.label())),
+        // The one wire verdict that is a claim rather than a guess: a tag is
+        // there, it reads as a number, and the number is below the floor.
         Reach::TooOld(v) => with_hint(
             check(
                 name,
@@ -813,6 +851,39 @@ fn remote_check(probe: &remote::Probe, local: &str) -> Check {
                 ),
             ),
             upgrade,
+        ),
+        // No tag means "older than wire tagging", which spans everything up to
+        // and including bd-8lz.5.3 — binaries this `q` drives end to end and
+        // binaries that reject `--expect`, indistinguishable from here. `q
+        // list` will talk to it and will usually be right, so failing it would
+        // be doctor contradicting the listing about the same host. Report what
+        // is unknown instead (bd-8lz.5.4 review F3).
+        Reach::Untagged(v) => with_hint(
+            check(
+                name,
+                Status::Warn,
+                format!(
+                    "{} · ssh {alias} — no wire tag, so whether it speaks wire {} \
+                     cannot be told from here; a proxied command may still fail with \
+                     `unexpected argument '--expect'`",
+                    v.label(),
+                    remote::WIRE
+                ),
+            ),
+            format!("{upgrade} to make its wire knowable"),
+        ),
+        // A tag that is not a number is a broken answer, not an old `q`, and
+        // must not be read as "older than everything".
+        Reach::BadWire(v) => with_hint(
+            check(
+                name,
+                Status::Warn,
+                format!(
+                    "{} · ssh {alias} — its wire tag is not a number this `q` can read",
+                    v.label()
+                ),
+            ),
+            format!("check what `ssh {alias} q --version` prints"),
         ),
         // Not a failure: the far end knows a wire this one does not, and the
         // listing parse already ignores fields it has never heard of. The fix
@@ -830,6 +901,9 @@ fn remote_check(probe: &remote::Probe, local: &str) -> Check {
             ),
             format!("upgrade `q` on {local}"),
         ),
+        // A failure, unlike the *local* `q on PATH` warning above: there a `q`
+        // is provably running and the question is only which one, here there
+        // is none and every remote feature for this machine is dead.
         Reach::NoQ => with_hint(
             check(
                 name,
@@ -841,8 +915,11 @@ fn remote_check(probe: &remote::Probe, local: &str) -> Check {
                 probe.name
             ),
         ),
+        // A warning, not a failure: a laptop that is asleep or off the VPN is
+        // neither a broken setup nor one this machine can repair, and a
+        // scripted `q doctor` must not flap with it (bd-8lz.5.4 review F4).
         Reach::Down(why) => with_hint(
-            check(name, Status::Fail, format!("ssh {alias}: {why}")),
+            check(name, Status::Warn, format!("ssh {alias}: {why}")),
             format!("check that `ssh {alias}` works — host, network, key, ~/.ssh/config"),
         ),
         Reach::Ran(what) => with_hint(check(name, Status::Fail, what), upgrade),
@@ -915,7 +992,11 @@ fn check_remotes(ctx: &Ctx) -> Vec<Check> {
         .iter()
         .flat_map(|probe| {
             [
-                remote_check(probe, ctx.machine()),
+                // The machine this `q` is *running on*, never `--machine`'s
+                // target: `Reach::Newer`'s hint says "the fix is here", and
+                // under `--machine ws` `ctx.machine()` is `ws` — the machine
+                // that is already newer (bd-8lz.5.4 review F1).
+                remote_check(probe, &ctx.config.machine.name),
                 multiplexing_check(probe),
             ]
         })
@@ -1103,10 +1184,27 @@ mod tests {
             Reach::NoQ
         );
 
-        // A `q` that answers, and predates the wire — the bd-8lz.5.3 skew.
-        assert!(
-            matches!(diagnose(&answered(0, "q 0.1.0\n", "")), Reach::TooOld(v) if v.wire.is_none())
-        );
+        // A `q` that answers and predates the wire tag: unknown, not too old.
+        assert!(matches!(
+            diagnose(&answered(0, "q 0.1.0\n", "")),
+            Reach::Untagged(v) if v.wire == remote::Wire::Untagged
+        ));
+
+        // A tag that is there and below the floor is the one wire verdict that
+        // is a claim. (Unreachable while `MIN_REMOTE_WIRE == 1`, so it is
+        // asserted against the rule rather than a literal.)
+        assert!(matches!(
+            diagnose(&answered(0, "q 0.0.1 (wire 0)\n", "")),
+            Reach::TooOld(_)
+        ));
+
+        // A tag that is not a number is a broken answer, not an old `q`.
+        for line in ["q 0.1.0 (wire 4294967296)", "q 0.1.0 (wire -1)"] {
+            assert!(
+                matches!(diagnose(&answered(0, line, "")), Reach::BadWire(_)),
+                "{line}"
+            );
+        }
 
         // A `q` this one can drive, and one from the future.
         assert!(matches!(
@@ -1142,27 +1240,68 @@ mod tests {
         }
     }
 
-    /// The fix line the whole version story exists to be able to print.
+    /// The fix line the whole version story exists to be able to print — and
+    /// the severity each verdict earns (bd-8lz.5.4 review F3/F4/F5).
     #[test]
-    fn a_remote_too_old_for_the_wire_is_told_to_upgrade_its_own_q() {
-        let old = remote_check(
-            &remote_probe(answered(0, "q 0.1.0\n", ""), remote::Multiplexing::Off),
-            "laptop",
+    fn only_a_readable_tag_below_the_floor_fails_the_remote_check() {
+        let checked = |stdout: &str| {
+            remote_check(
+                &remote_probe(answered(0, stdout, ""), remote::Multiplexing::Off),
+                "laptop",
+            )
+        };
+
+        // No tag: everything up to and including bd-8lz.5.3 prints this, and
+        // `q list` talks to most of it happily. Advisory, and it says so.
+        let untagged = checked("q 0.1.0\n");
+        assert_eq!(untagged.status, Status::Warn);
+        assert!(
+            untagged
+                .fix_hint
+                .as_deref()
+                .unwrap()
+                .contains("upgrade `q` on ws"),
+            "{untagged:?}"
         );
+        assert!(untagged.detail.contains("no wire tag"), "{untagged:?}");
+
+        // A tag below the floor: the one claim, and the one failure.
+        let old = checked("q 0.0.1 (wire 0)\n");
         assert_eq!(old.status, Status::Fail);
         assert_eq!(old.fix_hint.as_deref(), Some("upgrade `q` on ws"));
-        assert!(old.detail.contains("no wire version"), "{old:?}");
+
+        // A tag that is not a number: unreadable, never "older than nothing".
+        let bad = checked("q 0.1.0 (wire -1)\n");
+        assert_eq!(bad.status, Status::Warn);
+        assert!(bad.detail.contains("(wire -1)"), "{bad:?}");
+        assert!(!bad.detail.contains("needs wire"), "{bad:?}");
 
         // The other direction points at this machine instead.
-        let new = remote_check(
-            &remote_probe(
-                answered(0, "q 9.9.9 (wire 99)\n", ""),
-                remote::Multiplexing::Off,
-            ),
-            "laptop",
-        );
+        let new = checked("q 9.9.9 (wire 99)\n");
         assert_eq!(new.status, Status::Warn);
         assert_eq!(new.fix_hint.as_deref(), Some("upgrade `q` on laptop"));
+    }
+
+    /// A remote that is asleep or off the network is not a broken setup and
+    /// not one this machine can repair, so it warns; a remote with no `q` on
+    /// it is permanently unable to serve, so it fails (review F4).
+    #[test]
+    fn an_unreachable_remote_warns_while_a_remote_without_q_fails() {
+        let probe = |v| remote_check(&remote_probe(v, remote::Multiplexing::Off), "laptop");
+
+        for down in [
+            answered(255, "", "ssh: connect to host ws port 22: No route to host"),
+            remote::SshOutcome::TimedOut,
+            remote::SshOutcome::Failed("ssh not found on PATH".into()),
+        ] {
+            let check = probe(down);
+            assert_eq!(check.status, Status::Warn, "{check:?}");
+        }
+
+        let no_q = probe(answered(127, "", "zsh: command not found: q"));
+        assert_eq!(no_q.status, Status::Fail);
+        let broken = probe(answered(2, "", "error: nope"));
+        assert_eq!(broken.status, Status::Fail);
     }
 
     /// SPEC §23 #6: a missing `ControlMaster` is advice, never a failure — and

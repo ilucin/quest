@@ -398,12 +398,36 @@ fn machine_flag_accepts_this_machines_own_name() {
 fn machine_flag_is_not_persisted_by_config_set() {
     let mut cmd = q();
     let path = config_path(&cmd);
+    std::fs::write(
+        &path,
+        "[machine]\nname = \"laptop\"\n\n[[remotes]]\nname = \"ws\"\nssh = \"ws-host\"\n",
+    )
+    .unwrap();
     cmd.args(["--machine", "ws", "config", "set", "ui.mouse", "false"])
         .assert()
         .success();
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(!text.contains("name = \"ws\""), "{text}");
+    assert!(text.contains("name = \"laptop\""), "{text}");
     assert!(text.contains("mouse = false"), "{text}");
+}
+
+/// `--machine` is validated wherever it is given, including on the commands
+/// that tolerate a broken config — swallowing it is how `q doctor` came to
+/// answer about machines that do not exist (bd-8lz.5.4 review F2).
+#[test]
+fn machine_flag_is_validated_even_on_the_lenient_commands() {
+    for args in [
+        vec!["--machine", "nope", "config", "set", "ui.mouse", "false"],
+        vec!["--machine", "nope", "config", "path"],
+        vec!["--machine", "nope", "doctor"],
+    ] {
+        let mut cmd = q();
+        std::fs::write(config_path(&cmd), "[machine]\nname = \"laptop\"\n").unwrap();
+        cmd.args(&args)
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("known machines: laptop"));
+    }
 }
 
 #[test]
@@ -1745,14 +1769,28 @@ fn doctor_probes_every_remote_with_q_version() {
 /// older one.
 #[test]
 fn the_version_banner_carries_the_wire_version() {
-    q().arg("--version")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("(wire "));
+    let assert = q().arg("--version").assert().success();
+    let banner = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(banner.contains("(wire "), "{banner}");
+
+    // …and bare `q --json` reports the same two facts, each in its own field
+    // rather than one string a script would have to re-parse.
+    let assert = q().arg("--json").assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let wire = parsed["wire"].as_u64().expect("a wire number");
+    assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        banner.contains(&format!("(wire {wire})")),
+        "{banner} vs {parsed}"
+    );
 }
 
+/// A host that is asleep or off the network is not a broken setup and not one
+/// this machine can repair, so it warns and the report still passes — a
+/// scripted `q doctor` must not flap with a laptop's lid (bd-8lz.5.4 F4).
 #[test]
-fn doctor_fails_on_an_unreachable_remote() {
+fn doctor_warns_about_an_unreachable_remote() {
     let mut cmd = doctor(&["claude"]);
     doctor_remotes(
         &mut cmd,
@@ -1764,10 +1802,10 @@ fn doctor_fails_on_an_unreachable_remote() {
             ),
         }),
     );
-    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
     let parsed = json_of(&assert);
     let remote = check(&parsed, "remote ws");
-    assert_eq!(remote["status"], "fail");
+    assert_eq!(remote["status"], "warn");
     assert!(
         remote["detail"].as_str().unwrap().contains("No route"),
         "{parsed}"
@@ -1793,7 +1831,7 @@ fn doctor_gives_up_on_a_silent_remote_at_the_deadline() {
         }),
     );
     let started = std::time::Instant::now();
-    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
     let elapsed = started.elapsed();
     assert!(
         elapsed < std::time::Duration::from_secs(60),
@@ -1801,7 +1839,7 @@ fn doctor_gives_up_on_a_silent_remote_at_the_deadline() {
     );
     let parsed = json_of(&assert);
     let remote = check(&parsed, "remote ws");
-    assert_eq!(remote["status"], "fail");
+    assert_eq!(remote["status"], "warn");
     assert!(
         remote["detail"].as_str().unwrap().contains("no answer"),
         "{parsed}"
@@ -1844,10 +1882,14 @@ fn doctor_tells_a_reachable_host_without_q_apart_from_a_dead_one() {
 }
 
 /// The debt bd-8lz.5.3 left: a `q` too old to understand `--expect` answers
-/// with clap's exit 2 and no explanation. Its `--version` has no wire tag, and
-/// that is what doctor turns into "upgrade `q` on ws".
+/// with clap's exit 2 and no explanation. Its `--version` has no wire tag —
+/// but so does every `q` up to and including bd-8lz.5.3's own `main`, which
+/// this one drives end to end and which `q list` reports as `ok`. A banner
+/// cannot tell those apart, so doctor advises and does not condemn: failing
+/// here would make doctor contradict `q list` about the same host
+/// (bd-8lz.5.4 review F3).
 #[test]
-fn doctor_reports_a_q_too_old_for_the_wire() {
+fn doctor_advises_rather_than_fails_a_remote_that_reports_no_wire() {
     let mut cmd = doctor(&["claude"]);
     doctor_remotes(
         &mut cmd,
@@ -1856,13 +1898,70 @@ fn doctor_reports_a_q_too_old_for_the_wire() {
             "ws-host": host(serde_json::json!({ "stdout": "q 0.1.0" }), MUX_ON),
         }),
     );
+    let assert = cmd.args(["doctor", "--json"]).assert().success();
+    let parsed = json_of(&assert);
+    let remote = check(&parsed, "remote ws");
+    assert_eq!(remote["status"], "warn");
+    let detail = remote["detail"].as_str().unwrap();
+    assert!(detail.contains("q 0.1.0"), "{detail}");
+    assert!(detail.contains("no wire tag"), "{detail}");
+    assert!(detail.contains("--expect"), "{detail}");
+    assert!(
+        remote["fix_hint"]
+            .as_str()
+            .unwrap()
+            .contains("upgrade `q` on ws"),
+        "{parsed}"
+    );
+}
+
+/// A tag that is there and is not a number is a broken answer, not an ancient
+/// `q`; reading it as "older than everything" told a far end claiming
+/// `(wire 4294967296)` to upgrade (bd-8lz.5.4 review F5).
+#[test]
+fn doctor_warns_about_a_wire_tag_it_cannot_read() {
+    for tag in ["4294967296", "-1", "99999999999999999999"] {
+        let mut cmd = doctor(&["claude"]);
+        doctor_remotes(
+            &mut cmd,
+            &[("ws", "ws-host")],
+            serde_json::json!({
+                "ws-host": host(
+                    serde_json::json!({ "stdout": format!("q 0.1.0 (wire {tag})") }),
+                    MUX_ON,
+                ),
+            }),
+        );
+        let assert = cmd.args(["doctor", "--json"]).assert().success();
+        let parsed = json_of(&assert);
+        let remote = check(&parsed, "remote ws");
+        assert_eq!(remote["status"], "warn", "{parsed}");
+        let detail = remote["detail"].as_str().unwrap();
+        assert!(detail.contains(&format!("(wire {tag})")), "{detail}");
+        assert!(!detail.contains("needs wire"), "{detail}");
+    }
+}
+
+/// A tag that is present, readable and below the floor is the one thing a
+/// version banner can *prove*, and the only wire verdict that fails.
+#[test]
+fn doctor_fails_a_remote_whose_wire_is_below_the_floor() {
+    let mut cmd = doctor(&["claude"]);
+    doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host")],
+        serde_json::json!({
+            "ws-host": host(serde_json::json!({ "stdout": "q 0.0.1 (wire 0)" }), MUX_ON),
+        }),
+    );
     let assert = cmd.args(["doctor", "--json"]).assert().code(1);
     let parsed = json_of(&assert);
     let remote = check(&parsed, "remote ws");
     assert_eq!(remote["status"], "fail");
-    let detail = remote["detail"].as_str().unwrap();
-    assert!(detail.contains("q 0.1.0"), "{detail}");
-    assert!(detail.contains("no wire version"), "{detail}");
+    assert!(
+        remote["detail"].as_str().unwrap().contains("needs wire"),
+        "{parsed}"
+    );
     assert_eq!(remote["fix_hint"], "upgrade `q` on ws");
 }
 
@@ -1990,6 +2089,131 @@ fn doctor_warns_about_a_control_master_that_never_persists() {
             .contains("ControlPersist 10m"),
         "{parsed}"
     );
+}
+
+// ------------------------------- doctor: --machine (bd-8lz.5.4 review F1/F2)
+
+/// `--machine` now decides which remotes are probed, so an unknown one is a
+/// user error here exactly as it is for `q list`. It used to be swallowed by
+/// `Ctx::lenient`, which produced a **green** report about a machine that does
+/// not exist — no remote lines, no error, exit 0.
+#[test]
+fn doctor_refuses_a_machine_that_does_not_exist() {
+    let mut cmd = doctor(&["claude"]);
+    let log = doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host")],
+        serde_json::json!({
+            "ws-host": host(serde_json::json!({ "stdout": "q 0.1.0 (wire 1)" }), MUX_ON),
+        }),
+    );
+    cmd.args(["--machine", "bogus", "doctor", "--json"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("known machines: laptop, ws"));
+    assert!(ssh_log_lines(&log).is_empty(), "{:?}", ssh_log_lines(&log));
+}
+
+/// The other invocation `q list` refuses outright and doctor used to accept.
+#[test]
+fn doctor_refuses_a_remote_machine_together_with_no_remote() {
+    let mut cmd = doctor(&["claude"]);
+    doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host")],
+        serde_json::json!({
+            "ws-host": host(serde_json::json!({ "stdout": "q 0.1.0 (wire 1)" }), MUX_ON),
+        }),
+    );
+    cmd.args(["--machine", "ws", "--no-remote", "doctor", "--json"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("--no-remote"));
+}
+
+/// A broken config is what doctor is *for*, so it stays lenient about the
+/// file — but `--machine` names something only the config could define, so it
+/// says it cannot resolve one rather than quietly answering about another
+/// machine.
+#[test]
+fn doctor_still_diagnoses_a_broken_config_but_not_under_machine() {
+    let mut cmd = doctor(&["claude"]);
+    std::fs::write(cmd.dir.path().join("config.toml"), "[machine\n").unwrap();
+    let assert = cmd.args(["doctor", "--json"]).assert().code(1);
+    assert_eq!(check(&json_of(&assert), "config")["status"], "fail");
+
+    let mut cmd = doctor(&["claude"]);
+    std::fs::write(cmd.dir.path().join("config.toml"), "[machine\n").unwrap();
+    cmd.args(["--machine", "ws", "doctor", "--json"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("config is unreadable"));
+}
+
+/// `--machine <a remote>` narrows the probe to that remote, and the "the fix
+/// is on this machine" hint still names the machine `q` is *running on* — it
+/// used to name `--machine`'s target, i.e. the one that is already newer.
+#[test]
+fn doctor_under_machine_probes_only_it_and_still_names_the_local_machine() {
+    let mut cmd = doctor(&["claude"]);
+    let log = doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host"), ("box", "box-host")],
+        serde_json::json!({
+            "ws-host": host(serde_json::json!({ "stdout": "q 9.9.9 (wire 99)" }), MUX_ON),
+            "box-host": host(serde_json::json!({ "stdout": "q 0.1.0 (wire 1)" }), MUX_ON),
+        }),
+    );
+    let assert = cmd
+        .args(["--machine", "ws", "doctor", "--json"])
+        .assert()
+        .success();
+    let parsed = json_of(&assert);
+
+    let names: Vec<&str> = parsed["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .filter(|n| n.starts_with("remote "))
+        .collect();
+    assert_eq!(names, ["remote ws"], "{parsed}");
+    let lines = ssh_log_lines(&log);
+    assert!(
+        lines.iter().all(|l| l.contains("ws-host")),
+        "the other remote was probed anyway: {lines:?}"
+    );
+
+    let remote = check(&parsed, "remote ws");
+    assert_eq!(remote["status"], "warn");
+    assert_eq!(remote["fix_hint"], "upgrade `q` on laptop");
+}
+
+/// `--machine <this machine>` is valid and means "no remotes" — the same
+/// contract `q list` has, and it must still cost no ssh.
+#[test]
+fn doctor_under_this_machines_own_name_makes_no_ssh_call() {
+    let mut cmd = doctor(&["claude"]);
+    let log = doctor_remotes(
+        &mut cmd,
+        &[("ws", "ws-host")],
+        serde_json::json!({
+            "ws-host": host(serde_json::json!({ "stdout": "q 0.1.0 (wire 1)" }), MUX_ON),
+        }),
+    );
+    let assert = cmd
+        .args(["--machine", "laptop", "doctor", "--json"])
+        .assert()
+        .success();
+    assert!(ssh_log_lines(&log).is_empty(), "{:?}", ssh_log_lines(&log));
+    let parsed = json_of(&assert);
+    let names: Vec<&str> = parsed["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(!names.iter().any(|n| n.starts_with("remote ")), "{names:?}");
 }
 
 /// The human report keeps doctor's ✓/✗ shape for the remote lines too.
