@@ -430,6 +430,12 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
                 HookAction::PostToolUse => commands::hook_capture::run(),
             };
         }
+        Command::Completions { shell } => {
+            // Pure command tree → stdout: no config and no database, so it works
+            // before the environment is set up and is safe to eval from a shell
+            // rc (SPEC §21).
+            return commands::completions::run(*shell).map(|()| 0);
+        }
         Command::Skill { action } => {
             // Installs an agent skill file, like `q hook install` merges hooks:
             // no database, works before the environment is otherwise ready.
@@ -464,7 +470,8 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
         Command::Config { .. }
         | Command::Doctor { .. }
         | Command::Hook { .. }
-        | Command::Skill { .. } => {
+        | Command::Skill { .. }
+        | Command::Completions { .. } => {
             unreachable!("handled before the database is opened")
         }
         Command::New {

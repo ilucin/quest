@@ -401,6 +401,16 @@ pub enum Command {
         #[command(subcommand)]
         action: WorkflowAction,
     },
+
+    /// Print a shell completion script to stdout (SPEC §21)
+    ///
+    /// Generated straight off the command tree, so it needs no database or
+    /// config and is safe to run before the environment is set up. Load it
+    /// from your shell rc, e.g. `eval "$(q completions zsh)"`.
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Subcommand, Debug)]

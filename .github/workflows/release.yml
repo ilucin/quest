@@ -1,0 +1,39 @@
+name: Release
+
+# Fires only on a real version tag push (e.g. `git tag v0.1.0 && git push --tags`).
+# Ordinary pushes and PRs are covered by ci.yml; this workflow never runs on them.
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # GitHub's macos-latest runner is arm64 (Apple silicon); this is the only
+    # target q ships per bd-8lz.7.4.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Add target
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Build
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Stage asset
+        run: cp target/aarch64-apple-darwin/release/q q-aarch64-apple-darwin
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: q-aarch64-apple-darwin
+          generate_release_notes: true
