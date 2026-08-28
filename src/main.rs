@@ -6,6 +6,7 @@ mod config;
 mod db;
 mod doctor;
 mod editor;
+mod enrich;
 mod error;
 mod hooks;
 mod model;

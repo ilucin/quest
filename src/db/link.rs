@@ -88,6 +88,26 @@ impl Db {
         Ok(())
     }
 
+    /// Writes an enrichment reading back: `title`, `meta` and the `enriched_at`
+    /// stamp the TTL is keyed on (SPEC §12). Unlike [`update_link_details`] this
+    /// also moves the cache clock forward.
+    pub fn update_enrichment(
+        &self,
+        id: i64,
+        title: Option<&str>,
+        meta: Option<&serde_json::Value>,
+        enriched_at: i64,
+    ) -> anyhow::Result<()> {
+        let meta = json_val(meta)?;
+        self.conn
+            .execute(
+                "UPDATE link SET title = ?1, meta = ?2, enriched_at = ?3 WHERE id = ?4",
+                params![title, meta, enriched_at, id],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     /// True when a row was deleted.
     pub fn delete_link(&self, id: i64) -> anyhow::Result<bool> {
         let n = self
