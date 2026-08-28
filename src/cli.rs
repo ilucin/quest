@@ -377,9 +377,10 @@ pub enum Command {
 
     /// Quest templates: reusable Quest definitions (SPEC §11)
     ///
-    /// Templates are rows in this machine's database, so no `q tpl`
-    /// subcommand is ever proxied and a global `--machine <other>` is
-    /// refused rather than ignored; move a definition with
+    /// Templates are rows in this machine's database, so a global
+    /// `--machine <other>` is refused rather than ignored — except on
+    /// `q tpl run`, which reaches that machine and runs *its* template of the
+    /// name. Move a definition with
     /// `q tpl export <name> | ssh <alias> q tpl import -`.
     Tpl {
         #[command(subcommand)]
@@ -523,6 +524,10 @@ pub enum TplAction {
     /// ahead of its repository); a template with no `cwd` uses the current
     /// directory. Everything else is `q new`, `-d` included, and the Quest is
     /// named after the template.
+    ///
+    /// `--machine <other>` runs the template of this name that lives on *that*
+    /// machine (the run is proxied over ssh, like `q new --machine`), and the
+    /// Quest is created — and, unless `-d`, attached — there.
     Run {
         /// Name, id, or an unambiguous fragment
         name: String,

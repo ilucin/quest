@@ -32,13 +32,15 @@
 //!   third of five templates leaves the database exactly as it was.
 //! * **Deleting a template does not delete its Quests** — see
 //!   [`crate::db::Db::delete_template`].
-//! * **`q tpl` is never proxied, and `--machine` is refused rather than
-//!   ignored.** A template is a row in *this* machine's database, like the
-//!   config and the hooks; `q --machine ws tpl run x` would have to mean a
-//!   template over there, which is not the one the user just listed — and
-//!   left alone it would create the Quest *here* while stamping it `ws`, the
-//!   very row `src/tui/quests.rs`'s machine select stopped producing. See
-//!   [`refuse_remote`] and [`crate::commands::proxy::route`].
+//! * **`q tpl` stays on this machine, except `q tpl run --machine`.** A
+//!   template is a row in *this* machine's database, like the config and the
+//!   hooks, so `q tpl list`/`add`/`edit`/… are refused a `--machine <other>`
+//!   rather than silently creating a local Quest stamped `ws` — the very row
+//!   `src/tui/quests.rs`'s machine select stopped producing ([`refuse_remote`]).
+//!   `q tpl run <name> --machine ws` is the one that travels: it is intercepted
+//!   by [`crate::commands::proxy`] *before* it reaches here, sent over ssh, and
+//!   the far end instantiates **its own** template of that name — the definition
+//!   `--machine ws` explicitly asked for. See [`crate::commands::proxy::route`].
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -67,15 +69,19 @@ pub fn run(ctx: &Ctx, action: &TplAction) -> anyhow::Result<()> {
     }
 }
 
-/// `--machine <other>` is an error for every `q tpl` subcommand — and for the
-/// TUI's Templates tab, which runs the same definitions through the same
-/// [`instantiate_with`] (`src/tui/templates.rs`).
+/// `--machine <other>` is an error for every `q tpl` subcommand *that reaches
+/// here* — and for the TUI's Templates tab, which runs the same definitions
+/// through the same [`instantiate_with`] (`src/tui/templates.rs`).
 ///
-/// Nothing here can honour it: the definitions are this machine's rows, and
-/// `q --machine ws tpl run x` used to create the Quest here and record it as
-/// living on `ws` — a local row indistinguishable from a real remote one.
-/// Refusing says what the user asked for cannot be done and names the thing
-/// that can.
+/// `q tpl run <name> --machine ws` never reaches here: [`crate::commands::proxy`]
+/// sends it over ssh, and the far end runs it with no `--machine` at all. So the
+/// only `run` this sees is a local one (`--machine` absent, or naming this
+/// machine), which is honoured. Every other subcommand names a definition that
+/// is this machine's row: `q --machine ws tpl edit x` used to create nothing
+/// remote, and `q --machine ws tpl run x` used to create the Quest here and
+/// record it as living on `ws` — a local row indistinguishable from a real
+/// remote one. Refusing says what the user asked for cannot be done and names
+/// the thing that can.
 pub fn refuse_remote(ctx: &Ctx) -> anyhow::Result<()> {
     let Some(machine) = ctx.machine_filter() else {
         return Ok(());
