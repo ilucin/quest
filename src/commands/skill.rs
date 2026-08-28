@@ -189,28 +189,80 @@ fn dir_is_empty(dir: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use clap::CommandFactory;
+
     use super::*;
+    use crate::cli::Cli;
 
     #[test]
     fn the_embedded_skill_is_non_empty_and_states_the_confirmation_rule() {
         assert!(!SKILL.trim().is_empty());
         assert!(SKILL.contains("confirmation"));
-        // Every command the skill names must exist as a real `q` subcommand.
-        for cmd in [
-            "q brief",
-            "q sessions",
-            "q peek",
-            "q phase",
-            "q note",
-            "q link add",
-            "q artifact add",
-            "q spawn",
-            "q send",
-            "q kill",
-            "q close",
-        ] {
-            assert!(SKILL.contains(cmd), "skill should mention `{cmd}`");
+    }
+
+    /// Every command path clap actually exposes, space-joined (`"link"`,
+    /// `"link add"`, …). clap — not a copy of the strings — is the source of
+    /// truth the skill is checked against.
+    fn clap_command_paths() -> HashSet<String> {
+        fn walk(cmd: &clap::Command, prefix: &str, out: &mut HashSet<String>) {
+            for sub in cmd.get_subcommands() {
+                let path = if prefix.is_empty() {
+                    sub.get_name().to_string()
+                } else {
+                    format!("{prefix} {}", sub.get_name())
+                };
+                walk(sub, &path, out);
+                out.insert(path);
+            }
         }
+        let mut out = HashSet::new();
+        walk(&Cli::command(), "", &mut out);
+        out
+    }
+
+    /// The command path a `` `q …` `` inline-code span names: the leading
+    /// command words, stopping at the first flag, placeholder, or quote — so
+    /// `` `q link add <ref> [--kind …]` `` yields `link add`. `None` when the
+    /// span is not a `q` command (`` `--json` ``, `` `$Q_QUEST` ``, …).
+    fn command_path(span: &str) -> Option<String> {
+        let rest = span.strip_prefix("q ")?;
+        let words: Vec<&str> = rest
+            .split_whitespace()
+            .take_while(|w| {
+                !w.starts_with('-') && w.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+            })
+            .collect();
+        (!words.is_empty()).then(|| words.join(" "))
+    }
+
+    #[test]
+    fn every_command_the_skill_names_is_a_real_subcommand() {
+        // Pull every `q …` inline-code span out of the embedded skill and
+        // assert clap actually exposes that command. Because clap is the
+        // source of truth, renaming or removing a subcommand in `cli.rs`
+        // fails this test: the skill still names the old one, which clap no
+        // longer has. (Odd `split('`')` segments are the backtick spans;
+        // the skill has no triple-backtick fences.)
+        let valid = clap_command_paths();
+        let mut seen = 0;
+        for span in SKILL.split('`').skip(1).step_by(2) {
+            let Some(path) = command_path(span) else {
+                continue;
+            };
+            assert!(
+                valid.contains(&path),
+                "skill names `q {path}`, which is not a real `q` subcommand"
+            );
+            seen += 1;
+        }
+        // Guard the guard: a parser that stopped finding commands would make
+        // the loop above vacuously green.
+        assert!(
+            seen >= 8,
+            "expected several `q …` commands in the skill, saw {seen}"
+        );
     }
 
     #[test]

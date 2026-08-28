@@ -44,7 +44,11 @@ fn sandbox(cmd: &mut Command, dir: &std::path::Path) {
         // under `$HOME`; no test may see the real ones. `HOME` is a
         // subdirectory so paths elsewhere in `dir` are not home-relative.
         .env("HOME", dir.join("home"))
-        .env("Q_CLAUDE_SETTINGS", claude_dir(dir).join("settings.json"));
+        .env("Q_CLAUDE_SETTINGS", claude_dir(dir).join("settings.json"))
+        // Pin the skill file explicitly too, exactly as `tests/skill.rs` does:
+        // no skill/doctor test may ever write to the real `~/.claude`, and a
+        // faked `$HOME` alone leaves that one `dirs`/platform change away.
+        .env("Q_CLAUDE_SKILL", claude_dir(dir).join("skills/q/SKILL.md"));
 }
 
 /// Claude Code's user directory inside a sandboxed `HOME`.

@@ -410,11 +410,16 @@ fn check_skill(fix: bool, fixed: &mut Vec<String>) -> Check {
     if fix && status.state != hook::State::Installed {
         match skill::ensure_installed() {
             Ok(true) => {
-                fixed.push(format!("installed q skill at {}", status.path.display()));
+                // A missing file was installed; a drifted one was refreshed.
+                let verb = match status.state {
+                    hook::State::Drifted => "refreshed",
+                    _ => "installed",
+                };
+                fixed.push(format!("{verb} q skill at {}", status.path.display()));
                 return check(
                     SKILL,
                     Status::Ok,
-                    format!("installed · {}", status.path.display()),
+                    format!("{verb} · {}", status.path.display()),
                 );
             }
             // Nothing to do (already installed) falls through to the report.
