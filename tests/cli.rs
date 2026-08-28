@@ -13153,3 +13153,35 @@ fn close_summarize_skips_gracefully_when_claude_is_unavailable() {
     let body = std::fs::read_to_string(brain_note(&root, "cq")).unwrap();
     assert!(!body.contains("summarized_to"), "{body}");
 }
+
+#[test]
+fn completions_zsh_emits_script() {
+    // No DB or config is set up here, yet the command must still succeed: it is
+    // generated straight off the clap command tree (SPEC §21).
+    let assert = q().args(["completions", "zsh"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.contains("#compdef q"), "zsh header missing:\n{out}");
+    assert!(
+        out.contains("_q"),
+        "zsh completion function missing:\n{out}"
+    );
+}
+
+#[test]
+fn completions_bash_emits_script() {
+    let assert = q().args(["completions", "bash"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("_q()"),
+        "bash completion function missing:\n{out}"
+    );
+    assert!(
+        out.contains("complete "),
+        "bash complete registration missing:\n{out}"
+    );
+}
+
+#[test]
+fn completions_reject_unknown_shell() {
+    q().args(["completions", "tcsh"]).assert().failure();
+}

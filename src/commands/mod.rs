@@ -2,6 +2,7 @@
 
 pub mod brief;
 pub mod close;
+pub mod completions;
 pub mod enter;
 pub mod events;
 pub mod fmt;
