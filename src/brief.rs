@@ -887,8 +887,7 @@ fn event_text(e: &Event) -> String {
 
 /// The blocker contract for `note` events (what `q note --blocker` writes):
 /// the payload is `{"text": "<text>", "blocker": true}`. Nothing else marks a
-/// blocker — no `tag`/`tags` fields, no kind of its own. Blockers are not
-/// resolvable yet; that is a follow-up.
+/// blocker — no `tag`/`tags` fields, no kind of its own.
 fn is_blocker(e: &Event) -> bool {
     e.payload
         .as_ref()
@@ -897,9 +896,23 @@ fn is_blocker(e: &Event) -> bool {
         == Some(true)
 }
 
+/// The event id a resolution note points at (`q note --resolve <id>` writes a
+/// `note` event with payload `{"resolves": <id>}`), or `None` for any other
+/// note.
+fn resolves_id(e: &Event) -> Option<i64> {
+    e.payload
+        .as_ref()
+        .and_then(|p| p.get("resolves"))
+        .and_then(Value::as_i64)
+}
+
 fn section_blockers(out: &mut String, notes: &[Event], sessions: &[Session]) {
     out.push_str("## 10. Open questions / blockers\n\n");
-    let blockers: Vec<&Event> = notes.iter().filter(|e| is_blocker(e)).collect();
+    let resolved: std::collections::HashSet<i64> = notes.iter().filter_map(resolves_id).collect();
+    let blockers: Vec<&Event> = notes
+        .iter()
+        .filter(|e| is_blocker(e) && !resolved.contains(&e.id))
+        .collect();
     let mut waiting: Vec<&Session> = sessions
         .iter()
         .filter(|s| s.status == SessionStatus::Waiting)
@@ -1105,6 +1118,43 @@ mod tests {
         assert!(phase < note, "{events}");
         let blockers = md.split("## 10.").nth(1).unwrap();
         assert!(!blockers.contains("plain note"));
+    }
+
+    #[test]
+    fn a_resolved_blocker_drops_out_of_section_ten() {
+        let (db, quest) = seeded();
+        // The seed's blocker.
+        let blocker = db
+            .list_events_by_kinds(&quest.id, &["note"], usize::MAX)
+            .unwrap()
+            .into_iter()
+            .find(is_blocker)
+            .unwrap();
+        // A second, unresolved blocker that must survive.
+        db.append_event(
+            &quest.id,
+            None,
+            "note",
+            &serde_json::json!({ "text": "waiting on review", "blocker": true }),
+        )
+        .unwrap();
+
+        let before = render_with(&db, &quest, &Opts::default(), &NoExternal).unwrap();
+        let section = |md: &str| md.split("## 10.").nth(1).unwrap().to_string();
+        assert!(section(&before).contains("DB is locked"));
+        assert!(section(&before).contains("waiting on review"));
+
+        db.append_event(
+            &quest.id,
+            None,
+            "note",
+            &serde_json::json!({ "resolves": blocker.id }),
+        )
+        .unwrap();
+
+        let after = section(&render_with(&db, &quest, &Opts::default(), &NoExternal).unwrap());
+        assert!(!after.contains("DB is locked"), "{after}");
+        assert!(after.contains("waiting on review"), "{after}");
     }
 
     #[test]

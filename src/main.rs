@@ -639,8 +639,10 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
         Command::Note {
             text,
             blocker,
+            resolve,
             quest,
-        } => commands::note::run(ctx, text, *blocker, quest.as_deref()).map(|()| 0),
+        } => commands::note::run(ctx, text.as_deref(), *blocker, *resolve, quest.as_deref())
+            .map(|()| 0),
         Command::Link { action } => match action {
             LinkAction::Add {
                 r#ref,
