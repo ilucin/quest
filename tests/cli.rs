@@ -44,7 +44,11 @@ fn sandbox(cmd: &mut Command, dir: &std::path::Path) {
         // under `$HOME`; no test may see the real ones. `HOME` is a
         // subdirectory so paths elsewhere in `dir` are not home-relative.
         .env("HOME", dir.join("home"))
-        .env("Q_CLAUDE_SETTINGS", claude_dir(dir).join("settings.json"));
+        .env("Q_CLAUDE_SETTINGS", claude_dir(dir).join("settings.json"))
+        // Pin the skill file explicitly too, exactly as `tests/skill.rs` does:
+        // no skill/doctor test may ever write to the real `~/.claude`, and a
+        // faked `$HOME` alone leaves that one `dirs`/platform change away.
+        .env("Q_CLAUDE_SKILL", claude_dir(dir).join("skills/q/SKILL.md"));
 }
 
 /// Claude Code's user directory inside a sandboxed `HOME`.
@@ -1327,12 +1331,21 @@ fn doctor_bare(names: &[&str]) -> TestCmd {
     cmd
 }
 
-/// `doctor_bare` plus q's hooks installed into the temp settings.json, so a
-/// test about some other check is not drowned in hook failures.
+/// `doctor_bare` plus q's hooks and agent skill installed, so a test about
+/// some other check is not drowned in hook or skill failures.
 fn doctor(names: &[&str]) -> TestCmd {
     let cmd = doctor_bare(names);
     install_hooks(&cmd);
+    install_skill(&cmd);
     cmd
+}
+
+/// `q skill install` into the sandboxed `~/.claude` (HOME is faked by
+/// `sandbox`), so `q doctor`'s skill check reports it installed.
+fn install_skill(cmd: &TestCmd) {
+    let mut installer = Command::cargo_bin("q").unwrap();
+    sandbox(&mut installer, cmd.dir.path());
+    installer.args(["skill", "install"]).assert().success();
 }
 
 /// `q hook install` against this command's temp settings.json.
@@ -1412,6 +1425,7 @@ fn doctor_json_reports_every_check() {
             "hook SessionEnd",
             "hook PostToolUse",
             "hook statusLine",
+            "skill",
             "statusline chain",
             "orphan sessions",
         ]
@@ -2671,6 +2685,7 @@ fn doctor_reports_the_claude_version_and_who_is_logged_in() {
         r#"{"loggedIn":true,"authMethod":"claude.ai","email":"a@b.c","subscriptionType":"team"}"#,
     );
     install_hooks(&cmd);
+    install_skill(&cmd);
 
     let assert = cmd.args(["doctor", "--json"]).assert().success();
     let parsed = json_of(&assert);
@@ -2721,6 +2736,7 @@ fn doctor_falls_back_to_the_credentials_file_then_to_a_warning() {
     let mut cmd = doctor_bare(&[]);
     stub_claude(&bin_dir(&cmd), "1.0.0 (Claude Code)", "");
     install_hooks(&cmd);
+    install_skill(&cmd);
     let creds = credentials_path(&cmd);
 
     let assert = cmd.args(["doctor", "--json"]).assert().success();
@@ -2740,6 +2756,7 @@ fn doctor_falls_back_to_the_credentials_file_then_to_a_warning() {
     let elsewhere = cmd.dir.path().join("elsewhere").join("settings.json");
     std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
     install_hooks_at(&cmd, &elsewhere);
+    install_skill(&cmd);
     cmd.env("Q_CLAUDE_SETTINGS", &elsewhere);
     std::fs::create_dir_all(claude_dir(cmd.dir.path())).unwrap();
     std::fs::write(credentials_path(&cmd), "{}").unwrap();

@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 
-use cli::{ArtifactAction, Cli, Command, ConfigAction, HookAction, LinkAction};
+use cli::{ArtifactAction, Cli, Command, ConfigAction, HookAction, LinkAction, SkillAction};
 use config::Config;
 use db::Db;
 use error::QError;
@@ -417,6 +417,15 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
                 HookAction::PostToolUse => commands::hook_capture::run(),
             };
         }
+        Command::Skill { action } => {
+            // Installs an agent skill file, like `q hook install` merges hooks:
+            // no database, works before the environment is otherwise ready.
+            return match action {
+                SkillAction::Install => commands::skill::install(&Ctx::config_only(args)?),
+                SkillAction::Uninstall => commands::skill::uninstall(&Ctx::config_only(args)?),
+                SkillAction::Status => commands::skill::status(&Ctx::config_only(args)?),
+            };
+        }
         _ => {}
     }
 
@@ -439,7 +448,10 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
 /// The command, on this machine.
 fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
     match command {
-        Command::Config { .. } | Command::Doctor { .. } | Command::Hook { .. } => {
+        Command::Config { .. }
+        | Command::Doctor { .. }
+        | Command::Hook { .. }
+        | Command::Skill { .. } => {
             unreachable!("handled before the database is opened")
         }
         Command::New {

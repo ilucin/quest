@@ -309,6 +309,12 @@ pub enum Command {
         action: HookAction,
     },
 
+    /// The embedded agent SKILL.md: install into ~/.claude/skills/q, or check
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+
     // Agent self-report (SPEC §7, §12): quest from $Q_QUEST, session from
     // $Q_SESSION unless overridden.
     /// Report what this session is doing now (requires $Q_SESSION)
@@ -680,6 +686,16 @@ pub enum HookAction {
     PostToolUse,
     #[command(hide = true)]
     Statusline,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillAction {
+    /// Write the embedded SKILL.md to ~/.claude/skills/q/SKILL.md
+    Install,
+    /// Remove q's skill from ~/.claude/skills/q, touching nothing else
+    Uninstall,
+    /// Report whether the skill is installed, missing or out of date
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
