@@ -99,14 +99,12 @@ install_from_source() {
     # matter where the script was invoked from.
     script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
     echo "No release asset found — building from source with cargo…"
-    cargo install --path "${script_dir}" --locked
+    # `--root ~/.local` lands the binary at ~/.local/bin/q, the same place the
+    # download path installs to, rather than cargo's default ~/.cargo/bin.
+    cargo install --path "${script_dir}" --root "${HOME}/.local" --locked
     echo
-    echo "Installed q to $(cargo_bin)/q via cargo."
-    path_hint "$(cargo_bin)"
-}
-
-cargo_bin() {
-    echo "${CARGO_HOME:-${HOME}/.cargo}/bin"
+    echo "Installed q to ${BIN_PATH} (built from source)."
+    path_hint "${BIN_DIR}"
 }
 
 path_hint() {
@@ -133,8 +131,10 @@ main() {
         install_from_source
     fi
     echo
-    echo "Tip: enable shell completions with, e.g.:"
-    echo "  eval \"\$(q completions zsh)\""
+    echo "Tip: enable shell completions from your shell rc, e.g.:"
+    # `eval` works on stock macOS bash 3.2; `source <(q completions bash)` does
+    # not (process substitution truncates the script over a FIFO there).
+    echo "  eval \"\$(q completions bash)\"   # zsh: eval \"\$(q completions zsh)\""
 }
 
 main
