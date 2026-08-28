@@ -4145,6 +4145,56 @@ fn link_add_detects_the_kind_and_is_idempotent() {
 }
 
 #[test]
+fn links_enriches_a_pr_from_the_fixture_and_caches_it() {
+    let pane = Pane::new();
+    let url = "https://github.com/acme/api/pull/42";
+    pane.json(&["link", "add", url]);
+
+    // The fixture stands in for `gh pr view`; `enrich::FixtureFetcher` reads it
+    // because `Q_FIXTURE` is already set for the sandbox.
+    let gh = pane.env.dir.path().join("gh-pr.json");
+    std::fs::write(
+        &gh,
+        r#"{"title":"Fix the backfill","state":"OPEN","isDraft":false,
+            "reviewDecision":"APPROVED",
+            "statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"}]}"#,
+    )
+    .unwrap();
+
+    let out = {
+        let mut cmd = pane.cmd();
+        cmd.env("Q_FIXTURE_GH_PR", &gh);
+        let assert = cmd.args(["links", "--json"]).assert().success();
+        json_of(&assert)
+    };
+    assert_eq!(out[0]["title"], "Fix the backfill");
+    assert_eq!(out[0]["meta"]["state"], "open");
+    assert_eq!(out[0]["meta"]["status"], "approved");
+    assert_eq!(out[0]["meta"]["ci"], "passing");
+    assert!(out[0]["enriched_at"].is_i64(), "cache stamp written: {out}");
+
+    // Second call is a cache hit: even with the fixture removed the row still
+    // reads back enriched rather than reverting to the bare ref.
+    std::fs::remove_file(&gh).unwrap();
+    let again = pane.json(&["links"]);
+    assert_eq!(again[0]["title"], "Fix the backfill");
+    assert_eq!(again[0]["meta"]["ci"], "passing");
+}
+
+#[test]
+fn links_degrades_to_the_bare_ref_when_enrichment_is_unavailable() {
+    let pane = Pane::new();
+    let url = "https://github.com/acme/api/pull/7";
+    pane.json(&["link", "add", url]);
+    // No `Q_FIXTURE_GH_PR`, so the fixture fetcher returns nothing: the command
+    // still succeeds and shows the bare ref, unenriched.
+    let out = pane.json(&["links"]);
+    assert_eq!(out[0]["ref"], url);
+    assert!(out[0]["title"].is_null(), "no title without a fetch: {out}");
+    assert!(out[0]["enriched_at"].is_null(), "no cache stamp: {out}");
+}
+
+#[test]
 fn link_add_detects_worktrees_and_files_by_absolute_path() {
     let pane = Pane::new();
     let wt = pane.env.work("wt");

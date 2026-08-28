@@ -206,13 +206,12 @@ pub fn rm(ctx: &Ctx, id: i64, quest: Option<&str>) -> anyhow::Result<()> {
 }
 
 pub fn list(ctx: &Ctx, quest: Option<&str>, refresh: bool) -> anyhow::Result<()> {
-    if refresh && !ctx.quiet {
-        // TODO(M2): enrichment; the flag is accepted so scripts can start using it.
-        eprintln!("note: --refresh is not implemented yet; showing stored links");
-    }
     // Read-only: any Quest may be listed from any pane.
     let quest = report::resolve_quest(ctx, quest)?;
-    let links = ctx.db()?.list_links_by_quest(&quest.id)?;
+    let db = ctx.db()?;
+    let mut links = db.list_links_by_quest(&quest.id)?;
+    // Lazy enrichment (SPEC §12): best effort, capped, never fails the listing.
+    crate::enrich::enrich(db, &mut links, refresh);
 
     output::emit(ctx.json, &links, || {
         if links.is_empty() {
@@ -231,11 +230,31 @@ pub fn list(ctx: &Ctx, quest: Option<&str>, refresh: bool) -> anyhow::Result<()>
                 if let Some(t) = l.title.as_deref().filter(|t| !t.is_empty()) {
                     out.push_str(&format!(" — {t}"));
                 }
+                let extras = meta_extras(l);
+                if !extras.is_empty() {
+                    out.push_str(&format!(" ({})", extras.join(", ")));
+                }
                 out.push('\n');
             }
         }
         out.trim_end().to_string()
     })
+}
+
+/// The enrichment meta the listing shows, in the brief's order: `state`,
+/// `status`, `ci` (SPEC §12). Best effort — any absent key is skipped.
+fn meta_extras(link: &Link) -> Vec<String> {
+    let Some(meta) = link.meta.as_ref().and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    ["state", "status", "ci"]
+        .iter()
+        .filter_map(|key| {
+            meta.get(*key)
+                .and_then(serde_json::Value::as_str)
+                .map(|v| format!("{key}: {v}"))
+        })
+        .collect()
 }
 
 fn line(link: &Link) -> String {

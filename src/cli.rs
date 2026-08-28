@@ -345,8 +345,8 @@ pub enum Command {
     /// List a Quest's links grouped by kind
     Links {
         quest: Option<String>,
-        /// Re-fetch enrichment (reserved: enrichment lands in a later milestone)
-        #[arg(long, hide = true)]
+        /// Force-refresh enrichment, ignoring the 5-minute cache
+        #[arg(long)]
         refresh: bool,
     },
 
