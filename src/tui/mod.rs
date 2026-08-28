@@ -96,6 +96,13 @@ trait TermIo {
     fn paste(&mut self, on: bool) -> io::Result<()>;
     fn show_cursor(&mut self) -> io::Result<()>;
     fn flush(&mut self) -> io::Result<()>;
+    /// One line on the terminal this process is about to give away for good.
+    ///
+    /// Only [`land`]'s exec shape uses it, and only after the TUI is off the
+    /// screen: nothing will be drawn again, so the status bar is not a place
+    /// to say anything. Written where the CLI writes the same lines — stderr,
+    /// the way `q tpl run` flushes its warnings before it attaches.
+    fn note(&mut self, line: &str) -> io::Result<()>;
 }
 
 impl<T: TermIo + ?Sized> TermIo for &mut T {
@@ -116,6 +123,9 @@ impl<T: TermIo + ?Sized> TermIo for &mut T {
     }
     fn flush(&mut self) -> io::Result<()> {
         (**self).flush()
+    }
+    fn note(&mut self, line: &str) -> io::Result<()> {
+        (**self).note(line)
     }
 }
 
@@ -168,6 +178,10 @@ impl TermIo for Stdio {
 
     fn flush(&mut self) -> io::Result<()> {
         io::stdout().flush()
+    }
+
+    fn note(&mut self, line: &str) -> io::Result<()> {
+        writeln!(io::stderr(), "{line}")
     }
 }
 
@@ -655,6 +669,11 @@ where
 /// attach's reasons: with `[ui] return_after_detach` the tmux client runs as a
 /// child and the TUI comes back; without it the terminal is given away for
 /// good and this process stops drawing.
+///
+/// Whatever the run wanted to say rides along on the [`templates::Landing`]
+/// and is said from here, on both shapes. It cannot be left on the status bar
+/// for the next redraw: this function overwrites the status bar, and on the
+/// exec shape there is no next redraw.
 fn land<B, T>(
     ctx: &Ctx,
     io: &mut T,
@@ -675,6 +694,13 @@ where
     let _away = Away::new(poller);
     if !ctx.config.ui.return_after_detach {
         restore_with(io);
+        // After the restore and before the attach, exactly where
+        // `tpl::instantiate` flushes: the screen is the shell's again, and an
+        // attach outside tmux `exec`s this process away.
+        for warning in &landing.warnings {
+            let _ = io.note(warning);
+        }
+        let _ = io.flush();
         ctx.tmux()
             .attach(&landing.tmux_session, Some(&landing.pane))?;
         app.should_quit = true;
@@ -684,11 +710,12 @@ where
         ctx.tmux()
             .attach_child(&landing.tmux_session, Some(&landing.pane))
     })?;
-    app.say(match attached {
+    let said = match attached {
         Ok(()) if ctx.tmux().in_tmux() => format!("switched to {}", landing.name),
         Ok(()) => format!("back from {}", landing.name),
         Err(e) => format!("{} is running; cannot enter it: {e:#}", landing.name),
-    });
+    };
+    app.say(joined(&said, &landing.warnings));
     Ok(())
 }
 
@@ -1255,6 +1282,9 @@ pub(super) fn arms_bracketed_paste() -> bool {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+        fn note(&mut self, _line: &str) -> io::Result<()> {
+            Ok(())
+        }
     }
     // The flags are process-global, and the probe leaves them as it found
     // them: clear on the way in (the lock does that) and clear on the way out.
@@ -1334,6 +1364,9 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeTerm {
         calls: Vec<&'static str>,
+        /// Lines written to the terminal on the way out of TUI mode — the
+        /// exec shape of `land` is the only thing that writes any.
+        notes: Vec<String>,
         /// `(step, (raw, alt, mouse, paste))` as each step was issued, so a
         /// teardown that drops a flag too early is visible rather than merely
         /// narrow.
@@ -1383,6 +1416,10 @@ mod tests {
         }
         fn flush(&mut self) -> io::Result<()> {
             self.step("flush")
+        }
+        fn note(&mut self, line: &str) -> io::Result<()> {
+            self.notes.push(line.to_string());
+            Ok(())
         }
     }
 
@@ -2776,6 +2813,111 @@ mod tests {
         assert_eq!(fixture(&_dir).attach_mode.as_deref(), Some("exec"));
         assert!(app.should_quit, "the TUI kept running with no terminal");
         assert_eq!(flags(), (false, false, false, false));
+        // Nothing will be drawn again, so what the run had to say went to the
+        // terminal on the way out — where `q tpl run` flushes the same line.
+        assert!(
+            term.notes.iter().any(|n| n.contains("no beads epic")),
+            "the warning went nowhere: {:?}",
+            term.notes
+        );
+    }
+
+    /// A warning the run raised reaches the user on every shape the landing
+    /// takes. `land` overwrites the status line, so the warning rides on the
+    /// landing and is said from there rather than left on the `Ctx` for a
+    /// redraw that may never come (bd-8lz.6.2).
+    #[test]
+    fn a_run_says_its_warnings_however_it_lands() {
+        let _lock = lifecycle_lock();
+
+        // The bare `⏎`: no form between the keypress and the landing.
+        let cwd = tempfile::tempdir().unwrap();
+        let (ctx, _dir, mut app) = templates_ctx(cwd.path());
+        assert_eq!(app.handle(Input::Enter), Action::Run);
+        templates::run_now(&ctx, &mut app);
+        assert!(
+            ctx.take_warnings().is_empty(),
+            "left buffered, where a later unrelated action would wear it"
+        );
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        let mut terminal = test_terminal();
+        land(&ctx, &mut term, &mut terminal, &mut app, None).expect("land");
+        restore_with(&mut term);
+        assert!(app.status.contains("back from"), "{}", app.status);
+        assert!(app.status.contains("no beads epic"), "{}", app.status);
+        // And the loop's reload afterwards has nothing left to add.
+        let was = app.status.clone();
+        refresh_now(&ctx, &mut app);
+        assert_eq!(app.status, was);
+
+        // The argument form: `submit` drains the warning onto the status line
+        // and `land` used to overwrite it before a single frame was drawn.
+        let cwd = tempfile::tempdir().unwrap();
+        let (ctx, _dir, mut app) = templates_ctx(cwd.path());
+        let mut with_arg = crate::model::Template::new("pr-review");
+        with_arg.goal = Some("review PR {{arg.pr}}".to_string());
+        with_arg.cwd = Some(cwd.path().to_string_lossy().to_string());
+        ctx.db().unwrap().insert_template(&with_arg).unwrap();
+        refresh_now(&ctx, &mut app);
+        app.handle(Input::Char('g'));
+        assert_eq!(app.handle(Input::Enter), Action::None, "no form went up");
+        focus_field(&mut app, "arg pr");
+        for c in "4821".chars() {
+            app.handle(Input::Char(c));
+        }
+        arm_action(&mut app);
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+
+        submit(&ctx, &mut app);
+        assert!(app.modal.is_none(), "{}", app.status);
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        let mut terminal = test_terminal();
+        land(&ctx, &mut term, &mut terminal, &mut app, None).expect("land");
+        restore_with(&mut term);
+        assert!(app.status.contains("back from"), "{}", app.status);
+        assert!(app.status.contains("no beads epic"), "{}", app.status);
+    }
+
+    /// The `Action::Submit` wiring itself: the loop runs the prompt and lands
+    /// in the master it made, in that order and without a frame in between.
+    #[test]
+    fn the_loops_dispatcher_runs_a_template_prompt_and_lands_in_it() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (ctx, _dir, mut app) = templates_ctx(cwd.path());
+        let mut with_arg = crate::model::Template::new("pr-review");
+        with_arg.goal = Some("review PR {{arg.pr}}".to_string());
+        with_arg.cwd = Some(cwd.path().to_string_lossy().to_string());
+        ctx.db().unwrap().insert_template(&with_arg).unwrap();
+        refresh_now(&ctx, &mut app);
+        app.handle(Input::Char('g'));
+        app.handle(Input::Enter);
+        focus_field(&mut app, "arg pr");
+        for c in "4821".chars() {
+            app.handle(Input::Char(c));
+        }
+        arm_action(&mut app);
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        let mut terminal = test_terminal();
+        // Exactly the loop's `Action::Submit` arm.
+        submit(&ctx, &mut app);
+        land(&ctx, &mut term, &mut terminal, &mut app, None).expect("land");
+        restore_with(&mut term);
+
+        let quests = ctx.db().unwrap().list_quests(true).unwrap();
+        assert_eq!(quests.len(), 1);
+        assert_eq!(quests[0].goal.as_deref(), Some("review PR 4821"));
+        assert_eq!(fixture(&_dir).attach_mode.as_deref(), Some("child"));
+        assert!(app.status.contains("back from"), "{}", app.status);
+        assert!(app.templates.take_landing().is_none(), "landed twice");
     }
 
     /// Nothing to land in is the ordinary case — every prompt that is not a

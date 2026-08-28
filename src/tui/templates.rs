@@ -79,6 +79,14 @@ pub struct Landing {
     pub tmux_session: String,
     pub pane: String,
     pub name: String,
+    /// What the run wanted to say — a missing beads epic, an unused `--arg`.
+    ///
+    /// Carried with the landing rather than left on the `Ctx`, because the
+    /// landing is the last thing that happens: `land` overwrites the status
+    /// line, and on the exec shape it hands the terminal away and this
+    /// process never draws again. [`super::land`] is what says them, once,
+    /// on whichever of its two shapes it took.
+    pub warnings: Vec<String>,
 }
 
 /// Per-tab state, owned by `App`.
@@ -434,11 +442,26 @@ fn instantiate(
     template: &Template,
     args: &BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
+    // `q tpl` refuses `--machine <other>` for every subcommand, and this is
+    // the same instantiation: without the guard `q --machine ws`, tab `3`,
+    // `⏎` makes the Quest *here* and stamps it `ws` — the local row
+    // indistinguishable from a real remote one that both siblings were
+    // hardened against (`tpl::refuse_remote`, and the new-Quest form's route
+    // through `proxy::create_remote`).
+    tpl::refuse_remote(ctx)?;
     let created = tpl::instantiate_with(ctx, template, args, true)?;
     app.templates.landing = Some(Landing {
         tmux_session: created.tmux_session.clone(),
         pane: created.session.tmux_pane.clone(),
         name: created.quest.slug.clone(),
+        // Drained here for `tpl::instantiate`'s reason: the landing that comes
+        // next hands the terminal over — outside tmux it `exec`s and this
+        // process is gone — so a warning left in the buffer for a later
+        // redraw would only ever be seen when the run did not attach.
+        // A *failed* run leaves them buffered on purpose: `tui::submit` puts
+        // them next to the error in the form, and `refresh_now` next to the
+        // status message, and neither path attaches.
+        warnings: ctx.take_warnings(),
     });
     app.say(format!(
         "{} from {} \u{b7} entering it",
@@ -455,8 +478,17 @@ pub fn submit(ctx: &Ctx, app: &mut App, prompt: &Prompt, form: &Form) -> anyhow:
         Prompt::EditTemplate(target) => edit(ctx, app, target, form),
         Prompt::DeleteTemplate(target) => delete(ctx, app, target),
         Prompt::RunTemplate(target) => run_with_args(ctx, app, target, form),
-        // Dispatched on in `tui::submit`; this arm only makes the match total.
-        _ => Ok(()),
+        // A Quests or Sessions prompt never reaches here; `tui::submit`
+        // dispatches on the variant first. Listed rather than `_` so a new
+        // Templates prompt added without wiring fails to compile here instead
+        // of silently doing nothing.
+        Prompt::NewQuest
+        | Prompt::Rename(_)
+        | Prompt::Close(_)
+        | Prompt::Resume(_)
+        | Prompt::Send(_)
+        | Prompt::Kill(_)
+        | Prompt::Reset(_) => Ok(()),
     }
 }
 
@@ -534,10 +566,12 @@ fn run_with_args(
     let template = template_for(ctx, target)?;
     let mut args: BTreeMap<String, String> = BTreeMap::new();
     for key in tpl::wanted_args(&template) {
-        // Not `trimmed`: an argument is text a placeholder drops into, and a
-        // form field is the only place it can be given. Blank is allowed, and
-        // `expand` is what decides whether the result still makes sense.
-        args.insert(key.clone(), form.trimmed(&arg_label(&key)).to_string());
+        // `raw`, not `trimmed`: an argument is text a placeholder drops into,
+        // and `--arg pad=" x "` keeps its spaces (`templates::parse_args`
+        // stores the value untouched), so this must too or the same routine
+        // expands two ways. Blank is allowed; `expand` is what decides whether
+        // the result still makes sense.
+        args.insert(key.clone(), form.raw(&arg_label(&key)).to_string());
     }
     instantiate(ctx, app, &template, &args)
 }
@@ -675,15 +709,19 @@ fn description_cell(t: &Template) -> String {
     if let Some(workflow) = t.workflow.as_deref().filter(|w| !w.is_empty()) {
         parts.push(workflow.to_string());
     }
-    match t.cwd.as_deref() {
-        Some(cwd) => parts.push(fmt::tilde(cwd)),
-        None => parts.push("anywhere".to_string()),
-    }
-    // Said on the row rather than discovered by pressing `⏎`: a routine that
-    // asks a question first is a different thing from one that just goes.
+    // Before the cwd, which is the longest and least surprising thing on the
+    // line: `row_lines` truncates the join from the right, and a nested `cwd`
+    // used to take the marker with it at every ordinary width. Said on the row
+    // rather than discovered by pressing `⏎` — a routine that asks a question
+    // first is a different thing from one that just goes — so it is the last
+    // part that may be dropped, not the first.
     let wanted = tpl::wanted_args(t);
     if !wanted.is_empty() {
         parts.push(format!("args {}", wanted.join(", ")));
+    }
+    match t.cwd.as_deref() {
+        Some(cwd) => parts.push(fmt::tilde(cwd)),
+        None => parts.push("anywhere".to_string()),
     }
     parts.join(" \u{b7} ")
 }
@@ -766,6 +804,18 @@ mod tests {
 
         fn quests(&self) -> Vec<crate::model::Quest> {
             self.ctx.db().unwrap().list_quests(true).unwrap()
+        }
+
+        /// The same rig under `q --machine <other>` — the invocation
+        /// `tpl::refuse_remote` exists for.
+        fn pinned_to(self, machine: &str) -> Rig {
+            let mut ctx = self.ctx.with_machine(Some(machine));
+            ctx.config.machine.name = "laptop".to_string();
+            Rig {
+                ctx,
+                tmux: self.tmux,
+                cwd: self.cwd,
+            }
         }
     }
 
@@ -973,6 +1023,39 @@ mod tests {
         assert_eq!(selected(&app).unwrap().name, "weekly-hygiene");
     }
 
+    /// More rows than the body can hold: the offset follows the selection to
+    /// the end of the list and all the way back, and the selected row is on
+    /// screen at both ends.
+    #[test]
+    fn a_list_taller_than_the_viewport_scrolls_with_the_selection() {
+        let rig = Rig::new();
+        for n in 0..12 {
+            rig.template(&format!("t{n:02}"), |_| {});
+        }
+        let mut app = rig.app();
+        // 12 rows tall: two for the tab bar and footer, five two-line rows.
+        app.set_size(120, 12);
+        settle_view(&mut app);
+        let top = screen_at(&mut app, 120, 12);
+        assert_eq!(app.templates.offset, 0);
+        assert!(top.contains("t00"), "{top}");
+        assert!(!top.contains("t11"), "{top}");
+
+        app.handle(Input::Char('G'));
+        let bottom = screen_at(&mut app, 120, 12);
+        assert_eq!(selected(&app).unwrap().name, "t11");
+        assert_eq!(app.templates.offset, 7, "{bottom}");
+        assert!(bottom.contains("t11"), "{bottom}");
+        assert!(!bottom.contains("t00"), "{bottom}");
+
+        app.handle(Input::Char('g'));
+        let back = screen_at(&mut app, 120, 12);
+        assert_eq!(selected(&app).unwrap().name, "t00");
+        assert_eq!(app.templates.offset, 0);
+        assert!(back.contains("t00"), "{back}");
+        assert!(!back.contains("t11"), "{back}");
+    }
+
     // ----------------------------------------------------------------- run
 
     #[test]
@@ -1068,6 +1151,87 @@ mod tests {
         });
         let mut app = rig.app();
         assert!(screen(&mut app).contains("args pr"), "{}", screen(&mut app));
+    }
+
+    /// And keeps saying it once the `cwd` is long: the marker is the least
+    /// droppable fact on the line, so the path is what the truncation eats.
+    #[test]
+    fn the_args_marker_outlives_a_long_cwd_at_every_width() {
+        let rig = Rig::new();
+        rig.template("pr-review", |t| {
+            t.description = Some("review the oldest PR in the queue".to_string());
+            t.goal = Some("review PR {{arg.pr}}".to_string());
+            t.cwd = Some("/a/very/deeply/nested/directory/for/this/routine".to_string());
+        });
+        let mut app = rig.app();
+        for width in [200, 160, 120, 100, 80, 70] {
+            app.set_size(width, 40);
+            let text = screen_at(&mut app, width, 40);
+            assert!(text.contains("args pr"), "{width} cols: {text}");
+        }
+        // The other half of the same rule: at 80 the path is the thing that
+        // did not fit.
+        app.set_size(80, 40);
+        let narrow = screen_at(&mut app, 80, 40);
+        assert!(!narrow.contains("this/routine"), "{narrow}");
+    }
+
+    /// `q tpl run t --arg pad=" x "` keeps its spaces (`templates::parse_args`
+    /// stores the value untouched), so the form standing in for `--arg` keeps
+    /// them too — one routine, one expansion.
+    #[test]
+    fn an_argument_reaches_the_run_exactly_as_it_was_typed() {
+        let rig = Rig::new();
+        rig.template("pad", |t| {
+            t.goal = Some("[{{arg.pad}}]".to_string());
+        });
+        let mut app = rig.app();
+        press(&rig, &mut app, Input::Enter);
+        set(&mut app, &arg_label("pad"), " x ");
+        submit_form(&rig, &mut app);
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+        let quests = rig.quests();
+        assert_eq!(quests.len(), 1);
+        assert_eq!(quests[0].goal.as_deref(), Some("[ x ]"));
+    }
+
+    /// `q --machine ws`, tab `3`, `⏎`: the Quest would be made *here* and
+    /// stamped `ws`. `q tpl` refuses that shape and so does this — on both
+    /// ways in, since the argument form reaches the same instantiation.
+    #[test]
+    fn a_run_pinned_to_another_machine_is_refused_as_q_tpl_refuses_it() {
+        let rig = Rig::new().pinned_to("ws");
+        rig.template("weekly-hygiene", |_| {});
+        rig.template("pr-review", |t| {
+            t.goal = Some("review PR {{arg.pr}}".to_string());
+        });
+        let mut app = rig.app();
+
+        // The bare keypress.
+        app.handle(Input::Char('G'));
+        assert_eq!(selected(&app).unwrap().name, "weekly-hygiene");
+        assert_eq!(press(&rig, &mut app, Input::Enter), Action::Run);
+        assert!(app.status.contains("--machine ws"), "{}", app.status);
+        assert!(app.status.contains("q tpl export"), "{}", app.status);
+        assert!(rig.quests().is_empty(), "a local quest was minted anyway");
+        assert!(app.templates.landing.is_none(), "it landed somewhere");
+
+        // And the argument form, which refuses on submit and stays up.
+        app.handle(Input::Char('g'));
+        assert_eq!(press(&rig, &mut app, Input::Enter), Action::None);
+        set(&mut app, &arg_label("pr"), "4821");
+        submit_form(&rig, &mut app);
+        let error = app
+            .modal
+            .as_ref()
+            .expect("the form went away")
+            .form
+            .error()
+            .unwrap_or_default()
+            .to_string();
+        assert!(error.contains("--machine ws"), "{error}");
+        assert!(rig.quests().is_empty(), "a local quest was minted anyway");
+        assert!(app.templates.landing.is_none(), "it landed somewhere");
     }
 
     /// A `cwd` that has gone is a status message, not a half-made Quest.
@@ -1260,6 +1424,56 @@ mod tests {
         assert!(app.modal.is_none());
     }
 
+    /// The same identity check on the other two prompts that carry a target:
+    /// a delete whose row was renamed underneath, and a run whose definition
+    /// was removed while the argument form was up.
+    #[test]
+    fn the_delete_and_run_prompts_refuse_a_template_that_changed_under_them() {
+        let rig = Rig::new();
+        let stored = rig.template("weekly-hygiene", |_| {});
+        let mut app = rig.app();
+        app.handle(Input::Char('d'));
+        let mut renamed = stored.clone();
+        renamed.name = "weekly-tidy".to_string();
+        rig.ctx
+            .db()
+            .unwrap()
+            .update_template(&stored.id, &renamed)
+            .unwrap();
+        submit_form(&rig, &mut app);
+        let error = app
+            .modal
+            .as_ref()
+            .expect("the box went away")
+            .form
+            .error()
+            .unwrap_or_default()
+            .to_string();
+        assert!(error.contains("was renamed to weekly-tidy"), "{error}");
+        assert_eq!(rig.names(), ["weekly-tidy"], "it was deleted anyway");
+
+        let rig = Rig::new();
+        let stored = rig.template("pr-review", |t| {
+            t.goal = Some("review PR {{arg.pr}}".to_string());
+        });
+        let mut app = rig.app();
+        assert_eq!(press(&rig, &mut app, Input::Enter), Action::None);
+        rig.ctx.db().unwrap().delete_template(&stored.id).unwrap();
+        set(&mut app, &arg_label("pr"), "4821");
+        submit_form(&rig, &mut app);
+        let error = app
+            .modal
+            .as_ref()
+            .expect("the box went away")
+            .form
+            .error()
+            .unwrap_or_default()
+            .to_string();
+        assert!(error.contains("is gone"), "{error}");
+        assert!(rig.quests().is_empty(), "it ran a template that is gone");
+        assert!(app.templates.landing.is_none());
+    }
+
     // -------------------------------------------------------------- delete
 
     #[test]
@@ -1307,6 +1521,37 @@ mod tests {
         assert_eq!(quests.len(), 1, "the delete took the quest with it");
         assert_eq!(quests[0].template_id, None);
         let _ = stored;
+    }
+
+    /// Deleting the row at the bottom of the list leaves the selection on the
+    /// one before it, not on nothing.
+    #[test]
+    fn deleting_the_last_row_selects_the_one_above_it() {
+        let rig = Rig::new();
+        for name in ["alpha", "beta", "gamma"] {
+            rig.template(name, |_| {});
+        }
+        let mut app = rig.app();
+        app.handle(Input::Char('G'));
+        assert_eq!(selected(&app).unwrap().name, "gamma");
+
+        app.handle(Input::Char('d'));
+        submit_form(&rig, &mut app);
+        refresh(&rig.ctx, &mut app).unwrap();
+        assert_eq!(rig.names(), ["alpha", "beta"]);
+        assert_eq!(selected(&app).unwrap().name, "beta");
+
+        // …and down to nothing, where there is no selection to keep.
+        app.handle(Input::Char('d'));
+        submit_form(&rig, &mut app);
+        refresh(&rig.ctx, &mut app).unwrap();
+        assert_eq!(selected(&app).unwrap().name, "alpha");
+        app.handle(Input::Char('d'));
+        submit_form(&rig, &mut app);
+        refresh(&rig.ctx, &mut app).unwrap();
+        assert!(rig.names().is_empty());
+        assert!(selected(&app).is_none());
+        assert_eq!(app.templates.offset, 0);
     }
 
     #[test]

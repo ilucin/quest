@@ -67,14 +67,16 @@ pub fn run(ctx: &Ctx, action: &TplAction) -> anyhow::Result<()> {
     }
 }
 
-/// `--machine <other>` is an error for every `q tpl` subcommand.
+/// `--machine <other>` is an error for every `q tpl` subcommand — and for the
+/// TUI's Templates tab, which runs the same definitions through the same
+/// [`instantiate_with`] (`src/tui/templates.rs`).
 ///
 /// Nothing here can honour it: the definitions are this machine's rows, and
 /// `q --machine ws tpl run x` used to create the Quest here and record it as
 /// living on `ws` — a local row indistinguishable from a real remote one.
 /// Refusing says what the user asked for cannot be done and names the thing
 /// that can.
-fn refuse_remote(ctx: &Ctx) -> anyhow::Result<()> {
+pub fn refuse_remote(ctx: &Ctx) -> anyhow::Result<()> {
     let Some(machine) = ctx.machine_filter() else {
         return Ok(());
     };
@@ -599,15 +601,28 @@ fn pin_cwd(definition: &mut Definition, was: Option<&str>) -> anyhow::Result<()>
         return Ok(());
     }
     let name = definition.name.trim();
-    let path = new::resolve_dir(Some(&cwd)).map_err(|e| {
-        let message = format!("{name}: cwd `{cwd}`: {e}");
-        match e.downcast_ref::<QError>() {
-            Some(QError::NotFound(_)) => QError::NotFound(message),
-            _ => QError::Invalid(message),
-        }
-    })?;
+    let path = new::resolve_dir(Some(&cwd)).map_err(|e| cwd_error(name, &cwd, &e))?;
     definition.cwd = path.to_string_lossy().to_string();
     Ok(())
+}
+
+/// One line for a `cwd` that will not resolve: ``<name>: cwd `<path>`: <why>``.
+///
+/// [`new::resolve_dir`]'s error carries its own kind prefix and names the path
+/// again, so wrapping it whole read
+/// ``not found: t: cwd `/nope`: not found: no such directory: /nope`` — the
+/// prefix twice and the path twice. Only the reason is kept, and the kind
+/// travels so `--json` still reports `not_found` for a directory that is not
+/// there, exactly as `q new --dir /nope` does.
+fn cwd_error(name: &str, cwd: &str, e: &anyhow::Error) -> QError {
+    let line = |why: &str| format!("{name}: cwd `{cwd}`: {why}");
+    match e.downcast_ref::<QError>() {
+        Some(QError::NotFound(_)) => QError::NotFound(line("no such directory")),
+        Some(QError::Invalid(_)) => QError::Invalid(line("not a directory")),
+        // Anything else is `resolve_dir` failing to *read* the path; it names
+        // no kind worth repeating, so its own message is the reason.
+        _ => QError::Invalid(line(&format!("{e:#}"))),
+    }
 }
 
 /// A `cwd` an import brought in: made absolute, so it pins a directory rather
@@ -937,8 +952,30 @@ mod tests {
             Some("not_found"),
             "{e}"
         );
-        // The field and the template, so the message says what to fix.
-        assert!(e.to_string().contains("routine: cwd"), "{e}");
+        // The field and the template, so the message says what to fix — and
+        // one prefix, one path: `resolve_dir`'s error used to be wrapped
+        // whole, which said "not found:" twice and named the directory twice.
+        assert_eq!(
+            e.to_string(),
+            "not found: routine: cwd `/definitely/not/here`: no such directory"
+        );
+
+        // A path that is there but is not a directory is the other kind, and
+        // says so without borrowing "not found".
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut at_a_file = Definition {
+            name: "routine".to_string(),
+            cwd: file.path().to_string_lossy().to_string(),
+            ..Definition::default()
+        };
+        let e = pin_cwd(&mut at_a_file, None).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<QError>().map(QError::code),
+            Some("invalid"),
+            "{e}"
+        );
+        assert!(e.to_string().ends_with(": not a directory"), "{e}");
+        assert!(!e.to_string().contains("not found"), "{e}");
 
         // The same value it already had is not a set at all.
         let mut unchanged = setting.clone();
