@@ -239,11 +239,15 @@ pub enum Passage {
 ///   which is what makes `q peek`/`q send` on that machine usable.
 /// * `q hook`, `q doctor`, `q config`, the TUI: machine-local by definition.
 /// * `q tpl`: a template is a row in *this* machine's database (SPEC §11 — the
-///   database is the source of truth, and SPEC §15 syncs nothing). There is no
-///   `<quest>` in `q tpl add`/`list`/`run` to resolve elsewhere, and proxying
-///   `q tpl run` would run whatever the far end happens to call that name
-///   rather than the definition the user just listed. `q tpl from <quest>`
-///   reads a Quest, but writes a template here, so it stays here too;
+///   database is the source of truth, and SPEC §15 syncs nothing), so
+///   `q tpl list`/`add`/`edit`/… stay here and `--machine` is refused
+///   ([`crate::commands::tpl::refuse_remote`]). `q tpl run` is the one
+///   exception: with an explicit `--machine ws` there is no `<quest>` to
+///   resolve, so it is a create-on-a-named-machine exactly like
+///   `q new --machine ws` — the same [`Aim::Create`] path — and the far end
+///   instantiates *its own* template of that name (the one `--machine ws`
+///   asked for), never this machine's. `q tpl from <quest>` reads a Quest but
+///   writes a template here, so it stays too;
 ///   `q tpl export | ssh <alias> q tpl import -` is how a definition travels.
 /// * `q workflow list`/`show`/`add`/`edit`/`rm`: a workflow is a file in *this*
 ///   machine's config directory (SPEC §11 — files, not rows), for the same
@@ -256,6 +260,13 @@ pub fn route(command: &Command) -> Option<(Aim<'_>, Passage)> {
     use Passage::{Proxy, Refuse, ThenEnter};
     Some(match command {
         Command::New { .. } => (Aim::Create, Proxy),
+        // The one `q tpl` subcommand that reaches another machine. `--machine
+        // ws` names no `<quest>` to resolve — it is a create-on-a-named-machine
+        // exactly like `q new --machine ws`, so it takes the same [`Aim::Create`]
+        // path and the far end instantiates *its own* template of that name.
+        Command::Tpl {
+            action: crate::cli::TplAction::Run { .. },
+        } => (Aim::Create, Proxy),
 
         Command::Show { quest } => (Aim::Quest(quest), Proxy),
         Command::Rename { quest, .. } => (Aim::Quest(quest), Proxy),
@@ -1059,22 +1070,47 @@ fn expected_target(command: &Command) -> Option<&str> {
 
 // ------------------------------------------------------------------ create
 
-/// `q new --machine ws …` → `ssh <alias> q new … -d`, then enter (SPEC §15).
+/// The [`Aim::Create`] path: a Quest **built** on a named machine rather than
+/// resolved and forwarded — `q new --machine` ([`create_new`]) and
+/// `q tpl run --machine` ([`run_template`]).
 ///
-/// The one command whose remote form is **built** rather than forwarded. It has
-/// to be: the TUI's new-Quest form (SPEC §17) reaches the same path with no
-/// argv behind it at all, and the machine select in that form was the other
-/// half of this bead's bug — it labelled a *local* Quest with a remote's name.
-/// One builder, so the CLI and the form cannot drift.
+/// Built rather than forwarded because `q new`'s remote form has no argv behind
+/// it at all when the TUI's new-Quest form (SPEC §17) reaches the same path, and
+/// the machine select in that form was the other half of bd-8lz.5.3's bug — it
+/// labelled a *local* Quest with a remote's name. One builder, so the CLI and
+/// the form cannot drift. A `--machine` naming this machine falls through to the
+/// local path (`find` returns nothing), which is `q new`/`q tpl run` here.
 fn create(ctx: &Ctx, command: &Command) -> anyhow::Result<Option<u8>> {
     let Some(machine) = ctx.machine_filter() else {
         return Ok(None);
     };
     // `targets` being non-empty already proved this, but `find` is what turns
-    // the name into an alias.
+    // the name into an alias. A `--machine` naming this machine (never a remote)
+    // fails `find`, which is the local path — `q new`/`q tpl run` on the machine
+    // that typed it, exactly as with no `--machine` at all.
     let Ok(remote) = remote::find(&ctx.config.remotes, machine) else {
         return Ok(None);
     };
+    match command {
+        Command::New { .. } => create_new(ctx, remote, machine, command),
+        // `q tpl run <name> --machine ws`: the far end reads *its* template of
+        // that name (the definition `--machine ws` asked for), instantiates it,
+        // and this machine attaches to the master it created — the same shape as
+        // `q new --machine`, differing only in how the far end makes the Quest.
+        Command::Tpl {
+            action: crate::cli::TplAction::Run { detach, .. },
+        } => run_template(ctx, remote, command, *detach),
+        _ => Ok(None),
+    }
+}
+
+/// `q new --machine ws …` → `ssh <alias> q new … -d`, then enter (SPEC §15).
+fn create_new(
+    ctx: &Ctx,
+    remote: &Remote,
+    machine: &str,
+    command: &Command,
+) -> anyhow::Result<Option<u8>> {
     let Command::New {
         name,
         template,
@@ -1138,6 +1174,56 @@ fn create(ctx: &Ctx, command: &Command) -> anyhow::Result<Option<u8>> {
     ctx.ssh().attach(&remote.ssh, &argv).map(|()| Some(0))
 }
 
+/// `q tpl run <name> --machine ws` → `ssh <alias> q tpl run <name> … -d`, then
+/// enter (SPEC §15). Reports the Quest the far end made and attaches to it here,
+/// exactly as [`create_new`] does — the far end reads *its* template of `<name>`.
+fn run_template(
+    ctx: &Ctx,
+    remote: &Remote,
+    command: &Command,
+    detach: bool,
+) -> anyhow::Result<Option<u8>> {
+    let created = read_created(ctx, remote, &tpl_run_argv(command), "q tpl run")?;
+    report_created(ctx, &created, !detach)?;
+    if detach {
+        return Ok(Some(0));
+    }
+    let argv = enter::attach_command(ctx, &created.tmux_session);
+    std::io::stdout().flush()?;
+    ctx.ssh().attach(&remote.ssh, &argv).map(|()| Some(0))
+}
+
+/// The far end's command line for `q tpl run --machine`, built rather than
+/// forwarded so exactly one place decides it.
+///
+/// Always `-d` and always `--json` on the wire, for [`create_remote`]'s reasons:
+/// there is no terminal at the far end to attach to (that is this machine's job,
+/// afterwards), and the slug and tmux session name have to be *read* back. The
+/// user's own `-d`/`--json` are subsumed rather than duplicated: this argv is
+/// built from the parsed `<name>`/`--arg`, not from this process's argv.
+fn tpl_run_argv(command: &Command) -> Vec<String> {
+    let Command::Tpl {
+        action: crate::cli::TplAction::Run { name, args, .. },
+    } = command
+    else {
+        unreachable!("run_template is only reached for `q tpl run`");
+    };
+    let mut argv = vec![
+        REMOTE_Q.to_string(),
+        "tpl".to_string(),
+        "run".to_string(),
+        name.clone(),
+    ];
+    for arg in args {
+        argv.push("--arg".to_string());
+        argv.push(arg.clone());
+    }
+    argv.push("-d".to_string());
+    argv.push("--json".to_string());
+    argv.push(NO_REMOTE.to_string());
+    argv
+}
+
 /// A Quest as the machine that created it reported it back.
 pub struct CreatedRemote {
     pub machine: String,
@@ -1171,7 +1257,19 @@ pub fn create_remote(
         )
         .into());
     }
-    let argv = new::remote_argv(args);
+    read_created(ctx, remote, &new::remote_argv(args), "q new")
+}
+
+/// Run `argv` — a `q new` or `q tpl run`, already carrying `-d --json
+/// --no-remote` — on `remote` and read back the Quest it made
+/// ([`CreatedRemote`]). Shared by [`create_remote`] and [`run_template`]; `verb`
+/// names the far-end command in every failure.
+fn read_created(
+    ctx: &Ctx,
+    remote: &Remote,
+    argv: &[String],
+    verb: &str,
+) -> anyhow::Result<CreatedRemote> {
     let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
     let outcome = ctx.ssh().run(&remote.ssh, &borrowed, remote::PROXY_TIMEOUT);
     let stdout = match outcome {
@@ -1181,11 +1279,11 @@ pub fn create_remote(
             ..
         } => stdout,
         SshOutcome::Done { code, stderr, .. } => {
-            return Err(create_failed(&remote.name, code, &stderr));
+            return Err(create_failed(&remote.name, code, &stderr, verb));
         }
         SshOutcome::TimedOut => {
             return Err(QError::Other(format!(
-                "`q new` did not finish within {}s on {}; check `q list` before retrying",
+                "`{verb}` did not finish within {}s on {}; check `q list` before retrying",
                 remote::PROXY_TIMEOUT.as_secs(),
                 remote.name
             ))
@@ -1206,7 +1304,7 @@ pub fn create_remote(
     // can make of the answer.
     let payload: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|e| {
         QError::Other(format!(
-            "cannot read `q new --json` from {}: {e}{MAY_EXIST}",
+            "cannot read `{verb} --json` from {}: {e}{MAY_EXIST}",
             remote.name
         ))
     })?;
@@ -1216,7 +1314,7 @@ pub fn create_remote(
             .map(str::to_string)
             .ok_or_else(|| {
                 QError::Other(format!(
-                    "`q new --json` from {} has no `{key}`{MAY_EXIST}",
+                    "`{verb} --json` from {} has no `{key}`{MAY_EXIST}",
                     remote.name
                 ))
                 .into()
@@ -1245,7 +1343,7 @@ pub fn create_remote(
 const MAY_EXIST: &str = "; the quest may already have been created there — check `q list` \
                          before retrying";
 
-fn create_failed(machine: &str, code: Option<i32>, stderr: &str) -> anyhow::Error {
+fn create_failed(machine: &str, code: Option<i32>, stderr: &str, verb: &str) -> anyhow::Error {
     // No `q` ran, so nothing was created and `MAY_EXIST` would be a lie.
     if code == Some(NO_COMMAND) {
         return no_q_there(machine, stderr);
@@ -1264,7 +1362,7 @@ fn create_failed(machine: &str, code: Option<i32>, stderr: &str) -> anyhow::Erro
         .ok()
         .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
         .unwrap_or_else(|| output::first_line(stderr, 200));
-    QError::Other(format!("`q new` failed on {machine}: {said}")).into()
+    QError::Other(format!("`{verb}` failed on {machine}: {said}")).into()
 }
 
 /// The one-liner (or payload) for a Quest that was created elsewhere.

@@ -11376,15 +11376,21 @@ fn an_import_never_checks_a_directory_the_far_machine_may_not_have() {
     assert_eq!(json_of(&assert)["cwd"], "/Users/someone-else/Code/work");
 }
 
-/// `q --machine ws tpl run x` used to create the Quest here and stamp it `ws`,
-/// which is a local row indistinguishable from a real remote one.
+/// Every `q tpl` subcommand but `run` names a definition that is *this*
+/// machine's row, so a `--machine <other>` on it is refused rather than
+/// ignored — it used to create nothing remote while suggesting it had.
+/// `q tpl run --machine` is the exception and is tested separately.
 #[test]
 fn tpl_refuses_a_machine_it_cannot_reach_rather_than_ignoring_it() {
     let env = Env::new();
     env.with_remotes(&[("ws", "ws-host")]);
     env.cmd().args(["tpl", "add", "routine"]).assert().success();
 
-    for action in [vec!["tpl", "list"], vec!["tpl", "run", "routine", "-d"]] {
+    for action in [
+        vec!["tpl", "list"],
+        vec!["tpl", "edit", "routine", "--description", "x"],
+        vec!["tpl", "export", "routine"],
+    ] {
         env.cmd()
             .args(["--machine", "ws"])
             .args(action)
@@ -11400,6 +11406,128 @@ fn tpl_refuses_a_machine_it_cannot_reach_rather_than_ignoring_it() {
         .args(["--machine", "laptop", "tpl", "list"])
         .assert()
         .success();
+}
+
+/// A far-end `q tpl run --json` reply: the same envelope the real command emits,
+/// with the two fields the proxy reads back — `quest.slug` and `tmux_session`.
+fn tpl_run_reply(slug: &str) -> serde_json::Value {
+    serde_json::json!({
+        "template": { "name": "weekly" },
+        "quest": { "id": "q-1234", "slug": slug, "machine": "ws" },
+        "session": { "id": "s-0001" },
+        "tmux_session": format!("q-{slug}"),
+        "attach": "none",
+    })
+}
+
+/// SPEC §15: `q tpl run <name> --machine ws` reaches ws, which reads **its own**
+/// template of that name and creates the Quest there — never here. `-d --json`
+/// are added and `--machine` does not travel, exactly as `q new --machine` does.
+#[test]
+fn tpl_run_on_a_remote_runs_it_there_and_not_here() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let hosts = serde_json::json!({
+        "ws-host": { "proxied": { "stdout": tpl_run_reply("weekly-run").to_string() } },
+    });
+    let assert = env
+        .over_ssh(
+            hosts,
+            &[
+                "--machine",
+                "ws",
+                "tpl",
+                "run",
+                "weekly",
+                "--arg",
+                "k=v",
+                "-d",
+                "--json",
+            ],
+        )
+        .success();
+
+    // Built, not forwarded: the far end's line is `q tpl run weekly --arg k=v`
+    // with `-d --json --no-remote` — the user's own `-d`/`--json` subsumed, and
+    // `--machine` gone (over there it would name a machine `q` has never heard).
+    assert_eq!(
+        env.proxy_calls(),
+        ["ws-host\tq\ttpl\trun\tweekly\t--arg\t'k=v'\t-d\t--json\t--no-remote"]
+    );
+    let out = json_of(&assert);
+    assert_eq!(out["machine"], "ws", "{out}");
+    assert_eq!(out["remote"], true, "{out}");
+    assert_eq!(out["quest"]["slug"], "weekly-run", "{out}");
+
+    // Nothing was written here.
+    assert_eq!(env.count("SELECT COUNT(*) FROM quest"), 0);
+}
+
+/// …and then enter (SPEC §15), unless `-d` said not to. The tmux session name
+/// comes from the machine that created it.
+#[test]
+fn tpl_run_on_a_remote_attaches_to_the_machine_that_created_it() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let hosts = serde_json::json!({
+        "ws-host": { "proxied": { "stdout": tpl_run_reply("weekly-run").to_string() } },
+    });
+    env.over_ssh(hosts, &["--machine", "ws", "tpl", "run", "weekly"])
+        .success()
+        .stdout(predicate::str::contains("created quest weekly-run on ws"));
+    assert_eq!(
+        attach_calls(&env),
+        ["attach\tws-host\ttmux\tattach\t-t\t'=q-weekly-run'"]
+    );
+}
+
+/// A `q tpl run` that fails over there (e.g. ws has no template by that name)
+/// fails here, with what the far end said and the machine it ran on.
+#[test]
+fn a_remote_tpl_run_that_fails_says_what_the_far_end_said() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let hosts = serde_json::json!({
+        "ws-host": {
+            "proxied": {
+                "stderr": "{\"error\":\"no template `weekly`\",\"code\":\"not_found\"}\n",
+                "exit": 1,
+            },
+        },
+    });
+    env.over_ssh(hosts, &["--machine", "ws", "tpl", "run", "weekly", "-d"])
+        .code(1)
+        .stderr(predicate::str::contains("no template `weekly`"))
+        .stderr(predicate::str::contains("on ws"));
+    assert_eq!(env.count("SELECT COUNT(*) FROM quest"), 0);
+}
+
+/// `--machine <this machine>` is not a remote, so `q tpl run` runs locally with
+/// no ssh at all — the template is read here and the Quest is created here.
+#[test]
+fn tpl_run_with_the_local_machine_name_runs_here() {
+    let env = Env::new();
+    env.with_remotes(&[("ws", "ws-host")]);
+    let work = env.work("repo");
+    env.cmd()
+        .args(["tpl", "add", "routine", "--cwd", work.to_str().unwrap()])
+        .assert()
+        .success();
+    let mut cmd = env.cmd();
+    env.with_ssh(&mut cmd, serde_json::json!({}));
+    cmd.args([
+        "--machine",
+        "laptop",
+        "tpl",
+        "run",
+        "routine",
+        "-d",
+        "--json",
+    ])
+    .assert()
+    .success();
+    assert!(env.proxy_calls().is_empty(), "{:?}", env.proxy_calls());
+    assert_eq!(env.count("SELECT COUNT(*) FROM quest"), 1);
 }
 
 /// SPEC §4's third `name_source`: a routine run three times is three
