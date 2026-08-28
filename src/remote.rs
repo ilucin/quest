@@ -251,24 +251,12 @@ fn ssh_argv(alias: &str, argv: &[&str], timeout: Duration) -> Vec<String> {
     out
 }
 
-/// The remote command, wrapped so it bounds its **own** lifetime on the far
-/// end. Killing the local ssh client cannot reach the process on the other
-/// side: under ssh multiplexing (SPEC §23 #6) the mux master keeps the channel
-/// open, so the far end never sees the disconnect and a command that hangs
-/// there would run forever — one orphaned process piling up per tick, which is
-/// exactly what a wedged remote produced.
-///
-/// So the far end starts its own watchdog beside the command: a poll loop that
-/// SIGTERMs the command once `secs` elapse, and that stops the moment the
-/// command exits on its own — a healthy call leaves nothing behind but a
-/// `sleep` of at most one second. `secs` matches the client's deadline; the
-/// client still owns the *result* (it returns at its own deadline regardless),
-/// this timer only reaps the far end when the client's kill cannot.
-///
-/// POSIX `sh` on purpose (bash 3.2 on macOS, dash on Linux, no `wait -n`): the
-/// watchdog runs in a subshell because a sibling's pid cannot be `wait`ed, and
-/// `kill "$p"` reaches the command itself — a child it spawns is not in scope,
-/// which the far-end `q` (`--no-remote`, no long-lived children) does not need.
+/// The remote command, wrapped so it reaps itself on the far end. Killing the
+/// local ssh client cannot reach the far side — under ssh multiplexing (SPEC
+/// §23 #6) the mux master keeps the channel open — so a hung command there
+/// would run forever, one orphan per tick. A watchdog beside it SIGTERMs it at
+/// `secs` (the client's deadline) and exits early once it finishes on its own.
+/// POSIX `sh` only: bash 3.2 / dash, no `wait -n`, no `timeout`/`setsid`.
 fn self_bounded(argv: &[&str], secs: u64) -> [String; 3] {
     let cmd = argv
         .iter()
@@ -1775,8 +1763,7 @@ mod tests {
                 "ws",
             ]
         );
-        // The remote command is handed to the far end's login shell wrapped in
-        // a self-bounding `sh -c` (see `self_bounded`), never as bare argv.
+        // Wrapped in a self-bounding `sh -c`, not bare argv (see `self_bounded`).
         assert_eq!(&argv[5..7], ["sh", "-c"]);
         assert!(argv[7].contains("q list --json --no-remote --all"));
         // However short the deadline, ssh is never told to wait zero seconds.
@@ -2337,9 +2324,8 @@ mod tests {
     /// below live for, so a deadline that is not enforced cannot pass them.
     const PATIENCE: Duration = Duration::from_secs(10);
 
-    /// Feed `self_bounded`'s script to a local shell exactly as the far end's
-    /// login shell would (`sh -c <script>`), and report the code and how long
-    /// it took — the two things the watchdog is meant to control.
+    /// Run `self_bounded`'s script through a local shell, as the far end's
+    /// login shell would, and report the code and how long it took.
     fn run_self_bounded(argv: &[&str], secs: u64) -> (Option<i32>, Duration) {
         let wrapped = self_bounded(argv, secs);
         let started = Instant::now();
@@ -2353,8 +2339,7 @@ mod tests {
 
     #[test]
     fn a_hung_far_end_command_kills_itself_at_the_deadline() {
-        // The client's kill cannot reach it, so the far end must reap itself:
-        // the inner `sleep 30` has to be gone in ~1 s, reported non-zero.
+        // The inner `sleep 30` must be gone in ~1 s, reported non-zero.
         let (code, elapsed) = run_self_bounded(&["sleep", "30"], 1);
         assert!(elapsed < PATIENCE, "took {elapsed:?}");
         assert_ne!(code, Some(0));
@@ -2362,8 +2347,7 @@ mod tests {
 
     #[test]
     fn a_healthy_far_end_command_returns_at_once_with_its_own_code() {
-        // The watchdog must neither delay a command that finishes on its own
-        // nor swallow its exit code.
+        // No delay, and its exit code survives the wrapper.
         let (code, elapsed) = run_self_bounded(&["sh", "-c", "exit 7"], 30);
         assert_eq!(code, Some(7));
         assert!(elapsed < PATIENCE, "took {elapsed:?}");
@@ -2580,8 +2564,7 @@ mod tests {
         // ssh's own options are ours to exec, never the far end's to read.
         let argv = ssh_argv("ws", &LIST_ARGV, TIMEOUT);
         assert_eq!(argv[1], "BatchMode=yes");
-        // The command travels inside the self-bounding wrapper, not as bare
-        // argv — but every word of it is still there, in order.
+        // Inside the wrapper, but every word of the command is still there.
         assert_eq!(&argv[5..7], ["sh", "-c"]);
         assert!(argv[7].contains(&LIST_ARGV.join(" ")));
     }
