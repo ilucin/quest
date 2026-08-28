@@ -310,6 +310,10 @@ pub fn instantiate_with(
             prompt: prompt.as_deref(),
             detach,
             template: Some(template),
+            // SPEC §14: a template's stored `create_brain` decides whether the
+            // Quest it instantiates gets a brain session — shared by `q tpl
+            // run` and the TUI Templates tab, which both land here.
+            brain: template.create_brain,
             ..new::Args::default()
         },
     )
@@ -829,15 +833,7 @@ fn human_show(t: &Template) -> String {
     line("beads repo", super::fmt::or_dash(t.beads_repo.as_deref()));
     line(
         "brain",
-        // TODO(bd-8lz follow-up): `q new` has no `--brain` yet
-        // (`commands::new`'s `TODO(M2)`), so this field is stored and
-        // exported but nothing acts on it. Said out loud rather than implied.
-        if t.create_brain {
-            "yes (stored; q tpl run does not create one yet)"
-        } else {
-            "no"
-        }
-        .to_string(),
+        if t.create_brain { "yes" } else { "no" }.to_string(),
     );
     line(
         "tags",
