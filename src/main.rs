@@ -38,6 +38,12 @@ pub struct Ctx {
     /// SPEC §15's recursion guard: set on the `q list` we run over ssh, so the
     /// far end answers out of its own database instead of fanning out again.
     no_remote: bool,
+    /// A human already answered this command's confirmation, on the machine
+    /// that had the terminal — see [`cli::Cli::confirmed`].
+    confirmed: bool,
+    /// The Quest identity this command was pinned to before it crossed the
+    /// wire — see [`cli::Cli::expect`] and [`commands::proxy::verify`].
+    expect: Option<String>,
     /// Absent only for `q config`, which has to work before — and in order to
     /// fix — a broken environment.
     db: Option<Db>,
@@ -81,6 +87,18 @@ impl Ctx {
         !self.no_remote
     }
 
+    /// True under `--confirmed`: skip the `[y/N]`, and only that. Nothing in
+    /// `q` may read this as `-f`.
+    pub fn confirmed(&self) -> bool {
+        self.confirmed
+    }
+
+    /// `--expect`'s value: the Quest identity the sending machine resolved and
+    /// the human confirmed. `None` for a command nobody proxied.
+    pub fn expected(&self) -> Option<&str> {
+        self.expect.as_deref()
+    }
+
     fn new(args: &Cli, config: Config, db: Option<Db>) -> anyhow::Result<Ctx> {
         let machine_override = match &args.machine {
             Some(m) => {
@@ -107,6 +125,8 @@ impl Ctx {
             config,
             machine_override,
             no_remote: args.no_remote,
+            confirmed: args.confirmed,
+            expect: args.expect.clone(),
             db,
             tmux: tmux::tmux(),
             ssh: remote::ssh().into(),
@@ -149,6 +169,8 @@ impl Ctx {
             config: Config::default(),
             machine_override: None,
             no_remote: args.no_remote,
+            confirmed: args.confirmed,
+            expect: args.expect.clone(),
             db: None,
             tmux: tmux::tmux(),
             ssh: remote::ssh().into(),
@@ -213,6 +235,8 @@ impl Ctx {
             config,
             machine_override: None,
             no_remote: false,
+            confirmed: false,
+            expect: None,
             db: Some(db),
             tmux,
             ssh: Arc::new(remote::stub::NoSsh),
@@ -242,6 +266,12 @@ impl Ctx {
     #[cfg(test)]
     pub fn with_no_remote(mut self, no_remote: bool) -> Ctx {
         self.no_remote = no_remote;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_confirmed(mut self, confirmed: bool) -> Ctx {
+        self.confirmed = confirmed;
         self
     }
 }
@@ -302,6 +332,8 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
         return Ok(0);
     };
 
+    // The three commands that must work without a database — a broken
+    // environment is what they exist to inspect or repair.
     match command {
         Command::Config { action } => {
             // No database, whichever action it is.
@@ -310,7 +342,65 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             } else {
                 Ctx::lenient(args)
             };
-            config::run(&ctx, action.as_ref()).map(|()| 0)
+            return config::run(&ctx, action.as_ref()).map(|()| 0);
+        }
+        Command::Doctor { fix } => {
+            // Diagnosing a broken environment must not require a working one:
+            // doctor opens the config and the database itself, and reports
+            // whatever it finds.
+            return doctor::run(&Ctx::lenient(args), *fix);
+        }
+        Command::Hook { action } => {
+            return match action {
+                HookAction::Install { command } => {
+                    commands::hook::install(&Ctx::config_only(args)?, command.as_deref())
+                }
+                HookAction::Uninstall => commands::hook::uninstall(&Ctx::config_only(args)?),
+                HookAction::Status { command } => {
+                    commands::hook::status(&Ctx::config_only(args)?, command.as_deref())
+                }
+                // Everything below is a hook firing inside a live Claude session.
+                // A Claude q started for its own bookkeeping — naming (SPEC §10) —
+                // must not be able to write to the Quest it is naming: its pane
+                // environment is scrubbed and its settings are not loaded, and this
+                // is the last line of that defence.
+                _ if naming::suppressed() => Ok(0),
+                // Lenient: a broken config must never break the statusline.
+                HookAction::Statusline => commands::hook::statusline(&Ctx::lenient(args)),
+                HookAction::SessionStart => hooks::run(hooks::Event::SessionStart),
+                HookAction::UserPromptSubmit => hooks::run(hooks::Event::UserPromptSubmit),
+                HookAction::Stop => hooks::run(hooks::Event::Stop),
+                HookAction::Notification => hooks::run(hooks::Event::Notification),
+                HookAction::PreCompact => hooks::run(hooks::Event::PreCompact),
+                HookAction::SessionEnd => hooks::run(hooks::Event::SessionEnd),
+                // No Ctx: reads `$Q_DB` itself and never creates the database.
+                HookAction::PostToolUse => commands::hook_capture::run(),
+            };
+        }
+        _ => {}
+    }
+
+    // Everything else runs against the database — and, before it runs here at
+    // all, may turn out to belong to another machine (SPEC §15). The proxy is
+    // one gate for every command rather than a branch inside each of them; it
+    // answers `None` when this machine is the one, which is always the case
+    // with no `[[remotes]]` configured or under `--no-remote`.
+    let ctx = Ctx::with_db(args)?;
+    if let Some(code) = commands::proxy::dispatch(&ctx, command)? {
+        return Ok(code);
+    }
+    // The receiving half of that same gate: a command that arrived over ssh
+    // carries the identity it was resolved against, and this machine refuses
+    // it unless the target still names that Quest here (SPEC §15).
+    commands::proxy::verify(&ctx, command)?;
+    local(&ctx, command)
+}
+
+/// The command, on this machine.
+fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
+    match command {
+        Command::Config { .. } | Command::Doctor { .. } | Command::Hook { .. } => {
+            unreachable!("handled before the database is opened")
         }
         Command::New {
             name,
@@ -324,9 +414,8 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             no_auto_reset,
             detach,
         } => {
-            let ctx = Ctx::with_db(args)?;
             commands::new::run(
-                &ctx,
+                ctx,
                 &commands::new::Args {
                     name: name.as_deref(),
                     goal: goal.as_deref(),
@@ -348,40 +437,21 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             )
             .map(|()| 0)
         }
-        Command::Doctor { fix } => {
-            // Diagnosing a broken environment must not require a working one:
-            // doctor opens the config and the database itself, and reports
-            // whatever it finds.
-            doctor::run(&Ctx::lenient(args), *fix)
-        }
-        Command::List { all, state } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::list::run(&ctx, *all, *state).map(|()| 0)
-        }
-        Command::Show { quest } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::show::run(&ctx, quest).map(|()| 0)
-        }
+        Command::List { all, state } => commands::list::run(ctx, *all, *state).map(|()| 0),
+        Command::Show { quest } => commands::show::run(ctx, quest).map(|()| 0),
         Command::Enter { quest, session } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::enter::run(&ctx, quest, session.as_deref()).map(|()| 0)
+            commands::enter::run(ctx, quest, session.as_deref()).map(|()| 0)
         }
         Command::Close {
             quest,
             force,
             close_epic,
-        } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::close::run(&ctx, quest, *force, *close_epic).map(|()| 0)
-        }
+        } => commands::close::run(ctx, quest, *force, *close_epic).map(|()| 0),
         Command::Resume {
             quest,
             prompt,
             detach,
-        } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::resume::run(&ctx, quest, prompt.as_deref(), *detach).map(|()| 0)
-        }
+        } => commands::resume::run(ctx, quest, prompt.as_deref(), *detach).map(|()| 0),
         Command::Spawn {
             quest,
             prompt,
@@ -389,75 +459,54 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             workflow,
             dir,
             no_attach,
-        } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::spawn::run(
-                &ctx,
-                &commands::spawn::Args {
-                    quest,
-                    label,
-                    prompt,
-                    workflow: workflow.as_deref(),
-                    dir: dir.as_deref(),
-                    no_attach: *no_attach,
-                },
-            )
-            .map(|()| 0)
-        }
-        Command::Sessions { quest, all } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::sessions::run(
-                &ctx,
-                &commands::sessions::Args {
-                    quest: quest.as_deref(),
-                    all: *all,
-                },
-            )
-            .map(|()| 0)
-        }
-        Command::Peek { session, lines } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::peek::run(&ctx, session, *lines).map(|()| 0)
-        }
+        } => commands::spawn::run(
+            ctx,
+            &commands::spawn::Args {
+                quest,
+                label,
+                prompt,
+                workflow: workflow.as_deref(),
+                dir: dir.as_deref(),
+                no_attach: *no_attach,
+            },
+        )
+        .map(|()| 0),
+        Command::Sessions { quest, all } => commands::sessions::run(
+            ctx,
+            &commands::sessions::Args {
+                quest: quest.as_deref(),
+                all: *all,
+            },
+        )
+        .map(|()| 0),
+        Command::Peek { session, lines } => commands::peek::run(ctx, session, *lines).map(|()| 0),
         Command::Send {
             session,
             text,
             force,
-        } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::send::run(
-                &ctx,
-                &commands::send::Args {
-                    session,
-                    text,
-                    force: *force,
-                },
-            )
-            .map(|()| 0)
-        }
+        } => commands::send::run(
+            ctx,
+            &commands::send::Args {
+                session,
+                text,
+                force: *force,
+            },
+        )
+        .map(|()| 0),
         Command::Reset {
             session,
             delay,
             strategy,
-        } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::reset::run(
-                &ctx,
-                &commands::reset::Args {
-                    session,
-                    delay: *delay,
-                    strategy: strategy.map(Into::into),
-                },
-            )
-        }
-        Command::Kill { session, force } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::kill::run(&ctx, session, *force).map(|()| 0)
-        }
-        Command::Rename { quest, slug } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::rename::run(&ctx, quest, slug).map(|()| 0)
-        }
+        } => commands::reset::run(
+            ctx,
+            &commands::reset::Args {
+                session,
+                delay: *delay,
+                strategy: strategy.map(Into::into),
+            },
+        ),
+        Command::Kill { session, force } => commands::kill::run(ctx, session, *force).map(|()| 0),
+        Command::Rename { quest, slug } => commands::rename::run(ctx, quest, slug).map(|()| 0),
         Command::Name {
             quest,
             auto,
@@ -465,138 +514,88 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
             refresh,
             detach,
             force,
-        } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::name::run(
-                &ctx,
-                &commands::name::Args {
-                    quest,
-                    auto: *auto,
-                    apply: *apply,
-                    refresh: *refresh,
-                    detach: *detach,
-                    force: *force,
-                },
-            )
-            .map(|()| 0)
-        }
+        } => commands::name::run(
+            ctx,
+            &commands::name::Args {
+                quest,
+                auto: *auto,
+                apply: *apply,
+                refresh: *refresh,
+                detach: *detach,
+                force: *force,
+            },
+        )
+        .map(|()| 0),
         Command::Set { quest, key, value } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::set::run(&ctx, quest, *key, value).map(|()| 0)
+            commands::set::run(ctx, quest, *key, value).map(|()| 0)
         }
         Command::Brief {
             quest,
             r#for,
             session,
-        } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::brief::run(
-                &ctx,
-                &commands::brief::Args {
-                    quest: quest.as_deref(),
-                    role: r#for.map(Into::into),
-                    session: session.as_deref(),
-                },
-            )
-            .map(|()| 0)
-        }
+        } => commands::brief::run(
+            ctx,
+            &commands::brief::Args {
+                quest: quest.as_deref(),
+                role: r#for.map(Into::into),
+                session: session.as_deref(),
+            },
+        )
+        .map(|()| 0),
         Command::Events {
             quest,
             follow,
             kinds,
             limit,
             session,
-        } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::events::run(
-                &ctx,
-                &commands::events::Args {
-                    quest: quest.as_deref(),
-                    kinds,
-                    session: session.as_deref(),
-                    limit: *limit,
-                    follow: *follow,
-                },
-            )
-            .map(|()| 0)
-        }
-        Command::Rm { quest, force } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::rm::run(&ctx, quest, *force).map(|()| 0)
-        }
-        Command::Hook { action } => match action {
-            HookAction::Install { command } => {
-                commands::hook::install(&Ctx::config_only(args)?, command.as_deref())
-            }
-            HookAction::Uninstall => commands::hook::uninstall(&Ctx::config_only(args)?),
-            HookAction::Status { command } => {
-                commands::hook::status(&Ctx::config_only(args)?, command.as_deref())
-            }
-            // Everything below is a hook firing inside a live Claude session.
-            // A Claude q started for its own bookkeeping — naming (SPEC §10) —
-            // must not be able to write to the Quest it is naming: its pane
-            // environment is scrubbed and its settings are not loaded, and this
-            // is the last line of that defence.
-            _ if naming::suppressed() => Ok(0),
-            // Lenient: a broken config must never break the statusline.
-            HookAction::Statusline => commands::hook::statusline(&Ctx::lenient(args)),
-            HookAction::SessionStart => hooks::run(hooks::Event::SessionStart),
-            HookAction::UserPromptSubmit => hooks::run(hooks::Event::UserPromptSubmit),
-            HookAction::Stop => hooks::run(hooks::Event::Stop),
-            HookAction::Notification => hooks::run(hooks::Event::Notification),
-            HookAction::PreCompact => hooks::run(hooks::Event::PreCompact),
-            HookAction::SessionEnd => hooks::run(hooks::Event::SessionEnd),
-            // No Ctx: reads `$Q_DB` itself and never creates the database.
-            HookAction::PostToolUse => commands::hook_capture::run(),
-        },
-
+        } => commands::events::run(
+            ctx,
+            &commands::events::Args {
+                quest: quest.as_deref(),
+                kinds,
+                session: session.as_deref(),
+                limit: *limit,
+                follow: *follow,
+            },
+        )
+        .map(|()| 0),
+        Command::Rm { quest, force } => commands::rm::run(ctx, quest, *force).map(|()| 0),
         // Agent self-report (bd-8lz.2.5).
         Command::Phase { text, quest } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::phase::run(&ctx, text, quest.as_deref()).map(|()| 0)
+            commands::phase::run(ctx, text, quest.as_deref()).map(|()| 0)
         }
         Command::Note {
             text,
             blocker,
             quest,
-        } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::note::run(&ctx, text, *blocker, quest.as_deref()).map(|()| 0)
-        }
-        Command::Link { action } => {
-            let ctx = Ctx::with_db(args)?;
-            match action {
-                LinkAction::Add {
+        } => commands::note::run(ctx, text, *blocker, quest.as_deref()).map(|()| 0),
+        Command::Link { action } => match action {
+            LinkAction::Add {
+                r#ref,
+                kind,
+                title,
+                quest,
+            } => commands::link::add(
+                ctx,
+                &commands::link::AddArgs {
                     r#ref,
-                    kind,
-                    title,
-                    quest,
-                } => commands::link::add(
-                    &ctx,
-                    &commands::link::AddArgs {
-                        r#ref,
-                        kind: *kind,
-                        title: title.as_deref(),
-                        quest: quest.as_deref(),
-                    },
-                ),
-                LinkAction::Rm { id, quest } => commands::link::rm(&ctx, *id, quest.as_deref()),
-            }
-            .map(|()| 0)
+                    kind: *kind,
+                    title: title.as_deref(),
+                    quest: quest.as_deref(),
+                },
+            ),
+            LinkAction::Rm { id, quest } => commands::link::rm(ctx, *id, quest.as_deref()),
         }
+        .map(|()| 0),
         Command::Links { quest, refresh } => {
-            let ctx = Ctx::with_db(args)?;
-            commands::link::list(&ctx, quest.as_deref(), *refresh).map(|()| 0)
+            commands::link::list(ctx, quest.as_deref(), *refresh).map(|()| 0)
         }
-        Command::Artifact { action } => {
-            let ctx = Ctx::with_db(args)?;
-            match action {
-                ArtifactAction::Add { path, note, quest } => {
-                    commands::link::add_artifact(&ctx, path, note.as_deref(), quest.as_deref())
-                }
+        Command::Artifact { action } => match action {
+            ArtifactAction::Add { path, note, quest } => {
+                commands::link::add_artifact(ctx, path, note.as_deref(), quest.as_deref())
             }
-            .map(|()| 0)
         }
+        .map(|()| 0),
     }
 }
 
