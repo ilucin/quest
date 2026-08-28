@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::Ctx;
 use crate::commands::{
-    QuestRow, close, fill_progress, fmt, load_quests, new, proxy, rename, resume,
+    QuestRow, close, fill_progress, fmt, load_quests, new, proxy, rename, resume, tpl,
 };
 use crate::error::QError;
 use crate::model::{
@@ -982,42 +982,41 @@ fn quest_for_state(ctx: &Ctx, target: &Target) -> anyhow::Result<Quest> {
 
 fn create(ctx: &Ctx, app: &mut App, form: &Form) -> anyhow::Result<()> {
     // The chosen template supplies whatever the form was left blank for; it
-    // never overrides something typed. Placeholder expansion and the run
-    // bookkeeping of `q tpl run` are bd-8lz.5's.
-    let template: Option<Template> = app
+    // never overrides something typed — so only the template's own text is
+    // placeholder-expanded, and a goal typed into the form is taken literally.
+    // `tpl::Merge` is the same merge `q new --template` runs (SPEC §16).
+    let chosen: Option<Template> = app
         .quests
         .templates
         .iter()
         .find(|t| t.name == form.choice(F_TEMPLATE))
         .cloned();
-    let from = |field: &str, of: fn(&Template) -> Option<String>| -> Option<String> {
-        form.optional(field)
-            .map(str::to_string)
-            .or_else(|| template.as_ref().and_then(of))
-    };
-    let goal = from(F_GOAL, |t| t.goal.clone());
-    let dir = from(F_DIR, |t| t.cwd.clone());
-    let workflow = from(F_WORKFLOW, |t| t.workflow.clone());
+    let template = chosen.map(expand).transpose()?;
     let machine = form.choice(F_MACHINE).to_string();
     let no_beads = !form.is_on(F_BEADS);
-    // `--repo` alongside `--no-beads` is a contradiction `q new` rejects;
-    // there would be no epic for the label to go on.
-    let repo = template
-        .as_ref()
-        .and_then(|t| t.beads_repo.clone())
-        .filter(|_| !no_beads);
-    let prompt = template.as_ref().and_then(|t| t.master_prompt.clone());
+    let merged = tpl::Merge::new(
+        template.as_ref(),
+        &tpl::Given {
+            goal: form.optional(F_GOAL),
+            dir: form.optional(F_DIR),
+            workflow: form.optional(F_WORKFLOW),
+            no_beads,
+            ..tpl::Given::default()
+        },
+    );
 
     let args = new::Args {
-        // SPEC §11: the Quest records which template made it.
-        template: template.as_ref().map(|t| t.id.as_str()),
+        // SPEC §11: the Quest records which template made it, and its run is
+        // counted inside `new::create` — so a Quest that is never created
+        // never counts, whatever the caller forgets.
+        template: template.as_ref(),
         name: form.optional(F_NAME),
-        goal: goal.as_deref(),
-        dir: dir.as_deref(),
-        workflow: workflow.as_deref(),
-        repo: repo.as_deref(),
+        goal: merged.goal.as_deref(),
+        dir: merged.dir.as_deref(),
+        workflow: merged.workflow.as_deref(),
+        repo: merged.repo.as_deref(),
         no_beads,
-        prompt: prompt.as_deref(),
+        prompt: merged.prompt.as_deref(),
         prompt_file: None,
         no_auto_reset: false,
         // The TUI never attaches on its own: `q new` ends at a tmux pane,
@@ -1033,10 +1032,22 @@ fn create(ctx: &Ctx, app: &mut App, form: &Form) -> anyhow::Result<()> {
     // with a remote's name, which made it indistinguishable from a real one.
     if let Some(remote) = ctx.config.remotes.iter().find(|r| r.name == machine) {
         let created = proxy::create_remote(ctx, remote, &args)?;
+        // The template's *text* travelled as plain `q new` flags, but the link
+        // did not: `template_id` names a row in this machine's database, and
+        // `proxy::create_remote` has nowhere to put it. So the run is not
+        // counted either — `run_count` records Quests this definition made,
+        // and the Quest over there is not one of them.
+        let note = match template.as_ref() {
+            Some(t) => format!(
+                " · not linked to template {} (it is this machine's)",
+                t.name
+            ),
+            None => String::new(),
+        };
         // No anchor: the row lives in that machine's database and arrives with
         // the next remote tick (SPEC §17's `[ui] tick_remote`).
         app.say(format!(
-            "created {} on {} · it appears at the next remote tick",
+            "created {} on {} · it appears at the next remote tick{note}",
             created.slug, created.machine
         ));
         return Ok(());
@@ -1046,6 +1057,21 @@ fn create(ctx: &Ctx, app: &mut App, form: &Form) -> anyhow::Result<()> {
     app.quests.focus_on(Anchor::local(&created.quest));
     app.say(format!("created {} · o enters it", created.quest.slug));
     Ok(())
+}
+
+/// The form's half of `q tpl run`'s expansion: `{{date}}` is filled in, and a
+/// template that wants a `{{arg.k}}` is refused with the command that can give
+/// it one.
+fn expand(template: Template) -> anyhow::Result<Template> {
+    tpl::expanded_without_args(&template).map_err(|e| {
+        // The command first: the form's error line is one row wide and
+        // ellipsises, and the actionable half is the one that has to survive.
+        QError::Invalid(format!(
+            "run it from the CLI: q tpl run {} --arg k=v — {e:#}",
+            template.name
+        ))
+        .into()
+    })
 }
 
 fn rename_quest(ctx: &Ctx, app: &mut App, target: &Target, form: &Form) -> anyhow::Result<()> {
@@ -4422,6 +4448,77 @@ mod form_tests {
             "{:?}",
             pane.command
         );
+    }
+
+    /// bd-8lz.6.1: the form does the run bookkeeping `q tpl run` does, and
+    /// expands the one placeholder it can — `{{date}}`.
+    #[test]
+    fn a_templated_quest_expands_the_date_and_counts_the_run() {
+        let rig = Rig::new();
+        let mut template = crate::model::Template::new("weekly-hygiene");
+        template.goal = Some("tidy up on {{date}}".to_string());
+        template.cwd = Some(rig.dir());
+        rig.ctx.db().unwrap().insert_template(&template).unwrap();
+
+        let mut app = rig.app();
+        app.handle(Input::Char('n'));
+        set(&mut app, F_NAME, "from-template");
+        focus(&mut app, F_TEMPLATE);
+        app.handle(Input::Right);
+        no_beads(&mut app);
+        // Read on both sides of the submit: computing "today" only afterwards
+        // is a once-a-year midnight flake.
+        let before = crate::templates::today();
+        submit(&rig, &mut app);
+        let after = crate::templates::today();
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+
+        let goal = rig.quests()[0].goal.clone().unwrap_or_default();
+        assert!(
+            goal == format!("tidy up on {before}") || goal == format!("tidy up on {after}"),
+            "{goal}"
+        );
+        let stored = rig
+            .ctx
+            .db()
+            .unwrap()
+            .get_template(&template.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.run_count, 1);
+        assert!(stored.last_run_at.is_some());
+    }
+
+    /// A form has nowhere to type `--arg`, so a template that wants one is
+    /// refused rather than instantiated with the braces still in it.
+    #[test]
+    fn a_template_that_needs_an_argument_is_refused_by_the_form() {
+        let rig = Rig::new();
+        let mut template = crate::model::Template::new("weekly-hygiene");
+        template.goal = Some("tidy {{arg.repo}}".to_string());
+        template.cwd = Some(rig.dir());
+        rig.ctx.db().unwrap().insert_template(&template).unwrap();
+
+        let mut app = rig.app();
+        app.handle(Input::Char('n'));
+        set(&mut app, F_NAME, "from-template");
+        focus(&mut app, F_TEMPLATE);
+        app.handle(Input::Right);
+        no_beads(&mut app);
+        submit(&rig, &mut app);
+
+        let text = screen(&mut app);
+        assert!(app.modal.is_some(), "the form closed: {text}");
+        assert!(text.contains("q tpl run"), "{text}");
+        assert!(rig.quests().is_empty(), "a quest was created: {text}");
+        let stored = rig
+            .ctx
+            .db()
+            .unwrap()
+            .get_template(&template.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.run_count, 0);
     }
 
     // ----------------------------------------------------------- the mouse

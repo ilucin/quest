@@ -238,6 +238,13 @@ pub enum Passage {
 ///   multi-machine is SPEC §17's, not this bead's. With a Quest it is proxied,
 ///   which is what makes `q peek`/`q send` on that machine usable.
 /// * `q hook`, `q doctor`, `q config`, the TUI: machine-local by definition.
+/// * `q tpl`: a template is a row in *this* machine's database (SPEC §11 — the
+///   database is the source of truth, and SPEC §15 syncs nothing). There is no
+///   `<quest>` in `q tpl add`/`list`/`run` to resolve elsewhere, and proxying
+///   `q tpl run` would run whatever the far end happens to call that name
+///   rather than the definition the user just listed. `q tpl from <quest>`
+///   reads a Quest, but writes a template here, so it stays here too;
+///   `q tpl export | ssh <alias> q tpl import -` is how a definition travels.
 /// * `q brief`/`q links`/`q note`/`q link` with no `--quest` fall back to
 ///   `$Q_QUEST`, which is this machine's pane environment.
 pub fn route(command: &Command) -> Option<(Aim<'_>, Passage)> {
@@ -1058,6 +1065,7 @@ fn create(ctx: &Ctx, command: &Command) -> anyhow::Result<Option<u8>> {
     };
     let Command::New {
         name,
+        template,
         goal,
         dir,
         workflow,
@@ -1071,6 +1079,17 @@ fn create(ctx: &Ctx, command: &Command) -> anyhow::Result<Option<u8>> {
     else {
         return Ok(None);
     };
+    // A template is a row in *this* machine's database (`commands::tpl`), so
+    // `--template` names nothing over there and silently expanding it here
+    // would create a Quest the far end could never link back to a definition.
+    if let Some(template) = template {
+        return Err(QError::Invalid(format!(
+            "--machine {machine} with --template {template}: a template is a row in this \
+             machine's database; copy it over with \
+             `q tpl export {template} | ssh {machine} q tpl import -`, then run it there"
+        ))
+        .into());
+    }
     // A relative `--dir` is the `link add` relative-`<ref>` caveat again (see
     // `route`): it is made absolute against the far end's login directory, not
     // this one. The common case is an absolute path or none at all, and the

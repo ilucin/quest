@@ -61,10 +61,20 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Create a new Quest
+    ///
+    /// `--template` starts from a stored definition (SPEC §11) and every
+    /// other flag wins over it: the template fills only what was left out.
+    /// Without `--name` the Quest is named after the template, stepping
+    /// aside to `-2`, `-3`, … as a routine is run again. To take a
+    /// definition whole, with `{{arg.k}}` and no overrides, use
+    /// `q tpl run` instead.
     New {
         /// Slug: lowercase kebab-case, at most 40 characters
         #[arg(long, value_name = "SLUG")]
         name: Option<String>,
+        /// Template to start from: name, id, or an unambiguous fragment
+        #[arg(long, value_name = "NAME")]
+        template: Option<String>,
         /// One line on what this Quest is for
         #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
         goal: Option<String>,
@@ -339,6 +349,169 @@ pub enum Command {
         #[command(subcommand)]
         action: ArtifactAction,
     },
+
+    /// Quest templates: reusable Quest definitions (SPEC §11)
+    ///
+    /// Templates are rows in this machine's database, so no `q tpl`
+    /// subcommand is ever proxied and a global `--machine <other>` is
+    /// refused rather than ignored; move a definition with
+    /// `q tpl export <name> | ssh <alias> q tpl import -`.
+    Tpl {
+        #[command(subcommand)]
+        action: TplAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TplAction {
+    /// List templates
+    List,
+    /// Show one template
+    Show {
+        /// Name, id, or an unambiguous fragment
+        name: String,
+    },
+    /// Create a template
+    ///
+    /// `--goal` and `--prompt` may use `{{date}}` (today, local, YYYY-MM-DD)
+    /// and `{{arg.<key>}}`, which `q tpl run --arg key=value` fills in. Any
+    /// other `{{...}}` is rejected here rather than at run time.
+    Add {
+        /// Name: lowercase kebab-case, at most 40 characters
+        name: String,
+        #[command(flatten)]
+        fields: TplFields,
+    },
+    /// Change a template: with no field flag, its TOML opens in $EDITOR
+    ///
+    /// With field flags it is a plain patch: a flag that is not given leaves
+    /// its field alone, and a blank one clears it. Without them the template's
+    /// whole definition is rendered as TOML into $Q_EDITOR / $VISUAL /
+    /// $EDITOR (else `vi`) and read back — so a field the saved file leaves
+    /// out is cleared, and `name` may be changed to rename the template.
+    Edit {
+        /// Name, id, or an unambiguous fragment
+        name: String,
+        #[command(flatten)]
+        fields: TplFields,
+    },
+    /// Delete a template; Quests made from it are unlinked, never removed
+    Rm {
+        /// Name, id, or an unambiguous fragment
+        name: String,
+        /// Do not ask for confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Create a Quest from a template
+    ///
+    /// The template's goal and master prompt are expanded first: `{{date}}` is
+    /// today's local date (YYYY-MM-DD) and `{{arg.<key>}}` comes from `--arg`.
+    /// A placeholder nothing fills is an error naming every missing key — the
+    /// Quest is not created and the run is not counted — rather than a prompt
+    /// handed to an agent with the braces still in it.
+    ///
+    /// The template's `cwd` has to be a directory on this machine at this
+    /// point (it is not checked before then, so a definition can travel
+    /// ahead of its repository); a template with no `cwd` uses the current
+    /// directory. Everything else is `q new`, `-d` included, and the Quest is
+    /// named after the template.
+    Run {
+        /// Name, id, or an unambiguous fragment
+        name: String,
+        /// `k=v` for a `{{arg.k}}` in the goal or the prompt; repeatable
+        #[arg(long = "arg", value_name = "K=V", allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Do not attach after creating
+        #[arg(short = 'd', long)]
+        detach: bool,
+    },
+    /// Print templates as TOML; no name prints every one
+    Export {
+        /// Name, id, or an unambiguous fragment
+        name: Option<String>,
+    },
+    /// Read templates from a TOML file (`-` reads stdin)
+    ///
+    /// All or nothing: one bad or already-taken name leaves the database
+    /// untouched. `--replace` overwrites a template's definition in place and
+    /// keeps its run count and last run, which are this machine's history
+    /// rather than part of the definition — and are why neither ever appears
+    /// in a `q tpl export`.
+    Import {
+        path: String,
+        /// Overwrite a template that already has the name, keeping its run
+        /// count and last run
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Build a template out of an existing Quest
+    From {
+        quest: String,
+        /// Name for the new template
+        name: String,
+    },
+}
+
+/// The fields `q tpl add` sets and `q tpl edit` patches. Blank clears a field
+/// (`--goal ""` stores NULL); an omitted flag leaves it as it was.
+///
+/// Placeholders: `goal` and `--prompt` support `{{date}}` (today, local, ISO)
+/// and `{{arg.<key>}}`, filled by `q tpl run --arg key=value`. A run whose
+/// template still has an unfilled `{{arg.…}}`, or any other `{{…}}`, fails and
+/// names the keys rather than passing the braces on to an agent.
+#[derive(clap::Args, Debug, Default)]
+pub struct TplFields {
+    /// One line on what this template is for
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+    pub description: Option<String>,
+    /// Working directory for the Quest (blank: whatever `q tpl run`'s is)
+    #[arg(long, value_name = "PATH")]
+    pub cwd: Option<String>,
+    /// Workflow for the Quest
+    #[arg(long, value_name = "NAME")]
+    pub workflow: Option<String>,
+    /// Goal for the Quest; supports {{date}} and {{arg.k}}
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+    pub goal: Option<String>,
+    /// First prompt for the master; supports {{date}} and {{arg.k}}
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+    pub prompt: Option<String>,
+    /// The same, from a file (`-` reads stdin)
+    #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
+    pub prompt_file: Option<String>,
+    /// `repo:<name>` label for the Quest's beads epic
+    #[arg(long, value_name = "NAME")]
+    pub repo: Option<String>,
+    /// Record that Quests from this template want a brain session
+    ///
+    /// Stored, shown and exported; nothing creates the session yet — `q new`
+    /// has no `--brain` either.
+    #[arg(long)]
+    pub brain: bool,
+    /// The opposite, for `q tpl edit`
+    #[arg(long, conflicts_with = "brain")]
+    pub no_brain: bool,
+    /// Tag, repeatable; giving any replaces the whole set, `--tag ""` clears it
+    #[arg(long = "tag", value_name = "TAG")]
+    pub tags: Vec<String>,
+}
+
+impl TplFields {
+    /// Whether anything at all was given — what tells `q tpl edit` to patch
+    /// rather than open an editor.
+    pub fn any(&self) -> bool {
+        self.description.is_some()
+            || self.cwd.is_some()
+            || self.workflow.is_some()
+            || self.goal.is_some()
+            || self.prompt.is_some()
+            || self.prompt_file.is_some()
+            || self.repo.is_some()
+            || self.brain
+            || self.no_brain
+            || !self.tags.is_empty()
+    }
 }
 
 #[derive(Subcommand, Debug)]

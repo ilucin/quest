@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod db;
 mod doctor;
+mod editor;
 mod error;
 mod hooks;
 mod model;
@@ -13,6 +14,7 @@ mod output;
 mod proc;
 mod registry;
 mod remote;
+mod templates;
 mod tmux;
 mod tui;
 
@@ -419,6 +421,7 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
         }
         Command::New {
             name,
+            template,
             goal,
             dir,
             workflow,
@@ -429,25 +432,44 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
             no_auto_reset,
             detach,
         } => {
-            commands::new::run(
-                ctx,
-                &commands::new::Args {
-                    name: name.as_deref(),
+            // SPEC §16's `--template`: the definition fills in what the flags
+            // left out, and a flag always wins — the merge the TUI's form
+            // runs, shared rather than copied (`commands::tpl::Merge`).
+            let chosen = template
+                .as_deref()
+                .map(|target| commands::tpl::for_new(ctx, target))
+                .transpose()?;
+            let prompt = commands::new::resolve_prompt(prompt.as_deref(), prompt_file.as_deref())?;
+            let merged = commands::tpl::Merge::new(
+                chosen.as_ref(),
+                &commands::tpl::Given {
                     goal: goal.as_deref(),
                     dir: dir.as_deref(),
                     workflow: workflow.as_deref(),
                     repo: repo.as_deref(),
-                    no_beads: *no_beads,
                     prompt: prompt.as_deref(),
-                    prompt_file: prompt_file.as_deref(),
+                    no_beads: *no_beads,
+                },
+            );
+            commands::new::run(
+                ctx,
+                &commands::new::Args {
+                    name: name.as_deref(),
+                    goal: merged.goal.as_deref(),
+                    dir: merged.dir.as_deref(),
+                    workflow: merged.workflow.as_deref(),
+                    repo: merged.repo.as_deref(),
+                    no_beads: *no_beads,
+                    prompt: merged.prompt.as_deref(),
+                    // Already resolved above, so the template's prompt and a
+                    // `--prompt-file` cannot both reach `create`.
+                    prompt_file: None,
                     no_auto_reset: *no_auto_reset,
                     detach: *detach,
                     // The global `--machine` already decides this; only the
                     // TUI's form sets it per Quest.
                     machine: None,
-                    // `q tpl run` (bd-8lz.5) is what will set this from the
-                    // CLI; `q new` has no template.
-                    template: None,
+                    template: chosen.as_ref(),
                 },
             )
             .map(|()| 0)
@@ -611,6 +633,7 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
             }
         }
         .map(|()| 0),
+        Command::Tpl { action } => commands::tpl::run(ctx, action).map(|()| 0),
     }
 }
 

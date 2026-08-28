@@ -237,6 +237,15 @@ pub fn render_with(
         .as_deref()
         .and_then(|s| resolve_session(quest, &sessions, s).cloned());
 
+    // The **name**, because the master reading this brief has no way to look
+    // `t-f5b1` up mid-turn. The id stays alongside it for `q tpl show`.
+    let template = match quest.template_id.as_deref() {
+        None => "-".to_string(),
+        Some(id) => match db.get_template(id)? {
+            Some(t) => format!("{} ({})", t.name, t.id),
+            None => id.to_string(),
+        },
+    };
     let beads = beads::epic_of(quest).map(|_| ext.bd_list(&quest.id));
     let brain = quest
         .brain_session
@@ -259,6 +268,7 @@ pub fn render_with(
             opts,
             beads.as_ref(),
             brain.as_deref(),
+            &template,
             Caps {
                 brain: brain_cap,
                 events: event_cap,
@@ -298,10 +308,11 @@ fn assemble(
     opts: &Opts,
     beads: Option<&Option<String>>,
     brain: Option<&str>,
+    template: &str,
     caps: Caps,
 ) -> String {
     let mut out = String::new();
-    section_quest(&mut out, quest, sessions);
+    section_quest(&mut out, quest, sessions, template);
     section_how(&mut out, quest, sessions, me, opts);
     section_workflow(&mut out, quest);
     section_beads(&mut out, quest, beads);
@@ -314,7 +325,7 @@ fn assemble(
     out
 }
 
-fn section_quest(out: &mut String, quest: &Quest, sessions: &[Session]) {
+fn section_quest(out: &mut String, quest: &Quest, sessions: &[Session], template: &str) {
     out.push_str(&format!("# Quest {} `{}`\n\n", quest.id, quest.slug));
     out.push_str("## 1. Quest\n\n");
     let rows: Vec<(&str, String)> = vec![
@@ -329,7 +340,7 @@ fn section_quest(out: &mut String, quest: &Quest, sessions: &[Session]) {
         ("cwd", quest.cwd.clone()),
         ("workflow", fmt::or_dash(quest.workflow.as_deref())),
         ("created", stamp(quest.created_at)),
-        ("template", fmt::or_dash(quest.template_id.as_deref())),
+        ("template", template.to_string()),
     ];
     for (k, v) in rows {
         out.push_str(&format!("- **{k}**: {v}\n"));

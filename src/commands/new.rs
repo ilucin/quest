@@ -11,7 +11,7 @@ use crate::commands::{AttachMode, attach_mode, sweep_quiet};
 use crate::db::quest::QuestPatch;
 use crate::db::{Db, ID_ATTEMPTS};
 use crate::error::QError;
-use crate::model::{NameSource, Quest, Session, SessionRole, SessionStatus, new_id};
+use crate::model::{NameSource, Quest, Session, SessionRole, SessionStatus, Template, new_id, now};
 use crate::output;
 use crate::tmux::{NewSession, config_override, db_override, quest_env, session_name};
 
@@ -43,10 +43,12 @@ pub struct Args<'a> {
     /// which is what the global `--machine` already decides for the CLI; the
     /// TUI's new-Quest form picks it per Quest instead (SPEC §17).
     pub machine: Option<&'a str>,
-    /// The **id** of the template this Quest was instantiated from (SPEC §11's
-    /// `template_id` column). No CLI flag reaches it yet: `q tpl run` is
-    /// bd-8lz.5's, and the TUI's template select is the one caller today.
-    pub template: Option<&'a str>,
+    /// The template this Quest is instantiated from (SPEC §11's `template_id`
+    /// column) — `q tpl run`, `q new --template`, and the TUI's template
+    /// select. The whole row rather than the id: it also names the Quest
+    /// (`NameSource::Template`, below) and its run is counted here, so no
+    /// caller can record one half and forget the other.
+    pub template: Option<&'a Template>,
 }
 
 /// Everything `q new` creates, before anything is printed or attached to.
@@ -59,6 +61,9 @@ pub struct Created {
     pub quest: Quest,
     pub session: Session,
     pub tmux_session: String,
+    /// The template this Quest came from, with the run just counted — SPEC
+    /// §11's `run_count` / `last_run_at`. `None` when no template was used.
+    pub template: Option<Template>,
 }
 
 pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
@@ -72,6 +77,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         quest,
         session,
         tmux_session,
+        template: _,
     } = created?;
 
     let attach = attach_mode(ctx, !args.detach);
@@ -111,7 +117,7 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
     let repo = repo_flag(args)?;
     let cwd = resolve_dir(args.dir)?;
     let prompt = resolve_prompt(args.prompt, args.prompt_file)?;
-    let (base, name_source) = resolve_slug(args.name, &cwd)?;
+    let (base, name_source) = resolve_slug(args.name, args.template, &cwd)?;
     let (slug, tmux_session) = claim_slug(ctx, db, &base, name_source)?;
 
     let machine = match args.machine {
@@ -128,7 +134,7 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
     row.goal = args.goal.map(str::to_string);
     // TODO(M5): validate `--workflow` against the workflow registry.
     row.workflow = args.workflow.map(str::to_string);
-    row.template_id = args.template.map(str::to_string);
+    row.template_id = args.template.map(|t| t.id.clone());
     // Only the opt-out is stored; NULL keeps following `[context] auto_reset`.
     row.auto_reset = args.no_auto_reset.then_some(false);
     let quest = db.insert_quest(&row)?;
@@ -164,10 +170,18 @@ pub fn create(ctx: &Ctx, args: &Args) -> anyhow::Result<Created> {
             return Err(e);
         }
     };
+    // After the master is up, so a rollback never counts a run that produced
+    // nothing; before the caller attaches, because an `exec` attach never
+    // comes back here (`q tpl run`).
+    let template = match args.template {
+        Some(template) => Some(db.bump_template_run(&template.id, now())?),
+        None => None,
+    };
     Ok(Created {
         quest,
         session: master.session,
         tmux_session,
+        template,
     })
 }
 
@@ -369,15 +383,17 @@ pub fn claim(ctx: &Ctx, base: &str, own: &str) -> anyhow::Result<Claim> {
     Ok(Claim::Exhausted)
 }
 
-/// The first free slug and the tmux session that goes with it. An auto slug
-/// steps aside (`-2`, `-3`, …); an explicit `--name` is a hard error instead.
+/// The first free slug and the tmux session that goes with it. A slug nobody
+/// typed steps aside (`-2`, `-3`, …) — an auto one and a template's name
+/// alike, since the second run of a routine must not fail on the first run's
+/// row. Only an explicit `--name` is a hard error instead.
 fn claim_slug(
     ctx: &Ctx,
     db: &Db,
     base: &str,
     source: NameSource,
 ) -> anyhow::Result<(String, String)> {
-    let auto = source == NameSource::Auto;
+    let auto = source != NameSource::Manual;
     for n in 1..=SLUG_ATTEMPTS {
         let slug = candidate(base, n);
         match taken(ctx, db, &slug)? {
@@ -513,22 +529,32 @@ pub fn resolve_prompt(prompt: Option<&str>, file: Option<&str>) -> anyhow::Resul
     Ok((!text.is_empty()).then(|| text.to_string()))
 }
 
-/// `--name` is taken as given (validated); everything else is the M0 heuristic.
-fn resolve_slug(name: Option<&str>, cwd: &Path) -> anyhow::Result<(String, NameSource)> {
-    match name {
-        Some(name) => {
-            validate_slug(name)?;
-            Ok((name.to_string(), NameSource::Manual))
-        }
-        // A new Quest gets the heuristic slug right away — `q new` must not
-        // wait on a model. `name_source = auto` and a NULL `name_input_hash`
-        // then make the master's first `Stop` hook schedule the real
-        // auto-name (SPEC §10, `naming.rs`).
-        None => Ok((
-            heuristic_slug(git_branch(cwd).as_deref(), cwd),
-            NameSource::Auto,
-        )),
+/// `--name` is taken as given (validated), then the template's name, then the
+/// M0 heuristic (SPEC §4's three `name_source` values).
+fn resolve_slug(
+    name: Option<&str>,
+    template: Option<&Template>,
+    cwd: &Path,
+) -> anyhow::Result<(String, NameSource)> {
+    if let Some(name) = name {
+        validate_slug(name)?;
+        return Ok((name.to_string(), NameSource::Manual));
     }
+    // A routine run three times should be three recognisable rows in `q list`,
+    // not three model-invented names: a templated Quest is named after its
+    // template (`weekly-hygiene`, `weekly-hygiene-2`, …). `template` is also
+    // what stops `naming::schedule` renaming it — that gate is `auto` only.
+    if let Some(template) = template {
+        return Ok((template.name.clone(), NameSource::Template));
+    }
+    // A new Quest gets the heuristic slug right away — `q new` must not
+    // wait on a model. `name_source = auto` and a NULL `name_input_hash`
+    // then make the master's first `Stop` hook schedule the real
+    // auto-name (SPEC §10, `naming.rs`).
+    Ok((
+        heuristic_slug(git_branch(cwd).as_deref(), cwd),
+        NameSource::Auto,
+    ))
 }
 
 pub fn validate_slug(slug: &str) -> anyhow::Result<()> {
@@ -539,6 +565,14 @@ pub fn validate_slug(slug: &str) -> anyhow::Result<()> {
 /// name and of `claude -n <slug>/<label>` (SPEC §6).
 pub fn validate_label(label: &str) -> anyhow::Result<()> {
     validate_kebab("label", label)
+}
+
+/// A template name follows the same grammar (SPEC §11). It is not a slug — no
+/// Quest is named after it — but it is typed as a target, matched by prefix,
+/// and written into TOML by hand, and one grammar for all three is one rule to
+/// remember.
+pub fn validate_template_name(name: &str) -> anyhow::Result<()> {
+    validate_kebab("template name", name)
 }
 
 fn validate_kebab(what: &str, value: &str) -> anyhow::Result<()> {
