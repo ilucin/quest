@@ -216,16 +216,28 @@ impl Registry {
     /// it shares a name with.
     ///
     /// A directory that is not there is not an error — it is the ordinary state
-    /// of a machine that has never run `q workflow add`. Anything else about it
-    /// (unreadable, not a directory) is reported: silently answering "only the
-    /// built-ins" would hide a whole shelf of workflows the user wrote.
+    /// of a machine that has never run `q workflow add`. A directory that
+    /// cannot be *listed* (unreadable, not a directory) is reported: silently
+    /// answering "only the built-ins" would hide a whole shelf of workflows the
+    /// user wrote.
+    ///
+    /// One unreadable *file* among many, though — a non-UTF-8 blob, a dangling
+    /// symlink, a directory named `x.md` — is skipped with a note on stderr, not
+    /// made fatal: one bad entry must not stop the user from seeing every other
+    /// workflow, the built-ins included.
     pub fn list(&self) -> anyhow::Result<Vec<Entry>> {
         let mut by_name: BTreeMap<String, Entry> = BTreeMap::new();
         for (name, body) in BUILTIN {
             by_name.insert(name.to_string(), entry(name, Source::Builtin, None, body));
         }
         for (name, path) in self.files()? {
-            let body = read(&path)?;
+            let body = match read(&path) {
+                Ok(body) => body,
+                Err(e) => {
+                    eprintln!("note: skipping workflow file: {e:#}");
+                    continue;
+                }
+            };
             let source = if is_builtin(&name) {
                 Source::Shadow
             } else {
@@ -502,16 +514,61 @@ pub fn worker_section(body: &str) -> Option<&str> {
 }
 
 fn is_worker_heading(line: &str) -> bool {
-    line.trim().eq_ignore_ascii_case(WORKER_HEADING)
+    // An ATX heading carries at most three spaces of indent (CommonMark); four
+    // or more make the line indented code — or a lazy paragraph continuation —
+    // never the heading that carves the worker's section. Without this, a
+    // `## worker` indented four spaces inside an indented code block was taken
+    // as the heading: it leaked the master's prose to the worker and lost the
+    // real section (D2).
+    line_indent(line) <= 3 && line.trim().eq_ignore_ascii_case(WORKER_HEADING)
 }
 
 /// A `#` or `##` heading — what ends the worker section. A deeper heading
 /// (`###`) is part of it. Callers feed only lines [`Fences`] says are outside
-/// a code block.
+/// a *fenced* code block; the indent guard here is what keeps an indented-code
+/// `## after` from ending the section.
 fn is_section_break(line: &str) -> bool {
+    if line_indent(line) > 3 {
+        return false;
+    }
     let line = line.trim_start();
     (line.starts_with("## ") && !line.starts_with("### "))
         || (line.starts_with("# ") && !line.starts_with("## "))
+}
+
+/// Leading-whitespace width in columns, a tab advancing to the next four-column
+/// stop — CommonMark's measure of how deep a line is indented. Four or more is
+/// a code indent; an ATX heading may carry at most three. The one answer both
+/// [`worker_section`]'s heading tests and `brief::demote` ask, so a `## worker`
+/// that is really indented code is judged the same way in both.
+pub fn line_indent(line: &str) -> usize {
+    let mut width = 0;
+    for b in line.bytes() {
+        match b {
+            b' ' => width += 1,
+            b'\t' => width += 4 - (width % 4),
+            _ => break,
+        }
+    }
+    width
+}
+
+/// How many `## worker` headings the file defines — one for the whole scan the
+/// writer warns on when a second, silently-ignored section slips in. Fence- and
+/// indent-aware, so it counts exactly the headings [`worker_section`] would act
+/// on.
+pub fn worker_heading_count(body: &str) -> usize {
+    let mut fences = Fences::default();
+    let mut count = 0;
+    for line in body.lines() {
+        if fences.feed(line) {
+            continue;
+        }
+        if is_worker_heading(line) {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Fenced-code-block state, line by line — the one answer in the codebase to
@@ -690,6 +747,82 @@ mod tests {
         let fenced_break = "## worker\n\nyours\n\n~~~\n## after\n~~~\n\nstill yours\n";
         let section = worker_section(fenced_break).unwrap();
         assert!(section.contains("still yours"), "{section:?}");
+    }
+
+    /// D2: an indented code block (four spaces, or a tab) is not modelled by
+    /// `Fences`, so a `## worker` inside one used to be taken as the heading —
+    /// leaking the master's prose and losing the real section. The fix is the
+    /// CommonMark rule that an ATX heading carries at most three spaces of
+    /// indent, applied in `is_worker_heading` and `is_section_break`.
+    #[test]
+    fn an_indented_worker_heading_is_not_the_section_heading() {
+        // Four spaces (the repro's `f07b`): the indented `## worker` is code,
+        // the real one below carves the section.
+        let four = concat!(
+            "# f07b\n\n",
+            "MASTER-SECRET\n\n",
+            "    ```\n",
+            "    ## worker\n",
+            "    FAKE-4SP\n",
+            "    ```\n\n",
+            "MASTER-SECOND\n\n",
+            "## worker\n\n",
+            "REAL-WORKER-TEXT\n",
+        );
+        let section = worker_section(four).expect("the real heading is still found");
+        assert_eq!(section, "REAL-WORKER-TEXT", "the loss half: {section:?}");
+        assert!(
+            !section.contains("MASTER-SECOND") && !section.contains("FAKE-4SP"),
+            "the leak half: {section:?}"
+        );
+
+        // A tab indent behaves the same (the repro's `f17`).
+        let tab = "# f17\n\nMASTER\n\n\t## worker\n\tnope\n\n## worker\n\nreal\n";
+        assert_eq!(worker_section(tab).unwrap(), "real");
+
+        // A file whose only `## worker` is indented defines no section at all —
+        // `has_worker_section` must say so.
+        let only_indented = "# f\n\nmaster\n\n    ## worker\n    not a heading\n";
+        assert!(worker_section(only_indented).is_none());
+        assert!(!entry("f", Source::User, None, only_indented).has_worker_section);
+
+        // An indented `## after` does not end the section either.
+        let indented_break = "## worker\n\nyours\n\n    ## after\n    code\n\nstill yours\n";
+        assert!(
+            worker_section(indented_break)
+                .unwrap()
+                .contains("still yours")
+        );
+    }
+
+    /// The mirror of the above: a `## worker` indented at most three spaces, or
+    /// nested in a list rather than in code, is still the heading. The indent
+    /// rule must not over-reach and swallow real headings.
+    #[test]
+    fn a_shallowly_indented_or_list_adjacent_worker_heading_still_counts() {
+        // Up to three spaces is a legal ATX heading indent.
+        assert_eq!(
+            worker_section("# w\n\nm\n\n   ## worker\nx\n").unwrap(),
+            "x"
+        );
+        assert_eq!(worker_section("  ## worker  \nx\n").unwrap(), "x");
+        // A `## worker` on the line right after a paragraph (no blank line) is
+        // not indented code — but a four-space one is still not a heading, and
+        // treating it as master-only text is the safe reading.
+        let para_adjacent = "# w\n\ntext line\n    ## worker\nmore\n";
+        assert!(
+            worker_section(para_adjacent).is_none(),
+            "indented ≥4 is not a heading"
+        );
+        // `worker_heading_count` sees exactly one real heading here.
+        assert_eq!(
+            worker_heading_count("# w\n\n## worker\na\n\n    ## worker\nb\n"),
+            1
+        );
+        assert_eq!(
+            worker_heading_count("# w\n\n## worker\na\n\n## worker\nb\n"),
+            2
+        );
     }
 
     #[test]
@@ -979,13 +1112,17 @@ mod tests {
         std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
         std::fs::write(dir.path().join("Bad Name.md"), "x").unwrap();
         std::fs::write(dir.path().join("solo.md~"), "x").unwrap();
+        // A directory entry `sub.md` has the extension but is not a file: it
+        // cannot be read, and one unreadable entry must not sink the listing —
+        // the built-ins and every real workflow still come back.
         std::fs::create_dir(dir.path().join("sub.md")).unwrap();
+        std::fs::write(dir.path().join("real.md"), "# real\n\nmine\n").unwrap();
         let registry = Registry::new(dir.path());
-        // The directory entry `sub.md` has the extension but is not a file;
-        // reading it has to fail loudly rather than be reported as a workflow.
-        assert!(registry.list().is_err());
-        std::fs::remove_dir(dir.path().join("sub.md")).unwrap();
-        assert_eq!(registry.names().unwrap().len(), BUILTIN.len());
+        let names = registry.names().unwrap();
+        assert_eq!(names.len(), BUILTIN.len() + 1, "{names:?}");
+        assert!(names.contains(&"real".to_string()), "{names:?}");
+        // A whole directory that cannot be *listed* is still an error, though;
+        // that is [`an_unreadable_workflows_directory_is_an_io_error…`].
     }
 
     #[test]

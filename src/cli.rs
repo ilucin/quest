@@ -384,6 +384,7 @@ pub enum WorkflowAction {
     List,
     /// Print a workflow's markdown
     Show {
+        /// Name of the workflow to print (built-in or one of yours)
         name: String,
         /// Only the `## worker` section, as a worker's brief would get it
         #[arg(long)]
@@ -406,6 +407,7 @@ pub enum WorkflowAction {
     /// deletes the copy and the built-in comes back, so a built-in is never
     /// lost by editing it.
     Edit {
+        /// Name of the workflow to change (a built-in is copied to your config first)
         name: String,
         /// Replace the body from a file instead of opening an editor (`-` is stdin)
         #[arg(long, value_name = "PATH")]
@@ -413,6 +415,7 @@ pub enum WorkflowAction {
     },
     /// Delete one of your workflow files; a built-in it shadowed comes back
     Rm {
+        /// Name of the workflow file to delete (a built-in cannot be removed)
         name: String,
         /// Do not ask for confirmation
         #[arg(short, long)]
@@ -423,7 +426,12 @@ pub enum WorkflowAction {
     /// The same write as `q set <quest> workflow <name>`, with the same
     /// `quest.updated` event — spelled the way SPEC §11 spells it. A blank
     /// name clears the Quest's workflow.
-    Set { quest: String, name: String },
+    Set {
+        /// Quest to change: slug, id, or an unambiguous fragment
+        quest: String,
+        /// Workflow to set; a blank name clears it
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

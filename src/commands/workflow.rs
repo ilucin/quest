@@ -75,6 +75,10 @@ fn list(ctx: &Ctx, registry: &Registry) -> anyhow::Result<()> {
 }
 
 fn show(ctx: &Ctx, registry: &Registry, name: &str, worker: bool) -> anyhow::Result<()> {
+    // Trim as the set paths do (`check_opt`), so `q workflow show " solo "` and
+    // `q new --workflow " solo "` agree on what the name is instead of one
+    // accepting the string and the other refusing it.
+    let name = name.trim();
     let workflow = registry.get(name)?;
     // `q tpl show`'s gate, which the module docs say this follows.
     if !ctx.json && ctx.quiet {
@@ -254,6 +258,16 @@ fn report(
         eprintln!(
             "note: this file now shadows the built-in `{name}`; \
              `q workflow rm {name}` brings the built-in back"
+        );
+    }
+    // Only the first `## worker` section is read; a second is silently
+    // master-only text as far as a worker is concerned. Say so once, on save,
+    // rather than let the author wonder why half their worker prose never
+    // reaches a worker.
+    if crate::workflows::worker_heading_count(&workflow.body) > 1 && !ctx.quiet && !ctx.json {
+        eprintln!(
+            "note: `{name}` defines more than one `## worker` section; only the first is \
+             used — the rest stays in the master's copy"
         );
     }
     Ok(())

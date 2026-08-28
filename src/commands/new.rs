@@ -482,7 +482,12 @@ pub fn spawn_master(ctx: &Ctx, quest: &Quest, prompt: Option<String>) -> anyhow:
     );
     row.id = session_id.clone();
     row.status = SessionStatus::Starting;
-    row.workflow = quest.workflow.clone();
+    // The master's workflow *is* the Quest's, by definition (SPEC §11: "master
+    // može promijeniti"). Leaving its session column unset — rather than
+    // snapshotting the Quest's value at `q new` time — is what lets a later
+    // `q workflow set` reach the master's own brief (D5): `effective_workflow`
+    // falls through to the Quest's. A worker still gets its own via
+    // `q spawn --workflow`, which is why the session column exists at all.
     row.first_prompt = prompt;
     // The name `claude -n` was just given, so the registry's identity check has
     // something true to compare against before any rename (SPEC §6).
@@ -857,6 +862,34 @@ mod tests {
         assert!(warnings[0].contains("bd close bd-7fx"), "{warnings:?}");
         // Drained: nothing is carried into the next command.
         assert!(ctx.take_warnings().is_empty());
+    }
+
+    /// D5: `q new` must not snapshot the Quest's workflow onto the *master*
+    /// session row. If it did, a later `q workflow set` would change the Quest's
+    /// column but never the master's own brief — which reads the session's over
+    /// the Quest's. Left unset, the master falls through to the Quest's, so the
+    /// value the master reads is always the current one.
+    #[test]
+    fn the_master_session_does_not_snapshot_the_quests_workflow() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ctx = Ctx::for_tests(
+            crate::config::Config::default(),
+            crate::db::Db::open_in_memory().unwrap(),
+            Box::new(crate::tmux::FixtureTmux::new(
+                fixture.path().join("tmux.json"),
+            )),
+        );
+        let mut quest = Quest::new("wq", "/tmp", "laptop");
+        quest.workflow = Some("orchestrator".to_string());
+        let quest = ctx.db().unwrap().insert_quest(&quest).unwrap();
+
+        let master = spawn_master(&ctx, &quest, None).unwrap();
+        assert_eq!(
+            master.session.workflow, None,
+            "the master inherits the Quest's workflow at read time, never a snapshot"
+        );
+        // The Quest still carries it, so the master's brief resolves it.
+        assert_eq!(quest.workflow.as_deref(), Some("orchestrator"));
     }
 
     #[test]

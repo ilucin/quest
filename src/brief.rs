@@ -549,8 +549,28 @@ fn section_workflow(out: &mut String, name: Option<&str>, role: SessionRole, reg
         ));
         return;
     }
+    // A workflow *file* whose own fence is never closed at EOF would otherwise
+    // push an open fence into the brief and render the truncation notice and
+    // sections 4–10 as code — the sole cause of every outline break the test
+    // fuzz found. The truncation path already closes it; the ordinary path
+    // must too, through the same [`Fences`] answer (D1).
     out.push_str(&demoted);
+    if let Some(closer) = open_fence_closer(&demoted) {
+        out.push('\n');
+        out.push_str(&closer);
+    }
     out.push_str("\n\n");
+}
+
+/// The delimiter that closes any code fence `text` leaves open at its end, else
+/// `None` — the one place the brief asks "is a fence still open here", so the
+/// truncated and the whole-file render paths answer it the same way.
+fn open_fence_closer(text: &str) -> Option<String> {
+    let mut fences = Fences::default();
+    for line in text.lines() {
+        fences.feed(line);
+    }
+    fences.closer()
 }
 
 /// `text` cut to at most `max` characters, at a line boundary, with any code
@@ -563,15 +583,16 @@ fn section_workflow(out: &mut String, name: Option<&str>, role: SessionRole, reg
 fn truncate_markdown(text: &str, max: usize) -> String {
     let cut: String = text.chars().take(max).collect();
     let kept = match cut.rfind('\n') {
-        Some(i) if i > 0 => &cut[..i],
+        // Cut back to the last line boundary so no half-written line — a split
+        // fence delimiter included — is left. But markdown is commonly one
+        // paragraph per line: when the last newline is near the very start, a
+        // one-line body would truncate to nothing (D3), so keep the
+        // char-boundary cut and let the fence-closer below tidy it.
+        Some(i) if i > max / 2 => &cut[..i],
         _ => cut.as_str(),
     };
-    let mut fences = Fences::default();
-    for line in kept.lines() {
-        fences.feed(line);
-    }
     let mut out = kept.trim_end().to_string();
-    if let Some(closer) = fences.closer() {
+    if let Some(closer) = open_fence_closer(&out) {
         out.push('\n');
         out.push_str(&closer);
     }
@@ -589,7 +610,11 @@ fn demote(body: &str) -> String {
     let mut fences = Fences::default();
     for line in body.lines() {
         let trimmed = line.trim_start();
-        let hashes = if fences.feed(line) {
+        // A fenced-code line, or one indented four or more (an ATX heading
+        // carries at most three — CommonMark), is never a heading: counting its
+        // hashes and stripping its indent would lift a `## worker` out of the
+        // code block it sits in (D2).
+        let hashes = if fences.feed(line) || crate::workflows::line_indent(line) > 3 {
             0
         } else {
             trimmed.bytes().take_while(|b| *b == b'#').count()
@@ -1642,6 +1667,129 @@ mod tests {
         assert!(section3(&md).contains("_(truncated:"), "{md}");
         // The cut lands on a line boundary, so no half-written line is left.
         assert!(!md.contains("echo line 1\n```\n\necho"), "{md}");
+    }
+
+    /// D1: a workflow *file* whose fence is never closed at EOF — under budget,
+    /// so the truncation path is not what saves it — must still not push an open
+    /// fence into the brief and render sections 4–10 as code.
+    #[test]
+    fn an_unclosed_fence_in_the_file_does_not_swallow_the_later_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "# f11\n\nMASTER\n\n## worker\n\nREAL\n\n```\nunterminated\n";
+        Registry::new(dir.path()).write("f11", body).unwrap();
+        let (db, quest, opts) = with_workflow("f11", dir.path());
+        let md = render_with(&db, &quest, &opts, &NoExternal).unwrap();
+
+        assert_eq!(
+            outline(&md),
+            BRIEF_OUTLINE,
+            "sections rendered as code:\n{md}"
+        );
+        let fences = md
+            .lines()
+            .filter(|l| l.trim_start().starts_with("```"))
+            .count();
+        assert_eq!(
+            fences % 2,
+            0,
+            "an odd number of fence lines ({fences}):\n{md}"
+        );
+        assert_eq!(open_fence_closer(&md), None, "a fence was left open:\n{md}");
+    }
+
+    /// D3: an overlong body written as a single line — a heading then one huge
+    /// paragraph — used to truncate to nothing, because the only newline is at
+    /// the very top and cutting back to it dropped every character of content.
+    #[test]
+    fn a_single_line_body_over_budget_keeps_its_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!("# t\n\n{}\n", "x ".repeat(WORKFLOW_MAX_CHARS));
+        Registry::new(dir.path()).write("t", &body).unwrap();
+        let (db, quest, opts) = with_workflow("t", dir.path());
+        let md = render_with(&db, &quest, &opts, &NoExternal).unwrap();
+        let body3 = section3(&md);
+        assert!(
+            body3.contains("q workflow show t"),
+            "no truncation note:\n{body3}"
+        );
+        assert!(
+            body3.matches('x').count() > 1_000,
+            "the single line was dropped, leaving no content:\n{body3}"
+        );
+        assert_eq!(outline(&md), BRIEF_OUTLINE, "{md}");
+    }
+
+    /// D2 end to end: a `## worker` inside an indented code block must not leak
+    /// the master's prose into a worker's brief, nor cost the worker its real
+    /// section — the same double failure the fenced case was fixed for.
+    #[test]
+    fn an_indented_worker_heading_does_not_leak_into_a_workers_brief() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = concat!(
+            "# f07b\n\n",
+            "MASTER-SECRET\n\n",
+            "    ```\n",
+            "    ## worker\n",
+            "    FAKE-4SP\n",
+            "    ```\n\n",
+            "MASTER-SECOND\n\n",
+            "## worker\n\n",
+            "REAL-WORKER-TEXT\n",
+        );
+        Registry::new(dir.path()).write("f07b", body).unwrap();
+        let (db, quest, opts) = with_workflow("f07b", dir.path());
+        let worker = Opts {
+            role: SessionRole::Worker,
+            ..opts
+        };
+        let md = render_with(&db, &quest, &worker, &NoExternal).unwrap();
+        let body3 = section3(&md);
+        assert!(
+            body3.contains("REAL-WORKER-TEXT"),
+            "the worker lost its section:\n{body3}"
+        );
+        assert!(
+            !body3.contains("MASTER-SECOND") && !body3.contains("MASTER-SECRET"),
+            "master-only prose leaked to the worker:\n{body3}"
+        );
+    }
+
+    /// D5: with the master's session workflow left unset (it is not snapshotted
+    /// at `q new` — see `commands::new`), the master reads the Quest's, so a
+    /// `q workflow set` that changes the Quest changes the master's own brief.
+    #[test]
+    fn a_master_with_no_session_workflow_follows_the_quest() {
+        let dir = tempfile::tempdir().unwrap();
+        Registry::new(dir.path())
+            .write("orchestrator", "# orchestrator\n\nORCH-BODY\n")
+            .unwrap();
+        Registry::new(dir.path())
+            .write("solo", "# solo\n\nSOLO-BODY\n")
+            .unwrap();
+        let (db, quest, opts) = with_workflow("orchestrator", dir.path());
+        // The master's session row carries no workflow of its own.
+        let by_master = Opts {
+            session: Some("master".to_string()),
+            ..opts.clone()
+        };
+        let md = render_with(&db, &quest, &by_master, &NoExternal).unwrap();
+        assert!(section3(&md).contains("ORCH-BODY"), "{md}");
+
+        // `q workflow set` changes the Quest; the master's brief follows.
+        let quest = db
+            .update_quest(
+                &quest.id,
+                &crate::db::quest::QuestPatch {
+                    workflow: Some(Some("solo".to_string())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let md = render_with(&db, &quest, &by_master, &NoExternal).unwrap();
+        assert!(
+            section3(&md).contains("SOLO-BODY") && !section3(&md).contains("ORCH-BODY"),
+            "the master read a stale workflow:\n{md}"
+        );
     }
 
     /// SPEC §11 and `q spawn --workflow`'s own help ("default: the Quest's"):
