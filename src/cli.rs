@@ -61,10 +61,20 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Create a new Quest
+    ///
+    /// `--template` starts from a stored definition (SPEC §11) and every
+    /// other flag wins over it: the template fills only what was left out.
+    /// Without `--name` the Quest is named after the template, stepping
+    /// aside to `-2`, `-3`, … as a routine is run again. To take a
+    /// definition whole, with `{{arg.k}}` and no overrides, use
+    /// `q tpl run` instead.
     New {
         /// Slug: lowercase kebab-case, at most 40 characters
         #[arg(long, value_name = "SLUG")]
         name: Option<String>,
+        /// Template to start from: name, id, or an unambiguous fragment
+        #[arg(long, value_name = "NAME")]
+        template: Option<String>,
         /// One line on what this Quest is for
         #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
         goal: Option<String>,
@@ -341,6 +351,11 @@ pub enum Command {
     },
 
     /// Quest templates: reusable Quest definitions (SPEC §11)
+    ///
+    /// Templates are rows in this machine's database, so no `q tpl`
+    /// subcommand is ever proxied and a global `--machine <other>` is
+    /// refused rather than ignored; move a definition with
+    /// `q tpl export <name> | ssh <alias> q tpl import -`.
     Tpl {
         #[command(subcommand)]
         action: TplAction,
@@ -396,8 +411,11 @@ pub enum TplAction {
     /// Quest is not created and the run is not counted — rather than a prompt
     /// handed to an agent with the braces still in it.
     ///
-    /// Everything else is `q new`: a template with no `cwd` uses the current
-    /// directory, and `-d` means the same thing it does there.
+    /// The template's `cwd` has to be a directory on this machine at this
+    /// point (it is not checked before then, so a definition can travel
+    /// ahead of its repository); a template with no `cwd` uses the current
+    /// directory. Everything else is `q new`, `-d` included, and the Quest is
+    /// named after the template.
     Run {
         /// Name, id, or an unambiguous fragment
         name: String,
@@ -465,7 +483,10 @@ pub struct TplFields {
     /// `repo:<name>` label for the Quest's beads epic
     #[arg(long, value_name = "NAME")]
     pub repo: Option<String>,
-    /// Create a brain session for Quests from this template
+    /// Record that Quests from this template want a brain session
+    ///
+    /// Stored, shown and exported; nothing creates the session yet — `q new`
+    /// has no `--brain` either.
     #[arg(long)]
     pub brain: bool,
     /// The opposite, for `q tpl edit`

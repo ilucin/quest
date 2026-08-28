@@ -100,9 +100,14 @@ impl Db {
         if let Some(hit) = all.iter().find(|t| t.name == target).cloned() {
             return Ok(hit);
         }
+        // Id as well as name, exactly as `Db::resolve_quest` narrows on both
+        // the id and the slug — `q tpl show t-63f` has to work where
+        // `q show q-b4` does.
         for matches in [
-            narrow(&all, |t| t.name.starts_with(target)),
-            narrow(&all, |t| t.name.contains(target)),
+            narrow(&all, |t| {
+                t.name.starts_with(target) || t.id.starts_with(target)
+            }),
+            narrow(&all, |t| t.name.contains(target) || t.id.contains(target)),
         ] {
             match matches.len() {
                 0 => continue,
@@ -287,6 +292,15 @@ mod tests {
         );
         assert_eq!(db.resolve_template("weekly-h").unwrap().id, hygiene.id);
         assert_eq!(db.resolve_template("audit").unwrap().name, "deps-audit");
+        // An id fragment resolves the way a Quest id fragment does.
+        assert_eq!(
+            db.resolve_template(&hygiene.id[..4]).unwrap().id,
+            hygiene.id
+        );
+        assert_eq!(
+            db.resolve_template(&hygiene.id[2..5]).unwrap().id,
+            hygiene.id
+        );
 
         let e = db.resolve_template("weekly").unwrap_err();
         assert_eq!(

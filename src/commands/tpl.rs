@@ -9,10 +9,19 @@
 //!
 //! * **A run that cannot be filled in does not happen.** `{{arg.k}}` with no
 //!   `--arg k=…`, or any `{{…}}` that is neither `date` nor `arg.<key>`, fails
-//!   the command and names every offending key at once
-//!   ([`crate::templates::expand`]). The alternative — leaving the braces in —
-//!   hands an agent a prompt with a hole in it, which is worse than not
-//!   starting.
+//!   the command and names every offending key **of every field** at once
+//!   ([`expand_fields`]). The alternative — leaving the braces in — hands an
+//!   agent a prompt with a hole in it, which is worse than not starting. Text
+//!   that means the braces literally doubles them
+//!   ([`crate::templates::escape`]).
+//! * **A directory is checked where it has to exist.** `--cwd` is
+//!   canonicalized when it is *set*, exactly as `q new --dir` is, so `--cwd .`
+//!   pins the directory it was typed in. It is checked again at `q tpl run`,
+//!   and nowhere else: re-checking it on an unrelated `q tpl edit
+//!   --description` refuses an edit over a directory the edit never touched,
+//!   and refusing it at import time would break
+//!   `q tpl export | ssh <alias> q tpl import -` for every template whose
+//!   directory the far machine has not checked out yet.
 //! * **Run stats are history, not definition.** `run_count` and `last_run_at`
 //!   never leave through `q tpl export` and are never written by
 //!   `q tpl import --replace`: overwriting a definition says nothing about how
@@ -23,10 +32,13 @@
 //!   third of five templates leaves the database exactly as it was.
 //! * **Deleting a template does not delete its Quests** — see
 //!   [`crate::db::Db::delete_template`].
-//! * **`q tpl` is never proxied.** A template is a row in *this* machine's
-//!   database, like the config and the hooks; `q --machine ws tpl run x` would
-//!   have to mean a template over there, which is not the one the user just
-//!   listed. See [`crate::commands::proxy::route`].
+//! * **`q tpl` is never proxied, and `--machine` is refused rather than
+//!   ignored.** A template is a row in *this* machine's database, like the
+//!   config and the hooks; `q --machine ws tpl run x` would have to mean a
+//!   template over there, which is not the one the user just listed — and
+//!   left alone it would create the Quest *here* while stamping it `ws`, the
+//!   very row `src/tui/quests.rs`'s machine select stopped producing. See
+//!   [`refuse_remote`] and [`crate::commands::proxy::route`].
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -36,11 +48,12 @@ use crate::cli::{TplAction, TplFields};
 use crate::commands::{AttachMode, attach_mode, confirm, flush_warnings, new};
 use crate::db::Db;
 use crate::error::QError;
-use crate::model::{Quest, SessionRole, Template, now};
+use crate::model::{Quest, SessionRole, Template};
 use crate::output;
 use crate::templates::{self, Definition};
 
 pub fn run(ctx: &Ctx, action: &TplAction) -> anyhow::Result<()> {
+    refuse_remote(ctx)?;
     match action {
         TplAction::List => list(ctx),
         TplAction::Show { name } => show(ctx, name),
@@ -52,6 +65,28 @@ pub fn run(ctx: &Ctx, action: &TplAction) -> anyhow::Result<()> {
         TplAction::Import { path, replace } => import(ctx, path, *replace),
         TplAction::From { quest, name } => from_quest(ctx, quest, name),
     }
+}
+
+/// `--machine <other>` is an error for every `q tpl` subcommand.
+///
+/// Nothing here can honour it: the definitions are this machine's rows, and
+/// `q --machine ws tpl run x` used to create the Quest here and record it as
+/// living on `ws` — a local row indistinguishable from a real remote one.
+/// Refusing says what the user asked for cannot be done and names the thing
+/// that can.
+fn refuse_remote(ctx: &Ctx) -> anyhow::Result<()> {
+    let Some(machine) = ctx.machine_filter() else {
+        return Ok(());
+    };
+    if machine == ctx.config.machine.name {
+        return Ok(());
+    }
+    Err(QError::Invalid(format!(
+        "--machine {machine}: templates are rows in this machine's database and `q tpl` \
+         never reaches another one; copy one over with \
+         `q tpl export <name> | ssh {machine} q tpl import -`"
+    ))
+    .into())
 }
 
 fn list(ctx: &Ctx) -> anyhow::Result<()> {
@@ -72,7 +107,8 @@ fn show(ctx: &Ctx, target: &str) -> anyhow::Result<()> {
 
 fn add(ctx: &Ctx, name: &str, fields: &TplFields) -> anyhow::Result<()> {
     let db = ctx.db()?;
-    let definition = patched(&Definition::default(), name, fields)?;
+    let mut definition = patched(&Definition::default(), name, fields)?;
+    pin_cwd(&mut definition, None)?;
     let stored = insert(db, &definition)?;
     report(ctx, &stored, "created")
 }
@@ -81,15 +117,19 @@ fn add(ctx: &Ctx, name: &str, fields: &TplFields) -> anyhow::Result<()> {
 fn edit(ctx: &Ctx, target: &str, fields: &TplFields) -> anyhow::Result<()> {
     let db = ctx.db()?;
     let current = db.resolve_template(target)?;
-    let definition = if fields.any() {
+    let mut definition = if fields.any() {
         patched(&Definition::of(&current), &current.name, fields)?
     } else {
         from_editor(&current)?
     };
+    // Trimmed here as `insert` and `import` trim: a hand-edited TOML is
+    // exactly where a stray space around a rename happens.
+    definition.name = definition.name.trim().to_string();
     if definition.name != current.name {
         new::validate_template_name(&definition.name)?;
         taken(db, &definition.name)?;
     }
+    pin_cwd(&mut definition, current.cwd.as_deref())?;
     let mut row = current.clone();
     definition.apply(&mut row);
     check(&row)?;
@@ -151,33 +191,32 @@ fn instantiate(ctx: &Ctx, target: &str, raw_args: &[String], detach: bool) -> an
     let db = ctx.db()?;
     let template = db.resolve_template(target)?;
     let args = templates::parse_args(raw_args)?;
-    let date = templates::today();
-    let goal = fill("goal", template.goal.as_deref(), &date, &args)?;
-    let prompt = fill(
-        "master_prompt",
-        template.master_prompt.as_deref(),
-        &date,
-        &args,
-    )?;
+    let (goal, prompt) = expand_fields(&template, &templates::today(), &args)?;
+    // NULL cwd is SPEC §11's "wherever `q tpl run` was called"; a stored one
+    // has to be here *now*, which is the check `check` deliberately does not
+    // do at store time.
+    let cwd = run_cwd(&template)?;
+    warn_unused_args(ctx, &template, &args);
 
     let created = new::create(
         ctx,
         &new::Args {
             goal: goal.as_deref(),
-            // NULL cwd is SPEC §11's "wherever `q tpl run` was called".
-            dir: template.cwd.as_deref(),
+            dir: cwd.as_deref(),
             workflow: template.workflow.as_deref(),
             repo: template.beads_repo.as_deref(),
             prompt: prompt.as_deref(),
             detach,
-            template: Some(&template.id),
+            template: Some(&template),
             ..new::Args::default()
         },
     );
     flush_warnings(ctx);
     let created = created?;
 
-    let template = db.bump_template_run(&template.id, now())?;
+    // `new::create` counts the run, so no caller can create the Quest and
+    // forget the bookkeeping.
+    let template = created.template.clone().unwrap_or(template);
     let attach = attach_mode(ctx, !detach);
     if ctx.json || !ctx.quiet {
         output::emit(
@@ -217,32 +256,76 @@ fn instantiate(ctx: &Ctx, target: &str, raw_args: &[String], detach: bool) -> an
 /// A template that wants an argument is refused there rather than quietly
 /// instantiated with the braces still in it; the message points at the CLI,
 /// which is where `--arg` lives.
-pub fn expanded_for_form(template: &Template) -> anyhow::Result<Template> {
-    let date = templates::today();
-    let args = BTreeMap::new();
+pub fn expanded_without_args(template: &Template) -> anyhow::Result<Template> {
+    let (goal, master_prompt) = expand_fields(template, &templates::today(), &BTreeMap::new())?;
     let mut out = template.clone();
-    out.goal = fill("goal", template.goal.as_deref(), &date, &args)?;
-    out.master_prompt = fill(
-        "master_prompt",
-        template.master_prompt.as_deref(),
-        &date,
-        &args,
-    )?;
+    out.goal = goal;
+    out.master_prompt = master_prompt;
     Ok(out)
 }
 
-/// One placeholder-expanded field, or an error naming what could not be filled.
-fn fill(
-    field: &str,
-    text: Option<&str>,
+/// `goal` and `master_prompt`, expanded against the same day and the same
+/// `--arg` set — and, when they cannot be, **one** error naming every hole in
+/// both. Reporting the first field's alone costs a second failed run to
+/// discover what this one already knows.
+fn expand_fields(
+    template: &Template,
     date: &str,
     args: &BTreeMap<String, String>,
-) -> anyhow::Result<Option<String>> {
-    let Some(text) = text else {
-        return Ok(None);
-    };
-    let filled = templates::expand(text, date, args).map_err(|bad| bad.into_error(field))?;
-    Ok(templates::blank_to_none(&filled))
+) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let mut filled: Vec<Option<String>> = Vec::new();
+    let mut bad: Vec<(String, templates::Unresolved)> = Vec::new();
+    for (field, text) in [
+        ("goal", template.goal.as_deref()),
+        ("master_prompt", template.master_prompt.as_deref()),
+    ] {
+        match text.map(|t| templates::expand(t, date, args)) {
+            None => filled.push(None),
+            Some(Ok(text)) => filled.push(templates::blank_to_none(&text)),
+            Some(Err(unresolved)) => {
+                filled.push(None);
+                bad.push((field.to_string(), unresolved));
+            }
+        }
+    }
+    if !bad.is_empty() {
+        return Err(templates::unresolved_error(bad));
+    }
+    Ok((filled[0].clone(), filled[1].clone()))
+}
+
+/// A `--arg` no placeholder consumed is almost always a typo
+/// (`--arg tikcet=…`), and it is only ever caught today by leaving some
+/// *other* key unfilled. A warning rather than an error: the run itself is
+/// complete, and refusing it would make an extra argument fatal in a routine
+/// that a template edit has just stopped using.
+fn warn_unused_args(ctx: &Ctx, template: &Template, args: &BTreeMap<String, String>) {
+    let mut used: Vec<String> = Vec::new();
+    for text in [template.goal.as_deref(), template.master_prompt.as_deref()] {
+        used.extend(templates::arg_keys(text.unwrap_or_default()));
+    }
+    let unused: Vec<&str> = args
+        .keys()
+        .filter(|k| !used.iter().any(|u| u == *k))
+        .map(String::as_str)
+        .collect();
+    if unused.is_empty() {
+        return;
+    }
+    ctx.warn(format!(
+        "warning: template {} has no {} for --arg {}",
+        template.name,
+        if unused.len() == 1 {
+            "placeholder"
+        } else {
+            "placeholders"
+        },
+        unused
+            .iter()
+            .map(|k| format!("`{k}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
 }
 
 fn export(ctx: &Ctx, target: Option<&str>) -> anyhow::Result<()> {
@@ -263,7 +346,11 @@ fn export(ctx: &Ctx, target: Option<&str>) -> anyhow::Result<()> {
 fn import(ctx: &Ctx, path: &str, replace: bool) -> anyhow::Result<()> {
     let text = read_source(path)?;
     let doc = templates::parse(&text)?;
-    if doc.templates.is_empty() {
+    // `template = []` is what `q tpl export` writes for an empty database, so
+    // a scripted export-then-import of one is a no-op rather than a failure.
+    // A file that never mentions `template` is a different thing: not a
+    // template file at all.
+    if doc.templates.is_empty() && !templates::declares_templates(&text) {
         return Err(QError::Invalid(format!("no [[template]] in {path}")).into());
     }
     let db = ctx.db()?;
@@ -276,6 +363,11 @@ fn import(ctx: &Ctx, path: &str, replace: bool) -> anyhow::Result<()> {
         for definition in &doc.templates {
             let name = definition.name.trim().to_string();
             new::validate_template_name(&name)?;
+            // Absolute, so the file pins a directory; never checked, so a
+            // definition may arrive before the directory does.
+            let mut definition = definition.clone();
+            definition.cwd = portable_cwd(&definition.cwd);
+            let definition = &definition;
             if added.contains(&name) || replaced.contains(&name) {
                 return Err(
                     QError::Invalid(format!("{path} defines template `{name}` twice")).into(),
@@ -317,6 +409,9 @@ fn import(ctx: &Ctx, path: &str, replace: bool) -> anyhow::Result<()> {
                 if !replaced.is_empty() {
                     parts.push(format!("replaced {}", replaced.join(", ")));
                 }
+                if parts.is_empty() {
+                    return format!("{path} has no templates; nothing was imported");
+                }
                 format!(
                     "imported {} template(s) · {}",
                     added.len() + replaced.len(),
@@ -348,8 +443,12 @@ fn from_quest(ctx: &Ctx, target: &str, name: &str) -> anyhow::Result<()> {
         description: format!("from quest {}", quest.slug),
         cwd: quest.cwd.clone(),
         workflow: quest.workflow.clone().unwrap_or_default(),
-        goal: quest.goal.clone().unwrap_or_default(),
-        master_prompt: first_master_prompt(db, &quest)?.unwrap_or_default(),
+        // The Quest's text was never template syntax: `q new` accepted
+        // `{{user.name}}` in it, so capturing it must not be the one place
+        // that refuses it. Escaped, it expands back to exactly what the Quest
+        // said (`crate::templates::escape`).
+        goal: templates::escape(quest.goal.as_deref().unwrap_or_default()),
+        master_prompt: templates::escape(&first_master_prompt(db, &quest)?.unwrap_or_default()),
         beads_repo: quest.beads_repo.clone().unwrap_or_default(),
         create_brain: quest.brain_session.is_some(),
         tags: Vec::new(),
@@ -358,15 +457,16 @@ fn from_quest(ctx: &Ctx, target: &str, name: &str) -> anyhow::Result<()> {
     report(ctx, &stored, "created")
 }
 
-/// What the Quest's first master was started with. A Quest that has been
-/// resumed has several masters; the first one is the one whose prompt started
-/// the work.
+/// What the Quest's **first** master was started with. A Quest that has been
+/// resumed has several masters, and a later one's prompt continued work the
+/// template is not about — so a first master that was given no prompt means
+/// the template has none, rather than borrowing a resume's.
 fn first_master_prompt(db: &Db, quest: &Quest) -> anyhow::Result<Option<String>> {
     Ok(db
         .list_sessions_by_quest(&quest.id)?
         .into_iter()
-        .filter(|s| s.role == SessionRole::Master)
-        .find_map(|s| s.first_prompt))
+        .find(|s| s.role == SessionRole::Master)
+        .and_then(|s| s.first_prompt))
 }
 
 /// `definition` as a new row: name validated, name free, fields checked.
@@ -392,20 +492,81 @@ fn taken(db: &Db, name: &str) -> anyhow::Result<()> {
 
 /// Everything a stored template must satisfy, wherever it came from — a flag,
 /// an editor, or an imported file.
+///
+/// `cwd` is deliberately not among them: a definition is portable and a
+/// directory is not, so it is canonicalized when it is *set* ([`pin_cwd`])
+/// and required to exist when it is *used* ([`run_cwd`]). See the module docs.
 fn check(row: &Template) -> anyhow::Result<()> {
-    templates::check_placeholders("goal", row.goal.as_deref())?;
-    templates::check_placeholders("master_prompt", row.master_prompt.as_deref())?;
-    if let Some(cwd) = &row.cwd {
-        // Caught here rather than at `q tpl run`, when a routine is halfway
-        // through starting a tmux session.
-        new::resolve_dir(Some(cwd))?;
-    }
+    templates::check_placeholders(&[
+        ("goal", row.goal.as_deref()),
+        ("master_prompt", row.master_prompt.as_deref()),
+    ])?;
     if let Some(repo) = &row.beads_repo {
         crate::beads::validate_repo_label(repo)?;
     }
     // TODO(bd-8lz.6.3): validate `workflow` against the workflow registry; it
     // is a stored string until the registry exists.
     Ok(())
+}
+
+/// The `cwd` a caller is **setting** (`q tpl add --cwd`, `q tpl edit --cwd`,
+/// an editor that changed it), canonicalized the way `q new --dir` is
+/// (`new::resolve_dir`).
+///
+/// Storing the raw string is what made `q tpl add rel --cwd .` pin nothing:
+/// the template behaved exactly like a NULL `cwd`, re-resolving against
+/// whatever directory the routine was later run from. A `cwd` that did not
+/// change is left alone — `was` is what the row already held.
+fn pin_cwd(definition: &mut Definition, was: Option<&str>) -> anyhow::Result<()> {
+    let cwd = definition.cwd.trim().to_string();
+    if cwd.is_empty() || Some(cwd.as_str()) == was {
+        return Ok(());
+    }
+    let name = definition.name.trim();
+    let path = new::resolve_dir(Some(&cwd)).map_err(|e| {
+        let message = format!("{name}: cwd `{cwd}`: {e}");
+        match e.downcast_ref::<QError>() {
+            Some(QError::NotFound(_)) => QError::NotFound(message),
+            _ => QError::Invalid(message),
+        }
+    })?;
+    definition.cwd = path.to_string_lossy().to_string();
+    Ok(())
+}
+
+/// A `cwd` an import brought in: made absolute, so it pins a directory rather
+/// than following whichever one the importing shell happened to be in, but
+/// **never** checked for existence.
+///
+/// A template is allowed to travel to a machine that has not checked its
+/// repository out yet — that is what `q tpl export | ssh <alias> q tpl
+/// import -` is for — and one absent directory must not fail an all-or-nothing
+/// import of the other nine definitions.
+fn portable_cwd(cwd: &str) -> String {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return String::new();
+    }
+    std::path::absolute(cwd)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| cwd.to_string())
+}
+
+/// The directory `q tpl run` will start the master in: the template's, if it
+/// has one, and it has to be here now.
+fn run_cwd(template: &Template) -> anyhow::Result<Option<String>> {
+    let Some(cwd) = template.cwd.as_deref() else {
+        return Ok(None);
+    };
+    match new::resolve_dir(Some(cwd)) {
+        Ok(path) => Ok(Some(path.to_string_lossy().to_string())),
+        Err(_) => Err(QError::NotFound(format!(
+            "template `{}`: its cwd `{cwd}` is not a directory on this machine; \
+             point it somewhere else with `q tpl edit {} --cwd <path>`",
+            template.name, template.name
+        ))
+        .into()),
+    }
 }
 
 /// `base` with every flag that was given written over it. An omitted flag
@@ -437,6 +598,71 @@ fn patched(base: &Definition, name: &str, fields: &TplFields) -> anyhow::Result<
         out.tags = fields.tags.clone();
     }
     Ok(out)
+}
+
+/// What the caller said explicitly, for [`Merge`]. Every field is the flag of
+/// the same name on `q new`; the TUI's form fills the three it has.
+#[derive(Debug, Default)]
+pub struct Given<'a> {
+    pub goal: Option<&'a str>,
+    pub dir: Option<&'a str>,
+    pub workflow: Option<&'a str>,
+    pub repo: Option<&'a str>,
+    pub prompt: Option<&'a str>,
+    pub no_beads: bool,
+}
+
+/// SPEC §16's `q new --template`: **the template fills the blanks and a value
+/// the caller gave always wins.**
+///
+/// `q new --template` and the TUI's new-Quest form are the same operation
+/// asked two ways, so they share this rather than each deciding what "fills
+/// the blanks" means — which is how the CLI came to have no `--template` at
+/// all while the form had the merge. It is not `q tpl run`: that takes the
+/// definition whole and has no `--name`/`--goal` to lose.
+#[derive(Debug, Default)]
+pub struct Merge {
+    pub goal: Option<String>,
+    pub dir: Option<String>,
+    pub workflow: Option<String>,
+    pub repo: Option<String>,
+    pub prompt: Option<String>,
+}
+
+impl Merge {
+    pub fn new(template: Option<&Template>, given: &Given) -> Merge {
+        let from = |typed: Option<&str>, of: fn(&Template) -> Option<String>| -> Option<String> {
+            typed.map(str::to_string).or_else(|| template.and_then(of))
+        };
+        Merge {
+            goal: from(given.goal, |t| t.goal.clone()),
+            dir: from(given.dir, |t| t.cwd.clone()),
+            workflow: from(given.workflow, |t| t.workflow.clone()),
+            // A *typed* `--repo` alongside `--no-beads` is a contradiction,
+            // and `q new` says so. A template's is not the caller's mistake —
+            // it is dropped, because there is no epic for the label to go on.
+            repo: given.repo.map(str::to_string).or_else(|| {
+                template
+                    .and_then(|t| t.beads_repo.clone())
+                    .filter(|_| !given.no_beads)
+            }),
+            prompt: from(given.prompt, |t| t.master_prompt.clone()),
+        }
+    }
+}
+
+/// The template `q new --template` / the TUI form starts from: resolved, and
+/// with `{{date}}` filled in. A template that wants a `{{arg.k}}` is refused
+/// with the one command that can give it one.
+pub fn for_new(ctx: &Ctx, target: &str) -> anyhow::Result<Template> {
+    let template = ctx.db()?.resolve_template(target)?;
+    expanded_without_args(&template).map_err(|e| {
+        QError::Invalid(format!(
+            "run it from the CLI: q tpl run {} --arg k=v — {e:#}",
+            template.name
+        ))
+        .into()
+    })
 }
 
 fn report(ctx: &Ctx, template: &Template, verb: &str) -> anyhow::Result<()> {
@@ -490,7 +716,15 @@ fn human_show(t: &Template) -> String {
     line("beads repo", super::fmt::or_dash(t.beads_repo.as_deref()));
     line(
         "brain",
-        if t.create_brain { "yes" } else { "no" }.to_string(),
+        // TODO(bd-8lz follow-up): `q new` has no `--brain` yet
+        // (`commands::new`'s `TODO(M2)`), so this field is stored and
+        // exported but nothing acts on it. Said out loud rather than implied.
+        if t.create_brain {
+            "yes (stored; q tpl run does not create one yet)"
+        } else {
+            "no"
+        }
+        .to_string(),
     );
     line(
         "tags",
@@ -607,16 +841,95 @@ mod tests {
         assert!(e.to_string().contains("oops"), "{e}");
     }
 
+    /// A `cwd` is checked when it is set and when it is run, and at no other
+    /// time — `check` runs on every write, including ones that never touched
+    /// it (see the module docs).
     #[test]
-    fn a_cwd_that_is_not_a_directory_is_refused_before_it_is_stored() {
+    fn a_cwd_is_refused_when_it_is_set_and_ignored_when_it_is_not() {
         let mut row = Template::new("routine");
         row.cwd = Some("/definitely/not/here".to_string());
-        let e = check(&row).unwrap_err();
+        assert!(check(&row).is_ok(), "an unrelated write must not care");
+
+        let mut setting = Definition {
+            name: "routine".to_string(),
+            cwd: "/definitely/not/here".to_string(),
+            ..Definition::default()
+        };
+        let e = pin_cwd(&mut setting, None).unwrap_err();
         assert_eq!(
             e.downcast_ref::<QError>().map(QError::code),
             Some("not_found"),
             "{e}"
         );
+        // The field and the template, so the message says what to fix.
+        assert!(e.to_string().contains("routine: cwd"), "{e}");
+
+        // The same value it already had is not a set at all.
+        let mut unchanged = setting.clone();
+        pin_cwd(&mut unchanged, Some("/definitely/not/here")).unwrap();
+        assert_eq!(unchanged.cwd, "/definitely/not/here");
+
+        // Run time is where it has to exist, named with the template.
+        row.name = "routine".to_string();
+        let e = run_cwd(&row).unwrap_err();
+        assert!(e.to_string().contains("template `routine`"), "{e}");
+        assert!(e.to_string().contains("/definitely/not/here"), "{e}");
+        row.cwd = None;
+        assert_eq!(run_cwd(&row).unwrap(), None);
+    }
+
+    /// The blocking half of `--cwd`: a relative one has to pin the directory
+    /// it was typed in, exactly as `q new --dir .` does.
+    #[test]
+    fn a_relative_cwd_is_stored_as_the_directory_it_named() {
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let mut definition = Definition {
+            name: "routine".to_string(),
+            cwd: dir.to_string_lossy().to_string(),
+            ..Definition::default()
+        };
+        pin_cwd(&mut definition, None).unwrap();
+        assert_eq!(definition.cwd, dir.to_string_lossy());
+        assert!(
+            std::path::Path::new(&definition.cwd).is_absolute(),
+            "{}",
+            definition.cwd
+        );
+    }
+
+    #[test]
+    fn an_imported_cwd_is_made_absolute_but_never_checked() {
+        assert_eq!(portable_cwd(""), "");
+        assert_eq!(portable_cwd("  "), "");
+        assert_eq!(portable_cwd("/x/gone"), "/x/gone");
+        let relative = portable_cwd("gone-for-sure");
+        assert!(std::path::Path::new(&relative).is_absolute(), "{relative}");
+        assert!(relative.ends_with("gone-for-sure"), "{relative}");
+    }
+
+    #[test]
+    fn a_template_reports_every_field_it_cannot_fill_in_one_error() {
+        let mut row = Template::new("both");
+        row.goal = Some("g {{arg.a}}".to_string());
+        row.master_prompt = Some("p {{arg.b}}".to_string());
+        let e = expand_fields(&row, "2026-08-28", &BTreeMap::new()).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("goal: no --arg for `a`"), "{msg}");
+        assert!(msg.contains("master_prompt: no --arg for `b`"), "{msg}");
+
+        let filled = expand_fields(
+            &row,
+            "2026-08-28",
+            &[
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(filled.0.as_deref(), Some("g 1"));
+        assert_eq!(filled.1.as_deref(), Some("p 2"));
     }
 
     #[test]

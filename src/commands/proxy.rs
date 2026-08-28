@@ -1065,6 +1065,7 @@ fn create(ctx: &Ctx, command: &Command) -> anyhow::Result<Option<u8>> {
     };
     let Command::New {
         name,
+        template,
         goal,
         dir,
         workflow,
@@ -1078,6 +1079,17 @@ fn create(ctx: &Ctx, command: &Command) -> anyhow::Result<Option<u8>> {
     else {
         return Ok(None);
     };
+    // A template is a row in *this* machine's database (`commands::tpl`), so
+    // `--template` names nothing over there and silently expanding it here
+    // would create a Quest the far end could never link back to a definition.
+    if let Some(template) = template {
+        return Err(QError::Invalid(format!(
+            "--machine {machine} with --template {template}: a template is a row in this \
+             machine's database; copy it over with \
+             `q tpl export {template} | ssh {machine} q tpl import -`, then run it there"
+        ))
+        .into());
+    }
     // A relative `--dir` is the `link add` relative-`<ref>` caveat again (see
     // `route`): it is made absolute against the far end's login directory, not
     // this one. The common case is an absolute path or none at all, and the

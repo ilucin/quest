@@ -39,6 +39,15 @@
 //! offending key at once — see [`expand`]. A prompt is what an agent is about
 //! to be told; shipping it with `{{arg.ticket}}` still in it is worse than not
 //! running at all.
+//!
+//! # Escaping
+//!
+//! A prompt about templating carries `{{…}}` of its own — Mustache, Jinja,
+//! Handlebars, a Claude skill — so **doubling escapes**: `{{{{` is a literal
+//! `{{` and `}}}}` a literal `}}`, neither of which is a placeholder. It is
+//! the `{{` → `{` rule of `format!`, one level up, and it is what
+//! [`escape`] writes so `q tpl from` can capture a Quest whose text
+//! `q new` accepted. A `{{` with no `}}` after it is still text, unchanged.
 
 use std::collections::BTreeMap;
 
@@ -146,6 +155,17 @@ pub fn parse(text: &str) -> anyhow::Result<Document> {
     toml::from_str(text).map_err(|e| QError::Invalid(format!("invalid TOML: {}", tidy(&e))).into())
 }
 
+/// Whether the document says `template` **at all**.
+///
+/// `template = []` and a file with no `template` key both [`parse`] to an
+/// empty document, and they are not the same thing: the first is what
+/// `q tpl export` writes for an empty database, so a scripted backup and
+/// restore of one has to be a no-op; the second is not a template file.
+pub fn declares_templates(text: &str) -> bool {
+    text.parse::<toml::Table>()
+        .is_ok_and(|table| table.contains_key("template"))
+}
+
 /// toml's errors carry a multi-line span; one line is what an error message
 /// has room for.
 fn tidy(e: &toml::de::Error) -> String {
@@ -157,36 +177,92 @@ fn tidy(e: &toml::de::Error) -> String {
         .to_string()
 }
 
-/// A `{{…}}` occurrence: the name between the braces and the byte range it
-/// spans.
-struct Slot {
-    name: String,
-    start: usize,
-    end: usize,
+/// Something the scanner found, and the byte range it spans.
+enum Token {
+    /// `{{name}}` — a placeholder to fill.
+    Slot {
+        name: String,
+        start: usize,
+        end: usize,
+    },
+    /// `{{{{` or `}}}}` — the escape for the literal it carries.
+    Escaped {
+        literal: &'static str,
+        start: usize,
+        end: usize,
+    },
 }
 
-/// Every `{{…}}` in `text`, in order. An unclosed `{{` is not a placeholder —
-/// it is text that happens to contain two braces, and rewriting it would be a
-/// worse surprise than leaving it alone.
-fn slots(text: &str) -> Vec<Slot> {
+/// Every placeholder and every escape in `text`, in order. An unclosed `{{`
+/// is neither — it is text that happens to contain two braces, and rewriting
+/// it would be a worse surprise than leaving it alone.
+fn scan(text: &str) -> Vec<Token> {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
     let mut i = 0;
     while i + 1 < bytes.len() {
+        // A doubled brace pair is a literal one, and never opens a
+        // placeholder: `{{{{arg.k}}}}` is text about `{{arg.k}}`.
+        if bytes[i] == b'}' && bytes[i + 1] == b'}' {
+            if text[i..].starts_with("}}}}") {
+                out.push(Token::Escaped {
+                    literal: "}}",
+                    start: i,
+                    end: i + 4,
+                });
+                i += 4;
+            } else {
+                i += 2;
+            }
+            continue;
+        }
         if bytes[i] != b'{' || bytes[i + 1] != b'{' {
             i += 1;
+            continue;
+        }
+        if text[i..].starts_with("{{{{") {
+            out.push(Token::Escaped {
+                literal: "{{",
+                start: i,
+                end: i + 4,
+            });
+            i += 4;
             continue;
         }
         let Some(rel) = text[i + 2..].find("}}") else {
             break;
         };
         let inner_end = i + 2 + rel;
-        out.push(Slot {
+        out.push(Token::Slot {
             name: text[i + 2..inner_end].trim().to_string(),
             start: i,
             end: inner_end + 2,
         });
         i = inner_end + 2;
+    }
+    out
+}
+
+/// `text` with every `{{` and `}}` doubled, so [`expand`] gives it back
+/// exactly — what `q tpl from` runs over what it copies out of a Quest, whose
+/// goal and prompt were never placeholder syntax to begin with.
+pub fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let doubled = i + 1 < bytes.len()
+            && ((bytes[i] == b'{' && bytes[i + 1] == b'{')
+                || (bytes[i] == b'}' && bytes[i + 1] == b'}'));
+        if doubled {
+            out.push_str(&text[i..i + 2]);
+            out.push_str(&text[i..i + 2]);
+            i += 2;
+            continue;
+        }
+        let ch = text[i..].chars().next().expect("i is a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -213,8 +289,7 @@ impl Unresolved {
         }
     }
 
-    /// The error a command raises, naming the field it came from.
-    pub fn into_error(self, field: &str) -> anyhow::Error {
+    fn parts(&self) -> Vec<String> {
         let mut parts: Vec<String> = Vec::new();
         if !self.missing.is_empty() {
             parts.push(format!(
@@ -236,12 +311,27 @@ impl Unresolved {
                     .join(", ")
             ));
         }
-        QError::Invalid(format!(
-            "{field}: {} (supported: {{{{date}}}}, {{{{arg.<key>}}}})",
-            parts.join("; ")
-        ))
-        .into()
+        parts
     }
+}
+
+/// One error for **every** field of one template that could not be filled.
+///
+/// A template is expanded as a whole, so its holes are reported as a whole:
+/// discovering `master_prompt`'s missing key only after supplying `goal`'s
+/// costs a second failed `q tpl run` for something the first one already knew.
+pub fn unresolved_error(bad: Vec<(String, Unresolved)>) -> anyhow::Error {
+    let fields = bad
+        .iter()
+        .filter(|(_, u)| !u.is_empty())
+        .map(|(field, u)| format!("{field}: {}", u.parts().join("; ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    QError::Invalid(format!(
+        "{fields} (supported: {{{{date}}}}, {{{{arg.<key>}}}}; \
+         `{{{{{{{{` is a literal `{{{{`)"
+    ))
+    .into()
 }
 
 /// An `arg.<key>` key: what `--arg k=v` accepts on the left of the `=`.
@@ -266,19 +356,32 @@ pub fn expand(
     let mut bad = Unresolved::default();
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
-    for slot in slots(text) {
-        out.push_str(&text[cursor..slot.start]);
-        cursor = slot.end;
-        if slot.name == "date" {
+    for token in scan(text) {
+        let (name, start, end) = match token {
+            Token::Escaped {
+                literal,
+                start,
+                end,
+            } => {
+                out.push_str(&text[cursor..start]);
+                out.push_str(literal);
+                cursor = end;
+                continue;
+            }
+            Token::Slot { name, start, end } => (name, start, end),
+        };
+        out.push_str(&text[cursor..start]);
+        cursor = end;
+        if name == "date" {
             out.push_str(date);
             continue;
         }
-        match slot.name.strip_prefix("arg.").filter(|k| is_arg_key(k)) {
+        match name.strip_prefix("arg.").filter(|k| is_arg_key(k)) {
             Some(key) => match args.get(key) {
                 Some(value) => out.push_str(value),
                 None => Unresolved::push(&mut bad.missing, key),
             },
-            None => Unresolved::push(&mut bad.unknown, &slot.name),
+            None => Unresolved::push(&mut bad.unknown, &name),
         }
     }
     out.push_str(&text[cursor..]);
@@ -290,27 +393,54 @@ pub fn expand(
 /// at the point it is written instead of at the point it is run.
 pub fn unknown_placeholders(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for slot in slots(text) {
-        if slot.name == "date" || slot.name.strip_prefix("arg.").is_some_and(is_arg_key) {
+    for token in scan(text) {
+        let Token::Slot { name, .. } = token else {
+            continue;
+        };
+        if name == "date" || name.strip_prefix("arg.").is_some_and(is_arg_key) {
             continue;
         }
-        Unresolved::push(&mut out, &slot.name);
+        Unresolved::push(&mut out, &name);
+    }
+    out
+}
+
+/// The `arg.<key>` keys `text` actually uses — what tells `q tpl run` that an
+/// `--arg` it was handed fills nothing.
+pub fn arg_keys(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for token in scan(text) {
+        let Token::Slot { name, .. } = token else {
+            continue;
+        };
+        if let Some(key) = name.strip_prefix("arg.").filter(|k| is_arg_key(k)) {
+            Unresolved::push(&mut out, key);
+        }
     }
     out
 }
 
 /// `q tpl add`/`edit`'s gate: a stored field may only use placeholders that
-/// something could fill.
-pub fn check_placeholders(field: &str, text: Option<&str>) -> anyhow::Result<()> {
-    let unknown = unknown_placeholders(text.unwrap_or_default());
-    if unknown.is_empty() {
+/// something could fill. Every field is checked before anything is reported,
+/// for the reason [`unresolved_error`] gives.
+pub fn check_placeholders(fields: &[(&str, Option<&str>)]) -> anyhow::Result<()> {
+    let bad: Vec<(String, Unresolved)> = fields
+        .iter()
+        .map(|(field, text)| {
+            (
+                (*field).to_string(),
+                Unresolved {
+                    missing: Vec::new(),
+                    unknown: unknown_placeholders(text.unwrap_or_default()),
+                },
+            )
+        })
+        .filter(|(_, u)| !u.is_empty())
+        .collect();
+    if bad.is_empty() {
         return Ok(());
     }
-    Err(Unresolved {
-        missing: Vec::new(),
-        unknown,
-    }
-    .into_error(field))
+    Err(unresolved_error(bad))
 }
 
 /// Today, local, ISO — what `{{date}}` expands to.
@@ -391,7 +521,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(bad.missing, ["a", "b"]);
         assert_eq!(bad.unknown, ["today", "arg."]);
-        let msg = bad.into_error("goal").to_string();
+        let msg = unresolved_error(vec![("goal".to_string(), bad)]).to_string();
         assert!(msg.contains("goal:"), "{msg}");
         assert!(msg.contains("`a`") && msg.contains("`b`"), "{msg}");
         assert!(msg.contains("`{{today}}`"), "{msg}");
@@ -401,10 +531,99 @@ mod tests {
     fn a_placeholder_a_run_could_never_fill_is_caught_when_it_is_stored() {
         assert!(unknown_placeholders("{{date}} {{arg.x}}").is_empty());
         assert_eq!(unknown_placeholders("{{ARG.x}} {{date }}"), ["ARG.x"]);
-        assert!(check_placeholders("goal", Some("{{arg.x}}")).is_ok());
-        assert!(check_placeholders("goal", None).is_ok());
-        let e = check_placeholders("master_prompt", Some("{{nope}}")).unwrap_err();
+        assert!(check_placeholders(&[("goal", Some("{{arg.x}}"))]).is_ok());
+        assert!(check_placeholders(&[("goal", None)]).is_ok());
+        let e = check_placeholders(&[("master_prompt", Some("{{nope}}"))]).unwrap_err();
         assert!(e.to_string().contains("master_prompt"), "{e}");
+    }
+
+    /// One error for the whole template, not one per field.
+    #[test]
+    fn every_field_that_cannot_be_filled_is_named_in_one_error() {
+        let e = check_placeholders(&[
+            ("goal", Some("{{nope}}")),
+            ("master_prompt", Some("{{alsonope}}")),
+        ])
+        .unwrap_err();
+        let msg = e.to_string();
+        assert!(
+            msg.contains("goal: unknown placeholder `{{nope}}`"),
+            "{msg}"
+        );
+        assert!(msg.contains("master_prompt:"), "{msg}");
+        assert!(msg.contains("alsonope"), "{msg}");
+
+        let both = unresolved_error(vec![
+            (
+                "goal".to_string(),
+                Unresolved {
+                    missing: vec!["a".to_string()],
+                    unknown: Vec::new(),
+                },
+            ),
+            (
+                "master_prompt".to_string(),
+                Unresolved {
+                    missing: vec!["b".to_string()],
+                    unknown: Vec::new(),
+                },
+            ),
+        ])
+        .to_string();
+        assert!(both.contains("goal: no --arg for `a`"), "{both}");
+        assert!(both.contains("master_prompt: no --arg for `b`"), "{both}");
+    }
+
+    /// A prompt about templating is routine here, so `{{` has an escape.
+    #[test]
+    fn a_doubled_brace_is_a_literal_one_and_never_a_placeholder() {
+        let none = BTreeMap::new();
+        assert_eq!(
+            expand("render {{{{user.name}}}} please", "2026-08-28", &none).unwrap(),
+            "render {{user.name}} please"
+        );
+        assert!(unknown_placeholders("{{{{user.name}}}}").is_empty());
+        assert!(arg_keys("{{{{arg.x}}}} {{arg.y}}") == ["y"]);
+        // The escape and a real placeholder side by side.
+        assert_eq!(
+            expand("{{{{date}}}} is {{date}}", "2026-08-28", &none).unwrap(),
+            "{{date}} is 2026-08-28"
+        );
+    }
+
+    #[test]
+    fn escaping_survives_a_round_trip_through_expand() {
+        let none = BTreeMap::new();
+        for text in [
+            "{{user.name}}",
+            "a {{ b",
+            "}}{{",
+            "{{{x}}}",
+            "{{date}} and {{arg.k}}",
+            "nothing at all",
+            "čćž {{x}} 🎉",
+            "}}}} {{{{",
+        ] {
+            let escaped = escape(text);
+            assert!(
+                unknown_placeholders(&escaped).is_empty(),
+                "{text} -> {escaped}"
+            );
+            assert_eq!(
+                expand(&escaped, "2026-08-28", &none).unwrap(),
+                text,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_arg_keys_a_text_uses_are_the_ones_a_run_can_fill() {
+        assert_eq!(
+            arg_keys("{{arg.a}} {{date}} {{arg.b}} {{arg.a}}"),
+            ["a", "b"]
+        );
+        assert!(arg_keys("{{arg.}} {{nope}}").is_empty());
     }
 
     #[test]
@@ -483,6 +702,17 @@ mod tests {
             .collect();
         assert_eq!(names, ["a", "b"]);
         assert_eq!(parse("").unwrap(), Document::default());
+    }
+
+    /// An empty export is still an export, and has to import again.
+    #[test]
+    fn an_empty_list_of_templates_is_not_the_same_as_no_list_at_all() {
+        let empty = render(&[]).unwrap();
+        assert!(declares_templates(&empty), "{empty}");
+        assert!(parse(&empty).unwrap().templates.is_empty());
+        assert!(!declares_templates("# nothing\n"));
+        assert!(!declares_templates("not toml ["));
+        assert!(declares_templates("[[template]]\nname = \"a\"\n"));
     }
 
     #[test]

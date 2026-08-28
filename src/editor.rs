@@ -10,6 +10,13 @@
 //! |---|---|
 //! | `Q_FIXTURE_EDITOR` | a file whose contents are what the "editor" saved |
 //! | `Q_FIXTURE_EDITOR_FAIL` | the editor exits non-zero (content unused) |
+//! | `Q_FIXTURE_EDITOR_SEEN` | a file the buffer the editor was *handed* is written to |
+//!
+//! The stub writes `initial` out before it reads the reply so a test can
+//! assert on the half of the round trip a user sees: `q tpl edit` has to open
+//! on the template's current definition. Without it [`edit`] could be handed
+//! `""` and every `tpl edit` test would still pass, while every real user
+//! opened an empty buffer and wiped their template on `:wq`.
 //!
 //! Outside a fixture the program is `$Q_EDITOR`, else `$VISUAL`, else
 //! `$EDITOR`, else `vi` — `$Q_EDITOR` first so a scripted caller can override
@@ -28,7 +35,7 @@ use crate::model::new_id;
 /// to highlight by.
 pub fn edit(initial: &str, suffix: &str) -> anyhow::Result<String> {
     if fixtured() {
-        return fixture();
+        return fixture(initial);
     }
     let path = std::env::temp_dir().join(format!("q-{}{suffix}", new_id("edit")));
     std::fs::write(&path, initial)
@@ -73,7 +80,12 @@ fn fixtured() -> bool {
     std::env::var_os("Q_FIXTURE").is_some_and(|v| !v.is_empty())
 }
 
-fn fixture() -> anyhow::Result<String> {
+fn fixture(initial: &str) -> anyhow::Result<String> {
+    if let Some(seen) = std::env::var_os("Q_FIXTURE_EDITOR_SEEN") {
+        let seen = PathBuf::from(seen);
+        std::fs::write(&seen, initial)
+            .map_err(|e| QError::Io(std::io::Error::other(format!("{}: {e}", seen.display()))))?;
+    }
     if std::env::var_os("Q_FIXTURE_EDITOR_FAIL").is_some() {
         return Err(QError::Other("editor `stub` exited with exit status: 1".to_string()).into());
     }
