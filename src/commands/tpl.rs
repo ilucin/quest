@@ -833,15 +833,7 @@ fn human_show(t: &Template) -> String {
     line("beads repo", super::fmt::or_dash(t.beads_repo.as_deref()));
     line(
         "brain",
-        // TODO(bd-8lz follow-up): `q new` has no `--brain` yet
-        // (`commands::new`'s `TODO(M2)`), so this field is stored and
-        // exported but nothing acts on it. Said out loud rather than implied.
-        if t.create_brain {
-            "yes (stored; q tpl run does not create one yet)"
-        } else {
-            "no"
-        }
-        .to_string(),
+        if t.create_brain { "yes" } else { "no" }.to_string(),
     );
     line(
         "tags",

@@ -580,10 +580,7 @@ pub struct TplFields {
     /// `repo:<name>` label for the Quest's beads epic
     #[arg(long, value_name = "NAME")]
     pub repo: Option<String>,
-    /// Record that Quests from this template want a brain session
-    ///
-    /// Stored, shown and exported; nothing creates the session yet — `q new`
-    /// has no `--brain` either.
+    /// Create a brain session note when a Quest is run from this template
     #[arg(long)]
     pub brain: bool,
     /// The opposite, for `q tpl edit`
