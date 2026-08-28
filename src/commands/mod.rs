@@ -22,6 +22,7 @@ pub mod send;
 pub mod sessions;
 pub mod set;
 pub mod show;
+pub mod skill;
 pub mod spawn;
 pub mod target;
 pub mod tpl;

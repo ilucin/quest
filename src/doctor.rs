@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use crate::Ctx;
 use crate::commands::hook;
+use crate::commands::skill;
 use crate::config::Config;
 use crate::db::Db;
 use crate::model::{Session, now};
@@ -385,6 +386,61 @@ fn hook_check(name: String, state: hook::State, command: Option<&str>) -> Check 
     match state {
         hook::State::Installed => check(name, Status::Ok, text),
         _ => with_hint(check(name, Status::Fail, text), "q hook install"),
+    }
+}
+
+// --------------------------------------------------------------------- skill
+
+/// The embedded agent SKILL.md (SPEC §18). `drifted` is a failure like
+/// `missing` is: an out-of-date file means agents read a stale command surface,
+/// which is exactly what `q skill install` refreshes. With `--fix` it installs
+/// or updates the file and reports it as repaired.
+const SKILL: &str = "skill";
+
+fn check_skill(fix: bool, fixed: &mut Vec<String>) -> Check {
+    let status = match skill::installed_status() {
+        Ok(status) => status,
+        Err(e) => {
+            return with_hint(
+                check(SKILL, Status::Fail, detail(SKILL, &e)),
+                "q skill install",
+            );
+        }
+    };
+    if fix && status.state != hook::State::Installed {
+        match skill::ensure_installed() {
+            Ok(true) => {
+                fixed.push(format!("installed q skill at {}", status.path.display()));
+                return check(
+                    SKILL,
+                    Status::Ok,
+                    format!("installed · {}", status.path.display()),
+                );
+            }
+            // Nothing to do (already installed) falls through to the report.
+            Ok(false) => {}
+            Err(e) => {
+                return with_hint(
+                    check(SKILL, Status::Fail, detail(SKILL, &e)),
+                    "q skill install",
+                );
+            }
+        }
+    }
+    skill_check(status.state, &status.path.display().to_string())
+}
+
+fn skill_check(state: hook::State, path: &str) -> Check {
+    match state {
+        hook::State::Installed => check(SKILL, Status::Ok, path.to_string()),
+        hook::State::Missing => with_hint(
+            check(SKILL, Status::Fail, format!("not installed · {path}")),
+            "q skill install",
+        ),
+        hook::State::Drifted => with_hint(
+            check(SKILL, Status::Fail, format!("out of date · {path}")),
+            "q skill install",
+        ),
     }
 }
 
@@ -1097,6 +1153,7 @@ fn report(ctx: &Ctx, fix: bool) -> Report {
         check_beads(),
     ];
     checks.extend(check_hooks(chain));
+    checks.push(check_skill(fix, &mut fixed));
     checks.push(check_statusline(chain));
     // SPEC §19's order: the remotes, then the orphans.
     checks.extend(check_remotes(ctx));
