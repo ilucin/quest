@@ -356,8 +356,10 @@ pub(crate) fn normalize_productive_task_url(reference: &str) -> String {
         return reference.to_string();
     }
     let path = rest.strip_prefix("app.productive.io/").unwrap_or(rest);
-    let org = path.split('/').next().unwrap_or("");
     let mut segments = path.split(['/', '?', '&', '=']).peekable();
+    // Org is the first token of the same stream the id is read from, so a
+    // malformed `<org>?tasks/<id>` cannot leak `?tasks` into the org segment.
+    let org = segments.peek().copied().unwrap_or("");
     while let Some(seg) = segments.next() {
         if (seg == "task" || seg == "tasks")
             && let Some(id) = segments.peek()
@@ -656,6 +658,16 @@ mod tests {
             (
                 "https://app.productive.io/1-acme/projects/9",
                 "https://app.productive.io/1-acme/projects/9",
+            ),
+            // Non-numeric task id is not a task → passed through unchanged.
+            (
+                "https://app.productive.io/1-acme/tasks/abc",
+                "https://app.productive.io/1-acme/tasks/abc",
+            ),
+            // Malformed `<org>?tasks/<id>` still yields a clean org segment.
+            (
+                "https://app.productive.io/1-acme?tasks/123",
+                "https://app.productive.io/1-acme/tasks/123",
             ),
             // Non-Productive URLs and non-URLs pass through unchanged.
             ("https://example.com/x", "https://example.com/x"),

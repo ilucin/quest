@@ -4145,6 +4145,33 @@ fn link_add_detects_the_kind_and_is_idempotent() {
 }
 
 #[test]
+fn link_add_collapses_task_deep_link_and_plain_form_to_one_row() {
+    let pane = Pane::new();
+    let deep = "https://app.productive.io/1-acme/tasks?filter=1&task/123";
+    let plain = "https://app.productive.io/1-acme/tasks/123";
+    let canonical = plain;
+
+    let out = pane.json(&["link", "add", deep]);
+    assert_eq!(out["created"], true);
+    assert_eq!(out["link"]["kind"], "task");
+    assert_eq!(out["link"]["ref"], canonical);
+
+    // The plain form of the same task is the existing row, not a new one.
+    let out = pane.json(&["link", "add", plain]);
+    assert_eq!(out["created"], false);
+    assert_eq!(out["link"]["ref"], canonical);
+
+    assert_eq!(pane.env.count("SELECT count(*) FROM link"), 1);
+    assert_eq!(
+        pane.events()
+            .iter()
+            .filter(|(k, _, _)| k == "link.added")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn link_add_detects_worktrees_and_files_by_absolute_path() {
     let pane = Pane::new();
     let wt = pane.env.work("wt");

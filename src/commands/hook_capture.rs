@@ -487,6 +487,17 @@ mod tests {
                 ],
             ),
             (
+                "same task as deep link and plain url in one command → one row",
+                "Bash",
+                bash(
+                    "curl 'https://app.productive.io/1-acme/tasks?filter=1&task/123' \
+                     'https://app.productive.io/1-acme/tasks/123'",
+                    "",
+                    "",
+                ),
+                vec![cap(K::Task, "https://app.productive.io/1-acme/tasks/123")],
+            ),
+            (
                 "task url in output of an unrelated command → none",
                 "Bash",
                 bash(
