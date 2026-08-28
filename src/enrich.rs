@@ -90,7 +90,10 @@ impl Fetcher for RealFetcher {
     fn task(&self, id: &str) -> Option<String> {
         let token = env_nonempty("PRODUCTIVE_API_TOKEN")?;
         let org = env_nonempty("PRODUCTIVE_ORG_ID")?;
-        let url = format!("https://api.productive.io/api/v2/tasks/{id}");
+        // `include` side-loads the assignee's name and the workflow status
+        // name into `included`; without it the body carries only ids.
+        let url =
+            format!("https://api.productive.io/api/v2/tasks/{id}?include=assignee,workflow_status");
         let auth = format!("X-Auth-Token: {token}");
         let orgh = format!("X-Organization-Id: {org}");
         proc::run_capped(
@@ -169,12 +172,15 @@ fn enrich_with(fetcher: &dyn Fetcher, db: &Db, links: &mut [Link], refresh: bool
     let ts = now();
     for (idx, enrichment) in results {
         let link = &mut links[idx];
-        // A fetch that came back with a title keeps it; one that came back with
-        // only meta (a worktree always has a branch, but be safe) keeps the old.
+        // Only overwrite what actually came back: a fetch with a title but an
+        // empty meta map (a transient response missing status/ci) must not wipe
+        // a previously shown reading. A failed fetch never reaches here at all.
         if enrichment.title.is_some() {
             link.title = enrichment.title;
         }
-        link.meta = Some(Value::Object(enrichment.meta));
+        if !enrichment.meta.is_empty() {
+            link.meta = Some(Value::Object(enrichment.meta));
+        }
         link.enriched_at = Some(ts);
         let _ = db.update_enrichment(link.id, link.title.as_deref(), link.meta.as_ref(), ts);
     }
@@ -325,21 +331,22 @@ fn ci_rollup(v: Option<&Value>) -> Option<String> {
     )
 }
 
-/// Productive `GET /tasks/<id>` (JSON:API) → title + `meta{status, assignee}`.
-/// Defensive about the shape: a missing field is simply left out.
+/// Productive `GET /tasks/<id>?include=assignee,workflow_status` (JSON:API) →
+/// title + `meta{status, assignee}`. Status prefers the side-loaded workflow
+/// status name (e.g. `Working`) and falls back to the `is_closed`/`closed`
+/// boolean → `open`/`closed`. Defensive: a missing field is simply left out —
+/// there is no integer status attribute on a Productive task.
 pub fn map_task(raw: &str) -> Option<Enrichment> {
     let v: Value = serde_json::from_str(raw).ok()?;
     let data = v.get("data")?;
     let attrs = data.get("attributes");
+    let included = v.get("included");
     let mut meta = Map::new();
 
-    if let Some(label) = attrs
-        .and_then(|a| a.get("status"))
-        .and_then(task_status_label)
-    {
-        meta.insert("status".into(), Value::String(label));
+    if let Some(status) = task_status(data, attrs, included) {
+        meta.insert("status".into(), Value::String(status));
     }
-    if let Some(name) = task_assignee(data, v.get("included")) {
+    if let Some(name) = task_assignee(data, included) {
         meta.insert("assignee".into(), Value::String(name));
     }
 
@@ -349,22 +356,37 @@ pub fn map_task(raw: &str) -> Option<Enrichment> {
     })
 }
 
-/// Productive stores task status as an integer (`1` open, `2` closed); a string
-/// is passed through, anything else stringified.
-fn task_status_label(v: &Value) -> Option<String> {
-    if let Some(s) = v.as_str() {
-        return (!s.is_empty()).then(|| s.to_string());
+/// The task's status label: the workflow status name if it was side-loaded,
+/// else `open`/`closed` from the boolean flag (spelled `is_closed` or `closed`
+/// depending on the response). `None` when neither is present.
+fn task_status(data: &Value, attrs: Option<&Value>, included: Option<&Value>) -> Option<String> {
+    if let Some(name) = workflow_status_name(data, included) {
+        return Some(name);
     }
-    match v.as_i64()? {
-        1 => Some("open".to_string()),
-        2 => Some("closed".to_string()),
-        n => Some(n.to_string()),
-    }
+    let closed = attrs.and_then(|a| {
+        a.get("is_closed")
+            .or_else(|| a.get("closed"))
+            .and_then(Value::as_bool)
+    })?;
+    Some(if closed { "closed" } else { "open" }.to_string())
+}
+
+/// The `workflow_statuses` name resolved from `included` by the id in
+/// `relationships.workflow_status`.
+fn workflow_status_name(data: &Value, included: Option<&Value>) -> Option<String> {
+    let id = data
+        .get("relationships")?
+        .get("workflow_status")?
+        .get("data")?
+        .get("id")?
+        .as_str()?;
+    let status = included_by(included, id, "workflow_statuses")?;
+    str_field(status.get("attributes").and_then(|a| a.get("name")))
 }
 
 /// The assignee's name, resolved from the `included` people by the id in
-/// `relationships.assignee`; falls back to that id when the person was not
-/// side-loaded, and `None` when there is no assignee at all.
+/// `relationships.assignee`; falls back to that id only when the person was not
+/// side-loaded, and `None` when there is no assignee at all (a `null` data).
 fn task_assignee(data: &Value, included: Option<&Value>) -> Option<String> {
     let id = data
         .get("relationships")?
@@ -372,18 +394,19 @@ fn task_assignee(data: &Value, included: Option<&Value>) -> Option<String> {
         .get("data")?
         .get("id")?
         .as_str()?;
-    let person = included.and_then(Value::as_array).and_then(|arr| {
-        arr.iter().find(|it| {
-            it.get("id").and_then(Value::as_str) == Some(id)
-                && it
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| t == "people" || t == "person")
-        })
-    });
-    let attrs = person.and_then(|p| p.get("attributes"));
-    let name = attrs.and_then(person_name);
+    let name = included_by(included, id, "people")
+        .or_else(|| included_by(included, id, "person"))
+        .and_then(|p| p.get("attributes"))
+        .and_then(person_name);
     Some(name.unwrap_or_else(|| id.to_string()))
+}
+
+/// The `included` resource with this `id` and `type`, if side-loaded.
+fn included_by<'a>(included: Option<&'a Value>, id: &str, kind: &str) -> Option<&'a Value> {
+    included.and_then(Value::as_array)?.iter().find(|it| {
+        it.get("id").and_then(Value::as_str) == Some(id)
+            && it.get("type").and_then(Value::as_str) == Some(kind)
+    })
 }
 
 fn person_name(attrs: &Value) -> Option<String> {
@@ -574,54 +597,70 @@ mod tests {
     // ----------------------------------------------------------- task mapper
 
     #[test]
-    fn task_title_status_and_resolved_assignee() {
+    fn task_workflow_status_name_and_resolved_assignee() {
+        // A realistic JSON:API body from
+        // `GET /tasks/121073?include=assignee,workflow_status`.
         let raw = r#"{
             "data": {
-                "id": "123",
+                "id": "121073",
                 "type": "tasks",
-                "attributes": {"title": "Backfill CDC", "status": 1},
-                "relationships": {"assignee": {"data": {"type": "people", "id": "77"}}}
+                "attributes": {"title": "povezani taskovi", "is_closed": false},
+                "relationships": {
+                    "assignee": {"data": {"type": "people", "id": "77"}},
+                    "workflow_status": {"data": {"type": "workflow_statuses", "id": "48469"}}
+                }
             },
             "included": [
-                {"id":"77","type":"people","attributes":{"name":"Ada Lovelace"}}
+                {"id":"77","type":"people",
+                 "attributes":{"first_name":"Ada","last_name":"Lovelace","name":"Ada Lovelace"}},
+                {"id":"48469","type":"workflow_statuses","attributes":{"name":"Working"}}
             ]
         }"#;
         let e = map_task(raw).unwrap();
-        assert_eq!(e.title.as_deref(), Some("Backfill CDC"));
-        assert_eq!(state(&e, "status").as_deref(), Some("open"));
+        assert_eq!(e.title.as_deref(), Some("povezani taskovi"));
+        // Prefer the side-loaded workflow status name over the closed flag.
+        assert_eq!(state(&e, "status").as_deref(), Some("Working"));
         assert_eq!(state(&e, "assignee").as_deref(), Some("Ada Lovelace"));
     }
 
     #[test]
-    fn task_closed_status_and_first_last_name_assignee() {
-        let raw = r#"{
-            "data": {
-                "attributes": {"title": "Old", "status": 2},
-                "relationships": {"assignee": {"data": {"type": "people", "id": "9"}}}
-            },
-            "included": [
-                {"id":"9","type":"people","attributes":{"first_name":"Grace","last_name":"Hopper"}}
-            ]
-        }"#;
-        let e = map_task(raw).unwrap();
-        assert_eq!(state(&e, "status").as_deref(), Some("closed"));
-        assert_eq!(state(&e, "assignee").as_deref(), Some("Grace Hopper"));
+    fn task_status_falls_back_to_the_closed_flag_without_included() {
+        // No `included` (and no workflow_status side-load): the boolean flag is
+        // the signal. Both spellings are accepted.
+        let open = r#"{"data":{"attributes":{"title":"T","is_closed":false},
+            "relationships":{"workflow_status":{"data":{"type":"workflow_statuses","id":"1"}}}}}"#;
+        assert_eq!(
+            state(&map_task(open).unwrap(), "status").as_deref(),
+            Some("open")
+        );
+
+        let closed = r#"{"data":{"attributes":{"title":"T","closed":true}}}"#;
+        assert_eq!(
+            state(&map_task(closed).unwrap(), "status").as_deref(),
+            Some("closed")
+        );
+
+        // Neither a resolvable workflow status nor a boolean: no status key.
+        let neither = r#"{"data":{"attributes":{"title":"T"}}}"#;
+        let e = map_task(neither).unwrap();
+        assert!(!e.meta.contains_key("status"));
+        assert_eq!(e.title.as_deref(), Some("T"));
     }
 
     #[test]
-    fn task_unassigned_and_unsideloaded_assignee() {
-        let unassigned = r#"{"data":{"attributes":{"title":"T","status":1},
+    fn task_assignee_is_omitted_when_null_and_bare_id_only_without_included() {
+        // Unassigned → the key is dropped entirely (no "null", no id).
+        let unassigned = r#"{"data":{"attributes":{"title":"T","is_closed":false},
             "relationships":{"assignee":{"data":null}}}}"#;
         let e = map_task(unassigned).unwrap();
         assert!(!e.meta.contains_key("assignee"));
 
-        // Assignee present but not in `included`: fall back to the id.
-        let bare = r#"{"data":{"attributes":{"title":"T","status":1},
+        // Assignee present but not side-loaded: fall back to the bare id.
+        let bare = r#"{"data":{"attributes":{"title":"T","is_closed":false},
             "relationships":{"assignee":{"data":{"type":"people","id":"42"}}}}}"#;
         let e = map_task(bare).unwrap();
         assert_eq!(state(&e, "assignee").as_deref(), Some("42"));
     }
-
     #[test]
     fn task_garbage_and_missing_data_are_none() {
         assert!(map_task("nope").is_none());
@@ -801,6 +840,30 @@ mod tests {
             reloaded.meta.as_ref().unwrap()["state"].as_str(),
             Some("open")
         );
+    }
+
+    #[test]
+    fn a_title_only_fetch_keeps_prior_meta() {
+        let (db, q, id) = db_with_pr(Some(now() - ENRICH_TTL - 1));
+        db.update_enrichment(
+            id,
+            Some("Old title"),
+            Some(&serde_json::json!({"state": "open", "ci": "passing"})),
+            now() - ENRICH_TTL - 1,
+        )
+        .unwrap();
+        let mut links = db.list_links_by_quest(&q.id).unwrap();
+        // A response with a title but nothing else: map_pr yields an empty meta.
+        let stub = StubFetcher::new(Some(r#"{"title":"New title"}"#));
+        enrich_with(&stub, &db, &mut links, true);
+        let reloaded = db.get_link(id).unwrap().unwrap();
+        // Title refreshes, but the empty meta must not wipe the prior reading.
+        assert_eq!(reloaded.title.as_deref(), Some("New title"));
+        assert_eq!(
+            reloaded.meta.as_ref().unwrap()["ci"].as_str(),
+            Some("passing")
+        );
+        assert!(reloaded.enriched_at.is_some());
     }
 
     #[test]
