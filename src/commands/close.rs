@@ -116,16 +116,25 @@ pub fn apply(ctx: &Ctx, quest: &Quest, close_epic: bool) -> anyhow::Result<Close
     }
 
     let sessions = db.list_sessions_by_quest(&quest.id)?;
-    let ending: Vec<String> = live(&sessions).map(|s| s.id.clone()).collect();
+    let ending: Vec<&crate::model::Session> = live(&sessions).collect();
     let ts = now();
-    for id in &ending {
-        db.mark_session_ended(id, ts)?;
+    for session in &ending {
+        db.mark_session_ended(&session.id, ts)?;
         db.append_event(
             &quest.id,
-            Some(id),
+            Some(&session.id),
             "session.end",
             &serde_json::json!({ "reason": "quest_closed" }),
         )?;
+        // Each row goes live -> ended exactly once here, so the transition is
+        // the de-dupe (SPEC §20).
+        crate::notify::emit(
+            &ctx.config.notify,
+            crate::notify::runner().as_ref(),
+            crate::notify::Kind::Ended,
+            &format!("{} · ended", quest.slug),
+            &format!("{} ended", session.label),
+        );
     }
     // TODO(M2): `--summarize` (brain).
     let epic_closed = close_epic && close_the_epic(ctx, quest);

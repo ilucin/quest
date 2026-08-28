@@ -222,6 +222,15 @@ fn attempt(ctx: &Ctx, args: &Args, scheduled: bool) -> anyhow::Result<u8> {
         "session.reset",
         &payload,
     )?;
+    // One reset executed = one notification; the `session.reset` event above is
+    // the single edge, so no extra de-dupe is needed (SPEC §20).
+    crate::notify::emit(
+        &ctx.config.notify,
+        crate::notify::runner().as_ref(),
+        crate::notify::Kind::Reset,
+        &format!("{} · reset", found.quest.slug),
+        &format!("{} got a fresh context", session.label),
+    );
 
     if ctx.json || !ctx.quiet {
         output::emit(

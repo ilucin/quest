@@ -1694,3 +1694,44 @@ fn a_stop_hook_without_a_pending_rename_sends_nothing() {
     env.hook_no_detach("stop", &json!({})).success();
     assert_eq!(env.pane_buffer("%7"), "");
 }
+
+/// The `waiting` notification fires across the hook process boundary through a
+/// recording runner, and only on the edge INTO waiting: a second permission
+/// prompt while already waiting logs the event but notifies nothing (SPEC §20).
+#[test]
+fn a_waiting_hook_notifies_once_per_entry_into_waiting() {
+    let env = Env::new();
+    env.seed("busy");
+    let fixture = env.dir.path().join("notify.jsonl");
+
+    let waiting = json!({
+        "notification_type": "permission_prompt",
+        "message": "Claude needs your permission to use Bash",
+    });
+    let notify_hook = |payload: &Value| {
+        env.q()
+            .env("Q_QUEST", "q-0001")
+            .env("Q_SESSION", "s-0001")
+            .env("Q_NOTIFY_FIXTURE", &fixture)
+            .args(["hook", "notification"])
+            .write_stdin(payload.to_string())
+            .assert()
+            .success();
+    };
+
+    // First prompt: busy -> waiting, one recorded notification.
+    notify_hook(&waiting);
+    // Second prompt: already waiting, so the event is logged but nothing fires.
+    notify_hook(&waiting);
+
+    let lines: Vec<String> = fs::read_to_string(&fixture)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines.len(), 1, "de-dupe: one notification, got {lines:?}");
+    let call: Value = serde_json::from_str(&lines[0]).unwrap();
+    assert_eq!(call["channel"], "macos");
+    assert_eq!(call["title"], "alpha · waiting");
+    assert_eq!(call["body"], "w1 needs permission");
+}

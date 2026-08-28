@@ -175,6 +175,13 @@ pub enum Command {
         all: bool,
     },
 
+    /// Headless liveness loop: sweep sessions and notify on ends, no TUI
+    Watch {
+        /// Seconds between ticks (default: `[ui] tick_local`)
+        #[arg(long, value_name = "N")]
+        interval: Option<u64>,
+    },
+
     /// Print what a session's pane currently shows
     Peek {
         /// `<quest>/<label>`, a session id, or `<label>` inside a Quest
