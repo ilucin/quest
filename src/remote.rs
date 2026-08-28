@@ -1049,6 +1049,118 @@ pub fn retain_listed(results: &mut [RemoteResult], all: bool, state: Option<Stat
     }
 }
 
+// -------------------------------------------------- fleet sessions (SPEC §17)
+
+/// SPEC §17's Sessions tab is a fleet across machines, not just this one. The
+/// far end sends its whole session listing; `--all` because the tab's own `a`
+/// toggle filters rows it already has, exactly as [`list_argv`] fetches every
+/// Quest and lets `f` filter locally.
+pub const SESSIONS_ARGV: [&str; 5] = ["q", "sessions", "--all", "--json", "--no-remote"];
+
+/// The remote half of the fleet: every reachable machine's sessions, each row
+/// stamped with the machine it came from, plus a note per machine that could
+/// not be read. Never an error — a machine that is down contributes a note, not
+/// a failure that would blank the whole tab.
+#[derive(Debug, Default)]
+pub struct FleetSessions {
+    pub rows: Vec<crate::commands::sessions::SessionView>,
+    /// One line per unreachable/incompatible machine, in [`RemoteResult::note`]'s
+    /// wording.
+    pub notes: Vec<String>,
+}
+
+/// One machine's answer to the sessions fan-out.
+enum SessionsAnswer {
+    /// The machine's rows (its own `machine` name is re-stamped over them).
+    Rows(String, Vec<crate::commands::sessions::SessionView>),
+    /// It could not be read, and why.
+    Down(String, RemoteStatus),
+}
+
+impl From<PanickedRemote<'_>> for SessionsAnswer {
+    fn from(p: PanickedRemote<'_>) -> Self {
+        SessionsAnswer::Down(
+            p.0.name.clone(),
+            RemoteStatus::unreachable("the ssh call panicked"),
+        )
+    }
+}
+
+/// Fan out `q sessions` to every target and read the answers back (SPEC §17).
+///
+/// Blocking, and meant to be: the TUI runs it on a background thread so a remote
+/// that is down costs a round, never a frame — the UI thread never calls this.
+/// Bounded by [`TIMEOUT`] per machine, in parallel.
+pub fn fetch_sessions(ssh: &dyn Ssh, targets: &[Remote]) -> FleetSessions {
+    if targets.is_empty() {
+        return FleetSessions::default();
+    }
+    let borrowed: Vec<&Remote> = targets.iter().collect();
+    let argv: Vec<String> = SESSIONS_ARGV.iter().map(|a| (*a).to_string()).collect();
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let answers = scatter(&borrowed, |remote| read_sessions(ssh, remote, &argv));
+    let mut fleet = FleetSessions::default();
+    for answer in answers {
+        match answer {
+            SessionsAnswer::Rows(name, mut rows) => {
+                // The far end already names itself, but this end knows the row
+                // as `<remote>.name` — the value `--machine` and the fleet's
+                // remote-vs-local test use — so it is stamped to match, exactly
+                // as [`attribute`] does for a Quest listing.
+                for row in &mut rows {
+                    row.machine = name.clone();
+                }
+                fleet.rows.extend(rows);
+            }
+            SessionsAnswer::Down(name, status) => {
+                if let Some(note) = down_note(&name, &status) {
+                    fleet.notes.push(note);
+                }
+            }
+        }
+    }
+    fleet
+}
+
+/// Read one machine's `q sessions --json`, or say why it could not be. The
+/// exit-code reading is [`nonzero`]'s, shared with the Quest fan-out.
+fn read_sessions(ssh: &dyn Ssh, remote: &Remote, argv: &[&str]) -> SessionsAnswer {
+    let down = |status| SessionsAnswer::Down(remote.name.clone(), status);
+    match ssh.run(&remote.ssh, argv, TIMEOUT) {
+        SshOutcome::Done {
+            code: Some(0),
+            stdout,
+            ..
+        } => match serde_json::from_str(stdout.trim()) {
+            Ok(rows) => SessionsAnswer::Rows(remote.name.clone(), rows),
+            Err(e) => down(RemoteStatus::incompatible(format!(
+                "cannot read `q sessions --json`: {e}"
+            ))),
+        },
+        SshOutcome::Done { code, stderr, .. } => down(nonzero(code, &stderr)),
+        SshOutcome::TimedOut => down(RemoteStatus::unreachable(format!(
+            "no answer within {}s",
+            TIMEOUT.as_secs()
+        ))),
+        SshOutcome::TooLarge => down(RemoteStatus::incompatible(format!(
+            "`q sessions --json` was larger than {} MiB",
+            MAX_OUTPUT >> 20
+        ))),
+        SshOutcome::Failed(e) => down(RemoteStatus::unreachable(e)),
+    }
+}
+
+/// `ws ⚠ unreachable (host is down)` — [`RemoteResult::note`]'s line, for a
+/// machine whose sessions could not be fetched.
+fn down_note(name: &str, status: &RemoteStatus) -> Option<String> {
+    let marker = status.marker()?;
+    let mut line = format!("{name} {marker}");
+    if let Some(reason) = status.reason().filter(|r| !r.is_empty()) {
+        line.push_str(&format!(" ({reason})"));
+    }
+    Some(line)
+}
+
 // ----------------------------------------------------------------- polling
 
 /// One completed fan-out round on its way from the poller thread to the UI
@@ -1747,6 +1859,58 @@ mod tests {
             stdout,
             stderr: String::new(),
         }
+    }
+
+    /// One session as a remote's `q sessions --json` would send it, from a
+    /// machine that calls itself `machine`.
+    fn sessions_payload(machine: &str, slug: &str, label: &str) -> String {
+        use crate::model::{Session, SessionRole};
+        let session = Session::new(
+            "q-x",
+            SessionRole::Worker,
+            label,
+            &format!("q-{slug}"),
+            "%1",
+        );
+        let view = crate::commands::sessions::SessionView {
+            session,
+            quest_slug: slug.to_string(),
+            machine: machine.to_string(),
+            registry: None,
+        };
+        serde_json::to_string(&[view]).unwrap()
+    }
+
+    /// SPEC §17: the fleet fan-out stamps each row with the name this end knows
+    /// the machine by (not the name it called itself), and a machine that is
+    /// down contributes a note rather than a row or a failure.
+    #[test]
+    fn the_fleet_fan_out_stamps_rows_and_notes_a_down_machine() {
+        let ssh = StubSsh::new(&[
+            (
+                "ws-host",
+                ok(sessions_payload("its-own-name", "alpha", "tests")),
+            ),
+            ("box-host", SshOutcome::Failed("host is down".to_string())),
+        ]);
+        let fleet = fetch_sessions(&ssh, &[remote("ws"), remote("box")]);
+
+        assert_eq!(fleet.rows.len(), 1);
+        assert_eq!(fleet.rows[0].machine, "ws", "row not stamped with our name");
+        assert_eq!(fleet.rows[0].session.label, "tests");
+        assert_eq!(fleet.notes.len(), 1, "{:?}", fleet.notes);
+        assert!(fleet.notes[0].starts_with("box "), "{:?}", fleet.notes);
+    }
+
+    /// A far end whose `q sessions --json` this `q` cannot read is incompatible,
+    /// not a row of garbage — the same line `q list` draws for it.
+    #[test]
+    fn the_fleet_fan_out_reports_an_unreadable_answer() {
+        let ssh = StubSsh::new(&[("ws-host", ok("not json".to_string()))]);
+        let fleet = fetch_sessions(&ssh, &[remote("ws")]);
+        assert!(fleet.rows.is_empty());
+        assert_eq!(fleet.notes.len(), 1);
+        assert!(fleet.notes[0].contains("incompatible"), "{:?}", fleet.notes);
     }
 
     #[test]

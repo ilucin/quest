@@ -398,7 +398,7 @@ impl App {
             machines: machines(config, machine),
             tmux_prefix: config.tmux.session_prefix.clone(),
             quests: quests::State::default(),
-            sessions: sessions::State::new(config),
+            sessions: sessions::State::new(config, machine),
             templates: templates::State::default(),
             events: events::State::default(),
         }

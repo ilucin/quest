@@ -60,8 +60,20 @@ const F_FORCE: &str = "force";
 
 /// Per-tab state, owned by `App`.
 pub struct State {
-    /// The fleet as last loaded: already swept, annotated and ranked.
+    /// The fleet as last loaded: local rows merged with [`State::remote_rows`],
+    /// already swept, annotated and ranked.
     rows: Vec<SessionView>,
+    /// The remote half of the fleet (SPEC §17), last fetched — kept apart from
+    /// the local rows because the two arrive on different clocks: the local rows
+    /// reload every local tick, the remote ones only while this tab is active
+    /// (see [`crate::tui`]'s `SessionFetch`). A local reload re-merges this
+    /// snapshot rather than waiting on ssh.
+    remote_rows: Vec<SessionView>,
+    /// One line per machine whose sessions could not be fetched, for the chrome.
+    remote_notes: Vec<String>,
+    /// This machine's name, so a row from elsewhere can be told apart by its
+    /// `machine` column — the keys refuse on those, and the render marks them.
+    local_machine: String,
     /// Index into the *visible* rows.
     selected: usize,
     /// The selected session's id, so a reload that reorders keeps the
@@ -90,9 +102,16 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(config: &Config) -> State {
+    pub fn new(config: &Config, machine: &str) -> State {
         State {
             rows: Vec::new(),
+            remote_rows: Vec::new(),
+            remote_notes: Vec::new(),
+            // The same identity every tab uses for "this machine" (`App::machine`
+            // — `--machine` or `[machine] name`), not `config.machine.name`
+            // directly, so the fleet's local-vs-remote test matches the row
+            // `machine` the loader stamps.
+            local_machine: machine.to_string(),
             selected: 0,
             selected_id: None,
             offset: 0,
@@ -150,6 +169,23 @@ impl State {
     fn selected_row(&self) -> Option<&SessionView> {
         let visible = self.visible();
         visible.get(self.selected).map(|i| &self.rows[*i])
+    }
+
+    /// The machine a row lives on when that is not this one (SPEC §15) — what
+    /// tells a remote fleet row apart. `None` for a local row.
+    fn remote_of<'a>(&self, view: &'a SessionView) -> Option<&'a str> {
+        (view.machine != self.local_machine).then_some(view.machine.as_str())
+    }
+
+    /// Fold a finished remote fan-out into the fleet (SPEC §17). Replaces the
+    /// remote half wholesale — a machine that dropped out of the answer drops
+    /// out of the fleet — and hands back the chrome note, if any. The re-merge
+    /// with the local rows happens on the reload the caller schedules.
+    pub fn absorb_remote(&mut self, fleet: crate::remote::FleetSessions) -> Option<String> {
+        self.remote_rows = fleet.rows;
+        self.remote_notes = fleet.notes;
+        self.loaded = true;
+        (!self.remote_notes.is_empty()).then(|| self.remote_notes.join(" \u{b7} "))
     }
 
     /// Keep the selection on the session it was on; fall back to clamping the
@@ -216,7 +252,9 @@ impl State {
 
 impl Default for State {
     fn default() -> State {
-        State::new(&Config::default())
+        let config = Config::default();
+        let machine = config.machine.name.clone();
+        State::new(&config, &machine)
     }
 }
 
@@ -244,6 +282,18 @@ pub fn refresh(ctx: &Ctx, app: &mut App) -> anyhow::Result<()> {
             all: app.sessions.show_ended,
         },
     )?;
+    // SPEC §17: the fleet spans both machines. The remote half arrives on its
+    // own clock (see `SessionFetch`); a local reload re-merges the last snapshot
+    // rather than waiting on ssh, so a machine that is down never slows a tick.
+    // `a` is applied here too — the remote rows carry ended sessions the far end
+    // always sends, exactly as the local loader's `all` flag decides.
+    rows.extend(
+        app.sessions
+            .remote_rows
+            .iter()
+            .filter(|v| app.sessions.show_ended || v.session.status != SessionStatus::Ended)
+            .cloned(),
+    );
     sort_fleet(&mut rows);
 
     // Re-derived every reload rather than remembered: a `q rename` in another
@@ -324,6 +374,14 @@ fn viewport(app: &App) -> usize {
 /// and half a vim keymap — `j` moving while `k` ends an agent — is worse than
 /// none.
 pub fn handle(app: &mut App, input: Input) -> Action {
+    // SPEC §15: the five keys that act on an agent read or write its own
+    // machine's tmux, registry and database, so on a remote fleet row they are
+    // refused with the CLI command that does the work there (bd-8lz.5.10). The
+    // fleet is multi-machine to *look* at; acting on a far agent is the CLI's
+    // (`q peek`/`send`/`kill`/`reset` are proxied), or a follow-up here.
+    if let Some(refusal) = refuse_remote_act(app, input) {
+        return refusal;
+    }
     let page = viewport(app);
     match input {
         Input::Up => {
@@ -381,6 +439,41 @@ pub fn handle(app: &mut App, input: Input) -> Action {
         }
         _ => Action::None,
     }
+}
+
+/// The `q` command a refused Sessions key stands for, so the hint hands over
+/// something to run rather than a dead end. Enter/`o` attach; the other four map
+/// to the CLI verb the far end proxies (bd-8lz.5.8).
+fn cli_equivalent(input: Input) -> Option<&'static str> {
+    Some(match input {
+        Input::Enter | Input::Char('o') => "q enter",
+        Input::Char('p') => "q peek",
+        Input::Char('t') => "q send",
+        Input::Char('k') => "q kill",
+        Input::Char('Z') => "q reset",
+        _ => return None,
+    })
+}
+
+/// `Some` when `input` is one of the five acting keys and the selection lives on
+/// another machine: the key is refused with a hint (bd-8lz.5.10). `None` lets
+/// every other key — and every key on a local row — through unchanged.
+fn refuse_remote_act(app: &mut App, input: Input) -> Option<Action> {
+    let cli = cli_equivalent(input)?;
+    let view = app.sessions.selected_row()?;
+    let machine = app.sessions.remote_of(view)?.to_string();
+    let name = name_of(view);
+    // `q enter` takes the quest; the other four take the `<quest>/<label>`
+    // session spelling, the only one that names a session on another machine.
+    let target = if cli == "q enter" {
+        view.quest_slug.clone()
+    } else {
+        name.clone()
+    };
+    app.say(format!(
+        "{name} runs on {machine}; run `{cli} {target}` in a shell"
+    ));
+    Some(Action::None)
 }
 
 /// The two keys the loop performs: nothing happens with an empty listing, and
@@ -723,7 +816,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let across = state.quest.is_none();
     let cells: Vec<Cells> = visible
         .iter()
-        .map(|i| cells_of(&state.rows[*i], state.warn_pct))
+        .map(|i| {
+            let view = &state.rows[*i];
+            cells_of(view, state.warn_pct, state.remote_of(view))
+        })
         .collect();
     let widths = widths_of(&cells, across);
 
@@ -803,9 +899,12 @@ struct Cells {
     phase: String,
     ctx: String,
     age: String,
+    /// The machine, when the row is a remote one (SPEC §15): appended after the
+    /// age and the row dimmed, so a fleet row is visibly not this machine's.
+    remote: Option<String>,
 }
 
-fn cells_of(view: &SessionView, warn_pct: u8) -> Cells {
+fn cells_of(view: &SessionView, warn_pct: u8, remote: Option<&str>) -> Cells {
     let s = &view.session;
     Cells {
         quest: fmt::truncate(&view.quest_slug, QUEST_COLS),
@@ -818,6 +917,7 @@ fn cells_of(view: &SessionView, warn_pct: u8) -> Cells {
         ),
         ctx: ctx_cell(view, warn_pct),
         age: fmt::age(s.updated_at),
+        remote: remote.map(str::to_string),
     }
 }
 
@@ -872,8 +972,15 @@ fn row_line<'a>(c: &Cells, w: &[usize; 6], across: bool, selected: bool, width: 
         out.push(' ');
     }
     out.push_str(&c.age);
+    if let Some(machine) = &c.remote {
+        out.push_str(&format!(" \u{b7} on {machine}"));
+    }
     let style = if selected {
         Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else if c.remote.is_some() {
+        // A fleet row is dimmed: it is here to be seen, but the keys that act on
+        // an agent are its own machine's (bd-8lz.5.10).
+        Style::default().add_modifier(Modifier::DIM)
     } else {
         Style::default()
     };
@@ -2176,5 +2283,108 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    // ------------------------------------------------ the fleet across machines
+
+    /// A session as a remote's `q sessions --json` deserializes into it: a
+    /// foreign machine and a quest this database has never heard of.
+    fn remote_view(machine: &str, slug: &str, label: &str, status: SessionStatus) -> SessionView {
+        let mut session = Session::new(
+            "q-far",
+            SessionRole::Worker,
+            label,
+            &format!("q-{slug}"),
+            "%9",
+        );
+        session.status = status;
+        session.updated_at = 5_000;
+        SessionView {
+            session,
+            quest_slug: slug.to_string(),
+            machine: machine.to_string(),
+            registry: None,
+        }
+    }
+
+    /// SPEC §17: the fleet spans machines (bd-8lz.5.10). A remote row shows,
+    /// attributed to its machine, and the five acting keys refuse it with the
+    /// CLI command that does the work there.
+    #[test]
+    fn a_remote_fleet_row_shows_but_its_acting_keys_are_refused() {
+        let (rig, mut app) = fleet();
+        app.sessions.absorb_remote(crate::remote::FleetSessions {
+            rows: vec![remote_view(
+                "ws",
+                "over-there",
+                "build",
+                SessionStatus::Waiting,
+            )],
+            notes: Vec::new(),
+        });
+        refresh(&rig.ctx, &mut app).unwrap();
+
+        // On screen, attributed to the machine it lives on.
+        let screen = screen(&mut app, 120, 30);
+        assert!(screen.contains("over-there"), "{screen}");
+        assert!(screen.contains("on ws"), "{screen}");
+
+        // The remote waiting row leads the fleet (updated_at 5_000); select it.
+        app.sessions.selected_id = None;
+        app.sessions.selected = 0;
+        app.sessions.resync();
+        assert_eq!(sessions_label(&app), "build");
+
+        for (key, cli) in [
+            (Input::Enter, "q enter"),
+            (Input::Char('o'), "q enter"),
+            (Input::Char('p'), "q peek"),
+            (Input::Char('t'), "q send"),
+            (Input::Char('k'), "q kill"),
+            (Input::Char('Z'), "q reset"),
+        ] {
+            app.status.clear();
+            let action = handle(&mut app, key);
+            assert_eq!(action, Action::None, "{key:?} acted on a remote row");
+            assert!(app.modal.is_none(), "{key:?} opened a form");
+            assert!(
+                app.status.contains("runs on ws") && app.status.contains(cli),
+                "{key:?} did not name what does work: {}",
+                app.status
+            );
+        }
+        // A view-only key still works on a remote row.
+        assert_eq!(handle(&mut app, Input::Char('a')), Action::Refresh);
+    }
+
+    /// A finished round replaces the remote half wholesale — a machine that
+    /// drops out of the answer drops out of the fleet — and its notes come back
+    /// for the chrome line.
+    #[test]
+    fn absorbing_a_round_replaces_the_remote_half_and_returns_its_notes() {
+        let (rig, mut app) = fleet();
+        let before = app.sessions.rows.len();
+
+        let note = app.sessions.absorb_remote(crate::remote::FleetSessions {
+            rows: vec![remote_view(
+                "ws",
+                "over-there",
+                "build",
+                SessionStatus::Idle,
+            )],
+            notes: vec!["ws \u{26a0} unreachable (down)".to_string()],
+        });
+        assert_eq!(note.as_deref(), Some("ws \u{26a0} unreachable (down)"));
+        refresh(&rig.ctx, &mut app).unwrap();
+        assert_eq!(app.sessions.rows.len(), before + 1);
+
+        // A later empty round takes the remote rows away and carries no note.
+        assert!(
+            app.sessions
+                .absorb_remote(crate::remote::FleetSessions::default())
+                .is_none()
+        );
+        refresh(&rig.ctx, &mut app).unwrap();
+        assert_eq!(app.sessions.rows.len(), before);
     }
 }
