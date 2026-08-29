@@ -248,7 +248,7 @@ pub struct Modal {
 
 /// One row of the `?` overlay: the keys every tab answers to.
 pub const HELP: &[(&str, &str)] = &[
-    ("Tab / S-Tab", "next / previous tab"),
+    ("Tab / S-Tab", "next / previous tab (or ← →)"),
     (
         "1 2 3 4",
         "jump to a tab (phone keyboards: no Enter needed)",
@@ -536,8 +536,13 @@ impl App {
                 self.help = true;
                 Some(Action::None)
             }
-            Input::Tab => Some(self.switch(self.tab.next())),
-            Input::BackTab => Some(self.switch(self.tab.prev())),
+            // Tab/BackTab and the arrows both walk the tab bar: the rows are
+            // driven by `j`/`k` (and PageUp/Down, Home/End), so `←`/`→` are
+            // free here and read as "move along the bar" the way it looks.
+            // Reached only outside a form and a capture (see `handle`), so the
+            // N-1 paste-as-arrow path never lands here.
+            Input::Tab | Input::Right => Some(self.switch(self.tab.next())),
+            Input::BackTab | Input::Left => Some(self.switch(self.tab.prev())),
             Input::Char('x') => {
                 self.refreshes += 1;
                 Some(Action::Refresh)
@@ -768,6 +773,22 @@ mod tests {
         for want in [Tab::Events, Tab::Templates, Tab::Sessions, Tab::Quests] {
             a.handle(Input::BackTab);
             assert_eq!(a.tab, want);
+        }
+    }
+
+    /// The arrows walk the bar exactly as Tab/BackTab do — they are free at the
+    /// shell level, since the rows move on `j`/`k` (and PageUp/Down).
+    #[test]
+    fn the_arrows_cycle_the_tabs_like_tab_and_backtab() {
+        let mut a = app();
+        assert_eq!(a.tab, Tab::Quests);
+        for want in [Tab::Sessions, Tab::Templates, Tab::Events, Tab::Quests] {
+            a.handle(Input::Right);
+            assert_eq!(a.tab, want, "→ {want:?}");
+        }
+        for want in [Tab::Events, Tab::Templates, Tab::Sessions, Tab::Quests] {
+            a.handle(Input::Left);
+            assert_eq!(a.tab, want, "← {want:?}");
         }
     }
 
