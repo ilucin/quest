@@ -30,7 +30,7 @@ use super::layout;
 /// The tab's own half of the `?` overlay.
 pub const HELP: &[(&str, &str)] = &[
     ("↑ ↓ / k j", "move (leaving the last row pauses the tail)"),
-    ("Enter", "the whole event, payload and all"),
+    ("Enter / d", "toggle the whole event, payload and all"),
     ("/", "filter by kind — `note`, `session.*`, several at once"),
     (
         "Esc",
@@ -425,7 +425,9 @@ pub fn handle(app: &mut App, input: Input) -> Action {
             app.events.move_to(usize::MAX, page);
             Action::None
         }
-        Input::Enter => toggle_detail(app),
+        // `d` matches the Quests tab; `Enter` stays a toggle here too, since
+        // an event row has no master to enter.
+        Input::Enter | Input::Char('d') => toggle_detail(app),
         Input::Char('/') => {
             app.events.filtering = true;
             typing(app);
@@ -910,6 +912,9 @@ mod tests {
         fn app(&self) -> App {
             let mut app = App::new(&self.ctx.config, "laptop");
             app.set_size(120, 30);
+            // Open by default in production; the band-layout tests want the
+            // full width and the panel tests below opt back in.
+            app.detail = false;
             app.select(Tab::Events);
             self.reload(&mut app);
             app
@@ -2037,6 +2042,9 @@ mod tests {
 
         let mut app = App::new(&rig.ctx.config, "laptop");
         app.set_size(120, 30);
+        // This test is about the quest-filter hand-off, not the panel Esc peels
+        // first; close the default-open panel so Esc reaches the filter.
+        app.detail = false;
         rig.reload(&mut app);
         assert_eq!(app.tab, Tab::Quests);
 
@@ -2134,7 +2142,7 @@ mod tests {
     #[test]
     fn the_help_overlay_lists_the_keys_the_tab_answers_to() {
         let rows = crate::tui::app::help_rows(Tab::Events);
-        for key in ["/", "g / G", "Enter"] {
+        for key in ["/", "g / G", "Enter / d"] {
             assert!(
                 rows.iter().any(|(k, _)| *k == key),
                 "{key} is not in {rows:?}"

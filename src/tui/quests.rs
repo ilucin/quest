@@ -31,8 +31,8 @@ use super::layout::{self, RowMode};
 
 /// The tab's own half of the `?` overlay.
 pub const HELP: &[(&str, &str)] = &[
-    ("o", "enter the master (attach to its tmux session)"),
-    ("Enter", "toggle the detail panel"),
+    ("Enter / o", "enter the master (attach to its tmux session)"),
+    ("d", "toggle the detail panel (open by default)"),
     ("s", "this Quest's sessions"),
     ("e", "this Quest's events, in the tail"),
     ("n", "new Quest at once, every default (N: the form)"),
@@ -516,21 +516,14 @@ pub fn handle(app: &mut App, input: Input) -> Action {
             app.quests.move_to(usize::MAX, page);
             Action::None
         }
-        // SPEC §17 contradicts itself: `Enter` toggles the detail panel two
-        // lines above, and `⏎/o` is "enter master (attach)" below. Reading it
-        // the other way — both keys attach — would leave the detail panel, an
-        // explicitly specified feature, with no binding at all, so this is the
-        // only self-consistent split. `o` attaches; `Enter`, the key that gets
-        // pressed by accident, only opens the panel rather than taking over
-        // the terminal. (Nothing to do with phone keyboards: §17 gives `Ctrl-J`
-        // as the Enter alias precisely for clients where Enter never arrives,
-        // so either reading is reachable there.)
-        Input::Char('o') => attach_selection(app),
-        Input::Enter => toggle_detail(app),
+        // The detail panel is open by default (`d` toggles it), so `Enter` is
+        // free to do what `⏎/o` in SPEC §17 asks: enter the master. `o` is its
+        // alias, and `Ctrl-J` the one §17 names for clients where Enter never
+        // arrives.
+        Input::Char('o') | Input::Enter => attach_selection(app),
+        Input::Char('d') => toggle_detail(app),
         Input::Esc => {
-            if app.detail {
-                app.detail = false;
-            } else if !app.quests.query.is_empty() {
+            if !app.quests.query.is_empty() {
                 app.quests.query.clear();
                 app.quests.resync();
                 app.say("search cleared");
@@ -1880,6 +1873,9 @@ mod tests {
     fn app_with(rows: Vec<QuestRow>) -> App {
         let mut app = App::new(&Config::default(), "laptop");
         app.set_size(120, 30);
+        // The panel is open by default in production; the list-layout tests
+        // want the full width and the panel tests below opt back in.
+        app.detail = false;
         let links = vec![Vec::new(); rows.len()];
         app.quests.rows = rows;
         app.quests.links = links;
@@ -2122,9 +2118,9 @@ mod tests {
     #[test]
     fn the_detail_panel_shows_the_selected_quest() {
         let mut app = grouped();
-        assert!(!app.detail);
-        assert_eq!(handle(&mut app, Input::Enter), Action::None);
-        assert!(app.detail);
+        // The panel is open by default (`app_with` closes it for the layout
+        // tests; here we exercise the panel, so open it as production does).
+        app.detail = true;
         let text = screen(&mut app, 120, 30);
         for want in [
             "needs-me",
@@ -2138,11 +2134,26 @@ mod tests {
         }
         // Still shows the list beside it at this width.
         assert!(text.contains("running"), "{text}");
-        // Enter closes it again; `o` is the attach and leaves it alone.
+        // `d` toggles it shut; `Enter` and `o` both attach and leave it alone.
+        assert_eq!(handle(&mut app, Input::Enter), Action::Attach);
+        assert!(app.detail);
         assert_eq!(handle(&mut app, Input::Char('o')), Action::Attach);
         assert!(app.detail);
-        handle(&mut app, Input::Enter);
+        handle(&mut app, Input::Char('d'));
         assert!(!app.detail);
+        handle(&mut app, Input::Char('d'));
+        assert!(app.detail);
+    }
+
+    /// The default is a panel already up (production `App::new`), and `Enter`
+    /// enters the master rather than toggling it.
+    #[test]
+    fn the_detail_panel_is_open_by_default_and_enter_attaches() {
+        let app = App::new(&Config::default(), "laptop");
+        assert!(app.detail, "the panel should be open by default");
+        let mut app = grouped();
+        app.detail = true;
+        assert_eq!(handle(&mut app, Input::Enter), Action::Attach);
     }
 
     #[test]
@@ -2882,9 +2893,8 @@ mod tests {
         assert!(text.contains("[/run]"), "{text}");
         crate::tui::report_refresh(&mut app, Ok(()));
 
-        // The machine filter is announced the same way. Two Escs: `l` opened
-        // the detail panel, and Esc closes that before it clears the search.
-        app.handle(Input::Esc);
+        // The machine filter is announced the same way. Esc clears the search
+        // (the panel is toggled with `d` now, not peeled by Esc).
         app.handle(Input::Esc);
         handle(&mut app, Input::Char('m'));
         handle(&mut app, Input::Char('l'));

@@ -364,8 +364,8 @@ pub struct App {
     /// The Quest a tab handed to another tab — `s` on the Quests tab means
     /// "the Sessions tab, filtered to this one" (SPEC §17).
     pub focus_quest: Option<String>,
-    /// Whether the right-hand detail panel is up. Shell-level rather than
-    /// per-tab: it is one panel, and `Enter` means the same thing everywhere.
+    /// Whether the right-hand detail panel is up — open by default, toggled
+    /// with `d`. Shell-level rather than per-tab: it is one panel.
     pub detail: bool,
     /// The open form, if any. Shell-level like `help`: it is drawn over the
     /// whole frame whatever tab is behind it, which is what makes
@@ -404,7 +404,7 @@ impl App {
             remote_note: None,
             remote_tmux: std::collections::BTreeMap::new(),
             focus_quest: None,
-            detail: false,
+            detail: true,
             modal: None,
             machines: machines(config, machine),
             tmux_prefix: config.tmux.session_prefix.clone(),
