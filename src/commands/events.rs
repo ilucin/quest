@@ -242,7 +242,8 @@ fn write_lines(out: &mut impl Write, ctx: &Ctx, rows: &[EventRow]) -> anyhow::Re
         } else if ctx.quiet {
             continue;
         } else {
-            human_line(row)
+            // Bypasses output::emit, so it sanitizes here (bd-8lz.8).
+            output::sanitize(human_line(row))
         };
         match writeln!(out, "{line}").and_then(|()| out.flush()) {
             Ok(()) => {}
