@@ -84,27 +84,26 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
 
 /// The Sessions tab's fleet fan-out (SPEC §17, bd-8lz.5.10).
 ///
-/// On-demand rather than a second always-on [`remote::Poller`]: it is kicked
-/// only while the Sessions tab is the active one, so the Quests tab pays no ssh
-/// for a fleet nobody is looking at. Each kick runs [`remote::fetch_sessions`]
-/// on its own thread — the UI thread never blocks on ssh — and drops the answer
-/// in a slot the loop drains between frames. One fetch in flight at a time.
+/// On-demand rather than a second always-on [`remote::Poller`]: kicked only
+/// while the Sessions tab is active, so the Quests tab pays no ssh for a fleet
+/// nobody is looking at. Each kick runs [`remote::fetch_sessions`] on its own
+/// thread — the UI never blocks on ssh — and drops the answer in a slot the
+/// loop drains between frames. One fetch in flight at a time.
 struct SessionFetch {
     ssh: std::sync::Arc<dyn remote::Ssh>,
     targets: Vec<crate::config::Remote>,
-    /// The throttle: no new kick until this has passed since the last, so a busy
-    /// tab does not fan out every frame. `x` overrides it.
+    /// The throttle: no new kick within this of the last. `x` overrides it.
     every: Duration,
     slot: std::sync::Arc<std::sync::Mutex<Option<remote::FleetSessions>>>,
     /// Set while a fetch is on its thread, so only one runs at a time.
     busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// When the last kick went out. `Cell` because only the UI thread touches it.
+    /// When the last kick went out. `Cell`: only the UI thread touches it.
     last: std::cell::Cell<Option<Instant>>,
 }
 
 impl SessionFetch {
     /// `None` when there is nothing to fan out to — no remotes, `--no-remote`,
-    /// or a `--machine` that is not one of them — exactly as [`remote::Poller`].
+    /// or a `--machine` that is not one — like [`remote::Poller`].
     fn new(ctx: &Ctx, every: Duration) -> Option<SessionFetch> {
         let targets: Vec<crate::config::Remote> =
             remote::targets(ctx).into_iter().cloned().collect();
@@ -1103,9 +1102,8 @@ fn event_loop(
             refresh_due = true;
         }
 
-        // SPEC §17's fleet, on-demand: kick a fan-out while the Sessions tab is
-        // up (throttled), and fold in whatever the last one brought back. Both
-        // are no-ops off the tab and with no remotes.
+        // SPEC §17's fleet: kick a fan-out while the Sessions tab is up
+        // (throttled), and fold in whatever the last one brought back.
         if let Some(sessions) = sessions {
             if app.tab == Tab::Sessions {
                 sessions.kick(false);

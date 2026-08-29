@@ -1051,29 +1051,23 @@ pub fn retain_listed(results: &mut [RemoteResult], all: bool, state: Option<Stat
 
 // -------------------------------------------------- fleet sessions (SPEC §17)
 
-/// SPEC §17's Sessions tab is a fleet across machines, not just this one. The
-/// far end sends its whole session listing; `--all` because the tab's own `a`
-/// toggle filters rows it already has, exactly as [`list_argv`] fetches every
-/// Quest and lets `f` filter locally.
+/// The fleet fan-out (SPEC §17); `--all` because the tab's `a` toggle filters
+/// rows it already has, as [`list_argv`] does for `f`.
 pub const SESSIONS_ARGV: [&str; 5] = ["q", "sessions", "--all", "--json", "--no-remote"];
 
 /// The remote half of the fleet: every reachable machine's sessions, each row
 /// stamped with the machine it came from, plus a note per machine that could
-/// not be read. Never an error — a machine that is down contributes a note, not
-/// a failure that would blank the whole tab.
+/// not be read. Never an error — a down machine is a note, not a failure.
 #[derive(Debug, Default)]
 pub struct FleetSessions {
     pub rows: Vec<crate::commands::sessions::SessionView>,
-    /// One line per unreachable/incompatible machine, in [`RemoteResult::note`]'s
-    /// wording.
+    /// One line per unreachable/incompatible machine ([`RemoteResult::note`]'s).
     pub notes: Vec<String>,
 }
 
 /// One machine's answer to the sessions fan-out.
 enum SessionsAnswer {
-    /// The machine's rows (its own `machine` name is re-stamped over them).
     Rows(String, Vec<crate::commands::sessions::SessionView>),
-    /// It could not be read, and why.
     Down(String, RemoteStatus),
 }
 
@@ -1087,10 +1081,8 @@ impl From<PanickedRemote<'_>> for SessionsAnswer {
 }
 
 /// Fan out `q sessions` to every target and read the answers back (SPEC §17).
-///
-/// Blocking, and meant to be: the TUI runs it on a background thread so a remote
-/// that is down costs a round, never a frame — the UI thread never calls this.
-/// Bounded by [`TIMEOUT`] per machine, in parallel.
+/// Blocking, on purpose: the TUI runs it on a background thread so a down remote
+/// costs a round, never a frame. Bounded by [`TIMEOUT`] per machine, in parallel.
 pub fn fetch_sessions(ssh: &dyn Ssh, targets: &[Remote]) -> FleetSessions {
     if targets.is_empty() {
         return FleetSessions::default();
@@ -1103,10 +1095,9 @@ pub fn fetch_sessions(ssh: &dyn Ssh, targets: &[Remote]) -> FleetSessions {
     for answer in answers {
         match answer {
             SessionsAnswer::Rows(name, mut rows) => {
-                // The far end already names itself, but this end knows the row
-                // as `<remote>.name` — the value `--machine` and the fleet's
-                // remote-vs-local test use — so it is stamped to match, exactly
-                // as [`attribute`] does for a Quest listing.
+                // Stamped with the name this end knows the machine by — what
+                // `--machine` and the remote-vs-local test use — as [`attribute`]
+                // does for a Quest listing.
                 for row in &mut rows {
                     row.machine = name.clone();
                 }

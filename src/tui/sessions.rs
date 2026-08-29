@@ -64,10 +64,8 @@ pub struct State {
     /// already swept, annotated and ranked.
     rows: Vec<SessionView>,
     /// The remote half of the fleet (SPEC §17), last fetched — kept apart from
-    /// the local rows because the two arrive on different clocks: the local rows
-    /// reload every local tick, the remote ones only while this tab is active
-    /// (see [`crate::tui`]'s `SessionFetch`). A local reload re-merges this
-    /// snapshot rather than waiting on ssh.
+    /// the local rows, which reload on the faster local tick. A local reload
+    /// re-merges this snapshot rather than waiting on ssh (see `SessionFetch`).
     remote_rows: Vec<SessionView>,
     /// One line per machine whose sessions could not be fetched, for the chrome.
     remote_notes: Vec<String>,
@@ -107,10 +105,8 @@ impl State {
             rows: Vec::new(),
             remote_rows: Vec::new(),
             remote_notes: Vec::new(),
-            // The same identity every tab uses for "this machine" (`App::machine`
-            // — `--machine` or `[machine] name`), not `config.machine.name`
-            // directly, so the fleet's local-vs-remote test matches the row
-            // `machine` the loader stamps.
+            // `App::machine`, not `config.machine.name`, so the local-vs-remote
+            // test matches the `machine` the loader stamps on a row.
             local_machine: machine.to_string(),
             selected: 0,
             selected_id: None,
@@ -283,10 +279,8 @@ pub fn refresh(ctx: &Ctx, app: &mut App) -> anyhow::Result<()> {
         },
     )?;
     // SPEC §17: the fleet spans both machines. The remote half arrives on its
-    // own clock (see `SessionFetch`); a local reload re-merges the last snapshot
-    // rather than waiting on ssh, so a machine that is down never slows a tick.
-    // `a` is applied here too — the remote rows carry ended sessions the far end
-    // always sends, exactly as the local loader's `all` flag decides.
+    // own clock (see `SessionFetch`); `a` is applied to it here as the local
+    // loader's `all` flag applies it to the local rows.
     rows.extend(
         app.sessions
             .remote_rows
@@ -374,11 +368,10 @@ fn viewport(app: &App) -> usize {
 /// and half a vim keymap — `j` moving while `k` ends an agent — is worse than
 /// none.
 pub fn handle(app: &mut App, input: Input) -> Action {
-    // SPEC §15: the five keys that act on an agent read or write its own
-    // machine's tmux, registry and database, so on a remote fleet row they are
-    // refused with the CLI command that does the work there (bd-8lz.5.10). The
-    // fleet is multi-machine to *look* at; acting on a far agent is the CLI's
-    // (`q peek`/`send`/`kill`/`reset` are proxied), or a follow-up here.
+    // SPEC §15: the five keys that act on an agent touch its own machine's
+    // tmux, registry and database, so on a remote fleet row they are refused
+    // with the CLI that does the work there (bd-8lz.5.10). The fleet is
+    // multi-machine to *look* at; proxying the keys is a follow-up (bd-8lz.10).
     if let Some(refusal) = refuse_remote_act(app, input) {
         return refusal;
     }
@@ -978,8 +971,7 @@ fn row_line<'a>(c: &Cells, w: &[usize; 6], across: bool, selected: bool, width: 
     let style = if selected {
         Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
     } else if c.remote.is_some() {
-        // A fleet row is dimmed: it is here to be seen, but the keys that act on
-        // an agent are its own machine's (bd-8lz.5.10).
+        // A fleet row is dimmed — here to see, not to act on (bd-8lz.5.10).
         Style::default().add_modifier(Modifier::DIM)
     } else {
         Style::default()
