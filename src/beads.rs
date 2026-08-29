@@ -317,6 +317,9 @@ pub trait Bd {
     /// `bd update <epic> --remove-label repo:<old> --add-label repo:<new>` —
     /// one write, so the epic is never left carrying both labels or neither.
     fn relabel_repo(&self, epic: &str, old: Option<&str>, new: &str) -> Result<(), String>;
+    /// `bd update <epic> --title <title>` — the epic follows the Quest's slug
+    /// and goal, which a Quest made with a bare `n` gets after the fact.
+    fn retitle(&self, epic: &str, title: &str) -> Result<(), String>;
 
     /// The Quest's epic as `bd` has it, if any.
     fn find_epic(&self, quest_id: &str) -> Option<String> {
@@ -372,6 +375,10 @@ fn relabel_argv(epic: &str, old: Option<&str>, new: &str) -> Vec<String> {
     args.push("--add-label".to_string());
     args.push(format!("repo:{new}"));
     args
+}
+
+fn retitle_argv<'a>(epic: &'a str, title: &'a str) -> Vec<&'a str> {
+    vec!["update", epic, "--title", title]
 }
 
 fn as_argv(args: &[String]) -> Vec<&str> {
@@ -451,6 +458,19 @@ impl Bd for RealBd {
         let notice = self.notice("waiting on bd to relabel the epic…");
         let args = relabel_argv(epic, old, new);
         match bd(&as_argv(&args), WRITE_TIMEOUT, notice) {
+            Ok(out) if out.success() => Ok(()),
+            Ok(out) => Err(out.message()),
+            Err(BdFail::Spawn) => Err(unavailable()),
+            Err(BdFail::Timeout) => Err(format!(
+                "`bd update` did not finish within {}s",
+                WRITE_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
+    fn retitle(&self, epic: &str, title: &str) -> Result<(), String> {
+        let notice = self.notice("waiting on bd to retitle the epic…");
+        match bd(&retitle_argv(epic, title), WRITE_TIMEOUT, notice) {
             Ok(out) if out.success() => Ok(()),
             Ok(out) => Err(out.message()),
             Err(BdFail::Spawn) => Err(unavailable()),
@@ -569,6 +589,13 @@ impl Bd for FixtureBd {
             .map(|_| ())
             .ok_or_else(unavailable)
     }
+
+    fn retitle(&self, epic: &str, title: &str) -> Result<(), String> {
+        log(&retitle_argv(epic, title));
+        fixture_file("Q_FIXTURE_BD_RETITLE")
+            .map(|_| ())
+            .ok_or_else(unavailable)
+    }
 }
 
 fn fixture_file(var: &str) -> Option<String> {
@@ -600,6 +627,41 @@ pub fn epic_of(quest: &Quest) -> Option<&str> {
         .as_deref()
         .map(str::trim)
         .filter(|e| !e.is_empty())
+}
+
+/// The epic's title: `<slug>: <goal>`, or the slug alone while there is no
+/// goal. One function, because the title is written at creation and rewritten
+/// whenever the slug or the goal changes.
+pub fn epic_title(quest: &Quest) -> String {
+    match quest
+        .goal
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+    {
+        Some(goal) => format!("{}: {goal}", quest.slug),
+        None => quest.slug.clone(),
+    }
+}
+
+/// Retitles the Quest's epic after its slug or goal changed. Best effort: the
+/// column is already written, so a `bd` that will not cooperate is a warning
+/// with the command to run by hand.
+pub fn sync_epic_title(ctx: &crate::Ctx, quest: &Quest) -> bool {
+    let Some(epic) = epic_of(quest) else {
+        return false;
+    };
+    let title = epic_title(quest);
+    match ctx.bd().retitle(epic, &title) {
+        Ok(()) => true,
+        Err(e) => {
+            ctx.warn(format!(
+                "warning: epic {epic} could not be retitled ({e}); fix it with \
+                 `bd update {epic} --title \"{title}\"`"
+            ));
+            false
+        }
+    }
 }
 
 /// `q set <quest> beads_epic <id>`: an issue id `bd` could have minted, or a
@@ -910,6 +972,9 @@ pub(crate) mod stub {
         fn relabel_repo(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), String> {
             Err(REFUSED.to_string())
         }
+        fn retitle(&self, _: &str, _: &str) -> Result<(), String> {
+            Err(REFUSED.to_string())
+        }
     }
 
     /// A scriptable `bd` that records what it was asked for.
@@ -922,6 +987,8 @@ pub(crate) mod stub {
         pub(crate) listing: Option<String>,
         pub(crate) created: Mutex<Vec<(String, String)>>,
         pub(crate) closed: Mutex<Vec<(String, String)>>,
+        /// Every `(epic, title)` a `bd update --title` was asked for.
+        pub(crate) retitled: Mutex<Vec<(String, String)>>,
     }
 
     impl StubBd {
@@ -933,6 +1000,7 @@ pub(crate) mod stub {
                 listing: None,
                 created: Mutex::new(Vec::new()),
                 closed: Mutex::new(Vec::new()),
+                retitled: Mutex::new(Vec::new()),
             }
         }
 
@@ -945,6 +1013,7 @@ pub(crate) mod stub {
                 listing: None,
                 created: Mutex::new(Vec::new()),
                 closed: Mutex::new(Vec::new()),
+                retitled: Mutex::new(Vec::new()),
             }
         }
 
@@ -976,6 +1045,9 @@ pub(crate) mod stub {
         fn relabel_repo(&self, epic: &str, old: Option<&str>, new: &str) -> Result<(), String> {
             (**self).relabel_repo(epic, old, new)
         }
+        fn retitle(&self, epic: &str, title: &str) -> Result<(), String> {
+            (**self).retitle(epic, title)
+        }
     }
 
     impl Bd for StubBd {
@@ -1001,6 +1073,15 @@ pub(crate) mod stub {
         }
         fn relabel_repo(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), String> {
             Ok(())
+        }
+        // Follows `close`: a tracker that is there but will not write refuses
+        // this too.
+        fn retitle(&self, epic: &str, title: &str) -> Result<(), String> {
+            self.retitled
+                .lock()
+                .unwrap()
+                .push((epic.to_string(), title.to_string()));
+            self.close.clone()
         }
     }
 }
@@ -1499,6 +1580,9 @@ mod tests {
         fn relabel_repo(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), String> {
             unreachable!()
         }
+        fn retitle(&self, _: &str, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
     }
 
     /// A `bd` that never answers, and counts how often it was asked.
@@ -1521,6 +1605,9 @@ mod tests {
             unreachable!()
         }
         fn relabel_repo(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+        fn retitle(&self, _: &str, _: &str) -> Result<(), String> {
             unreachable!()
         }
     }

@@ -490,6 +490,7 @@ pub fn submit(ctx: &Ctx, app: &mut App, prompt: &Prompt, form: &Form) -> anyhow:
         // of silently doing nothing.
         Prompt::NewQuest
         | Prompt::Rename(_)
+        | Prompt::Edit(_)
         | Prompt::Close(_)
         | Prompt::Resume(_)
         | Prompt::Send(_)

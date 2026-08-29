@@ -8,17 +8,70 @@ use crate::commands::new::resolve_dir;
 use crate::commands::sweep_quiet;
 use crate::db::quest::QuestPatch;
 use crate::error::QError;
+use crate::model::Quest;
 use crate::output;
 
 /// Spellings that clear `ctx_reset_pct` back to the configured default.
 const CLEAR: [&str; 3] = ["default", "none", ""];
 
+/// `q set <quest> beads_epic new` — mint an epic rather than link one.
+pub const NEW_EPIC: &str = "new";
+
+/// What one `q set` did, for the payload of whatever asked for it.
+pub struct Applied {
+    pub quest: Quest,
+    pub key: &'static str,
+    /// What actually landed in the column.
+    pub value: String,
+    pub epic_relabelled: bool,
+}
+
+impl Applied {
+    pub fn describe(&self) -> String {
+        let moved = if self.epic_relabelled {
+            " · epic relabelled"
+        } else {
+            ""
+        };
+        format!(
+            "{} ({}) · {} = {}{moved}",
+            self.quest.id, self.quest.slug, self.key, self.value
+        )
+    }
+}
+
 pub fn run(ctx: &Ctx, target: &str, key: SetKey, value: &str) -> anyhow::Result<()> {
     sweep_quiet(ctx)?;
+    let quest = ctx.db()?.resolve_quest(target)?;
+    let out = apply(ctx, &quest, key, value)?;
+    crate::commands::flush_warnings(ctx);
+    if ctx.json || !ctx.quiet {
+        output::emit(
+            ctx.json,
+            &serde_json::json!({
+                "quest": out.quest,
+                "key": out.key,
+                "value": out.value,
+                "epic_relabelled": out.epic_relabelled,
+            }),
+            || out.describe(),
+        )?;
+    }
+    Ok(())
+}
+
+/// The whole of `q set` as a library call, so the TUI's edit form writes
+/// exactly what the CLI writes. Warnings stay buffered on the `Ctx`.
+pub fn apply(ctx: &Ctx, quest: &Quest, key: SetKey, value: &str) -> anyhow::Result<Applied> {
     let db = ctx.db()?;
-    let quest = db.resolve_quest(target)?;
     // The label the epic carries right now, before the column is overwritten.
     let had_repo = quest.beads_repo.clone();
+
+    // A Quest made with the TUI's bare `n` has no epic; this is how it gets
+    // one afterwards, titled from the slug and goal it has by now.
+    if key == SetKey::BeadsEpic && value.trim() == NEW_EPIC {
+        return new_epic(ctx, quest);
+    }
 
     let mut patch = QuestPatch::default();
     // What actually landed in the column, for the event and the payload.
@@ -72,9 +125,13 @@ pub fn run(ctx: &Ctx, target: &str, key: SetKey, value: &str) -> anyhow::Result<
     let quest = db.update_quest(&quest.id, &patch)?;
     let relabelled = match key {
         SetKey::BeadsRepo => relabel_epic(ctx, &quest, had_repo.as_deref(), &stored),
+        // The epic's title carries the goal (`beads::epic_title`).
+        SetKey::Goal => {
+            beads::sync_epic_title(ctx, &quest);
+            false
+        }
         _ => false,
     };
-    crate::commands::flush_warnings(ctx);
     let key = key_name(key);
     db.append_event(
         &quest.id,
@@ -82,27 +139,48 @@ pub fn run(ctx: &Ctx, target: &str, key: SetKey, value: &str) -> anyhow::Result<
         "quest.updated",
         &serde_json::json!({ "key": key, "value": stored }),
     )?;
+    Ok(Applied {
+        quest,
+        key,
+        value: stored,
+        epic_relabelled: relabelled,
+    })
+}
 
-    if ctx.json || !ctx.quiet {
-        output::emit(
-            ctx.json,
-            &serde_json::json!({
-                "quest": quest,
-                "key": key,
-                "value": stored,
-                "epic_relabelled": relabelled,
-            }),
-            || {
-                let moved = if relabelled {
-                    " · epic relabelled"
-                } else {
-                    ""
-                };
-                format!("{} ({}) · {key} = {stored}{moved}", quest.id, quest.slug)
-            },
-        )?;
+/// `beads_epic new`: refused when the Quest already has an epic — linking is
+/// `beads_epic <id>`, and two epics for one Quest is never what was meant. A
+/// `bd` that will not create one is an error here, unlike at `q new`: the epic
+/// is the whole of what was asked for.
+fn new_epic(ctx: &Ctx, quest: &Quest) -> anyhow::Result<Applied> {
+    if let Some(epic) = beads::epic_of(quest) {
+        return Err(QError::Conflict(format!(
+            "{} already has epic {epic}; link another with `beads_epic <id>`",
+            quest.slug
+        ))
+        .into());
     }
-    Ok(())
+    let quest = crate::commands::new::attach_epic(ctx, quest.clone(), quest.beads_repo.as_deref());
+    let Some(epic) = beads::epic_of(&quest) else {
+        let why = ctx
+            .take_warnings()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "`bd create` failed".to_string());
+        return Err(QError::Other(why).into());
+    };
+    let value = epic.to_string();
+    ctx.db()?.append_event(
+        &quest.id,
+        None,
+        "quest.updated",
+        &serde_json::json!({ "key": "beads_epic", "value": value }),
+    )?;
+    Ok(Applied {
+        quest,
+        key: "beads_epic",
+        value,
+        epic_relabelled: false,
+    })
 }
 
 /// `beads_repo` is not q's property: the label lives on the epic, and agents
@@ -111,7 +189,7 @@ pub fn run(ctx: &Ctx, target: &str, key: SetKey, value: &str) -> anyhow::Result<
 /// `bd update --remove-label … --add-label …`, one write. A `bd` that will not
 /// cooperate is a warning with the command to run by hand, never a failed
 /// `q set`: the column is already stored by then.
-fn relabel_epic(ctx: &Ctx, quest: &crate::model::Quest, old: Option<&str>, new: &str) -> bool {
+fn relabel_epic(ctx: &Ctx, quest: &Quest, old: Option<&str>, new: &str) -> bool {
     let Some(epic) = beads::epic_of(quest) else {
         return false;
     };

@@ -265,7 +265,8 @@ pub enum Command {
         quest: String,
         #[arg(value_enum)]
         key: SetKey,
-        /// Free text for `goal`; a leading `-` is text, not a flag
+        /// Free text for `goal`; a leading `-` is text, not a flag. For
+        /// `beads_epic`, `new` creates an epic for a Quest that has none
         #[arg(allow_hyphen_values = true)]
         value: String,
     },
@@ -756,7 +757,7 @@ pub enum QuestState {
 
 /// `brain_session` is not a `q set` key: it is managed by `q new --brain` and
 /// `q link add --kind brain <slug>` (SPEC §14), never set by hand.
-#[derive(ValueEnum, Clone, Copy, Debug)]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 #[value(rename_all = "snake_case")]
 pub enum SetKey {
     Goal,

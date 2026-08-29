@@ -127,6 +127,8 @@ pub fn apply(
     )?;
     // Claude keeps its own session name; it only follows when the pane is idle.
     let sync = naming::sync_claude_names(db, ctx.tmux(), &quest, &from)?;
+    // The epic was titled after the old slug (`beads::epic_title`).
+    crate::beads::sync_epic_title(ctx, &quest);
 
     Ok(Renamed {
         quest,

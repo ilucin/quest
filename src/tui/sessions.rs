@@ -679,6 +679,7 @@ pub fn submit(ctx: &Ctx, app: &mut App, prompt: &Prompt, form: &Form) -> anyhow:
         // `templates.rs` already carry.
         Prompt::NewQuest
         | Prompt::Rename(_)
+        | Prompt::Edit(_)
         | Prompt::Close(_)
         | Prompt::Resume(_)
         | Prompt::AddTemplate

@@ -30,6 +30,9 @@ are inside its Quest. `master` is the label of the first session.
 - `q link add <ref> [--kind pr|task|worktree|url|branch] [--title <t>]` — attach an
   external reference. The kind is auto-detected from a URL when omitted.
 - `q artifact add <path> [--note "<what it is>"]` — register a file you produced.
+- `q set <quest> goal "<text>"` — record the goal when the brief has none (a Quest
+  started bare gets it from you). `q set <quest> beads_epic new` creates the epic
+  for a Quest that has none.
 
 ## Delegate — master only
 

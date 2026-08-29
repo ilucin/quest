@@ -84,6 +84,9 @@ pub enum Action {
     /// Carries nothing: the loop reads the form — and the Quest id the prompt
     /// was opened against — out of `App::modal`.
     Submit,
+    /// Make a Quest right away with every default — no form (`n`; `N` is the
+    /// form). The loop runs `q new` and reloads.
+    QuickNew,
     /// Proxy an acting key against the machine the selection lives on (SPEC §15;
     /// bd-8lz.5.8 Quests, bd-8lz.10 Sessions): a read pages a captured `q`, a
     /// write hands over the terminal. The loop reads the selection and tab.
@@ -175,6 +178,9 @@ pub struct TemplateTarget {
 pub enum Prompt {
     NewQuest,
     Rename(Target),
+    /// `E` — goal, workflow and the beads epic of an existing Quest, which a
+    /// Quest made with a bare `n` has yet to be given.
+    Edit(Target),
     Close(Target),
     Resume(Target),
     /// SPEC §17 `t` — type into a live Claude session.
@@ -199,7 +205,9 @@ impl Prompt {
     pub fn quest(&self) -> Option<&str> {
         match self {
             Prompt::NewQuest => None,
-            Prompt::Rename(t) | Prompt::Close(t) | Prompt::Resume(t) => Some(t.quest.as_str()),
+            Prompt::Rename(t) | Prompt::Edit(t) | Prompt::Close(t) | Prompt::Resume(t) => {
+                Some(t.quest.as_str())
+            }
             Prompt::Send(t) | Prompt::Kill(t) | Prompt::Reset(t) => Some(t.quest.as_str()),
             // A template is a definition; the Quest a run makes does not
             // exist yet, and the other three never make one.
@@ -224,7 +232,7 @@ impl Prompt {
 
     pub fn target(&self) -> Option<&Target> {
         match self {
-            Prompt::Rename(t) | Prompt::Close(t) | Prompt::Resume(t) => Some(t),
+            Prompt::Rename(t) | Prompt::Edit(t) | Prompt::Close(t) | Prompt::Resume(t) => Some(t),
             _ => None,
         }
     }
@@ -997,7 +1005,7 @@ mod tests {
     #[test]
     fn a_form_takes_every_key_the_shell_would_have_claimed() {
         let mut a = app();
-        a.handle(Input::Char('n'));
+        a.handle(Input::Char('N'));
         assert!(a.modal.is_some());
         assert!(a.capturing());
 
@@ -1040,7 +1048,7 @@ mod tests {
     #[test]
     fn ctrl_c_quits_from_inside_a_form() {
         let mut a = app();
-        a.handle(Input::Char('n'));
+        a.handle(Input::Char('N'));
         assert_eq!(a.handle(Input::Ctrl('c')), Action::Quit);
         assert!(a.should_quit);
     }

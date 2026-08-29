@@ -1143,6 +1143,12 @@ fn event_loop(
                 }
                 // Creating, renaming, closing or resuming all change the
                 // listing, so the reload is part of the action.
+                // `n`: a Quest with every default, no form. Its master starts
+                // in tmux like any other, so the listing has to be reloaded.
+                Action::QuickNew => {
+                    quests::create_quick(ctx, app);
+                    refresh_due = true;
+                }
                 Action::Submit => {
                     submit(ctx, app);
                     // A template run submitted through its argument form
@@ -1280,7 +1286,7 @@ fn submit(ctx: &Ctx, app: &mut App) {
 }
 
 /// `head`, then anything buffered, on one line.
-fn joined(head: &str, rest: &[String]) -> String {
+pub(super) fn joined(head: &str, rest: &[String]) -> String {
     std::iter::once(head)
         .chain(rest.iter().map(String::as_str))
         .filter(|part| !part.is_empty())
@@ -2380,7 +2386,7 @@ mod tests {
         // With a form up neither is true — `q` is a letter in a field — so the
         // bar advertises the form's own keys instead.
         let mut with_form = app();
-        with_form.handle(Input::Char('n'));
+        with_form.handle(Input::Char('N'));
         let h = hint(&with_form);
         assert!(!h.contains("q quit"), "{h:?}");
         assert!(h.contains("Esc cancel"), "{h:?}");
@@ -2411,7 +2417,7 @@ mod tests {
             );
         }
         a.tab = Tab::Quests;
-        a.handle(Input::Char('n'));
+        a.handle(Input::Char('N'));
         let h = hint(&a);
         let want = layout::width(h) as u16;
         assert_eq!(layout::right_segment(70, want), want, "form hint {h:?}");
