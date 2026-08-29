@@ -469,8 +469,8 @@ fn attach_want(ctx: &Ctx, app: &App) -> anyhow::Result<Option<AttachWant>> {
                 label: Some(selection.label),
                 name: selection.name,
                 session: Some(selection.session),
-                // Every row on this tab is a local session: SPEC §15 keeps
-                // each machine's sessions in its own database.
+                // Always local here: a remote row's `⏎`/`o` is proxied through
+                // `q enter --machine` (bd-8lz.10) and never reaches this lookup.
                 machine: None,
             }))
         }
@@ -831,6 +831,94 @@ where
     Ok(())
 }
 
+/// Proxy a Sessions-tab key against the machine the selection lives on (SPEC §15,
+/// bd-8lz.10) — the parity of [`proxy_remote`]. The session target is
+/// `<quest>/<label>`, except `o` (attach), which the far end's own `q enter`
+/// resolves by slug and label. `p` reads (captured + paged); `k`/`Z` and the
+/// attach hand over the terminal. `t` proxies at submit (`sessions::send_remote`).
+fn proxy_remote_session<B, T>(
+    io: &mut T,
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    key: char,
+) -> anyhow::Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+    T: TermIo,
+{
+    let (Some(machine), Some(sel)) = (sessions::selected_remote(app), sessions::selected(app))
+    else {
+        return Ok(());
+    };
+    // `o` attaches to exactly that window (SPEC §17): the far end's `q enter`
+    // resolves the label, so it takes the slug and `--session`.
+    if key == 'o' {
+        let args = [
+            "enter",
+            sel.slug.as_str(),
+            "--session",
+            sel.label.as_str(),
+            "--machine",
+            machine.as_str(),
+        ];
+        let status = handoff(io, terminal, app.mouse, || {
+            std::process::Command::new(q_exe()).args(args).status()
+        })?;
+        app.say(match status {
+            Ok(s) if s.success() => format!("back from {} on {machine}", sel.name),
+            Ok(s) => match s.code() {
+                Some(code) => format!("q enter {} on {machine} exited {code}", sel.name),
+                None => format!("q enter {} on {machine} was killed by a signal", sel.name),
+            },
+            Err(e) => format!("cannot run q enter: {e}"),
+        });
+        return Ok(());
+    }
+    let Some((sub, paged)) = sessions::proxied(key) else {
+        return Ok(());
+    };
+    let target = sel.name;
+    let args = [sub, target.as_str(), "--machine", machine.as_str()];
+    if paged {
+        // A read: captured, then shown in the local peek pager.
+        let out = spawn_q(&args)?;
+        if !out.status.success() {
+            app.say(format!(
+                "q {sub} {target} on {machine}: {}",
+                child_said(&out)
+            ));
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        if text.trim().is_empty() {
+            app.say(format!("{sub} of {target} on {machine}: nothing to show"));
+            return Ok(());
+        }
+        let paged = handoff(io, terminal, app.mouse, || pager::show(&text))?;
+        if let Err(e) = paged {
+            app.say(format!("cannot page {sub}: {e:#}"));
+        }
+    } else {
+        // A write: the child gets the terminal, so `q kill`'s `[y/N]` runs
+        // against the real keyboard.
+        let status = handoff(io, terminal, app.mouse, || {
+            std::process::Command::new(q_exe()).args(args).status()
+        })?;
+        match status {
+            Ok(s) if s.success() => app.say(format!(
+                "{sub} {target} on {machine} \u{b7} it updates at the next remote tick"
+            )),
+            Ok(s) => app.say(match s.code() {
+                Some(code) => format!("q {sub} {target} on {machine} exited {code}"),
+                None => format!("q {sub} {target} on {machine} was killed by a signal"),
+            }),
+            Err(e) => app.say(format!("cannot run q {sub}: {e}")),
+        }
+    }
+    Ok(())
+}
+
 /// Land in the master a template run just made (SPEC §11: a routine runs from
 /// the TUI in one keypress).
 ///
@@ -965,10 +1053,8 @@ impl Drop for Away<'_> {
 /// owns the only connection; the ssh it is the answer to ran elsewhere.
 fn absorb(ctx: &Ctx, app: &mut App, round: remote::Round) {
     let mut results = remote::resolve_round(ctx, round);
-    let notes: Vec<String> = results
-        .iter()
-        .filter_map(remote::RemoteResult::note)
-        .collect();
+    let now = crate::model::now();
+    let notes: Vec<String> = results.iter().filter_map(|r| r.note(now)).collect();
     app.remote_note = (!notes.is_empty()).then(|| notes.join(" \u{b7} "));
     // Kept rather than replaced: a machine that did not answer this round
     // still has the prefix it reported when it did, which is the same age as
@@ -1057,6 +1143,12 @@ fn event_loop(
                 }
                 // Creating, renaming, closing or resuming all change the
                 // listing, so the reload is part of the action.
+                // `n`: a Quest with every default, no form. Its master starts
+                // in tmux like any other, so the listing has to be reloaded.
+                Action::QuickNew => {
+                    quests::create_quick(ctx, app);
+                    refresh_due = true;
+                }
                 Action::Submit => {
                     submit(ctx, app);
                     // A template run submitted through its argument form
@@ -1080,12 +1172,16 @@ fn event_loop(
                     out?;
                     dirty = true;
                 }
-                // SPEC §15, bd-8lz.5.8: a Quests key on a remote row runs the
-                // real `q` against the owning machine — reloaded afterwards
-                // like an attach, since a write can change the listing.
+                // SPEC §15: an acting key on a remote row runs the real `q`
+                // against the owning machine (bd-8lz.5.8 Quests, bd-8lz.10
+                // Sessions), reloaded afterwards since a write can change the row.
                 Action::Proxy(key) => {
                     let away = Away::new(poller);
-                    let out = proxy_remote(&mut Stdio, terminal, app, key);
+                    let out = if app.tab == Tab::Sessions {
+                        proxy_remote_session(&mut Stdio, terminal, app, key)
+                    } else {
+                        proxy_remote(&mut Stdio, terminal, app, key)
+                    };
                     drop(away);
                     out?;
                     refresh_due = true;
@@ -1190,7 +1286,7 @@ fn submit(ctx: &Ctx, app: &mut App) {
 }
 
 /// `head`, then anything buffered, on one line.
-fn joined(head: &str, rest: &[String]) -> String {
+pub(super) fn joined(head: &str, rest: &[String]) -> String {
     std::iter::once(head)
         .chain(rest.iter().map(String::as_str))
         .filter(|part| !part.is_empty())
@@ -2290,7 +2386,7 @@ mod tests {
         // With a form up neither is true — `q` is a letter in a field — so the
         // bar advertises the form's own keys instead.
         let mut with_form = app();
-        with_form.handle(Input::Char('n'));
+        with_form.handle(Input::Char('N'));
         let h = hint(&with_form);
         assert!(!h.contains("q quit"), "{h:?}");
         assert!(h.contains("Esc cancel"), "{h:?}");
@@ -2321,7 +2417,7 @@ mod tests {
             );
         }
         a.tab = Tab::Quests;
-        a.handle(Input::Char('n'));
+        a.handle(Input::Char('N'));
         let h = hint(&a);
         let want = layout::width(h) as u16;
         assert_eq!(layout::right_segment(70, want), want, "form hint {h:?}");

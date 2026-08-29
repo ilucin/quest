@@ -14,8 +14,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::Ctx;
+use crate::cli::SetKey;
 use crate::commands::{
-    QuestRow, close, fill_progress, fmt, load_quests, new, proxy, rename, resume, tpl,
+    QuestRow, close, fill_progress, fmt, load_quests, new, proxy, rename, resume, set, tpl,
 };
 use crate::error::QError;
 use crate::model::{
@@ -30,11 +31,12 @@ use super::layout::{self, RowMode};
 
 /// The tab's own half of the `?` overlay.
 pub const HELP: &[(&str, &str)] = &[
-    ("o", "enter the master (attach to its tmux session)"),
-    ("Enter", "toggle the detail panel"),
+    ("Enter / o", "enter the master (attach to its tmux session)"),
+    ("d", "toggle the detail panel (open by default)"),
     ("s", "this Quest's sessions"),
     ("e", "this Quest's events, in the tail"),
-    ("n", "new Quest (a form)"),
+    ("n", "new Quest at once, every default (N: the form)"),
+    ("E", "edit goal · workflow · beads epic"),
     ("r / c / R", "rename · close · resume (each prompts)"),
     ("b", "brief in a pager"),
     ("l", "links"),
@@ -66,6 +68,7 @@ const F_TEMPLATE: &str = "template";
 const F_BEADS: &str = "beads epic";
 const F_SLUG: &str = "slug";
 const F_CLOSE_EPIC: &str = "close beads epic";
+const F_NEW_EPIC: &str = "create beads epic";
 const F_PROMPT: &str = "prompt";
 /// The template select's "no template" option. Parenthesised, so no template
 /// name can collide with it: a name is a slug (`^[a-z0-9]+(-[a-z0-9]+)*$`).
@@ -513,21 +516,14 @@ pub fn handle(app: &mut App, input: Input) -> Action {
             app.quests.move_to(usize::MAX, page);
             Action::None
         }
-        // SPEC §17 contradicts itself: `Enter` toggles the detail panel two
-        // lines above, and `⏎/o` is "enter master (attach)" below. Reading it
-        // the other way — both keys attach — would leave the detail panel, an
-        // explicitly specified feature, with no binding at all, so this is the
-        // only self-consistent split. `o` attaches; `Enter`, the key that gets
-        // pressed by accident, only opens the panel rather than taking over
-        // the terminal. (Nothing to do with phone keyboards: §17 gives `Ctrl-J`
-        // as the Enter alias precisely for clients where Enter never arrives,
-        // so either reading is reachable there.)
-        Input::Char('o') => attach_selection(app),
-        Input::Enter => toggle_detail(app),
+        // The detail panel is open by default (`d` toggles it), so `Enter` is
+        // free to do what `⏎/o` in SPEC §17 asks: enter the master. `o` is its
+        // alias, and `Ctrl-J` the one §17 names for clients where Enter never
+        // arrives.
+        Input::Char('o') | Input::Enter => attach_selection(app),
+        Input::Char('d') => toggle_detail(app),
         Input::Esc => {
-            if app.detail {
-                app.detail = false;
-            } else if !app.quests.query.is_empty() {
+            if !app.quests.query.is_empty() {
                 app.quests.query.clear();
                 app.quests.resync();
                 app.say("search cleared");
@@ -556,7 +552,12 @@ pub fn handle(app: &mut App, input: Input) -> Action {
             typing(app);
             Action::None
         }
-        Input::Char('n') => open_new(app),
+        // The quick path is the lowercase key: a Quest is cheap to make and
+        // everything the form asks for can be given later (`E`, or the master
+        // itself via `q set`). The form is one shift away.
+        Input::Char('n') => Action::QuickNew,
+        Input::Char('N') => open_new(app),
+        Input::Char('E') => open_edit(app),
         Input::Char('r') => open_rename(app),
         Input::Char('c') => open_close(app),
         Input::Char('R') => open_resume(app),
@@ -794,7 +795,7 @@ fn show_links(app: &mut App) -> Action {
 // loaded by `refresh`. Running one is `submit`, below, which the event loop
 // calls: `q new` starts tmux and Claude, and that is loop work.
 
-/// `n` — the new-Quest form of SPEC §17: name / goal / dir / workflow /
+/// `N` — the new-Quest form of SPEC §17: name / goal / dir / workflow /
 /// machine / template, plus the beads epic §5 step 2 creates by default.
 fn open_new(app: &mut App) -> Action {
     let machines = app.machines.clone();
@@ -866,6 +867,45 @@ fn open_rename(app: &mut App) -> Action {
     Action::None
 }
 
+/// `E` — what a bare `n` left for later: the goal, the workflow, and the beads
+/// epic. Not `cwd` or the machine: the master is already running in that
+/// directory on that machine, and neither is a column to edit under it.
+fn open_edit(app: &mut App) -> Action {
+    let Some(row) = app.quests.selected_row() else {
+        return Action::None;
+    };
+    let target = target_of(row);
+    let quest = &row.view.quest;
+    let workflows: Vec<String> = std::iter::once(NO_WORKFLOW.to_string())
+        .chain(app.quests.workflows.iter().cloned())
+        .collect();
+    let current = quest
+        .workflow
+        .as_deref()
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .and_then(|w| workflows.iter().position(|o| o == w))
+        .unwrap_or(0);
+    // Harmless for the same reason `r` is: nothing starts and nothing dies,
+    // and a bare Enter re-submits what the Quest already has, which writes
+    // nothing (see `edit_quest`).
+    let mut form = Form::new(format!("edit {}", target.slug))
+        .harmless()
+        .hint("Tab field \u{b7} \u{2190}\u{2192} chooses \u{b7} \u{23ce} saves \u{b7} Esc cancels")
+        .text(F_GOAL, quest.goal.as_deref().unwrap_or(""), "(none)")
+        .select(F_WORKFLOW, workflows, current);
+    form = match &target.epic {
+        Some(epic) => form.note(format!("epic {epic} · retitled when the goal changes")),
+        // Off by default: the toggle is the one thing here that reaches
+        // outside q's database, and `E` is mostly about the goal.
+        None => form
+            .toggle(F_NEW_EPIC, false)
+            .note("titled `<slug>: <goal>`, labelled from the Quest's directory"),
+    };
+    app.open(Prompt::Edit(target), form);
+    Action::None
+}
+
 /// `c` — SPEC §5's confirmation, with `--close-epic` as its one live option.
 ///
 /// `--summarize` (the brain summary §5 also offers) is not offered: there is
@@ -934,6 +974,7 @@ pub fn submit(ctx: &Ctx, app: &mut App, prompt: &Prompt, form: &Form) -> anyhow:
     match prompt {
         Prompt::NewQuest => create(ctx, app, form),
         Prompt::Rename(target) => rename_quest(ctx, app, target, form),
+        Prompt::Edit(target) => edit_quest(ctx, app, target, form),
         Prompt::Close(target) => close_quest(ctx, app, target, form),
         Prompt::Resume(target) => resume_quest(ctx, app, target, form),
         // A Sessions or Templates prompt never reaches here; `tui::submit`
@@ -1152,6 +1193,134 @@ fn rename_remote(
     app.say(format!(
         "renamed {} to {new_slug} on {machine} \u{b7} it updates at the next remote tick",
         target.slug
+    ));
+    Ok(())
+}
+
+/// `n` — `q new` with every default: the heuristic slug, the directory `q`
+/// was started in, this machine, no workflow, no template and no epic. Beads
+/// is deliberately left out: the epic's title is the slug and goal, and a
+/// Quest made this way has neither yet — `E` (or the master, `q set … beads_epic
+/// new`) creates it once it does. The error, if any, goes to the status bar:
+/// there is no form to leave up.
+pub fn create_quick(ctx: &Ctx, app: &mut App) {
+    let args = new::Args {
+        no_beads: true,
+        detach: true,
+        ..new::Args::default()
+    };
+    let created = new::create(ctx, &args);
+    let warnings = ctx.take_warnings();
+    match created {
+        Ok(created) => {
+            app.quests.focus_on(Anchor::local(&created.quest));
+            let said = format!(
+                "created {} \u{b7} E sets its goal \u{b7} o enters it",
+                created.quest.slug
+            );
+            app.say(super::joined(&said, &warnings));
+        }
+        Err(e) => app.say(super::joined(&format!("new quest: {e:#}"), &warnings)),
+    }
+}
+
+/// Only what changed is written, each through `set::apply` — the same write
+/// as `q set`, event included — so a bare Enter over an unchanged form is a
+/// no-op rather than three `quest.updated` events saying nothing.
+fn edit_quest(ctx: &Ctx, app: &mut App, target: &Target, form: &Form) -> anyhow::Result<()> {
+    let goal = form.trimmed(F_GOAL);
+    let workflow = chosen_workflow(form).unwrap_or("");
+    let new_epic = target.epic.is_none() && form.is_on(F_NEW_EPIC);
+
+    // SPEC §15: a remote Quest is edited *there*, one `q set` per field.
+    if let Some(machine) = &target.machine {
+        return edit_remote(ctx, app, target, machine, goal, workflow, new_epic);
+    }
+
+    let quest = quest_for(ctx, target)?;
+    if quest.beads_epic != target.epic {
+        return Err(QError::Invalid(format!(
+            "{}'s beads epic changed while this box was up; Esc and try again",
+            quest.slug
+        ))
+        .into());
+    }
+    let mut changed: Vec<String> = Vec::new();
+    let mut quest = quest;
+    if goal != quest.goal.as_deref().map(str::trim).unwrap_or("") {
+        quest = set::apply(ctx, &quest, SetKey::Goal, goal)?.quest;
+        changed.push("goal".to_string());
+    }
+    let had = quest.workflow.as_deref().map(str::trim).unwrap_or("");
+    if workflow != had {
+        quest = set::apply(ctx, &quest, SetKey::Workflow, workflow)?.quest;
+        changed.push("workflow".to_string());
+    }
+    if new_epic {
+        let applied = set::apply(ctx, &quest, SetKey::BeadsEpic, set::NEW_EPIC)?;
+        changed.push(format!("epic {}", applied.value));
+        quest = applied.quest;
+    }
+    app.quests.focus_on(Anchor::local(&quest));
+    app.say(if changed.is_empty() {
+        format!("{} unchanged", quest.slug)
+    } else {
+        format!("{} \u{b7} set {}", quest.slug, changed.join(", "))
+    });
+    Ok(())
+}
+
+/// `q set <slug> <key> <value> --machine <m>` per changed field, as children of
+/// *this* `q` — the CLI proxy resolves, pins and sends each over ssh (see
+/// `rename_remote`). The row is the cache's, so "changed" is judged against
+/// what the box showed; the far end refuses nothing for being the same value.
+fn edit_remote(
+    _ctx: &Ctx,
+    app: &mut App,
+    target: &Target,
+    machine: &str,
+    goal: &str,
+    workflow: &str,
+    new_epic: bool,
+) -> anyhow::Result<()> {
+    let Some(row) =
+        app.quests.rows.iter().find(|r| {
+            r.view.quest.id == target.quest && r.view.quest.created_at == target.created_at
+        })
+    else {
+        return Err(QError::NotFound(format!("quest {} is gone", target.slug)).into());
+    };
+    let shown = &row.view.quest;
+    let mut writes: Vec<(&str, &str)> = Vec::new();
+    if goal != shown.goal.as_deref().map(str::trim).unwrap_or("") {
+        writes.push(("goal", goal));
+    }
+    if workflow != shown.workflow.as_deref().map(str::trim).unwrap_or("") {
+        writes.push(("workflow", workflow));
+    }
+    if new_epic {
+        writes.push(("beads_epic", set::NEW_EPIC));
+    }
+    if writes.is_empty() {
+        app.say(format!("{} unchanged", target.slug));
+        return Ok(());
+    }
+    for (key, value) in &writes {
+        let out = super::spawn_q(&["set", &target.slug, key, value, "--machine", machine])?;
+        if !out.status.success() {
+            return Err(QError::Other(format!(
+                "set {} {key} on {machine}: {}",
+                target.slug,
+                super::child_said(&out)
+            ))
+            .into());
+        }
+    }
+    let keys: Vec<&str> = writes.iter().map(|(k, _)| *k).collect();
+    app.say(format!(
+        "{} \u{b7} set {} on {machine} \u{b7} it updates at the next remote tick",
+        target.slug,
+        keys.join(", ")
     ));
     Ok(())
 }
@@ -1704,6 +1873,9 @@ mod tests {
     fn app_with(rows: Vec<QuestRow>) -> App {
         let mut app = App::new(&Config::default(), "laptop");
         app.set_size(120, 30);
+        // The panel is open by default in production; the list-layout tests
+        // want the full width and the panel tests below opt back in.
+        app.detail = false;
         let links = vec![Vec::new(); rows.len()];
         app.quests.rows = rows;
         app.quests.links = links;
@@ -1946,9 +2118,9 @@ mod tests {
     #[test]
     fn the_detail_panel_shows_the_selected_quest() {
         let mut app = grouped();
-        assert!(!app.detail);
-        assert_eq!(handle(&mut app, Input::Enter), Action::None);
-        assert!(app.detail);
+        // The panel is open by default (`app_with` closes it for the layout
+        // tests; here we exercise the panel, so open it as production does).
+        app.detail = true;
         let text = screen(&mut app, 120, 30);
         for want in [
             "needs-me",
@@ -1962,11 +2134,26 @@ mod tests {
         }
         // Still shows the list beside it at this width.
         assert!(text.contains("running"), "{text}");
-        // Enter closes it again; `o` is the attach and leaves it alone.
+        // `d` toggles it shut; `Enter` and `o` both attach and leave it alone.
+        assert_eq!(handle(&mut app, Input::Enter), Action::Attach);
+        assert!(app.detail);
         assert_eq!(handle(&mut app, Input::Char('o')), Action::Attach);
         assert!(app.detail);
-        handle(&mut app, Input::Enter);
+        handle(&mut app, Input::Char('d'));
         assert!(!app.detail);
+        handle(&mut app, Input::Char('d'));
+        assert!(app.detail);
+    }
+
+    /// The default is a panel already up (production `App::new`), and `Enter`
+    /// enters the master rather than toggling it.
+    #[test]
+    fn the_detail_panel_is_open_by_default_and_enter_attaches() {
+        let app = App::new(&Config::default(), "laptop");
+        assert!(app.detail, "the panel should be open by default");
+        let mut app = grouped();
+        app.detail = true;
+        assert_eq!(handle(&mut app, Input::Enter), Action::Attach);
     }
 
     #[test]
@@ -2283,8 +2470,9 @@ mod tests {
     #[test]
     fn the_prompt_keys_open_their_forms_against_the_selection() {
         for (key, title) in [
-            ('n', "new quest"),
+            ('N', "new quest"),
             ('r', "rename needs-me"),
+            ('E', "edit needs-me"),
             ('c', "close needs-me?"),
             ('R', "resume needs-me"),
         ] {
@@ -2297,9 +2485,42 @@ mod tests {
             assert_eq!(modal.form.title, title, "{key}");
             assert!(!app.should_quit);
             // The target is carried by id, not by "whatever is selected then".
-            let want = (key != 'n').then(|| app.quests.rows[0].view.quest.id.clone());
+            let want = (key != 'N').then(|| app.quests.rows[0].view.quest.id.clone());
             assert_eq!(modal.prompt.quest().map(str::to_string), want, "{key}");
         }
+    }
+
+    /// `n` is not a form: it asks the loop to make the Quest at once.
+    #[test]
+    fn n_asks_for_a_quest_right_away_without_a_form() {
+        let mut app = app_with(Vec::new());
+        assert_eq!(handle(&mut app, Input::Char('n')), Action::QuickNew);
+        assert!(app.modal.is_none());
+        assert!(!app.capturing());
+    }
+
+    /// The edit box starts on what the Quest has, and offers to create the
+    /// epic only when there is none to edit.
+    #[test]
+    fn the_edit_form_is_prefilled_and_offers_an_epic_only_when_missing() {
+        let mut app = grouped();
+        app.quests.rows[0].view.quest.goal = Some("ship it".to_string());
+        app.quests.rows[0].view.quest.workflow = Some("solo".to_string());
+        app.quests.workflows = vec!["solo".to_string(), "orchestrator".to_string()];
+        app.quests.rows[0].view.quest.beads_epic = None;
+        handle(&mut app, Input::Char('E'));
+        let form = &app.modal.as_ref().unwrap().form;
+        assert_eq!(form.trimmed(F_GOAL), "ship it");
+        assert_eq!(form.choice(F_WORKFLOW), "solo");
+        assert!(!form.is_on(F_NEW_EPIC));
+        assert!(form.fields().iter().any(|f| f.label() == F_NEW_EPIC));
+
+        let mut app = grouped();
+        app.quests.rows[0].view.quest.beads_epic = Some("bd-e1".to_string());
+        handle(&mut app, Input::Char('E'));
+        let form = &app.modal.as_ref().unwrap().form;
+        assert!(!form.fields().iter().any(|f| f.label() == F_NEW_EPIC));
+        assert_eq!(form.choice(F_WORKFLOW), NO_WORKFLOW);
     }
 
     /// With nothing selected there is nothing to rename, close or resume — and
@@ -2307,15 +2528,15 @@ mod tests {
     /// Quest that does not exist.
     #[test]
     fn the_selection_prompts_do_nothing_on_an_empty_listing() {
-        for key in ['r', 'c', 'R'] {
+        for key in ['r', 'E', 'c', 'R'] {
             let mut app = app_with(Vec::new());
             assert_eq!(handle(&mut app, Input::Char(key)), Action::None);
             assert!(app.modal.is_none(), "{key} armed a form with no Quest");
             assert!(!app.capturing());
         }
-        // `n` needs no selection: it is how the first Quest gets made.
+        // `N` needs no selection: it is how the first Quest gets made.
         let mut app = app_with(Vec::new());
-        handle(&mut app, Input::Char('n'));
+        handle(&mut app, Input::Char('N'));
         assert!(app.modal.is_some());
     }
 
@@ -2672,9 +2893,8 @@ mod tests {
         assert!(text.contains("[/run]"), "{text}");
         crate::tui::report_refresh(&mut app, Ok(()));
 
-        // The machine filter is announced the same way. Two Escs: `l` opened
-        // the detail panel, and Esc closes that before it clears the search.
-        app.handle(Input::Esc);
+        // The machine filter is announced the same way. Esc clears the search
+        // (the panel is toggled with `d` now, not peeled by Esc).
         app.handle(Input::Esc);
         handle(&mut app, Input::Char('m'));
         handle(&mut app, Input::Char('l'));
@@ -3117,7 +3337,7 @@ mod form_tests {
 
     /// Drive the whole new-Quest form for a named Quest in the rig's dir.
     fn make(rig: &Rig, app: &mut App, name: &str) {
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(app, F_NAME, name);
         set(app, F_DIR, &rig.dir());
         no_beads(app);
@@ -3132,7 +3352,7 @@ mod form_tests {
     fn the_new_quest_form_creates_exactly_one_quest_and_selects_it() {
         let rig = Rig::new();
         let mut app = rig.app();
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(&mut app, F_NAME, "cdc-backfill");
         set(&mut app, F_GOAL, "make the backfill idempotent");
         set(&mut app, F_DIR, &rig.dir());
@@ -3191,7 +3411,7 @@ mod form_tests {
     fn a_blank_name_is_named_from_the_directory() {
         let rig = Rig::new();
         let mut app = rig.app();
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(&mut app, F_DIR, &rig.dir());
         no_beads(&mut app);
         submit(&rig, &mut app);
@@ -3206,7 +3426,7 @@ mod form_tests {
     fn a_directory_that_does_not_exist_keeps_the_form_up_and_creates_nothing() {
         let rig = Rig::new();
         let mut app = rig.app();
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(&mut app, F_NAME, "nowhere");
         set(&mut app, F_DIR, "/no/such/place/at/all");
         no_beads(&mut app);
@@ -3241,7 +3461,7 @@ mod form_tests {
         let mut app = rig.app();
         rig.break_new_session("no server running on /tmp/tmux-501/default");
 
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(&mut app, F_NAME, "half-made");
         set(&mut app, F_DIR, &rig.dir());
         no_beads(&mut app);
@@ -3304,7 +3524,7 @@ mod form_tests {
         let mut app = App::new(&ctx.config, "laptop");
         app.set_size(120, 40);
         refresh(&ctx, &mut app).unwrap();
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(&mut app, F_NAME, "over-there");
         no_beads(&mut app);
         focus(&mut app, F_MACHINE);
@@ -3342,7 +3562,7 @@ mod form_tests {
     fn cancelling_the_form_restores_nothing() {
         let rig = Rig::new();
         let mut app = rig.app();
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(&mut app, F_NAME, "never-made");
         set(&mut app, F_GOAL, "nor this");
         app.handle(Input::Esc);
@@ -3364,7 +3584,7 @@ mod form_tests {
         });
         let mut app = App::new(&config, "laptop");
         app.set_size(120, 40);
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         focus(&mut app, F_MACHINE);
         let form = &app.modal.as_ref().unwrap().form;
         assert_eq!(form.choice(F_MACHINE), "laptop");
@@ -3381,7 +3601,7 @@ mod form_tests {
     fn the_workflow_field_is_a_select_over_the_registry() {
         let rig = Rig::new();
         let mut app = rig.app();
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         let form = &app.modal.as_ref().unwrap().form;
         // The rig's registry has no user directory, so this is the built-ins.
         assert_eq!(form.choice(F_WORKFLOW), NO_WORKFLOW, "unset by default");
@@ -3433,7 +3653,7 @@ mod form_tests {
         rig.ctx = rig.ctx.with_workflows(dir.path());
         let mut app = rig.app();
 
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(&mut app, F_NAME, "picked");
         set(&mut app, F_DIR, &rig.dir());
         choose(&mut app, F_WORKFLOW, "triage");
@@ -3456,7 +3676,7 @@ mod form_tests {
         rig.ctx.db().unwrap().insert_template(&template).unwrap();
 
         let mut app = rig.app();
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         assert_eq!(
             app.modal.as_ref().unwrap().form.choice(F_TEMPLATE),
             NO_TEMPLATE
@@ -3791,7 +4011,7 @@ mod form_tests {
     fn the_shells_keys_are_text_while_a_form_is_up() {
         let rig = Rig::new();
         let mut app = rig.app();
-        for (key, label) in [('n', F_GOAL), ('n', F_NAME)] {
+        for (key, label) in [('N', F_GOAL), ('N', F_NAME)] {
             app.modal = None;
             app.handle(Input::Char(key));
             focus(&mut app, label);
@@ -3806,7 +4026,7 @@ mod form_tests {
             app.handle(Input::Esc);
         }
         // `?` too: the help overlay would swallow the form underneath it.
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         type_text(&mut app, "?");
         assert!(!app.help);
         assert_eq!(app.modal.as_ref().unwrap().form.trimmed(F_NAME), "?");
@@ -3820,7 +4040,7 @@ mod form_tests {
     fn a_click_on_another_tab_cannot_strand_a_form() {
         let rig = Rig::new();
         let mut app = rig.app();
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(&mut app, F_NAME, "half-typed");
         assert!(app.capturing());
 
@@ -3852,8 +4072,9 @@ mod form_tests {
         let mut app = rig.app();
         make(&rig, &mut app, "some-quest");
         for (key, title) in [
-            ('n', "new quest"),
+            ('N', "new quest"),
             ('r', "rename some-quest"),
+            ('E', "edit some-quest"),
             ('c', "close some-quest?"),
             ('R', "resume some-quest"),
         ] {
@@ -3885,7 +4106,7 @@ mod form_tests {
         let rig = Rig::with_bd(Box::new(bd.clone()));
         let mut app = rig.app();
 
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(&mut app, F_NAME, "with-beads");
         set(&mut app, F_GOAL, "ship the thing");
         set(&mut app, F_DIR, &rig.dir());
@@ -3910,7 +4131,120 @@ mod form_tests {
         );
     }
 
-    /// B1. `n` with the epic on and a `bd` that will not answer. `q new` writes
+    /// `n` — the loop's `Action::QuickNew` arm: one Quest, every default, no
+    /// epic, the master up, and the selection on it. `E` then fills in what
+    /// was skipped, writing only what changed.
+    #[test]
+    fn n_creates_a_bare_quest_and_e_fills_it_in_afterwards() {
+        let _guard = crate::beads::backoff::acquire();
+        let bd = std::sync::Arc::new(crate::beads::stub::StubBd::working("bd-e7"));
+        let rig = Rig::with_bd(Box::new(bd.clone()));
+        let mut app = rig.app();
+
+        assert_eq!(app.handle(Input::Char('n')), Action::QuickNew);
+        create_quick(&rig.ctx, &mut app);
+        refresh(&rig.ctx, &mut app).unwrap();
+        let quests = rig.quests();
+        assert_eq!(quests.len(), 1, "{:?}", rig.slugs());
+        let quest = &quests[0];
+        assert_eq!(quest.name_source, crate::model::NameSource::Auto);
+        assert_eq!(quest.goal, None);
+        assert_eq!(quest.beads_epic, None, "a bare Quest gets no epic yet");
+        assert!(bd.created.lock().unwrap().is_empty());
+        let sessions = rig
+            .ctx
+            .db()
+            .unwrap()
+            .list_sessions_by_quest(&quest.id)
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].role, SessionRole::Master);
+        assert_eq!(app.quests.selected_row().unwrap().view.quest.id, quest.id);
+        assert!(app.status.contains("E sets its goal"), "{}", app.status);
+
+        // A bare Enter over an untouched box writes nothing.
+        app.handle(Input::Char('E'));
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+        crate::tui::submit(&rig.ctx, &mut app);
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+        assert!(app.status.ends_with("unchanged"), "{}", app.status);
+        let events = rig
+            .ctx
+            .db()
+            .unwrap()
+            .list_events_by_quest(&quest.id, 50)
+            .unwrap();
+        assert!(
+            !events.iter().any(|e| e.kind == "quest.updated"),
+            "{events:?}"
+        );
+
+        // Goal, workflow and the epic in one go; the epic is titled from both.
+        app.handle(Input::Char('E'));
+        set(&mut app, F_GOAL, "make the backfill idempotent");
+        choose(&mut app, F_WORKFLOW, "solo");
+        focus(&mut app, F_NEW_EPIC);
+        app.handle(Input::Char(' '));
+        assert_eq!(app.handle(Input::Enter), Action::Submit);
+        crate::tui::submit(&rig.ctx, &mut app);
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+
+        let quest = &rig.quests()[0];
+        assert_eq!(quest.goal.as_deref(), Some("make the backfill idempotent"));
+        assert_eq!(quest.workflow.as_deref(), Some("solo"));
+        assert_eq!(quest.beads_epic.as_deref(), Some("bd-e7"));
+        let created = bd.created.lock().unwrap().clone();
+        assert_eq!(created.len(), 1);
+        assert_eq!(
+            created[0].0,
+            format!("{}: make the backfill idempotent", quest.slug)
+        );
+        assert!(created[0].1.contains(&format!("quest:{}", quest.id)));
+        assert!(
+            app.status.contains("goal, workflow, epic bd-e7"),
+            "{}",
+            app.status
+        );
+    }
+
+    /// The epic's title carries the goal, so changing the goal under an
+    /// existing epic retitles it; and a rename does the same for the slug.
+    #[test]
+    fn editing_the_goal_or_renaming_retitles_the_epic() {
+        let _guard = crate::beads::backoff::acquire();
+        let bd = std::sync::Arc::new(crate::beads::stub::StubBd::working("bd-e1"));
+        let rig = Rig::with_bd(Box::new(bd.clone()));
+        let mut app = rig.app();
+        app.handle(Input::Char('N'));
+        set(&mut app, F_NAME, "titled");
+        set(&mut app, F_DIR, &rig.dir());
+        submit(&rig, &mut app);
+        refresh(&rig.ctx, &mut app).unwrap();
+
+        app.handle(Input::Char('E'));
+        set(&mut app, F_GOAL, "ship it");
+        app.handle(Input::Enter);
+        crate::tui::submit(&rig.ctx, &mut app);
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+
+        refresh(&rig.ctx, &mut app).unwrap();
+        app.handle(Input::Char('r'));
+        set(&mut app, F_SLUG, "retitled");
+        app.handle(Input::Enter);
+        crate::tui::submit(&rig.ctx, &mut app);
+        assert!(app.modal.is_none(), "{}", screen(&mut app));
+
+        let retitled = bd.retitled.lock().unwrap().clone();
+        assert_eq!(
+            retitled,
+            vec![
+                ("bd-e1".to_string(), "titled: ship it".to_string()),
+                ("bd-e1".to_string(), "retitled: ship it".to_string()),
+            ]
+        );
+    }
+
+    /// B1. `N` with the epic on and a `bd` that will not answer. `q new` writes
     /// that warning to stderr; here the same call is running in raw mode on the
     /// alternate screen, where a write scrolls the pane and leaves ratatui
     /// painting over garbage it never repaints. So it comes back as data.
@@ -3921,7 +4255,7 @@ mod form_tests {
         let rig = Rig::with_bd(Box::new(bd.clone()));
         let mut app = rig.app();
 
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(&mut app, F_NAME, "no-tracker");
         set(&mut app, F_DIR, &rig.dir());
         submit(&rig, &mut app);
@@ -3962,12 +4296,13 @@ mod form_tests {
             listing: None,
             created: std::sync::Mutex::new(Vec::new()),
             closed: std::sync::Mutex::new(Vec::new()),
+            retitled: std::sync::Mutex::new(Vec::new()),
         });
         let rig = Rig::with_bd(Box::new(bd.clone()));
         let mut app = rig.app();
         rig.break_new_session("no server running on /tmp/tmux-501/default");
 
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(&mut app, F_NAME, "half-made");
         set(&mut app, F_DIR, &rig.dir());
         submit(&rig, &mut app);
@@ -4385,7 +4720,7 @@ mod form_tests {
         let mut app = rig.app();
         make(&rig, &mut app, "one-quest");
 
-        for key in ['n', 'R'] {
+        for key in ['N', 'R'] {
             app.modal = None;
             app.handle(Input::Char(key));
             assert!(
@@ -4608,7 +4943,7 @@ mod form_tests {
         rig.ctx.db().unwrap().insert_template(&template).unwrap();
 
         let mut app = rig.app();
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         let text = screen(&mut app);
         assert!(text.contains("master's first prompt"), "{text}");
         assert!(text.contains("beads repo"), "{text}");
@@ -4652,7 +4987,7 @@ mod form_tests {
         rig.ctx.db().unwrap().insert_template(&template).unwrap();
 
         let mut app = rig.app();
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(&mut app, F_NAME, "from-template");
         focus(&mut app, F_TEMPLATE);
         app.handle(Input::Right);
@@ -4691,7 +5026,7 @@ mod form_tests {
         rig.ctx.db().unwrap().insert_template(&template).unwrap();
 
         let mut app = rig.app();
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(&mut app, F_NAME, "from-template");
         focus(&mut app, F_TEMPLATE);
         app.handle(Input::Right);
@@ -4738,7 +5073,7 @@ mod form_tests {
         let _guard = crate::beads::backoff::acquire();
         refresh(&rig.ctx, &mut app).unwrap();
 
-        for key in ['n', 'c'] {
+        for key in ['N', 'c'] {
             app.modal = None;
             app.handle(Input::Char(key));
             let before = app.modal.as_ref().unwrap().form.clone();
@@ -4761,7 +5096,7 @@ mod form_tests {
     fn a_tick_leaves_an_open_form_alone() {
         let rig = Rig::new();
         let mut app = rig.app();
-        app.handle(Input::Char('n'));
+        app.handle(Input::Char('N'));
         set(&mut app, F_NAME, "surviving");
         for _ in 0..50 {
             app.tick();

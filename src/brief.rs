@@ -453,6 +453,22 @@ fn section_how(
                  (`--blocker` when stuck). When you are done, leave a closing `q note`.\n\
                  - Lost the picture? `q brief` re-renders this document from the database.\n",
             );
+            // A Quest made with the TUI's bare `n` starts with neither; the
+            // master fills them in once it knows what the work is.
+            if quest.goal.as_deref().is_none_or(|g| g.trim().is_empty()) {
+                out.push_str(&format!(
+                    "- This Quest has no goal yet. Once you know what it is, record it in one \
+                     line: `q set {} goal \"<text>\"`.\n",
+                    quest.id
+                ));
+            }
+            if beads::epic_of(quest).is_none() {
+                out.push_str(&format!(
+                    "- No beads epic yet. When the work is worth tracking, \
+                     `q set {} beads_epic new` creates one.\n",
+                    quest.id
+                ));
+            }
         }
         SessionRole::Worker => {
             let master = sessions

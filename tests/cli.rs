@@ -3441,6 +3441,67 @@ fn an_agent_inside_a_quest_pane_is_never_prompted() {
     );
 }
 
+/// A Quest made without an epic (`--no-beads`, or the TUI's bare `n`) gets one
+/// later with `beads_epic new`, titled from the slug and goal it has by then;
+/// a second `new` is refused rather than minting a twin.
+#[test]
+fn set_beads_epic_new_creates_the_epic_once() {
+    let env = Env::new();
+    let work = env.work("bare");
+    env.cmd()
+        .args(["new", "--name", "bare", "--dir", work.to_str().unwrap()])
+        .args(["--no-beads", "-d"])
+        .assert()
+        .success();
+    env.json(&["set", "bare", "goal", "ship it"]);
+
+    let mut cmd = env.cmd();
+    env.with_bd_create(&mut cmd, "bd-late");
+    let out = json_of(
+        &cmd.args(["set", "bare", "beads_epic", "new", "--json"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(out["value"], "bd-late");
+    assert_eq!(out["quest"]["beads_epic"], "bd-late");
+    assert!(
+        env.bd_calls()
+            .iter()
+            .any(|c| c.contains("create bare: ship it --type epic")),
+        "{:?}",
+        env.bd_calls()
+    );
+
+    let mut cmd = env.cmd();
+    env.with_bd_create(&mut cmd, "bd-twin");
+    cmd.args(["set", "bare", "beads_epic", "new"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already has epic bd-late"));
+}
+
+/// The epic is titled `<slug>: <goal>`, so a new goal is written to it too.
+#[test]
+fn set_goal_retitles_the_epic() {
+    let env = Env::new();
+    env.quest_with_epic("retitle-me", "bd-epic");
+    let mut cmd = env.cmd();
+    let ok = env.dir.path().join("bd-retitle");
+    std::fs::write(&ok, "ok").unwrap();
+    cmd.env("Q_FIXTURE_BD_RETITLE", ok);
+    env.with_bd_log(&mut cmd);
+    cmd.args(["set", "retitle-me", "goal", "ship it"])
+        .assert()
+        .success();
+    assert!(
+        env.bd_calls()
+            .iter()
+            .any(|c| c.contains("update bd-epic --title retitle-me: ship it")),
+        "{:?}",
+        env.bd_calls()
+    );
+}
+
 #[test]
 fn set_clears_goal_and_workflow_with_an_empty_value() {
     let env = Env::new();

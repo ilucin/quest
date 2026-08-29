@@ -33,6 +33,12 @@ use crate::output;
 /// not a listing.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How stale a cached listing may be before it stops standing in for a machine
+/// that is down (bd-8lz.5.5). A week: long enough to survive a machine off for a
+/// weekend, short enough that week-old Quests are not shown as if current. Past
+/// it, the row is neither shown nor counted, and a live round evicts it.
+pub const CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+
 /// The deadline on a **proxied** command (SPEC §15, bd-8lz.5.3). Far longer
 /// than [`TIMEOUT`]: a listing that blocks is a broken listing, but a
 /// `q spawn` over there starts tmux and Claude, and a user who typed the
@@ -780,8 +786,9 @@ pub struct RemoteResult {
 }
 
 impl RemoteResult {
-    /// `ws ⚠ unreachable (host is down)` — one line for a human.
-    pub fn note(&self) -> Option<String> {
+    /// `ws ⚠ unreachable (host is down), showing 3 cached quest(s) from 2h ago`
+    /// — one line for a human, `now` supplied so the cache age can be shown.
+    pub fn note(&self, now: i64) -> Option<String> {
         let marker = self.status.marker()?;
         let mut line = format!("{} {marker}", self.name);
         if let Some(reason) = self.status.reason().filter(|r| !r.is_empty()) {
@@ -789,6 +796,12 @@ impl RemoteResult {
         }
         if self.stale {
             line.push_str(&format!(", showing {} cached quest(s)", self.quests.len()));
+            if let Some(at) = self.fetched_at {
+                line.push_str(&format!(
+                    " from {} ago",
+                    crate::commands::fmt::age_at(now, at)
+                ));
+            }
         }
         Some(line)
     }
@@ -999,6 +1012,9 @@ pub fn targets(ctx: &Ctx) -> Vec<&Remote> {
 /// fold in the cache. The whole round takes about as long as the slowest
 /// remote, and at most [`TIMEOUT`].
 pub fn fetch_all(ctx: &Ctx, all: bool, state: Option<StateFilter>) -> Vec<RemoteResult> {
+    // Before the target check, so a config that dropped its last remote still
+    // clears the orphaned rows (bd-8lz.5.5).
+    prune_cache(ctx.db().ok(), &ctx.config, now());
     let targets = targets(ctx);
     if targets.is_empty() {
         return Vec::new();
@@ -1027,9 +1043,10 @@ pub fn cached_quests(ctx: &Ctx) -> Vec<RemoteQuest> {
     let Ok(db) = ctx.db() else {
         return Vec::new();
     };
+    let now = now();
     targets
         .iter()
-        .filter_map(|remote| load(Some(db), &remote.name))
+        .filter_map(|remote| load(Some(db), &remote.name, now))
         .flat_map(|(listing, _)| listing.quests)
         .collect()
 }
@@ -1319,6 +1336,7 @@ impl Round {
 /// A polled round, folded through the cache exactly as [`fetch_all`] folds a
 /// synchronous one.
 pub fn resolve_round(ctx: &Ctx, round: Round) -> Vec<RemoteResult> {
+    prune_cache(ctx.db().ok(), &ctx.config, now());
     let targets: Vec<&Remote> = round.targets.iter().collect();
     resolve(ctx.db().ok(), &targets, round.answers, now())
 }
@@ -1351,7 +1369,8 @@ pub fn validate_target(config: &Config, name: &str) -> anyhow::Result<()> {
 /// Buffers one line per unhappy remote onto the `Ctx` (see [`Ctx::warn`]), so
 /// the caller decides where it goes.
 pub fn warn_unreachable(ctx: &Ctx, results: &[RemoteResult]) {
-    for note in results.iter().filter_map(RemoteResult::note) {
+    let now = now();
+    for note in results.iter().filter_map(|r| r.note(now)) {
         ctx.warn(format!("warning: {note}"));
     }
 }
@@ -1594,7 +1613,7 @@ fn resolve(
                 }
             }
             Err(status) => {
-                let cached = load(db, &remote.name);
+                let cached = load(db, &remote.name, ts);
                 RemoteResult {
                     name: remote.name.clone(),
                     ssh: remote.ssh.clone(),
@@ -1639,11 +1658,25 @@ fn store(db: Option<&Db>, name: &str, payload: &str, ts: i64) {
     let _ = db.put_remote_cache(name, payload, ts);
 }
 
-fn load(db: Option<&Db>, name: &str) -> Option<(Listing, i64)> {
+fn load(db: Option<&Db>, name: &str, now: i64) -> Option<(Listing, i64)> {
     let cached = db?.get_remote_cache(name).ok().flatten()?;
+    // Past the age cap the cache no longer stands in for the machine (bd-8lz.5.5);
+    // a live round will evict the row, this read just declines to use it.
+    if now - cached.fetched_at > CACHE_MAX_AGE.as_secs() as i64 {
+        return None;
+    }
     let mut listing = parse(&cached.payload).ok()?;
     attribute(&mut listing.quests, name);
     Some((listing, cached.fetched_at))
+}
+
+/// Evict cache rows a live round cannot refresh: dropped remotes and rows past
+/// the age cap (bd-8lz.5.5). Keyed on the *whole* configured roster — not the
+/// round's `--machine`-narrowed targets — so a scoped round keeps the rest.
+fn prune_cache(db: Option<&Db>, config: &Config, now: i64) {
+    let Some(db) = db else { return };
+    let keep: Vec<&str> = config.remotes.iter().map(|r| r.name.as_str()).collect();
+    let _ = db.prune_remote_cache(&keep, now - CACHE_MAX_AGE.as_secs() as i64);
 }
 
 /// The configured remote called `name`, for the commands that dispatch to one.
@@ -2142,7 +2175,7 @@ mod tests {
         assert!(!fresh[0].stale);
         assert_eq!(fresh[0].fetched_at, Some(1000));
         assert_eq!(fresh[0].quests[0].view.quest.slug, "one");
-        assert_eq!(fresh[0].note(), None);
+        assert_eq!(fresh[0].note(1000), None);
 
         let down = resolve(
             Some(&db),
@@ -2157,11 +2190,38 @@ mod tests {
             "the stale timestamp is kept"
         );
         assert_eq!(down[0].quests[0].view.quest.slug, "one");
-        let note = down[0].note().unwrap();
+        // 1000s between the cache and the round is 16m, shown after the count.
+        let note = down[0].note(2000).unwrap();
         assert!(
             note.contains(UNREACHABLE) && note.contains("host is down"),
             "{note}"
         );
+        assert!(
+            note.contains("1 cached quest(s) from 16m ago"),
+            "the cache age is not shown: {note}"
+        );
+    }
+
+    /// bd-8lz.5.5: a cache past the age cap no longer stands in for a machine
+    /// that is down — the fallback contributes nothing, not week-old Quests.
+    #[test]
+    fn a_cache_past_the_age_cap_is_not_used() {
+        let db = Db::open_in_memory().unwrap();
+        let remotes = [remote("ws")];
+        let targets: Vec<&Remote> = remotes.iter().collect();
+
+        resolve(Some(&db), &targets, vec![Ok(answer(&payload("one")))], 0);
+        let stale_by = CACHE_MAX_AGE.as_secs() as i64 + 1;
+        let down = resolve(
+            Some(&db),
+            &targets,
+            vec![Err(RemoteStatus::unreachable("host is down".to_string()))],
+            stale_by,
+        );
+        assert!(!down[0].stale, "an expired cache was used");
+        assert!(down[0].quests.is_empty());
+        assert_eq!(down[0].fetched_at, None);
+        assert!(!down[0].note(stale_by).unwrap().contains("cached"));
     }
 
     #[test]

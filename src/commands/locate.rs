@@ -477,9 +477,15 @@ mod tests {
             .iter()
             .map(|q| QuestView::new(q.clone(), &[]))
             .collect();
+        // A current timestamp, not epoch: `cached_quests` now declines a cache
+        // past the age cap (bd-8lz.5.5), and these rows stand for a live fleet.
         ctx.db()
             .unwrap()
-            .put_remote_cache(name, &serde_json::to_string(&views).unwrap(), 1)
+            .put_remote_cache(
+                name,
+                &serde_json::to_string(&views).unwrap(),
+                crate::model::now(),
+            )
             .unwrap();
     }
 

@@ -13,12 +13,33 @@ where
     let text = if json {
         serde_json::to_string(value)?
     } else {
-        human()
+        sanitize(human())
     };
     match writeln!(std::io::stdout().lock(), "{text}") {
         Err(e) if e.kind() == ErrorKind::BrokenPipe => Ok(()),
         other => Ok(other?),
     }
+}
+
+/// Neutralise terminal-driving control characters in human output — ESC, BEL,
+/// CR and the rest of C0/C1 — so an event payload or goal carrying `\033]0;…\a`
+/// cannot retitle or clear the terminal (bd-8lz.8). `\n` and `\t` are kept: the
+/// layout needs them. Mirrors the TUI's own sanitize (`tui::events`); `--json`
+/// is already safe via serde, so only the human path passes through here.
+pub fn sanitize(text: String) -> String {
+    let keep = |c: char| c == '\n' || c == '\t';
+    if !text.chars().any(|c| c.is_control() && !keep(c)) {
+        return text;
+    }
+    text.chars()
+        .map(|c| {
+            if c.is_control() && !keep(c) {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Centralized error rendering, mirroring `emit`'s two modes. `code` is a
@@ -109,5 +130,21 @@ mod tests {
         // A lone escape at the end must not panic or leak.
         assert_eq!(strip_ansi("a\u{1b}"), "a");
         assert_eq!(strip_ansi("a\u{1b}[38;5;196m"), "a");
+    }
+
+    #[test]
+    fn sanitize_neutralises_escapes_and_keeps_layout() {
+        // bd-8lz.8's repro: an OSC retitle and a clear-screen in a payload.
+        let out = sanitize("\u{1b}]0;pwned\u{7}\u{1b}[2Jhi".to_string());
+        assert!(
+            !out.chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+        );
+        assert!(out.contains("pwned") && out.contains("hi"));
+        // Newlines and tabs survive; the rest becomes the replacement char.
+        assert_eq!(sanitize("a\nb\tc".to_string()), "a\nb\tc");
+        assert_eq!(sanitize("a\rb".to_string()), "a\u{fffd}b");
+        // Clean text is returned untouched (and unallocated).
+        assert_eq!(sanitize("plain".to_string()), "plain");
     }
 }

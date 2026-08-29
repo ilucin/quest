@@ -289,17 +289,17 @@ fn create_epic(ctx: &Ctx, quest: Quest, args: &Args, repo: Option<&str>) -> Ques
     if args.no_beads {
         return quest;
     }
+    attach_epic(ctx, quest, repo)
+}
+
+/// Creates an epic for a Quest that has none and stores it on the row — at
+/// `q new`, or later from `q set <quest> beads_epic new` for a Quest the TUI's
+/// bare `n` made without one. `repo` is the label; `None` derives it from the
+/// config and the Quest's directory.
+pub fn attach_epic(ctx: &Ctx, quest: Quest, repo: Option<&str>) -> Quest {
     let repo = beads::repo_label(&ctx.config, repo, Path::new(&quest.cwd));
     let labels = format!("repo:{repo},quest:{}", quest.id);
-    let title = match quest
-        .goal
-        .as_deref()
-        .map(str::trim)
-        .filter(|g| !g.is_empty())
-    {
-        Some(goal) => format!("{}: {goal}", quest.slug),
-        None => quest.slug.clone(),
-    };
+    let title = beads::epic_title(&quest);
     match ctx.bd().create_epic(&title, &labels, &quest.id) {
         Ok(epic) => store_epic(ctx, quest, &epic, &repo),
         Err(e) => {

@@ -84,10 +84,12 @@ pub enum Action {
     /// Carries nothing: the loop reads the form — and the Quest id the prompt
     /// was opened against — out of `App::modal`.
     Submit,
-    /// Proxy a Quests-tab key against the machine the selection lives on
-    /// (SPEC §15, bd-8lz.5.8): `s`/`e`/`b`/`l` page a captured `q <cmd>`,
-    /// `c`/`R` hand over the terminal for the CLI's confirm/attach. Carries
-    /// only the key; the loop reads the selection out of the tab.
+    /// Make a Quest right away with every default — no form (`n`; `N` is the
+    /// form). The loop runs `q new` and reloads.
+    QuickNew,
+    /// Proxy an acting key against the machine the selection lives on (SPEC §15;
+    /// bd-8lz.5.8 Quests, bd-8lz.10 Sessions): a read pages a captured `q`, a
+    /// write hands over the terminal. The loop reads the selection and tab.
     Proxy(char),
     Quit,
 }
@@ -150,6 +152,10 @@ pub struct SessionTarget {
     /// a prompt is up must not be killed, or have text typed into a pane that
     /// by now belongs to something else.
     pub ended: bool,
+    /// The machine the session lives on, when not this one (SPEC §15, bd-8lz.10).
+    /// `Some` routes the submit through the proxy — the checks above are then the
+    /// far end's to make against its own row.
+    pub machine: Option<String>,
 }
 
 /// The template a prompt was opened against, and enough of it to notice if it
@@ -172,6 +178,9 @@ pub struct TemplateTarget {
 pub enum Prompt {
     NewQuest,
     Rename(Target),
+    /// `E` — goal, workflow and the beads epic of an existing Quest, which a
+    /// Quest made with a bare `n` has yet to be given.
+    Edit(Target),
     Close(Target),
     Resume(Target),
     /// SPEC §17 `t` — type into a live Claude session.
@@ -196,7 +205,9 @@ impl Prompt {
     pub fn quest(&self) -> Option<&str> {
         match self {
             Prompt::NewQuest => None,
-            Prompt::Rename(t) | Prompt::Close(t) | Prompt::Resume(t) => Some(t.quest.as_str()),
+            Prompt::Rename(t) | Prompt::Edit(t) | Prompt::Close(t) | Prompt::Resume(t) => {
+                Some(t.quest.as_str())
+            }
             Prompt::Send(t) | Prompt::Kill(t) | Prompt::Reset(t) => Some(t.quest.as_str()),
             // A template is a definition; the Quest a run makes does not
             // exist yet, and the other three never make one.
@@ -221,7 +232,7 @@ impl Prompt {
 
     pub fn target(&self) -> Option<&Target> {
         match self {
-            Prompt::Rename(t) | Prompt::Close(t) | Prompt::Resume(t) => Some(t),
+            Prompt::Rename(t) | Prompt::Edit(t) | Prompt::Close(t) | Prompt::Resume(t) => Some(t),
             _ => None,
         }
     }
@@ -237,7 +248,7 @@ pub struct Modal {
 
 /// One row of the `?` overlay: the keys every tab answers to.
 pub const HELP: &[(&str, &str)] = &[
-    ("Tab / S-Tab", "next / previous tab"),
+    ("Tab / S-Tab", "next / previous tab (or ← →)"),
     (
         "1 2 3 4",
         "jump to a tab (phone keyboards: no Enter needed)",
@@ -353,8 +364,8 @@ pub struct App {
     /// The Quest a tab handed to another tab — `s` on the Quests tab means
     /// "the Sessions tab, filtered to this one" (SPEC §17).
     pub focus_quest: Option<String>,
-    /// Whether the right-hand detail panel is up. Shell-level rather than
-    /// per-tab: it is one panel, and `Enter` means the same thing everywhere.
+    /// Whether the right-hand detail panel is up — open by default, toggled
+    /// with `d`. Shell-level rather than per-tab: it is one panel.
     pub detail: bool,
     /// The open form, if any. Shell-level like `help`: it is drawn over the
     /// whole frame whatever tab is behind it, which is what makes
@@ -393,7 +404,7 @@ impl App {
             remote_note: None,
             remote_tmux: std::collections::BTreeMap::new(),
             focus_quest: None,
-            detail: false,
+            detail: true,
             modal: None,
             machines: machines(config, machine),
             tmux_prefix: config.tmux.session_prefix.clone(),
@@ -525,8 +536,13 @@ impl App {
                 self.help = true;
                 Some(Action::None)
             }
-            Input::Tab => Some(self.switch(self.tab.next())),
-            Input::BackTab => Some(self.switch(self.tab.prev())),
+            // Tab/BackTab and the arrows both walk the tab bar: the rows are
+            // driven by `j`/`k` (and PageUp/Down, Home/End), so `←`/`→` are
+            // free here and read as "move along the bar" the way it looks.
+            // Reached only outside a form and a capture (see `handle`), so the
+            // N-1 paste-as-arrow path never lands here.
+            Input::Tab | Input::Right => Some(self.switch(self.tab.next())),
+            Input::BackTab | Input::Left => Some(self.switch(self.tab.prev())),
             Input::Char('x') => {
                 self.refreshes += 1;
                 Some(Action::Refresh)
@@ -757,6 +773,22 @@ mod tests {
         for want in [Tab::Events, Tab::Templates, Tab::Sessions, Tab::Quests] {
             a.handle(Input::BackTab);
             assert_eq!(a.tab, want);
+        }
+    }
+
+    /// The arrows walk the bar exactly as Tab/BackTab do — they are free at the
+    /// shell level, since the rows move on `j`/`k` (and PageUp/Down).
+    #[test]
+    fn the_arrows_cycle_the_tabs_like_tab_and_backtab() {
+        let mut a = app();
+        assert_eq!(a.tab, Tab::Quests);
+        for want in [Tab::Sessions, Tab::Templates, Tab::Events, Tab::Quests] {
+            a.handle(Input::Right);
+            assert_eq!(a.tab, want, "→ {want:?}");
+        }
+        for want in [Tab::Events, Tab::Templates, Tab::Sessions, Tab::Quests] {
+            a.handle(Input::Left);
+            assert_eq!(a.tab, want, "← {want:?}");
         }
     }
 
@@ -994,7 +1026,7 @@ mod tests {
     #[test]
     fn a_form_takes_every_key_the_shell_would_have_claimed() {
         let mut a = app();
-        a.handle(Input::Char('n'));
+        a.handle(Input::Char('N'));
         assert!(a.modal.is_some());
         assert!(a.capturing());
 
@@ -1037,7 +1069,7 @@ mod tests {
     #[test]
     fn ctrl_c_quits_from_inside_a_form() {
         let mut a = app();
-        a.handle(Input::Char('n'));
+        a.handle(Input::Char('N'));
         assert_eq!(a.handle(Input::Ctrl('c')), Action::Quit);
         assert!(a.should_quit);
     }
