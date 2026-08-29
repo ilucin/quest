@@ -36,6 +36,37 @@ impl Db {
         Ok(())
     }
 
+    /// Drops cache rows a live round can no longer refresh (bd-8lz.5.5): any
+    /// remote no longer in `keep` (dropped from the config), and any row older
+    /// than `min_fetched_at` (past the age cap). `keep` is the *whole* configured
+    /// roster, never a `--machine`-narrowed subset, so a scoped round cannot
+    /// evict the others' rows. Returns how many rows were deleted.
+    pub fn prune_remote_cache(&self, keep: &[&str], min_fetched_at: i64) -> anyhow::Result<usize> {
+        let aged = self
+            .conn
+            .execute(
+                "DELETE FROM remote_cache WHERE fetched_at < ?1",
+                params![min_fetched_at],
+            )
+            .map_err(db_err)?;
+        let names: Vec<String> = self
+            .conn
+            .prepare("SELECT name FROM remote_cache")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(db_err)?;
+        let mut dropped = 0;
+        for name in names.iter().filter(|n| !keep.contains(&n.as_str())) {
+            dropped += self
+                .conn
+                .execute("DELETE FROM remote_cache WHERE name = ?1", params![name])
+                .map_err(db_err)?;
+        }
+        Ok(aged + dropped)
+    }
+
     pub fn get_remote_cache(&self, name: &str) -> anyhow::Result<Option<RemoteCache>> {
         self.conn
             .query_row(
@@ -88,5 +119,33 @@ mod tests {
             db.get_remote_cache("other").unwrap().unwrap().fetched_at,
             150
         );
+    }
+
+    #[test]
+    fn prune_drops_unconfigured_remotes_and_keeps_the_rest() {
+        let db = Db::open_in_memory().unwrap();
+        db.put_remote_cache("ws", "[]", 1000).unwrap();
+        db.put_remote_cache("old-box", "[]", 1000).unwrap();
+
+        // `old-box` is no longer in the config; a scoped round that names only
+        // `ws` must still not evict rows it did not ask about, so `keep` is the
+        // whole roster and both survive.
+        assert_eq!(db.prune_remote_cache(&["ws", "old-box"], 0).unwrap(), 0);
+        // Dropped from the config: gone; `ws` stays.
+        assert_eq!(db.prune_remote_cache(&["ws"], 0).unwrap(), 1);
+        assert!(db.get_remote_cache("old-box").unwrap().is_none());
+        assert!(db.get_remote_cache("ws").unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_drops_rows_past_the_age_cap() {
+        let db = Db::open_in_memory().unwrap();
+        db.put_remote_cache("ws", "[]", 100).unwrap();
+        db.put_remote_cache("fresh", "[]", 5000).unwrap();
+
+        // Everything fetched before 1000 goes, whatever its name.
+        assert_eq!(db.prune_remote_cache(&["ws", "fresh"], 1000).unwrap(), 1);
+        assert!(db.get_remote_cache("ws").unwrap().is_none());
+        assert!(db.get_remote_cache("fresh").unwrap().is_some());
     }
 }

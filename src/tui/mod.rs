@@ -1053,10 +1053,8 @@ impl Drop for Away<'_> {
 /// owns the only connection; the ssh it is the answer to ran elsewhere.
 fn absorb(ctx: &Ctx, app: &mut App, round: remote::Round) {
     let mut results = remote::resolve_round(ctx, round);
-    let notes: Vec<String> = results
-        .iter()
-        .filter_map(remote::RemoteResult::note)
-        .collect();
+    let now = crate::model::now();
+    let notes: Vec<String> = results.iter().filter_map(|r| r.note(now)).collect();
     app.remote_note = (!notes.is_empty()).then(|| notes.join(" \u{b7} "));
     // Kept rather than replaced: a machine that did not answer this round
     // still has the prefix it reported when it did, which is the same age as
