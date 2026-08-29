@@ -61,14 +61,96 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     // SPEC §17's second clock. Started before the alternate screen so its
     // first round is already in flight while the first frame is drawn; it
     // never touches the terminal, and dropping it stops it.
-    let poller = remote::Poller::spawn(ctx, Duration::from_secs(ctx.config.ui.tick_remote.max(1)));
+    let remote_tick = Duration::from_secs(ctx.config.ui.tick_remote.max(1));
+    let poller = remote::Poller::spawn(ctx, remote_tick);
+    // The Sessions tab's fleet fan-out (SPEC §17), kicked only while that tab is
+    // active — no ssh load for the fleet while the Quests tab is up.
+    let sessions = SessionFetch::new(ctx, remote_tick);
 
     let (guard, mut terminal) = enter(mouse)?;
-    let result = event_loop(ctx, &mut terminal, &mut app, tick, poller.as_ref());
+    let result = event_loop(
+        ctx,
+        &mut terminal,
+        &mut app,
+        tick,
+        poller.as_ref(),
+        sessions.as_ref(),
+    );
     // Explicit so the terminal is back to normal before `main` prints an error
     // into it; a panic or a `?` above drops the guard just the same.
     drop(guard);
     result
+}
+
+/// The Sessions tab's fleet fan-out (SPEC §17, bd-8lz.5.10).
+///
+/// On-demand rather than a second always-on [`remote::Poller`]: kicked only
+/// while the Sessions tab is active, so the Quests tab pays no ssh for a fleet
+/// nobody is looking at. Each kick runs [`remote::fetch_sessions`] on its own
+/// thread — the UI never blocks on ssh — and drops the answer in a slot the
+/// loop drains between frames. One fetch in flight at a time.
+struct SessionFetch {
+    ssh: std::sync::Arc<dyn remote::Ssh>,
+    targets: Vec<crate::config::Remote>,
+    /// The throttle: no new kick within this of the last. `x` overrides it.
+    every: Duration,
+    slot: std::sync::Arc<std::sync::Mutex<Option<remote::FleetSessions>>>,
+    /// Set while a fetch is on its thread, so only one runs at a time.
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When the last kick went out. `Cell`: only the UI thread touches it.
+    last: std::cell::Cell<Option<Instant>>,
+}
+
+impl SessionFetch {
+    /// `None` when there is nothing to fan out to — no remotes, `--no-remote`,
+    /// or a `--machine` that is not one — like [`remote::Poller`].
+    fn new(ctx: &Ctx, every: Duration) -> Option<SessionFetch> {
+        let targets: Vec<crate::config::Remote> =
+            remote::targets(ctx).into_iter().cloned().collect();
+        if targets.is_empty() {
+            return None;
+        }
+        Some(SessionFetch {
+            ssh: ctx.ssh_shared(),
+            targets,
+            every,
+            slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last: std::cell::Cell::new(None),
+        })
+    }
+
+    /// Fan out on a background thread if none is already in flight and the
+    /// throttle window has passed. `force` (the `x` key) ignores the throttle.
+    fn kick(&self, force: bool) {
+        use std::sync::atomic::Ordering;
+        if self.busy.load(Ordering::SeqCst) {
+            return;
+        }
+        if !force && self.last.get().is_some_and(|t| t.elapsed() < self.every) {
+            return;
+        }
+        self.last.set(Some(Instant::now()));
+        self.busy.store(true, Ordering::SeqCst);
+        let (ssh, targets, slot, busy) = (
+            self.ssh.clone(),
+            self.targets.clone(),
+            self.slot.clone(),
+            self.busy.clone(),
+        );
+        std::thread::spawn(move || {
+            let fleet = remote::fetch_sessions(ssh.as_ref(), &targets);
+            if let Ok(mut slot) = slot.lock() {
+                *slot = Some(fleet);
+            }
+            busy.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// The newest finished fan-out, if any. Never blocks.
+    fn take(&self) -> Option<remote::FleetSessions> {
+        self.slot.lock().ok()?.take()
+    }
 }
 
 // ------------------------------------------------------------ terminal state
@@ -905,6 +987,7 @@ fn event_loop(
     app: &mut App,
     tick: Duration,
     poller: Option<&remote::Poller>,
+    sessions: Option<&SessionFetch>,
 ) -> anyhow::Result<()> {
     refresh_now(ctx, app);
     let mut last_tick = Instant::now();
@@ -938,6 +1021,11 @@ fn event_loop(
                     // reloads what is already here.
                     if let Some(poller) = poller {
                         poller.nudge();
+                    }
+                    if app.tab == Tab::Sessions
+                        && let Some(sessions) = sessions
+                    {
+                        sessions.kick(true);
                     }
                     refresh_due = true;
                 }
@@ -1012,6 +1100,18 @@ fn event_loop(
         if let Some(round) = poller.and_then(remote::Poller::take) {
             absorb(ctx, app, round);
             refresh_due = true;
+        }
+
+        // SPEC §17's fleet: kick a fan-out while the Sessions tab is up
+        // (throttled), and fold in whatever the last one brought back.
+        if let Some(sessions) = sessions {
+            if app.tab == Tab::Sessions {
+                sessions.kick(false);
+            }
+            if let Some(fleet) = sessions.take() {
+                app.remote_note = app.sessions.absorb_remote(fleet);
+                refresh_due = true;
+            }
         }
         // A poller that has stopped would otherwise leave the last chip
         // standing for ever, which reads as a fact about the machines rather

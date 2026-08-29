@@ -1,6 +1,6 @@
 //! `q sessions [<quest>]` — the fleet of agents, or one Quest's (SPEC §6, §16).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::Ctx;
 use crate::commands::{fmt, sweep_quiet};
@@ -20,7 +20,12 @@ const PROMPT_WIDTH: usize = 40;
 
 /// A session with the Quest it belongs to, so a fleet-wide listing is
 /// self-describing and `--json` needs no second lookup.
-#[derive(Debug, Serialize)]
+///
+/// `Deserialize` because this is the wire format between machines: the TUI's
+/// fleet view reads a remote's `q sessions --json` straight back into these
+/// (SPEC §15, §17), exactly as [`crate::commands::QuestView`] is read from
+/// `q list`. `registry` defaults so a remote that omits it still parses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionView {
     #[serde(flatten)]
     pub session: Session,
@@ -29,7 +34,7 @@ pub struct SessionView {
     /// What Claude's own registry says, when it says anything and it differs
     /// from the row. The hooks feed `status`; this is the second opinion that
     /// shows a row has gone stale (SPEC §6).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub registry: Option<String>,
 }
 
