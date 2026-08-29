@@ -368,12 +368,11 @@ fn viewport(app: &App) -> usize {
 /// and half a vim keymap — `j` moving while `k` ends an agent — is worse than
 /// none.
 pub fn handle(app: &mut App, input: Input) -> Action {
-    // SPEC §15: the five keys that act on an agent touch its own machine's
-    // tmux, registry and database, so on a remote fleet row they are refused
-    // with the CLI that does the work there (bd-8lz.5.10). The fleet is
-    // multi-machine to *look* at; proxying the keys is a follow-up (bd-8lz.10).
-    if let Some(refusal) = refuse_remote_act(app, input) {
-        return refusal;
+    // SPEC §15, bd-8lz.10: on a remote fleet row the acting keys are proxied
+    // through the real `q`. `⏎`/`o`/`p`/`k`/`Z` hand off as `Action::Proxy`;
+    // only `t` falls through, to open the send form (its submit proxies).
+    if let Some(action) = remote_proxy_key(app, input) {
+        return action;
     }
     let page = viewport(app);
     match input {
@@ -434,39 +433,38 @@ pub fn handle(app: &mut App, input: Input) -> Action {
     }
 }
 
-/// The `q` command a refused Sessions key stands for, so the hint hands over
-/// something to run rather than a dead end. Enter/`o` attach; the other four map
-/// to the CLI verb the far end proxies (bd-8lz.5.8).
-fn cli_equivalent(input: Input) -> Option<&'static str> {
-    Some(match input {
-        Input::Enter | Input::Char('o') => "q enter",
-        Input::Char('p') => "q peek",
-        Input::Char('t') => "q send",
-        Input::Char('k') => "q kill",
-        Input::Char('Z') => "q reset",
+/// The `q` subcommand a proxied Sessions key stands for, and whether its output
+/// is **paged** (a read) rather than handed the terminal (a write). `p` reads;
+/// `k`/`Z` write. `⏎`/`o` (attach) and `t` (send) are handled apart from here.
+pub fn proxied(key: char) -> Option<(&'static str, bool)> {
+    Some(match key {
+        'p' => ("peek", true),
+        'k' => ("kill", false),
+        'Z' => ("reset", false),
         _ => return None,
     })
 }
 
-/// `Some` when `input` is one of the five acting keys and the selection lives on
-/// another machine: the key is refused with a hint (bd-8lz.5.10). `None` lets
-/// every other key — and every key on a local row — through unchanged.
-fn refuse_remote_act(app: &mut App, input: Input) -> Option<Action> {
-    let cli = cli_equivalent(input)?;
+/// The machine a remote selection lives on, or `None` for a local one (or an
+/// empty listing) — which machine the loop's session proxy pins `--machine` to.
+pub fn selected_remote(app: &App) -> Option<String> {
     let view = app.sessions.selected_row()?;
-    let machine = app.sessions.remote_of(view)?.to_string();
-    let name = name_of(view);
-    // `q enter` takes the quest; the other four take the `<quest>/<label>`
-    // session spelling, the only one that names a session on another machine.
-    let target = if cli == "q enter" {
-        view.quest_slug.clone()
-    } else {
-        name.clone()
+    app.sessions.remote_of(view).map(str::to_string)
+}
+
+/// `Some(Action::Proxy)` when `input` is an acting key on a remote row; `None`
+/// otherwise — including any key on a local row, and `t` (which opens the send
+/// form). `⏎`/`o` normalise to `'o'`. A Quest id is 16 bits and unique only per
+/// machine, so acting on a remote row here could hit a local session sharing it.
+fn remote_proxy_key(app: &App, input: Input) -> Option<Action> {
+    let key = match input {
+        Input::Enter | Input::Char('o') => 'o',
+        Input::Char(c) if proxied(c).is_some() => c,
+        _ => return None,
     };
-    app.say(format!(
-        "{name} runs on {machine}; run `{cli} {target}` in a shell"
-    ));
-    Some(Action::None)
+    let view = app.sessions.selected_row()?;
+    app.sessions.remote_of(view)?;
+    Some(Action::Proxy(key))
 }
 
 /// The two keys the loop performs: nothing happens with an empty listing, and
@@ -485,6 +483,9 @@ pub struct Selection {
     pub quest: String,
     pub label: String,
     pub name: String,
+    /// The Quest's slug — what a proxied remote attach targets (bd-8lz.10); the
+    /// id above means nothing on another machine.
+    pub slug: String,
 }
 
 /// The selected session, cloned so the borrow of `app` ends with the lookup.
@@ -495,6 +496,7 @@ pub fn selected(app: &App) -> Option<Selection> {
         quest: view.session.quest_id.clone(),
         label: view.session.label.clone(),
         name: name_of(view),
+        slug: view.quest_slug.clone(),
     })
 }
 
@@ -506,7 +508,7 @@ fn name_of(view: &SessionView) -> String {
 
 /// What a prompt records about the session it was opened against; see
 /// [`SessionTarget`] for why each field is in there.
-fn target_of(view: &SessionView) -> SessionTarget {
+fn target_of(state: &State, view: &SessionView) -> SessionTarget {
     SessionTarget {
         session: view.session.id.clone(),
         quest: view.session.quest_id.clone(),
@@ -514,6 +516,8 @@ fn target_of(view: &SessionView) -> SessionTarget {
         started_at: view.session.started_at,
         name: name_of(view),
         ended: view.session.status == SessionStatus::Ended,
+        // Set only for a remote row, so its submit proxies (SPEC §15, bd-8lz.10).
+        machine: state.remote_of(view).map(str::to_string),
     }
 }
 
@@ -563,7 +567,7 @@ fn open_send(app: &mut App) -> Action {
         return Action::None;
     }
     let gate = not_idle(view);
-    let target = target_of(view);
+    let target = target_of(&app.sessions, view);
     let mut form = Form::new(format!("send to {}", target.name))
         .hint("Tab field \u{b7} \u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels")
         .text(F_TEXT, "", "");
@@ -609,7 +613,7 @@ fn open_kill(app: &mut App) -> Action {
         return Action::None;
     }
     let pane = view.session.tmux_pane.clone();
-    let target = target_of(view);
+    let target = target_of(&app.sessions, view);
     let form = Form::new(format!("kill {}?", target.name))
         .hint("\u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels")
         .action("kill")
@@ -644,7 +648,7 @@ fn open_reset(app: &mut App) -> Action {
         .ctx_pct
         .map(|p| format!("{p}%"))
         .unwrap_or_else(|| "unknown".to_string());
-    let target = target_of(view);
+    let target = target_of(&app.sessions, view);
     let mut form = Form::new(format!("reset {}?", target.name))
         .hint("\u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels")
         .action("reset")
@@ -754,9 +758,44 @@ fn session_for(ctx: &Ctx, target: &SessionTarget) -> anyhow::Result<resolve_targ
 }
 
 fn send_text(ctx: &Ctx, app: &mut App, target: &SessionTarget, form: &Form) -> anyhow::Result<()> {
+    // SPEC §15, bd-8lz.10: a remote session is typed into *there* — the form
+    // collected the text, the far end makes the idle check and acts on its pane.
+    if let Some(machine) = &target.machine {
+        return send_remote(app, target, machine, form);
+    }
     let found = session_for(ctx, target)?;
     let sent = send::apply(ctx, &found, form.trimmed(F_TEXT), form.is_on(F_FORCE))?;
     app.say(sent.describe());
+    Ok(())
+}
+
+/// `q send <quest>/<label> <text> [--force] --machine <m>` as a child of this
+/// `q` (SPEC §15): the CLI proxy resolves, pins and sends it over ssh. Captured,
+/// so a non-zero exit returns an error and the form stays up with its message.
+fn send_remote(
+    app: &mut App,
+    target: &SessionTarget,
+    machine: &str,
+    form: &Form,
+) -> anyhow::Result<()> {
+    let mut args = vec!["send", target.name.as_str(), form.trimmed(F_TEXT)];
+    if form.is_on(F_FORCE) {
+        args.push("--force");
+    }
+    args.extend(["--machine", machine]);
+    let out = super::spawn_q(&args)?;
+    if !out.status.success() {
+        return Err(QError::Other(format!(
+            "send to {} on {machine}: {}",
+            target.name,
+            super::child_said(&out)
+        ))
+        .into());
+    }
+    app.say(format!(
+        "sent to {} on {machine} \u{b7} it updates at the next remote tick",
+        target.name
+    ));
     Ok(())
 }
 
@@ -2154,6 +2193,7 @@ mod tests {
                 started_at: session.started_at,
                 name: "alpha/tests".to_string(),
                 ended: false,
+                machine: None,
             };
             let form = Form::new("box").text(F_TEXT, "hello", "").action("go");
             let error = submit(&rig.ctx, &mut app, &open(target), &form)
@@ -2299,11 +2339,13 @@ mod tests {
         }
     }
 
-    /// SPEC §17: the fleet spans machines (bd-8lz.5.10). A remote row shows,
-    /// attributed to its machine, and the five acting keys refuse it with the
-    /// CLI command that does the work there.
+    /// SPEC §17, bd-8lz.10: the fleet spans machines. A remote row shows,
+    /// attributed to its machine, and the acting keys are proxied against it
+    /// rather than run against this database — `⏎`/`o`/`p`/`k`/`Z` hand off to
+    /// the loop as `Action::Proxy` (`⏎`/`o` normalise to `'o'`), and `t` opens
+    /// the send form, whose target carries the machine so its submit proxies.
     #[test]
-    fn a_remote_fleet_row_shows_but_its_acting_keys_are_refused() {
+    fn a_remote_fleet_rows_acting_keys_are_proxied() {
         let (rig, mut app) = fleet();
         app.sessions.absorb_remote(crate::remote::FleetSessions {
             rows: vec![remote_view(
@@ -2327,26 +2369,61 @@ mod tests {
         app.sessions.resync();
         assert_eq!(sessions_label(&app), "build");
 
-        for (key, cli) in [
-            (Input::Enter, "q enter"),
-            (Input::Char('o'), "q enter"),
-            (Input::Char('p'), "q peek"),
-            (Input::Char('t'), "q send"),
-            (Input::Char('k'), "q kill"),
-            (Input::Char('Z'), "q reset"),
+        // The four keyboard-free keys proxy straight to the loop.
+        for (key, want) in [
+            (Input::Enter, 'o'),
+            (Input::Char('o'), 'o'),
+            (Input::Char('p'), 'p'),
+            (Input::Char('k'), 'k'),
+            (Input::Char('Z'), 'Z'),
         ] {
             app.status.clear();
             let action = handle(&mut app, key);
-            assert_eq!(action, Action::None, "{key:?} acted on a remote row");
+            assert_eq!(action, Action::Proxy(want), "{key:?} did not proxy");
             assert!(app.modal.is_none(), "{key:?} opened a form");
-            assert!(
-                app.status.contains("runs on ws") && app.status.contains(cli),
-                "{key:?} did not name what does work: {}",
-                app.status
-            );
+            assert_eq!(app.tab, Tab::Sessions, "{key:?} switched tabs");
         }
+
+        // `t` opens the send form even on a remote row — the text is typed here,
+        // and the submit is what travels, carrying the machine so it proxies.
+        app.status.clear();
+        assert_eq!(handle(&mut app, Input::Char('t')), Action::None);
+        let modal = app.modal.as_ref().expect("the send form did not open");
+        match &modal.prompt {
+            Prompt::Send(target) => {
+                assert_eq!(target.machine.as_deref(), Some("ws"));
+                assert_eq!(target.name, "over-there/build");
+            }
+            other => panic!("`t` opened {other:?}, not the send form"),
+        }
+        app.modal = None;
+
         // A view-only key still works on a remote row.
         assert_eq!(handle(&mut app, Input::Char('a')), Action::Refresh);
+    }
+
+    /// A local fleet row is untouched by the proxy router: its acting keys run
+    /// here as before, and the send form it opens carries no machine.
+    #[test]
+    fn a_local_fleet_rows_keys_are_not_proxied() {
+        let (rig, mut app) = fleet();
+        refresh(&rig.ctx, &mut app).unwrap();
+        // The waiting local worker `alpha/tests` leads the fleet.
+        assert_eq!(sessions_label(&app), "tests");
+
+        assert_eq!(handle(&mut app, Input::Char('p')), Action::Peek);
+        assert_eq!(handle(&mut app, Input::Enter), Action::Attach);
+
+        assert_eq!(handle(&mut app, Input::Char('t')), Action::None);
+        match &app
+            .modal
+            .as_ref()
+            .expect("the send form did not open")
+            .prompt
+        {
+            Prompt::Send(target) => assert!(target.machine.is_none()),
+            other => panic!("`t` opened {other:?}"),
+        }
     }
 
     /// A finished round replaces the remote half wholesale — a machine that

@@ -84,10 +84,9 @@ pub enum Action {
     /// Carries nothing: the loop reads the form — and the Quest id the prompt
     /// was opened against — out of `App::modal`.
     Submit,
-    /// Proxy a Quests-tab key against the machine the selection lives on
-    /// (SPEC §15, bd-8lz.5.8): `s`/`e`/`b`/`l` page a captured `q <cmd>`,
-    /// `c`/`R` hand over the terminal for the CLI's confirm/attach. Carries
-    /// only the key; the loop reads the selection out of the tab.
+    /// Proxy an acting key against the machine the selection lives on (SPEC §15;
+    /// bd-8lz.5.8 Quests, bd-8lz.10 Sessions): a read pages a captured `q`, a
+    /// write hands over the terminal. The loop reads the selection and tab.
     Proxy(char),
     Quit,
 }
@@ -150,6 +149,10 @@ pub struct SessionTarget {
     /// a prompt is up must not be killed, or have text typed into a pane that
     /// by now belongs to something else.
     pub ended: bool,
+    /// The machine the session lives on, when not this one (SPEC §15, bd-8lz.10).
+    /// `Some` routes the submit through the proxy — the checks above are then the
+    /// far end's to make against its own row.
+    pub machine: Option<String>,
 }
 
 /// The template a prompt was opened against, and enough of it to notice if it
