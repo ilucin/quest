@@ -442,8 +442,8 @@ fn section_how(
         SessionRole::Master => {
             out.push_str(
                 "You are the **master** of this Quest: you own the goal, split the work and \
-                 keep the picture. Workers are Claude sessions you spawn in this tmux session; \
-                 they report back to you.\n\n\
+                 keep the picture. Workers are Claude sessions you spawn, each in its own tmux \
+                 session; they report back to you.\n\n\
                  - See who is running: `q sessions`; look into one: `q peek <session>`.\n\
                  - Spawn a worker: `q spawn <quest> --label <l> \"<prompt>\"`; talk to it: \
                  `q send <session> \"<text>\"` or `SendMessage`.\n\

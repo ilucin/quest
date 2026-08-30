@@ -106,6 +106,11 @@ pub trait Tmux {
     /// is the only reason this exists.
     fn attach_child(&self, session: &str, pane: Option<&str>) -> anyhow::Result<()>;
     fn send_keys(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()>;
+    /// Send a single named tmux key (e.g. `C-u`), interpreted rather than sent
+    /// literally the way [`send_keys`](Tmux::send_keys) sends its text. Used to
+    /// clear a pane's input line before typing a command that must start at
+    /// column 0.
+    fn send_key(&self, pane_id: &str, key: &str) -> anyhow::Result<()>;
     /// One bracketed paste, then Enter when asked — for text a TUI has to read
     /// as a single input even though it spans lines.
     fn paste(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()>;
@@ -240,6 +245,13 @@ fn args_send_keys(pane_id: &str, text: &str, enter: bool) -> Vec<Vec<String>> {
 
 fn args_send_enter(pane_id: &str) -> Vec<String> {
     args(&["send-keys", "-t", pane_id, "Enter"])
+}
+
+/// A single named key, sent *without* `-l` so tmux interprets it (`C-u`, not the
+/// three literal characters). The key is a fixed constant at every call site, so
+/// it can never be mistaken for pane text.
+fn args_send_key(pane_id: &str, key: &str) -> Vec<String> {
+    args(&["send-keys", "-t", pane_id, key])
 }
 
 /// A paste buffer of our own, per process: two concurrent `q send`s must not
@@ -527,6 +539,11 @@ impl Tmux for RealTmux {
             run(&argv)?;
         }
         Ok(())
+    }
+
+    fn send_key(&self, pane_id: &str, key: &str) -> anyhow::Result<()> {
+        require_pane_id(pane_id)?;
+        run(&args_send_key(pane_id, key)).map(|_| ())
     }
 
     fn paste(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()> {
@@ -1032,6 +1049,21 @@ impl Tmux for FixtureTmux {
         })
     }
 
+    fn send_key(&self, pane_id: &str, key: &str) -> anyhow::Result<()> {
+        require_pane_id(pane_id)?;
+        self.edit(|state| {
+            let pane = state.pane_mut(pane_id)?;
+            // `C-u` kills the current (unsubmitted) input line: everything typed
+            // since the last Enter. Model it by truncating back to the last
+            // newline, so a `q stop` after stray typing lands `/exit` at col 0.
+            if key == "C-u" {
+                let keep = pane.buffer.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                pane.buffer.truncate(keep);
+            }
+            Ok(())
+        })
+    }
+
     fn paste(&self, pane_id: &str, text: &str, enter: bool) -> anyhow::Result<()> {
         require_pane_id(pane_id)?;
         self.edit(|state| {
@@ -1288,6 +1320,16 @@ pub const NEVER_STARTED: &str = "never_started";
 /// other. Longer than tmux needs to open a window, short enough to self-heal.
 pub const START_GRACE_SECS: i64 = 10;
 
+/// How long a `starting` row is left alone before the presence sweep, seeing a
+/// shell in its pane, demotes it to `off`. Longer than [`START_GRACE_SECS`]
+/// because this is not "tmux opened a window" but "Claude finished booting": a
+/// cold `claude`/npm/node on a loaded machine can read as a shell well past
+/// ten seconds, and demoting it to `off` invites a spurious `q start` on a
+/// session that is in fact coming up (correctness review #3). `q start`'s own
+/// launch types the command, so a genuine crash still surfaces once the row is
+/// reported by a hook or the pane truly goes.
+pub const BOOT_GRACE_SECS: i64 = 30;
+
 /// An orphaned session row and why it counts as one.
 #[derive(Debug)]
 pub struct Orphan {
@@ -1352,10 +1394,10 @@ fn claims_claude(status: SessionStatus) -> bool {
 /// * pane alive but reporting a shell while the row still claims Claude → `off`
 ///   (Ctrl-C, `/exit`, a crash), with a `session.off` event. Never the reverse:
 ///   a non-shell pane is not proof Claude is up — that comes only from hooks.
-///   A `starting` row is left alone until `START_GRACE_SECS` after `q start`
+///   A `starting` row is left alone until `BOOT_GRACE_SECS` after `q start`
 ///   typed its command (`claude_started_at`, else the row's own age), because
-///   tmux execs the login shell before Claude, so the pane reads as a shell for
-///   the blink between the send-keys and Claude taking over.
+///   tmux execs the login shell before Claude, so the pane reads as a shell
+///   while a cold `claude`/npm/node boots.
 ///
 /// Returns every row it changed, ended or demoted.
 pub fn sweep(db: &Db, tmux: &dyn Tmux) -> anyhow::Result<Vec<Session>> {
@@ -1410,7 +1452,7 @@ pub fn sweep(db: &Db, tmux: &dyn Tmux) -> anyhow::Result<Vec<Session>> {
         }
         if session.status == SessionStatus::Starting {
             let anchor = session.claude_started_at.unwrap_or(session.updated_at);
-            if ts - anchor <= START_GRACE_SECS {
+            if ts - anchor <= BOOT_GRACE_SECS {
                 continue;
             }
         }
@@ -2550,8 +2592,8 @@ mod tests {
             SessionStatus::Starting
         );
 
-        // Past the grace, a pane still on a shell means Claude never came up.
-        db.record_claude_launch(&row.id, "alpha/master", None, now() - START_GRACE_SECS - 1)
+        // Past the boot grace, a pane still on a shell means Claude never came up.
+        db.record_claude_launch(&row.id, "alpha/master", None, now() - BOOT_GRACE_SECS - 1)
             .unwrap();
         let changed = sweep(&db, &t).unwrap();
         assert_eq!(changed.len(), 1);
@@ -2621,6 +2663,9 @@ mod tests {
             unreachable!()
         }
         fn send_keys(&self, _: &str, _: &str, _: bool) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn send_key(&self, _: &str, _: &str) -> anyhow::Result<()> {
             unreachable!()
         }
         fn paste(&self, _: &str, _: &str, _: bool) -> anyhow::Result<()> {

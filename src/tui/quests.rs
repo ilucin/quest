@@ -1303,11 +1303,12 @@ pub fn spawn_worker(ctx: &Ctx, app: &mut App) {
     }
 }
 
-/// `q spawn <slug> --no-attach --machine <m>` as a child of *this* `q` — the CLI
-/// proxy resolves, pins and sends it over ssh. The far side picks the `w<n>`
-/// label, so nothing here needs the remote's session count.
+/// `q spawn <slug> --machine <m>` as a child of *this* `q` — the CLI proxy
+/// resolves, pins and sends it over ssh. `q spawn` is detached by default now,
+/// so no flag is needed. The far side picks the `w<n>` label, so nothing here
+/// needs the remote's session count.
 fn spawn_worker_remote(app: &mut App, slug: &str, machine: &str) {
-    match super::spawn_q(&["spawn", slug, "--no-attach", "--machine", machine]) {
+    match super::spawn_q(&["spawn", slug, "--machine", machine]) {
         Ok(out) if out.status.success() => {
             app.say(format!(
                 "{slug} \u{b7} spawned a worker on {machine} \u{b7} it appears at the next remote tick"

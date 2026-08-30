@@ -13,8 +13,11 @@ use crate::output;
 pub fn run(ctx: &Ctx, session_target: &str) -> anyhow::Result<()> {
     let found = target::resolve(ctx, session_target)?;
     let prompt = found.session.first_prompt.clone().unwrap_or_default();
-    // The human path prints the text verbatim (bar control-char sanitising), so
-    // the `$(q prompt …)` substitution hands Claude exactly what was stored.
+    // Deliberately unconditional — unlike the other query commands it does *not*
+    // gate on `ctx.quiet`: it is invoked as `$(q prompt <id>)` from a launch
+    // command, which must always capture the text and never passes `-q`. The
+    // human path prints the text verbatim (bar control-char sanitising), so the
+    // substitution hands Claude exactly what was stored.
     output::emit(
         ctx.json,
         &serde_json::json!({

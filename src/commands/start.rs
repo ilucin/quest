@@ -153,11 +153,29 @@ pub fn launch(
 pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     sweep_quiet(ctx)?;
     let found = target::resolve(ctx, args.session)?;
+    // Gate on the row like every sibling action command (`send`/`stop`), and on
+    // its status: `q start` launches Claude into a bare shell, so a row that is
+    // still `starting` (its `claude …` typed, Claude not yet up) or already
+    // running must not be double-started — a second `claude` typed into the boot
+    // window lands as type-ahead in Claude's stdin (correctness review #2).
+    found.require_live()?;
+    if found.session.status != crate::model::SessionStatus::Off && !args.force {
+        return Err(QError::Conflict(format!(
+            "{} is {} (Claude is already up or starting); pass --force to launch anyway",
+            found.name(),
+            found.session.status
+        ))
+        .into());
+    }
+    // Trim like every other prompt door (`new`/`spawn`): a whitespace-only
+    // `q start <s> "  "` is no prompt, not a literal argument after `--`, and
+    // must not overwrite a stored `first_prompt` with blanks.
+    let prompt = args.prompt.map(str::trim).filter(|p| !p.is_empty());
     let started = launch(
         ctx,
         &found.quest,
         &found.session,
-        args.prompt,
+        prompt,
         args.resume,
         args.force,
     )?;
