@@ -9,8 +9,8 @@ use crate::model::{Session, SessionRole, SessionStatus, new_id, now};
 
 const COLUMNS: &str = "id, quest_id, role, label, tmux_session, tmux_pane, claude_pid, \
      claude_session_id, claude_name, workflow, phase, status, waiting_for, ctx_pct, \
-     ctx_updated_at, first_prompt, last_prompt, pending_rename, started_at, ended_at, \
-     updated_at";
+     ctx_updated_at, first_prompt, last_prompt, pending_rename, last_pane_path, \
+     claude_started_at, started_at, ended_at, updated_at";
 
 impl Db {
     /// Inserts `session`, regenerating its id on collision.
@@ -33,7 +33,7 @@ impl Db {
             &format!(
                 "INSERT INTO session ({COLUMNS}) VALUES \
                  (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-                  ?18, ?19, ?20, ?21)"
+                  ?18, ?19, ?20, ?21, ?22, ?23)"
             ),
             params![
                 s.id,
@@ -54,6 +54,8 @@ impl Db {
                 s.first_prompt,
                 s.last_prompt,
                 s.pending_rename,
+                s.last_pane_path,
+                s.claude_started_at,
                 s.started_at,
                 s.ended_at,
                 s.updated_at,
@@ -345,6 +347,8 @@ fn row_to_session(row: &Row) -> rusqlite::Result<Session> {
         first_prompt: row.get("first_prompt")?,
         last_prompt: row.get("last_prompt")?,
         pending_rename: row.get("pending_rename")?,
+        last_pane_path: row.get("last_pane_path")?,
+        claude_started_at: row.get("claude_started_at")?,
         started_at: row.get("started_at")?,
         ended_at: row.get("ended_at")?,
         updated_at: row.get("updated_at")?,

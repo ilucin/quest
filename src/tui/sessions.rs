@@ -323,7 +323,11 @@ pub fn rank(view: &SessionView) -> u8 {
         SessionStatus::Waiting => 0,
         SessionStatus::Busy => 1,
         SessionStatus::Starting => 2,
-        SessionStatus::Idle => 3,
+        // `off` (a live shell, no Claude) rides in the idle group for now — a
+        // between-turns row and a no-Claude row are both "nothing running".
+        // M5 gives `off` its own glyph and group; M1a only needs it to sort and
+        // render without disturbing the existing Sessions-tab layout.
+        SessionStatus::Idle | SessionStatus::Off => 3,
         SessionStatus::Ended => 4,
     }
 }

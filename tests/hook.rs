@@ -1073,13 +1073,15 @@ fn stop_notification_compact_and_end_update_status_and_log_events() {
         "compact leaves status alone"
     );
 
+    // v2 (SPEC §6): Claude leaving a live pane makes the row `off`, not
+    // `ended` — the tmux session lives on and `q start` can bring Claude back.
     env.hook("session-end", &json!({ "reason": "exit" }))
         .success()
         .stdout("");
     let s = env.session();
-    assert_eq!(s["status"], "ended");
+    assert_eq!(s["status"], "off");
     assert_eq!(s["waiting_for"], Value::Null);
-    assert!(s["ended_at"].as_i64().unwrap() > 1);
+    assert_eq!(s["ended_at"], Value::Null, "off is not ended");
 
     let events = env.events();
     let kinds: Vec<&str> = events.iter().map(|(k, _)| k.as_str()).collect();
@@ -1104,6 +1106,87 @@ fn stop_notification_compact_and_end_update_status_and_log_events() {
     );
     assert_eq!(events[3].1["trigger"], "auto");
     assert_eq!(events[4].1["reason"], "exit");
+}
+
+/// v2 (SPEC §6): Claude exiting a live pane parks the row `off`; the tmux
+/// session lives on. `off` is not `ended` — no `ended_at`, still swept for a
+/// vanished pane, and revived by the next `SessionStart`.
+#[test]
+fn session_end_parks_a_live_row_off_and_session_start_revives_it() {
+    let env = Env::new();
+    env.seed("busy");
+
+    env.hook("session-end", &json!({ "reason": "exit" }))
+        .success()
+        .stdout("");
+    let s = env.session();
+    assert_eq!(s["status"], "off");
+    assert_eq!(s["ended_at"], Value::Null);
+
+    // A bare `claude` (or `q start`) in the same pane brings it back to idle.
+    env.hook(
+        "session-start",
+        &json!({ "source": "startup", "session_id": "cs-9" }),
+    )
+    .success();
+    let s = env.session();
+    assert_eq!(s["status"], "idle");
+    assert_eq!(s["claude_session_id"], "cs-9");
+
+    let kinds: Vec<String> = env.events().into_iter().map(|(k, _)| k).collect();
+    assert_eq!(
+        kinds,
+        ["session.end", "session.start", "session.brief_injected"],
+    );
+}
+
+/// A `SessionEnd` that lands after the row is already `ended` — a late hook
+/// after `q kill`/`q close`, or after the sweep ended a vanished pane — is a
+/// no-op: hooks never resurrect an `ended` row (SPEC §6).
+#[test]
+fn a_late_session_end_never_touches_an_ended_row() {
+    let env = Env::new();
+    env.seed("ended");
+
+    env.hook("session-end", &json!({ "reason": "exit" }))
+        .success()
+        .stdout("");
+    assert_eq!(env.session()["status"], "ended");
+    // Nothing was written — not even the event.
+    assert!(env.events().is_empty(), "{:?}", env.events());
+}
+
+/// `/clear` fires `SessionEnd(reason=clear)` immediately followed by
+/// `SessionStart(source=clear)`. The status must not flap through `off` in
+/// between: the reason guard leaves it busy, and the `Start` settles it to
+/// idle (SPEC §6, §8).
+#[test]
+fn a_clear_does_not_flap_the_status_to_off() {
+    let env = Env::new();
+    env.seed("busy");
+
+    env.hook("session-end", &json!({ "reason": "clear" }))
+        .success()
+        .stdout("");
+    assert_eq!(
+        env.session()["status"],
+        "busy",
+        "clear must not park the row off",
+    );
+
+    env.hook(
+        "session-start",
+        &json!({ "source": "clear", "session_id": "cs-1" }),
+    )
+    .success();
+    assert_eq!(env.session()["status"], "idle");
+
+    // The end is still logged, so the transcript is complete.
+    let kinds: Vec<String> = env.events().into_iter().map(|(k, _)| k).collect();
+    assert_eq!(
+        kinds,
+        ["session.end", "session.start", "session.brief_injected"],
+    );
 }
 
 #[test]

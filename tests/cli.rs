@@ -7433,6 +7433,32 @@ fn a_scheduled_reset_of_a_busy_session_is_a_skip_and_a_manual_one_is_an_error() 
     assert_eq!(fleet.env.buffer(&pane), "");
 }
 
+/// v2 (SPEC §6): an `off` row is a live shell with no Claude — `q reset` has
+/// nothing to reset, so it skips (scheduled) or refuses (manual), and the
+/// status surfaces verbatim in `q sessions`.
+#[test]
+fn an_off_session_renders_as_off_and_is_never_reset() {
+    let fleet = Fleet::new();
+    fleet.env.set_status(&fleet.master_id, "off", None);
+
+    let rows = fleet.env.json(&["sessions"]);
+    let master = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["quest_slug"] == "alpha" && r["label"] == "master")
+        .unwrap();
+    assert_eq!(master["status"], "off");
+
+    // The scheduled path skips and logs; the manual path is a conflict.
+    let out = fleet.env.json(&["reset", "alpha/master", "--delay", "0"]);
+    assert_eq!(out["action"], "skipped");
+    assert!(out["reason"].as_str().unwrap().contains("off"), "{out}");
+    let err = fleet.env.json_err(&["reset", "alpha/master"]);
+    assert_eq!(err["code"], "conflict");
+    assert!(err["error"].as_str().unwrap().contains("off"), "{err}");
+}
+
 #[test]
 fn a_reset_is_skipped_when_the_registry_says_the_session_is_waiting() {
     let fleet = Fleet::new();
