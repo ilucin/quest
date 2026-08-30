@@ -159,12 +159,14 @@ pub enum Command {
     /// Spawn a worker agent in a new window of the Quest's tmux session
     Spawn {
         quest: String,
-        /// First prompt for the worker; a leading `-` is text, not a flag
+        /// First prompt for the worker; omit for a bare interactive Claude.
+        /// A leading `-` is text, not a flag
         #[arg(allow_hyphen_values = true)]
-        prompt: String,
-        /// Session label: lowercase kebab-case, unique among live sessions
+        prompt: Option<String>,
+        /// Session label: lowercase kebab-case, unique among live sessions.
+        /// Omit for an auto `w<n>` worker
         #[arg(long, value_name = "LABEL")]
-        label: String,
+        label: Option<String>,
         /// Workflow for this worker (default: the Quest's)
         #[arg(long, value_name = "NAME")]
         workflow: Option<String>,
@@ -175,6 +177,14 @@ pub enum Command {
         /// own tmux session, where there is no client of ours to move)
         #[arg(long)]
         no_attach: bool,
+    },
+
+    /// Spawn a bare worker in the Quest that owns a tmux pane, then select it.
+    /// The `[tmux] spawn_key` binding runs this; `<pane>` is tmux's `#{pane_id}`
+    #[command(hide = true)]
+    SpawnHere {
+        /// The tmux pane the key was pressed in (`#{pane_id}`)
+        pane: String,
     },
 
     /// List sessions: one Quest's, or every live one across active Quests

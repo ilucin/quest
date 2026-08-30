@@ -65,6 +65,10 @@ pub struct Naming {
 pub struct Tmux {
     pub session_prefix: String,
     pub iterm_cc: bool,
+    /// tmux prefix key that spawns a fresh worker in the current Quest's
+    /// session (`q spawn-here`). Bound server-wide when a master comes up; an
+    /// empty string turns the auto-binding off.
+    pub spawn_key: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -137,6 +141,7 @@ impl Default for Tmux {
         Tmux {
             session_prefix: "q-".to_string(),
             iterm_cc: false,
+            spawn_key: "N".to_string(),
         }
     }
 }
@@ -630,6 +635,7 @@ mod tests {
         assert_eq!(c.naming.model, "haiku");
         assert_eq!(c.tmux.session_prefix, "q-");
         assert!(!c.tmux.iterm_cc);
+        assert_eq!(c.tmux.spawn_key, "N");
         assert_eq!(c.statusline.chain, "");
         assert!(c.notify.macos);
         assert_eq!(c.notify.on, ["waiting", "reset", "ended"]);

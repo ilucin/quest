@@ -569,7 +569,7 @@ fn open_send(app: &mut App) -> Action {
     let gate = not_idle(view);
     let target = target_of(&app.sessions, view);
     let mut form = Form::new(format!("send to {}", target.name))
-        .hint("Tab field \u{b7} \u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels")
+        .hint("Tab field \u{b7} \u{2190}\u{2192} chooses \u{b7} \u{23ce} press \u{b7} Esc cancels")
         .text(F_TEXT, "", "");
     form = match &gate {
         Some(why) => form.note(format!("{why} \u{b7} sending anyway needs force")),
@@ -615,7 +615,7 @@ fn open_kill(app: &mut App) -> Action {
     let pane = view.session.tmux_pane.clone();
     let target = target_of(&app.sessions, view);
     let form = Form::new(format!("kill {}?", target.name))
-        .hint("\u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels")
+        .hint("\u{2190}\u{2192} chooses \u{b7} \u{23ce} press \u{b7} Esc cancels")
         .action("kill")
         .note(format!("kills the tmux window of pane {pane}"))
         .note("whatever it was doing is lost; the row stays as history");
@@ -650,7 +650,7 @@ fn open_reset(app: &mut App) -> Action {
         .unwrap_or_else(|| "unknown".to_string());
     let target = target_of(&app.sessions, view);
     let mut form = Form::new(format!("reset {}?", target.name))
-        .hint("\u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels")
+        .hint("\u{2190}\u{2192} chooses \u{b7} \u{23ce} press \u{b7} Esc cancels")
         .action("reset")
         .note(format!(
             "types /{strategy} into pane {pane}, then the follow-up prompt (ctx {ctx_pct})"
@@ -682,6 +682,7 @@ pub fn submit(ctx: &Ctx, app: &mut App, prompt: &Prompt, form: &Form) -> anyhow:
         | Prompt::Edit(_)
         | Prompt::Close(_)
         | Prompt::Resume(_)
+        | Prompt::Remove(_)
         | Prompt::AddTemplate
         | Prompt::EditTemplate(_)
         | Prompt::DeleteTemplate(_)
@@ -1686,13 +1687,19 @@ mod tests {
 
     // --------------------------------------------------- the guarded prompts
 
-    /// B2's rule, on all three: a bare Enter does nothing, and the box stays
-    /// up saying what is missing. `q send` types into a live Claude and
-    /// `q reset` sends it `/clear`; neither is `harmless()`.
+    /// B2's rule, on all three: a bare Enter never *runs* the action. `q send`
+    /// types into a live Claude and `q reset` sends it `/clear`; neither is
+    /// `harmless()`. A confirm-only box (kill, reset) presses its focused
+    /// `[ Cancel ]` and dismisses; the send box, whose focus is on its text
+    /// field, stays up saying what is missing.
     #[test]
     fn every_destructive_prompt_refuses_a_bare_enter() {
         let (rig, mut app) = fleet();
-        for (key, title) in [('t', "send to"), ('k', "kill"), ('Z', "reset")] {
+        for (key, title, has_text) in [
+            ('t', "send to", true),
+            ('k', "kill", false),
+            ('Z', "reset", false),
+        ] {
             // Off the master, which `k` refuses outright.
             app.sessions.selected_id = None;
             app.sessions.quest = None;
@@ -1711,11 +1718,18 @@ mod tests {
                 !modal.form.confirmed(),
                 "{key} starts confirmed — a stray Enter would run it"
             );
+            // Never a submit, whatever the shape.
             assert_eq!(app.handle(Input::Enter), Action::None, "{key} submitted");
-            assert!(app.modal.is_some(), "{key} took the box down");
-            let error = app.modal.as_ref().unwrap().form.error().unwrap_or_default();
-            assert!(error.contains("nothing done"), "{key}: {error:?}");
-            app.handle(Input::Esc);
+            if has_text {
+                // Focus is on the text field, so the box stays and guides.
+                assert!(app.modal.is_some(), "{key} took the box down");
+                let error = app.modal.as_ref().unwrap().form.error().unwrap_or_default();
+                assert!(error.contains("nothing done"), "{key}: {error:?}");
+                app.handle(Input::Esc);
+            } else {
+                // Focus is on `[ Cancel ]`, so Enter dismisses without running.
+                assert!(app.modal.is_none(), "{key} did not press Cancel");
+            }
             assert!(app.modal.is_none());
             let _ = &rig;
         }
@@ -1737,21 +1751,11 @@ mod tests {
             handle(&mut app, Input::Char(key));
             let form = &app.modal.as_ref().unwrap().form;
             assert!(
-                form.fields().iter().any(|f| f.label() == form::ACTION),
-                "{key} has no action row"
+                form.fields()
+                    .iter()
+                    .any(|f| matches!(f, Field::Action { verb: v, .. } if v == verb)),
+                "{key} has no action row offering `{verb}`"
             );
-            let options: Vec<String> = form
-                .fields()
-                .iter()
-                .filter_map(|f| match f {
-                    Field::Select { label, options, .. } if label == form::ACTION => {
-                        Some(options.clone())
-                    }
-                    _ => None,
-                })
-                .next()
-                .unwrap();
-            assert_eq!(options, [form::CANCEL.to_string(), verb.to_string()]);
             app.handle(Input::Esc);
         }
     }

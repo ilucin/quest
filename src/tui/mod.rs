@@ -47,7 +47,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::Ctx;
 use crate::brief;
-use crate::commands::{enter, peek};
+use crate::commands::{enter, peek, resume};
 use crate::remote;
 
 use app::{Action, App, Tab};
@@ -514,6 +514,29 @@ where
     let _ = crate::commands::sweep_quiet(ctx);
     let target = match enter::resolve(ctx, &want.quest, want.label.as_deref()) {
         Ok(target) => target,
+        // No live master to enter — a master can die, and its tmux session may
+        // not survive a reboot. Rather than send the user to `q resume`, bring
+        // a fresh master up (SPEC §5) and resolve again, so the attach lands on
+        // it with the right pane and window. Only for the master: a named
+        // worker that is gone is a real miss, not something to resume.
+        Err(e) if want.label.is_none() => match resume::apply(ctx, &want.quest, None) {
+            Ok(_) => match enter::resolve(ctx, &want.quest, None) {
+                Ok(target) => {
+                    app.say(format!("resumed {} · entering", want.name));
+                    target
+                }
+                Err(e) => {
+                    app.say(format!("cannot enter {}: {e:#}", want.name));
+                    return Ok(());
+                }
+            },
+            // Resume declined too (e.g. the tmux session outlived its master
+            // window); the original reason is the one worth showing.
+            Err(_) => {
+                app.say(format!("cannot enter {}: {e:#}", want.name));
+                return Ok(());
+            }
+        },
         Err(e) => {
             app.say(format!("cannot enter {}: {e:#}", want.name));
             return Ok(());
@@ -1147,6 +1170,14 @@ fn event_loop(
                 // in tmux like any other, so the listing has to be reloaded.
                 Action::QuickNew => {
                     quests::create_quick(ctx, app);
+                    refresh_due = true;
+                }
+                // `w`: a bare worker in the selected Quest, then hand the
+                // terminal straight to it (`land`, as a template run does for
+                // its master). The reload afterwards moves the session count.
+                Action::SpawnWorker => {
+                    quests::spawn_worker(ctx, app);
+                    land(ctx, &mut Stdio, terminal, app, poller)?;
                     refresh_due = true;
                 }
                 Action::Submit => {
@@ -2682,6 +2713,34 @@ mod tests {
         assert_eq!(flags(), (false, false, false, false));
     }
 
+    #[test]
+    fn w_spawns_a_worker_and_queues_a_landing_on_it() {
+        let (ctx, dir) = quest_ctx(
+            "needs-me",
+            crate::model::QuestState::Active,
+            true,
+            &[("q-needs-me", "%1")],
+        );
+        let mut app = loaded(&ctx);
+        assert_eq!(app.handle(Input::Char('w')), Action::SpawnWorker);
+
+        quests::spawn_worker(&ctx, &mut app);
+
+        // A bare `w1` window is in the Quest's session…
+        let state = fixture(&dir);
+        assert!(
+            state
+                .panes
+                .iter()
+                .any(|p| p.session_name == "q-needs-me" && p.window_name == "w1"),
+            "no w1 window: {state:?}"
+        );
+        // …and the loop is told to hand the terminal straight to it.
+        let landing = app.templates.take_landing().expect("a landing was queued");
+        assert_eq!(landing.name, "needs-me/w1");
+        assert_eq!(landing.tmux_session, "q-needs-me");
+    }
+
     // ------------------------------------------------------------- attaching
 
     #[test]
@@ -3261,42 +3320,67 @@ mod tests {
         restore_with(&mut term);
     }
 
-    /// Every reason not to attach is the same reason `q enter` gives, and none
-    /// of them may cost the user their screen.
+    /// A master window that ended while its tmux session lingers cannot be
+    /// entered, and cannot be resumed either (resume refuses a live session) —
+    /// so the original reason stands, and the screen is kept.
     #[test]
     fn a_quest_that_cannot_be_entered_says_so_and_keeps_the_screen() {
-        for (what, live_master, panes, want) in [
-            ("no tmux session", true, &[][..], "no tmux session"),
-            (
-                "master ended",
-                false,
-                &[("q-needs-me", "%1")][..],
-                "master session of needs-me ended",
-            ),
-        ] {
-            let (ctx, _dir) = quest_ctx(
-                "needs-me",
-                crate::model::QuestState::Active,
-                live_master,
-                panes,
-            );
-            let mut app = loaded(&ctx);
-            let _lock = lifecycle_lock();
-            let mut term = FakeTerm::default();
-            let guard = arm(&mut term, true).expect("arm");
-            std::mem::forget(guard);
-            term.calls.clear();
-            let mut terminal = test_terminal();
-            attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
+        let (ctx, _dir) = quest_ctx(
+            "needs-me",
+            crate::model::QuestState::Active,
+            false,
+            &[("q-needs-me", "%1")],
+        );
+        let mut app = loaded(&ctx);
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        term.calls.clear();
+        let mut terminal = test_terminal();
+        attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
 
-            assert!(app.status.contains(want), "{what}: {}", app.status);
-            assert!(fixture(&_dir).attached.is_none(), "{what}: it attached");
-            // The screen was never given away, so there is nothing to rebuild.
-            assert!(term.calls.is_empty(), "{what}: {:?}", term.calls);
-            assert_eq!(flags(), (true, true, true, true), "{what}");
-            assert!(!app.should_quit, "{what}");
-            restore_with(&mut term);
-        }
+        assert!(
+            app.status.contains("master session of needs-me ended"),
+            "{}",
+            app.status
+        );
+        assert!(fixture(&_dir).attached.is_none(), "it attached");
+        // The screen was never given away, so there is nothing to rebuild.
+        assert!(term.calls.is_empty(), "{:?}", term.calls);
+        assert_eq!(flags(), (true, true, true, true));
+        assert!(!app.should_quit);
+        restore_with(&mut term);
+    }
+
+    /// A Quest with no tmux session at all — `q new -d` and then the session
+    /// killed, or a reboot — gets a fresh master on `⏎`/`o` rather than an
+    /// error, and the attach lands on it (the user's ask: no session, so make
+    /// one).
+    #[test]
+    fn entering_a_quest_with_no_session_resumes_a_fresh_master() {
+        let (ctx, _dir) = quest_ctx("needs-me", crate::model::QuestState::Active, false, &[]);
+        let mut app = loaded(&ctx);
+        let _lock = lifecycle_lock();
+        let mut term = FakeTerm::default();
+        let guard = arm(&mut term, true).expect("arm");
+        std::mem::forget(guard);
+        let mut terminal = test_terminal();
+        attach(&ctx, &mut term, &mut terminal, &mut app).expect("attach");
+
+        // A master came up and the attach landed on its tmux session; the
+        // final "back from" is the normal post-attach message (the transient
+        // "resumed" is overwritten by it, as any attach's is).
+        let attached = fixture(&_dir).attached.expect("nothing was attached");
+        assert_eq!(attached.0, "q-needs-me");
+        assert!(app.status.contains("back from needs-me"), "{}", app.status);
+        // The Quest is active, and a fresh live master row now exists.
+        let db = ctx.db().unwrap();
+        let quest = db.get_quest_by_slug("needs-me").unwrap().unwrap();
+        assert_eq!(quest.state, crate::model::QuestState::Active);
+        let live = crate::commands::live(&db.list_sessions_by_quest(&quest.id).unwrap()).count();
+        assert_eq!(live, 1, "expected one live master after the resume");
+        restore_with(&mut term);
     }
 
     /// A finished Quest is `q resume`'s business, from here as from the CLI.

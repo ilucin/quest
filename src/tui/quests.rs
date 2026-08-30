@@ -16,7 +16,8 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use crate::Ctx;
 use crate::cli::SetKey;
 use crate::commands::{
-    QuestRow, close, fill_progress, fmt, load_quests, new, proxy, rename, resume, set, tpl,
+    QuestRow, close, fill_progress, fmt, load_quests, new, proxy, rename, resume, rm, set, spawn,
+    tpl,
 };
 use crate::error::QError;
 use crate::model::{
@@ -36,8 +37,13 @@ pub const HELP: &[(&str, &str)] = &[
     ("s", "this Quest's sessions"),
     ("e", "this Quest's events, in the tail"),
     ("n", "new Quest at once, every default (N: the form)"),
+    ("w", "spawn a bare worker and enter it"),
     ("E", "edit goal · workflow · beads epic"),
     ("r / c / R", "rename · close · resume (each prompts)"),
+    (
+        "Backspace",
+        "delete the Quest and its tmux session (prompts)",
+    ),
     ("b", "brief in a pager"),
     ("l", "links"),
     ("f", "show finished Quests"),
@@ -556,11 +562,13 @@ pub fn handle(app: &mut App, input: Input) -> Action {
         // everything the form asks for can be given later (`E`, or the master
         // itself via `q set`). The form is one shift away.
         Input::Char('n') => Action::QuickNew,
+        Input::Char('w') => spawn_worker_selection(app),
         Input::Char('N') => open_new(app),
         Input::Char('E') => open_edit(app),
         Input::Char('r') => open_rename(app),
         Input::Char('c') => open_close(app),
         Input::Char('R') => open_resume(app),
+        Input::Backspace => open_remove(app),
         Input::Char('b') => brief_selection(app),
         Input::Char('l') => show_links(app),
         _ => Action::None,
@@ -807,7 +815,7 @@ fn open_new(app: &mut App) -> Action {
         .collect();
     let has_templates = templates.len() > 1;
     let mut form = Form::new("new quest")
-        .hint("Tab field \u{b7} \u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels")
+        .hint("Tab field \u{b7} \u{2190}\u{2192} chooses \u{b7} \u{23ce} press \u{b7} Esc cancels")
         .text(F_NAME, "", "(auto)")
         .text(F_GOAL, "", "(none)")
         .text(F_DIR, "", "(where q was started)")
@@ -925,7 +933,7 @@ fn open_close(app: &mut App) -> Action {
     // nothing to type here, so the affirmative is one arrow key away and a
     // keystroke that merely arrived is never it.
     let mut form = Form::new(format!("close {}?", target.slug))
-        .hint("\u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels")
+        .hint("\u{2190}\u{2192} chooses \u{b7} \u{23ce} press \u{b7} Esc cancels")
         .action("close");
     form = if target.finished {
         form.note("already finished — only the epic is left to do".to_string())
@@ -945,6 +953,34 @@ fn open_close(app: &mut App) -> Action {
     Action::None
 }
 
+/// Backspace — SPEC §5's `q rm`: delete the Quest and its whole tmux session,
+/// master and every worker window with it. The box opens already on
+/// `[ Remove ]`, so removing is Backspace-then-Enter; `←` steps to Cancel.
+fn open_remove(app: &mut App) -> Action {
+    let Some(row) = app.quests.selected_row() else {
+        return Action::None;
+    };
+    let target = target_of(row);
+    let epic = row.view.quest.beads_epic.clone();
+    let live = row.view.live_sessions;
+    let tmux = format!("{}{}", app.tmux_prefix, target.slug);
+
+    let mut form = Form::new(format!("remove {}?", target.slug))
+        .hint("\u{23ce} removes \u{b7} \u{2190} cancels \u{b7} Esc cancels")
+        .action_armed("remove")
+        .note(format!(
+            "deletes the Quest and all its history · kills tmux {tmux} \
+             ({live} live session(s))"
+        ));
+    form = match epic {
+        // `q rm` deletes history, it does not touch a shared tracker.
+        Some(epic) => form.note(format!("beads epic {epic} stays open")),
+        None => form.note("no beads epic"),
+    };
+    app.open(Prompt::Remove(target), form);
+    Action::None
+}
+
 /// `R` — SPEC §5: a fresh master from the brief, or from a prompt given here.
 fn open_resume(app: &mut App) -> Action {
     let Some(row) = app.quests.selected_row() else {
@@ -952,7 +988,7 @@ fn open_resume(app: &mut App) -> Action {
     };
     let target = target_of(row);
     let form = Form::new(format!("resume {}", target.slug))
-        .hint("Tab field \u{b7} \u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels")
+        .hint("Tab field \u{b7} \u{2190}\u{2192} chooses \u{b7} \u{23ce} press \u{b7} Esc cancels")
         .text(F_PROMPT, "", "(none — the master comes up on its brief)")
         .note("spawns a new master; the old session rows stay as history")
         // After the field, so the prompt can still be typed straight away.
@@ -977,6 +1013,7 @@ pub fn submit(ctx: &Ctx, app: &mut App, prompt: &Prompt, form: &Form) -> anyhow:
         Prompt::Edit(target) => edit_quest(ctx, app, target, form),
         Prompt::Close(target) => close_quest(ctx, app, target, form),
         Prompt::Resume(target) => resume_quest(ctx, app, target, form),
+        Prompt::Remove(target) => remove_quest(ctx, app, target),
         // A Sessions or Templates prompt never reaches here; `tui::submit`
         // dispatches on the variant first. Listed rather than `_` so a new
         // Quests prompt added without wiring fails to compile here instead of
@@ -1224,6 +1261,64 @@ pub fn create_quick(ctx: &Ctx, app: &mut App) {
     }
 }
 
+/// `w` — spawn a bare worker in the selected Quest. The keypress only names the
+/// intent; the loop (with `ctx`) does the work in [`spawn_worker`].
+fn spawn_worker_selection(app: &mut App) -> Action {
+    if selected_quest(app).is_none() {
+        app.say("no quest selected");
+        return Action::None;
+    }
+    Action::SpawnWorker
+}
+
+/// `w` on the Quests tab: a bare worker in the selected Quest — an auto `w<n>`
+/// label and no prompt (SPEC §6). A local Quest spawns in-process (quiet: the
+/// TUI owns the screen); a remote row proxies `q spawn` to the owning machine
+/// (bd-8lz.5.8). Either way the TUI stays put — enter the new worker from the
+/// Sessions tab (`s`).
+pub fn spawn_worker(ctx: &Ctx, app: &mut App) {
+    let Some(quest) = selected_quest(app) else {
+        app.say("no quest selected");
+        return;
+    };
+    if let Some(machine) = selected_remote(app) {
+        spawn_worker_remote(app, &quest.slug, &machine);
+        return;
+    }
+    match spawn::spawn_bare(ctx, &quest.id) {
+        Ok(session) => {
+            app.quests.focus_on(Anchor::local(&quest));
+            // Land on the fresh worker at once, the way a template run lands on
+            // the master it makes: the loop hands the terminal over next.
+            app.templates.set_landing(super::templates::Landing {
+                tmux_session: session.tmux_session,
+                pane: session.tmux_pane,
+                name: format!("{}/{}", quest.slug, session.label),
+                warnings: Vec::new(),
+            });
+        }
+        Err(e) => app.say(format!("spawn worker: {e:#}")),
+    }
+}
+
+/// `q spawn <slug> --no-attach --machine <m>` as a child of *this* `q` — the CLI
+/// proxy resolves, pins and sends it over ssh. The far side picks the `w<n>`
+/// label, so nothing here needs the remote's session count.
+fn spawn_worker_remote(app: &mut App, slug: &str, machine: &str) {
+    match super::spawn_q(&["spawn", slug, "--no-attach", "--machine", machine]) {
+        Ok(out) if out.status.success() => {
+            app.say(format!(
+                "{slug} \u{b7} spawned a worker on {machine} \u{b7} it appears at the next remote tick"
+            ));
+        }
+        Ok(out) => app.say(format!(
+            "spawn worker on {machine}: {}",
+            super::child_said(&out)
+        )),
+        Err(e) => app.say(format!("spawn worker on {machine}: {e:#}")),
+    }
+}
+
 /// Only what changed is written, each through `set::apply` — the same write
 /// as `q set`, event included — so a bare Enter over an unchanged form is a
 /// no-op rather than three `quest.updated` events saying nothing.
@@ -1341,6 +1436,39 @@ fn resume_quest(ctx: &Ctx, app: &mut App, target: &Target, form: &Form) -> anyho
     let resumed = resume::apply(ctx, &quest, form.optional(F_PROMPT))?;
     app.quests.focus_on(Anchor::local(&resumed.quest));
     app.say(format!("{} · o enters it", resumed.describe()));
+    Ok(())
+}
+
+fn remove_quest(ctx: &Ctx, app: &mut App, target: &Target) -> anyhow::Result<()> {
+    // SPEC §15: a remote Quest is removed *there*, through the CLI proxy.
+    if let Some(machine) = &target.machine {
+        return remove_remote(app, target, machine);
+    }
+    let quest = quest_for(ctx, target)?;
+    let removed = rm::apply(ctx, &quest)?;
+    // The row is gone; `resync` clamps the selection onto whatever took its
+    // place, so nothing is focused here.
+    app.say(removed.describe());
+    Ok(())
+}
+
+/// `q rm <slug> -f --machine <m>` as a child of *this* `q` (SPEC §15): the CLI
+/// proxy resolves, pins and sends it over ssh. `-f` because the TUI's box was
+/// the consent, exactly as `close`/`rename` proxy their own confirmations.
+fn remove_remote(app: &mut App, target: &Target, machine: &str) -> anyhow::Result<()> {
+    let out = super::spawn_q(&["rm", &target.slug, "-f", "--machine", machine])?;
+    if !out.status.success() {
+        return Err(QError::Other(format!(
+            "rm {} on {machine}: {}",
+            target.slug,
+            super::child_said(&out)
+        ))
+        .into());
+    }
+    app.say(format!(
+        "removed {} on {machine} \u{b7} it updates at the next remote tick",
+        target.slug
+    ));
     Ok(())
 }
 
@@ -2534,10 +2662,30 @@ mod tests {
             assert!(app.modal.is_none(), "{key} armed a form with no Quest");
             assert!(!app.capturing());
         }
+        // Backspace is the same: there is nothing to remove.
+        let mut app = app_with(Vec::new());
+        assert_eq!(handle(&mut app, Input::Backspace), Action::None);
+        assert!(app.modal.is_none());
         // `N` needs no selection: it is how the first Quest gets made.
         let mut app = app_with(Vec::new());
         handle(&mut app, Input::Char('N'));
         assert!(app.modal.is_some());
+    }
+
+    /// Backspace opens a confirm already on `[ Remove ]`, so removing is
+    /// Backspace-then-Enter; `←` steps to Cancel and disarms it.
+    #[test]
+    fn backspace_opens_a_confirm_armed_on_remove() {
+        let mut app = grouped();
+        let slug = app.quests.selected_row().unwrap().view.quest.slug.clone();
+        assert_eq!(handle(&mut app, Input::Backspace), Action::None);
+        let modal = app.modal.as_ref().expect("no form");
+        assert_eq!(modal.form.title, format!("remove {slug}?"));
+        // Armed: Remove is the focused button, so Enter would run it.
+        assert!(modal.form.confirmed());
+        // `←` steps to Cancel, disarming it (through the modal's own handler).
+        app.handle(Input::Left);
+        assert!(!app.modal.as_ref().unwrap().form.confirmed());
     }
 
     #[test]
@@ -4207,6 +4355,61 @@ mod form_tests {
         );
     }
 
+    /// Backspace → confirm removes the Quest and kills its whole tmux session
+    /// (master and every worker window), the same as `q rm -f`.
+    #[test]
+    fn backspace_removes_the_quest_and_kills_its_tmux_session() {
+        let rig = Rig::new();
+        let mut app = rig.app();
+        make(&rig, &mut app, "to-delete");
+        // The master's tmux session is up, plus a worker window in it — both
+        // belong to `q-to-delete`, so killing the session takes both.
+        {
+            let fixture = rig.fixture();
+            let mut state = fixture.load().unwrap();
+            state.panes.push(crate::tmux::FixturePane {
+                pane_id: "%77".to_string(),
+                pane_pid: 1234,
+                session_name: "q-to-delete".to_string(),
+                window_name: "worker".to_string(),
+                ..Default::default()
+            });
+            fixture.save(&state).unwrap();
+        }
+        assert_eq!(
+            rig.fixture()
+                .load()
+                .unwrap()
+                .panes
+                .iter()
+                .filter(|p| p.session_name == "q-to-delete")
+                .count(),
+            2
+        );
+
+        assert_eq!(
+            app.quests.selected_row().unwrap().view.quest.slug,
+            "to-delete"
+        );
+        app.handle(Input::Backspace);
+        assert_eq!(app.modal.as_ref().unwrap().form.title, "remove to-delete?");
+        submit(&rig, &mut app);
+        assert!(app.modal.is_none(), "form still up: {}", screen(&mut app));
+
+        // The row is gone from the database and its whole tmux session with it.
+        assert!(rig.quests().is_empty(), "{:?}", rig.slugs());
+        assert!(
+            !rig.fixture()
+                .load()
+                .unwrap()
+                .panes
+                .iter()
+                .any(|p| p.session_name == "q-to-delete"),
+            "tmux session (and its worker window) survived the remove"
+        );
+        assert!(app.status.contains("removed"), "{}", app.status);
+    }
+
     /// The epic's title carries the goal, so changing the goal under an
     /// existing epic retitles it; and a rename does the same for the slug.
     #[test]
@@ -4471,9 +4674,10 @@ mod form_tests {
 
     // -------------------------------------------- the affirmative is a choice
 
-    /// B2. `q close` asks `[y/N]` and reads a bare Enter as *abort*. So does
-    /// this box. A `c` and an Enter that arrived together — a burst buffered
-    /// during a stall, a newline in a paste — must not end a Quest.
+    /// B2. `q close` asks `[y/N]` and reads a bare Enter as *abort*. The button
+    /// dialog does the same: focus starts on `[ Cancel ]`, so a `c` and an
+    /// Enter that arrived together — a burst buffered during a stall, a newline
+    /// in a paste — press Cancel and end nothing.
     #[test]
     fn a_bare_enter_on_the_close_prompt_closes_nothing() {
         let rig = Rig::new();
@@ -4481,17 +4685,15 @@ mod form_tests {
         make(&rig, &mut app, "still-mine");
         let id = rig.quests()[0].id.clone();
 
-        // Exactly the burst, through the loop's own dispatch: `c`, then
-        // Enter, with no key in between.
+        // Exactly the burst, through the loop's own dispatch: `c`, then Enter,
+        // with no key in between. Enter presses the focused `[ Cancel ]`.
         press(&rig, &mut app, Input::Char('c'));
-        for _ in 0..3 {
-            assert_eq!(
-                press(&rig, &mut app, Input::Enter),
-                Action::None,
-                "Enter alone must not submit"
-            );
-        }
-        assert!(app.modal.is_some(), "the box was taken down");
+        assert_eq!(
+            press(&rig, &mut app, Input::Enter),
+            Action::None,
+            "Enter alone must not submit"
+        );
+        assert!(app.modal.is_none(), "Enter on Cancel dismisses the box");
 
         let quest = rig.quests().into_iter().find(|q| q.id == id).unwrap();
         assert_eq!(quest.state, QuestState::Active);
@@ -4505,10 +4707,6 @@ mod form_tests {
                 .any(|p| p.session_name == "q-still-mine"),
             "the tmux session was killed by a keystroke nobody aimed"
         );
-        // And the box says what is missing.
-        let text = screen(&mut app);
-        assert!(text.contains("nothing done"), "{text}");
-        assert!(text.contains("close"), "{text}");
     }
 
     /// Chosen, it still closes — the box is a guard, not a wall.
@@ -4520,16 +4718,12 @@ mod form_tests {
         let id = rig.quests()[0].id.clone();
 
         app.handle(Input::Char('c'));
-        assert_eq!(
-            app.modal
-                .as_ref()
-                .unwrap()
-                .form
-                .choice(crate::tui::form::ACTION),
-            crate::tui::form::CANCEL,
-            "the action row starts on cancel"
+        assert!(
+            !app.modal.as_ref().unwrap().form.confirmed(),
+            "the buttons start on cancel"
         );
-        // The focus starts on it, so it is one arrow key and an Enter away.
+        // The focus starts on the button row, so the verb is one arrow key and
+        // an Enter away.
         assert_eq!(
             app.modal.as_ref().unwrap().form.focused().map(Field::label),
             Some(crate::tui::form::ACTION)
@@ -4641,18 +4835,14 @@ mod form_tests {
             assert_eq!(deliver(&rig, &mut app, ev), Action::None, "a paste acted");
         }
         assert!(app.modal.is_some(), "a paste took the box down");
-        assert_eq!(
-            app.modal
-                .as_ref()
-                .unwrap()
-                .form
-                .choice(crate::tui::form::ACTION),
-            crate::tui::form::CANCEL,
+        assert!(
+            !app.modal.as_ref().unwrap().form.confirmed(),
             "a pasted arrow armed the close"
         );
-        // Nothing ran, and nothing is armed to run on the next Enter either.
+        // Nothing ran; the next Enter presses the focused Cancel and dismisses,
+        // closing nothing.
         assert_eq!(press(&rig, &mut app, Input::Enter), Action::None);
-        assert!(app.modal.is_some());
+        assert!(app.modal.is_none(), "Enter on Cancel dismisses");
 
         let quest = rig.quests().into_iter().find(|q| q.id == id).unwrap();
         assert_eq!(quest.state, QuestState::Active);

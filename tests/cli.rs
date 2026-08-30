@@ -5055,7 +5055,7 @@ fn spawn_refuses_a_label_that_is_already_live() {
 }
 
 #[test]
-fn spawn_validates_the_label_and_the_prompt() {
+fn spawn_validates_the_label_and_a_blank_prompt_is_a_bare_worker() {
     let env = Env::new();
     env.new_quest("foo");
     for bad in ["Tests", "with space", "under_score", "double--dash"] {
@@ -5065,12 +5065,66 @@ fn spawn_validates_the_label_and_the_prompt() {
             .code(1)
             .stderr(predicate::str::contains("invalid label"));
     }
-    env.cmd()
-        .args(["spawn", "foo", "   ", "--label", "tests"])
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("needs a prompt"));
+    // A rejected label opened nothing: only the master row is there.
     assert_eq!(env.count("SELECT count(*) FROM session"), 1);
+
+    // A blank prompt is no error now — it is a bare interactive worker with no
+    // first prompt (SPEC §6).
+    let out = env.json(&["spawn", "foo", "   ", "--label", "tests"]);
+    assert!(out["session"]["first_prompt"].is_null());
+    assert_eq!(env.count("SELECT count(*) FROM session"), 2);
+}
+
+#[test]
+fn spawn_without_a_label_or_prompt_makes_an_auto_bare_worker() {
+    let env = Env::new();
+    env.new_quest("foo");
+    // No `--label`, no prompt: the label is `w<n>` and the window carries it
+    // whole (no `w1-w1`), and Claude gets no `--` prompt.
+    let out = env.json(&["spawn", "foo"]);
+    assert_eq!(out["session"]["label"], "w1");
+    assert_eq!(out["window"], "w1");
+    assert!(out["session"]["first_prompt"].is_null());
+    let command = window_of(&env.fixture(), "q-foo", "w1")["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(command.contains("claude -n foo/w1"), "{command}");
+    assert!(!command.contains(" -- "), "{command}");
+
+    // The next auto worker is `w2`.
+    let out = env.json(&["spawn", "foo"]);
+    assert_eq!(out["session"]["label"], "w2");
+}
+
+#[test]
+fn spawn_here_reads_the_quest_from_the_pane_and_spawns_a_bare_worker() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let master_pane = window_of(&env.fixture(), "q-foo", "master")["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A pane in the Quest's session opens a bare worker there and selects it.
+    env.cmd()
+        .args(["spawn-here", &master_pane])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("spawned w1 in foo"));
+    assert_eq!(env.count("SELECT count(*) FROM session"), 2);
+    assert_eq!(
+        env.fixture()["selected"],
+        window_of(&env.fixture(), "q-foo", "w1")["pane_id"]
+    );
+
+    // A pane that is not any Quest's is a friendly no-op — nothing spawned.
+    env.cmd()
+        .args(["spawn-here", "%999"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("not in a Quest"));
+    assert_eq!(env.count("SELECT count(*) FROM session"), 2);
 }
 
 #[test]

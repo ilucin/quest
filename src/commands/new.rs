@@ -540,6 +540,9 @@ pub fn spawn_master(ctx: &Ctx, quest: &Quest, prompt: Option<String>) -> anyhow:
         command: Some(claude_command(&quest.slug, MASTER, prompt.as_deref())),
     };
     let pane = ctx.tmux().new_session(&spec)?;
+    // The Quest now has a tmux session, so the spawn-a-worker key can be live.
+    // Server-wide and best-effort (see `bind_spawn_key`), set on every master.
+    bind_spawn_key(ctx);
 
     let mut row = Session::new(
         &quest.id,
@@ -733,6 +736,30 @@ pub fn git_branch(cwd: &Path) -> Option<String> {
 }
 
 /// `claude -n <slug>/<label> [-- <prompt>]`, run by tmux through a shell.
+/// Bind `[tmux] spawn_key` (default prefix+`N`) server-wide to `q spawn-here`,
+/// so any pane in any Quest can open a fresh worker in its own Quest. The bind
+/// is a tmux server setting, not a session one, so setting it whenever a master
+/// comes up is idempotent; an empty `spawn_key` turns it off.
+///
+/// Best-effort throughout: a tmux that refuses the bind, or a `q` whose own path
+/// cannot be resolved, must not sink the master that has just come up.
+fn bind_spawn_key(ctx: &Ctx) {
+    let key = ctx.config.tmux.spawn_key.trim();
+    if key.is_empty() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    // `#{pane_id}` is tmux's, expanded to the pressed pane before the shell
+    // runs; single-quoted so the shell passes it through untouched.
+    let command = format!(
+        "{} spawn-here '#{{pane_id}}'",
+        shell_quote(&exe.to_string_lossy())
+    );
+    let _ = ctx.tmux().bind_key(key, &command);
+}
+
 pub fn claude_command(slug: &str, label: &str, prompt: Option<&str>) -> String {
     let mut cmd = format!("claude -n {}", shell_quote(&format!("{slug}/{label}")));
     if let Some(prompt) = prompt {

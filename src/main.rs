@@ -571,14 +571,15 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
             ctx,
             &commands::spawn::Args {
                 quest,
-                label,
-                prompt,
+                label: label.as_deref(),
+                prompt: prompt.as_deref(),
                 workflow: workflow.as_deref(),
                 dir: dir.as_deref(),
                 no_attach: *no_attach,
             },
         )
         .map(|()| 0),
+        Command::SpawnHere { pane } => commands::spawn::run_here(ctx, pane).map(|()| 0),
         Command::Sessions { quest, all } => commands::sessions::run(
             ctx,
             &commands::sessions::Args {

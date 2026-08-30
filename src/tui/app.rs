@@ -87,6 +87,9 @@ pub enum Action {
     /// Make a Quest right away with every default — no form (`n`; `N` is the
     /// form). The loop runs `q new` and reloads.
     QuickNew,
+    /// Spawn a bare worker in the selected Quest (`w`) — an auto `w<n>` label,
+    /// no prompt. The loop runs `q spawn` and reloads.
+    SpawnWorker,
     /// Proxy an acting key against the machine the selection lives on (SPEC §15;
     /// bd-8lz.5.8 Quests, bd-8lz.10 Sessions): a read pages a captured `q`, a
     /// write hands over the terminal. The loop reads the selection and tab.
@@ -183,6 +186,8 @@ pub enum Prompt {
     Edit(Target),
     Close(Target),
     Resume(Target),
+    /// Backspace — delete the Quest and its whole tmux session (SPEC §5 `q rm`).
+    Remove(Target),
     /// SPEC §17 `t` — type into a live Claude session.
     Send(SessionTarget),
     /// SPEC §17 `k` — end one worker.
@@ -205,9 +210,11 @@ impl Prompt {
     pub fn quest(&self) -> Option<&str> {
         match self {
             Prompt::NewQuest => None,
-            Prompt::Rename(t) | Prompt::Edit(t) | Prompt::Close(t) | Prompt::Resume(t) => {
-                Some(t.quest.as_str())
-            }
+            Prompt::Rename(t)
+            | Prompt::Edit(t)
+            | Prompt::Close(t)
+            | Prompt::Resume(t)
+            | Prompt::Remove(t) => Some(t.quest.as_str()),
             Prompt::Send(t) | Prompt::Kill(t) | Prompt::Reset(t) => Some(t.quest.as_str()),
             // A template is a definition; the Quest a run makes does not
             // exist yet, and the other three never make one.
@@ -232,7 +239,11 @@ impl Prompt {
 
     pub fn target(&self) -> Option<&Target> {
         match self {
-            Prompt::Rename(t) | Prompt::Edit(t) | Prompt::Close(t) | Prompt::Resume(t) => Some(t),
+            Prompt::Rename(t)
+            | Prompt::Edit(t)
+            | Prompt::Close(t)
+            | Prompt::Resume(t)
+            | Prompt::Remove(t) => Some(t),
             _ => None,
         }
     }

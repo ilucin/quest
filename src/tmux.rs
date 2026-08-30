@@ -105,6 +105,10 @@ pub trait Tmux {
     fn has_session(&self, name: &str) -> anyhow::Result<bool>;
     fn in_tmux(&self) -> bool;
     fn version(&self) -> anyhow::Result<String>;
+    /// Bind `key` (in the prefix table) server-wide to `run-shell <command>`.
+    /// `q` uses it once, when a master comes up, so any pane in a Quest can
+    /// spawn a fresh worker (SPEC §6; `[tmux] spawn_key`).
+    fn bind_key(&self, key: &str, command: &str) -> anyhow::Result<()>;
 }
 
 /// `FixtureTmux` when `$Q_FIXTURE` names a file, else the real thing.
@@ -138,6 +142,10 @@ fn args_list_panes() -> Vec<String> {
 
 fn args_display_pane(target: &str) -> Vec<String> {
     args(&["display-message", "-p", "-t", &exact(target), PANE_FORMAT])
+}
+
+fn args_bind_key(key: &str, command: &str) -> Vec<String> {
+    args(&["bind-key", key, "run-shell", command])
 }
 
 fn args_new_session(spec: &NewSession) -> Vec<String> {
@@ -540,6 +548,10 @@ impl Tmux for RealTmux {
 
     fn version(&self) -> anyhow::Result<String> {
         Ok(run(&args(&["-V"]))?.trim().to_string())
+    }
+
+    fn bind_key(&self, key: &str, command: &str) -> anyhow::Result<()> {
+        run(&args_bind_key(key, command)).map(|_| ())
     }
 }
 
@@ -981,6 +993,12 @@ impl Tmux for FixtureTmux {
             .load()?
             .version
             .unwrap_or_else(|| FIXTURE_VERSION.to_string()))
+    }
+
+    // Server-wide tmux state has no place in the per-session fixture, and no
+    // test drives the binding itself — the arg builder is unit-tested instead.
+    fn bind_key(&self, _key: &str, _command: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -1564,6 +1582,19 @@ mod tests {
     }
 
     #[test]
+    fn bind_key_binds_run_shell_in_the_prefix_table() {
+        assert_eq!(
+            args_bind_key("N", "/usr/local/bin/q spawn-here '#{pane_id}'"),
+            vec![
+                "bind-key",
+                "N",
+                "run-shell",
+                "/usr/local/bin/q spawn-here '#{pane_id}'",
+            ],
+        );
+    }
+
+    #[test]
     fn the_pane_line_is_the_last_line_of_stdout() {
         // tmux can warn ahead of the `-P -F` output; the format line is last.
         assert_eq!(last_line("%42\t1\tq-a\tw\t0\n"), "%42\t1\tq-a\tw\t0");
@@ -2073,6 +2104,9 @@ mod tests {
             false
         }
         fn version(&self) -> anyhow::Result<String> {
+            unreachable!()
+        }
+        fn bind_key(&self, _: &str, _: &str) -> anyhow::Result<()> {
             unreachable!()
         }
     }
