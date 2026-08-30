@@ -8,9 +8,9 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::error::QError;
 
 /// The version this binary expects. Must equal the last entry in `MIGRATIONS`.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
-const MIGRATIONS: &[(u32, &str)] = &[(1, V1), (2, V2), (3, V3), (4, V4)];
+const MIGRATIONS: &[(u32, &str)] = &[(1, V1), (2, V2), (3, V3), (4, V4), (5, V5)];
 
 const V1: &str = r#"
 CREATE TABLE quest (
@@ -122,6 +122,19 @@ CREATE TABLE remote_cache (
   payload    TEXT NOT NULL,      -- JSON array of quest views, as the remote sent it
   fetched_at INTEGER NOT NULL
 );
+"#;
+
+/// tmux-session fleet (SPEC §6, plan v2 M1a). Additive:
+///
+/// * `session.status` gains `'off'` (tmux pane alive, no Claude) — a TEXT enum
+///   value, no schema change of its own, listed here for the record;
+/// * `session.last_pane_path` — the main session's last-seen `pane_current_path`,
+///   so cwd-follow (M3) is edge-triggered on a change rather than level;
+/// * `session.claude_started_at` — set by `q start` (M1b), to bound the
+///   `starting` grace before the sweep may demote a row to `off`.
+const V5: &str = r#"
+ALTER TABLE session ADD COLUMN last_pane_path TEXT;
+ALTER TABLE session ADD COLUMN claude_started_at INTEGER;
 "#;
 
 pub fn user_version(conn: &Connection) -> anyhow::Result<u32> {

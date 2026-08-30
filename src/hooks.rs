@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use crate::brief::{self, Opts};
 use crate::commands::fmt::{EVENT_PROMPT_CHARS, truncate};
 use crate::db::Db;
-use crate::model::{Session, SessionStatus, now};
+use crate::model::{Session, SessionStatus};
 
 /// Stored on the session row.
 const LAST_PROMPT_CHARS: usize = 500;
@@ -321,15 +321,25 @@ fn pre_compact(db: &Db, session: &Session, payload: &Value) {
     });
 }
 
+/// Claude left the pane, but the tmux session lives on (SPEC §6): the row goes
+/// `off`, not `ended`. Two guards keep that honest:
+///
+/// * an already-`ended` row is never touched — a `SessionEnd` that lands after
+///   `q kill`/`q close` (or after the pane vanished and the sweep ended the
+///   row) must not resurrect it as `off`;
+/// * a `/clear` fires `SessionEnd(reason=clear)` immediately followed by
+///   `SessionStart(source=clear)`; flipping to `off` in between would flap the
+///   status for a blink, so the reason guard leaves it to the `Start`.
 fn session_end(db: &Db, session: &Session, payload: &Value) {
+    if session.status == SessionStatus::Ended {
+        return;
+    }
+    let reason = str_field(payload, "reason");
     let _ = db.transaction(|db| {
-        db.mark_session_ended(&session.id, now())?;
-        append(
-            db,
-            session,
-            "session.end",
-            json!({ "reason": str_field(payload, "reason") }),
-        )
+        if reason != Some("clear") {
+            db.update_session_status(&session.id, SessionStatus::Off, None)?;
+        }
+        append(db, session, "session.end", json!({ "reason": reason }))
     });
 }
 

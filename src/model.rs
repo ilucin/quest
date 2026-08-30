@@ -83,6 +83,11 @@ text_enum!(SessionStatus, "session status", {
     Busy => "busy",
     Idle => "idle",
     Waiting => "waiting",
+    // The tmux pane is alive but no Claude is running in it (SPEC §6): the pane
+    // reports a shell, or a `SessionEnd` other than `/clear` fired. Not-busy
+    // for `display_state`, and never reached from `ended` — a killed/closed
+    // session stays ended even if a late `SessionEnd` arrives.
+    Off => "off",
     Ended => "ended",
 });
 
@@ -185,6 +190,15 @@ pub struct Session {
     /// The `<slug>/<label>` a `/rename` still owes this Claude session, held
     /// because it was not idle when its Quest was renamed (SPEC §10).
     pub pending_rename: Option<String>,
+    /// The main session's last-seen `pane_current_path` (SPEC §6). cwd-follow
+    /// is edge-triggered on this changing, so a level difference (a frozen
+    /// Claude cwd, or an explicit `q set cwd`) never rewrites the Quest cwd.
+    /// Consumed in M3; carried on every row for simplicity.
+    pub last_pane_path: Option<String>,
+    /// When `q start` launched Claude in this pane (SPEC §6): bounds the
+    /// `starting` grace before the sweep may demote the row to `off`. Consumed
+    /// in M1b.
+    pub claude_started_at: Option<i64>,
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub updated_at: i64,
@@ -218,6 +232,8 @@ impl Session {
             first_prompt: None,
             last_prompt: None,
             pending_rename: None,
+            last_pane_path: None,
+            claude_started_at: None,
             started_at: ts,
             ended_at: None,
             updated_at: ts,
@@ -389,7 +405,7 @@ mod tests {
         for text in ["master", "worker"] {
             assert_eq!(SessionRole::from_str(text).unwrap().as_str(), text);
         }
-        for text in ["starting", "busy", "idle", "waiting", "ended"] {
+        for text in ["starting", "busy", "idle", "waiting", "off", "ended"] {
             assert_eq!(SessionStatus::from_str(text).unwrap().as_str(), text);
         }
     }
@@ -425,6 +441,10 @@ mod tests {
             (Q::Active, &[S::Ended], D::Idle),
             (Q::Active, &[S::Idle], D::Idle),
             (Q::Active, &[S::Idle, S::Ended], D::Idle),
+            // `off` (tmux alive, no Claude) is not-busy, like `idle`.
+            (Q::Active, &[S::Off], D::Idle),
+            (Q::Active, &[S::Off, S::Ended], D::Idle),
+            (Q::Active, &[S::Off, S::Busy], D::Active),
             (Q::Active, &[S::Busy], D::Active),
             (Q::Active, &[S::Starting], D::Active),
             (Q::Active, &[S::Waiting], D::Active),
