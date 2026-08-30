@@ -240,6 +240,63 @@ fn check_claude(claude: Option<&Path>) -> Check {
     }
 }
 
+/// A `claude` that is a shell-script wrapper launching the real binary *without*
+/// `exec` shows up in `pane_current_command` as the wrapper's own shell (`bash`),
+/// which the presence sweep reads as "no Claude" and would demote a live row to
+/// `off` (plan §3.2). Warn so the user adds an `exec`. A real binary, or a
+/// script that already execs, is fine.
+fn check_claude_wrapper(claude: Option<&Path>) -> Check {
+    let name = "claude wrapper";
+    let Some(path) = claude else {
+        // The missing-claude failure is check_claude's to report.
+        return check(name, Status::Ok, "n/a (claude not found)");
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => evaluate_wrapper(
+            &String::from_utf8_lossy(&bytes),
+            &path.display().to_string(),
+        ),
+        Err(_) => check(
+            name,
+            Status::Ok,
+            format!("{} is not a readable script", path.display()),
+        ),
+    }
+}
+
+/// The pure half of [`check_claude_wrapper`].
+fn evaluate_wrapper(contents: &str, path: &str) -> Check {
+    let name = "claude wrapper";
+    let first = contents.lines().next().unwrap_or("");
+    let is_shell_script = first.starts_with("#!")
+        && ["sh", "bash", "zsh", "dash", "ksh", "fish"]
+            .iter()
+            .any(|s| first.contains(s));
+    if !is_shell_script {
+        return check(name, Status::Ok, "claude is a binary (no wrapper)");
+    }
+    let launches = contents.lines().any(|l| {
+        let t = l.trim();
+        !t.starts_with('#') && (t.contains("claude") || t.contains("node"))
+    });
+    let execs = contents
+        .lines()
+        .any(|l| l.trim_start().starts_with("exec "));
+    if launches && !execs {
+        with_hint(
+            check(
+                name,
+                Status::Warn,
+                format!("{path} is a shell wrapper that does not `exec` Claude"),
+            ),
+            "prefix the launch with `exec` so tmux sees Claude, not the wrapper shell \
+             (else q reads the pane as `off`)",
+        )
+    } else {
+        check(name, Status::Ok, format!("{path} execs into Claude"))
+    }
+}
+
 /// `None` when the call failed or printed something unrecognisable.
 fn claude_version(claude: &Path) -> Option<String> {
     let mut cmd = Command::new(claude);
@@ -1145,6 +1202,7 @@ fn report(ctx: &Ctx, fix: bool) -> Report {
         check_config(),
         check_tmux(ctx.tmux()),
         check_claude(claude.as_deref()),
+        check_claude_wrapper(claude.as_deref()),
         check_claude_login(claude.as_deref()),
         db_check,
         // SPEC §23 #8 is only half checkable: which `q` a shell runs is

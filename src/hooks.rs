@@ -145,8 +145,9 @@ fn claude_pid() -> Option<i64> {
     let mut fields = text.split_whitespace();
     let grandparent: i64 = fields.next()?.parse().ok()?;
     let comm = Path::new(fields.next()?).file_name()?.to_str()?;
-    let is_shell = matches!(comm, "sh" | "bash" | "zsh" | "dash" | "fish");
-    Some(if is_shell {
+    // The same shell vocabulary the presence sweep uses (`tmux::SHELLS`), so a
+    // login shell the sweep would call idle is the one the pid walk skips over.
+    Some(if crate::tmux::is_shell(comm) {
         grandparent
     } else {
         i64::from(parent)
@@ -155,6 +156,22 @@ fn claude_pid() -> Option<i64> {
 
 fn session_start(db: &Db, session: &Session, payload: &Value) -> Option<String> {
     let source = str_field(payload, "source");
+    // An `ended` row is terminal: it was killed (`q kill`/`q close`) or its pane
+    // vanished and the sweep ended it. A late or stray `SessionStart` landing on
+    // it — a leftover `$Q_SESSION` in a pane whose tmux session was torn down —
+    // must not resurrect it. The supported way back is `q start` on a live pane
+    // (which uses the `off`/`starting` row) or `q resume`, which re-adopts the
+    // fleet with fresh rows; a no-op here keeps those the only two doors. The
+    // event is still logged so the stray start is not silently swallowed.
+    if session.status == SessionStatus::Ended {
+        let _ = append(
+            db,
+            session,
+            "session.start",
+            json!({ "source": source, "ignored": "ended" }),
+        );
+        return None;
+    }
     let claude_session_id = str_field(payload, "session_id");
     let pid = claude_pid();
     // `/clear` and `/compact` start a new context window, so the last

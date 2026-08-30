@@ -14,6 +14,7 @@ pub mod locate;
 pub mod name;
 pub mod new;
 pub mod peek;
+pub mod prompt;
 pub mod proxy;
 pub mod rename;
 pub mod reset;
@@ -25,6 +26,8 @@ pub mod set;
 pub mod show;
 pub mod skill;
 pub mod spawn;
+pub mod start;
+pub mod stop;
 pub mod target;
 pub mod tpl;
 pub mod watch;
@@ -318,6 +321,22 @@ pub fn sweep_quiet(ctx: &Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Kill every tmux session of a Quest (SPEC §6 v2): the main `q-<slug>` and
+/// every worker `q-<slug>+<label>`, including a pane with no session row.
+/// Best effort — a session already gone is not an error — so `q close`/`q rm`
+/// tear a crashed fleet down all the same. Returns how many it killed.
+pub fn kill_quest_fleet(ctx: &Ctx, slug: &str) -> anyhow::Result<usize> {
+    let panes = tmux::live_panes(ctx.tmux())?;
+    let names = tmux::sessions_of_quest(&ctx.config, &panes, slug);
+    let mut killed = 0;
+    for name in &names {
+        if ctx.tmux().kill_session(name).is_ok() {
+            killed += 1;
+        }
+    }
+    Ok(killed)
+}
+
 /// Write out and clear whatever the call buffered on the `Ctx` (see
 /// [`Ctx::warn`]). Every command that can warn calls this before its own
 /// output, so the order on the terminal is exactly what it was when these were
@@ -387,15 +406,14 @@ fn fixture_answer() -> Option<anyhow::Result<()>> {
 }
 
 /// What a command did with the terminal, for the payload and the one-liner.
-/// `Switch` and `Exec` move a client between sessions; `Select` only changes
-/// which window of the caller's own session is active, which is all `q spawn`
-/// ever does.
+/// `Switch` and `Exec` move a client between sessions — inside tmux and out;
+/// every worker is now its own tmux session (SPEC §6 v2), so landing on one is
+/// a full switch, never the in-session window select of old.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AttachMode {
-    /// `-d` / `--no-attach`: the terminal is left alone.
+    /// `-d` / no `--enter`: the terminal is left alone.
     None,
-    Select,
     Switch,
     Exec,
 }
@@ -404,7 +422,6 @@ impl std::fmt::Display for AttachMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             AttachMode::None => "none",
-            AttachMode::Select => "select",
             AttachMode::Switch => "switch",
             AttachMode::Exec => "exec",
         })

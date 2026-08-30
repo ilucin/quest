@@ -87,6 +87,11 @@ pub fn resolve(ctx: &Ctx, quest: &Quest, label: Option<&str>) -> anyhow::Result<
     // ever reported, and tmux is the one that knows it.
     let pane = session.tmux_pane.clone();
     let window = window_of(ctx.tmux(), &pane).unwrap_or_else(|| session.label.clone());
+    // Attach to the session's **own** tmux session (SPEC §6 v2): a worker is
+    // `q-<slug>+<label>`, not a window of the main one. A pre-v2 worker row
+    // still carries the main name here, so attaching by its pane keeps working
+    // until it is killed. An `off` row is enterable — it is a shell.
+    let tmux_session = session.tmux_session.clone();
     Ok(Target {
         tmux_session,
         session: session.clone(),

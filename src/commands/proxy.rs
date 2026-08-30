@@ -310,6 +310,9 @@ pub fn route(command: &Command) -> Option<(Aim<'_>, Passage)> {
         Command::Send { session, .. } => (Aim::Session(session), Proxy),
         Command::Reset { session, .. } => (Aim::Session(session), Proxy),
         Command::Kill { session, force } => (Aim::Session(session), asked(*force, "kill session")),
+        Command::Start { session, .. } => (Aim::Session(session), Proxy),
+        Command::Stop { session, .. } => (Aim::Session(session), Proxy),
+        Command::Prompt { session } => (Aim::Session(session), Proxy),
 
         Command::Note {
             quest: Some(quest), ..

@@ -9,12 +9,13 @@ use serde::Serialize;
 use crate::Ctx;
 use crate::commands::new::validate_slug;
 use crate::commands::sweep_quiet;
+use crate::db::Db;
 use crate::db::quest::QuestPatch;
 use crate::error::QError;
 use crate::model::{NameSource, Quest};
 use crate::naming::{self, Sync};
 use crate::output;
-use crate::tmux::session_name;
+use crate::tmux::{WORKER_SEP, live_panes, session_name, sessions_of_quest, worker_session_name};
 
 /// What a rename did, for the payload of whatever asked for it.
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +99,10 @@ pub fn apply(
     if ctx.tmux().has_session(&new_session)? {
         return Err(QError::Tmux(format!("tmux session `{new_session}` already exists")).into());
     }
+    // The main session is renamed first and hard: it is the one a failure must
+    // roll back cleanly, before any database write. The workers follow
+    // best-effort (SPEC §6 v2 — a fleet of sessions), and a rename that half
+    // fails there is a doctor mismatch, not a failed `q rename`.
     let renamed = ctx.tmux().has_session(&old_session)?;
     if renamed {
         ctx.tmux().rename_session(&old_session, &new_session)?;
@@ -118,7 +123,7 @@ pub fn apply(
             return Err(e);
         }
     };
-    db.update_sessions_tmux_session(&quest.id, &new_session)?;
+    rename_fleet(ctx, db, &quest, &from, slug)?;
     db.append_event(
         &quest.id,
         None,
@@ -138,4 +143,79 @@ pub fn apply(
         changed: true,
         sync,
     })
+}
+
+/// Move the rest of the fleet under the new slug (SPEC §6 v2): rename every
+/// worker tmux session `q-<from>+<label>` → `q-<slug>+<label>` best-effort, and
+/// remap every live session row's `tmux_session`. The main was already renamed
+/// by [`apply`]; a pre-v2 worker row still carrying the main name is remapped to
+/// the new main. A worker tmux rename that fails leaves a mismatch `q doctor`
+/// reports rather than failing the whole rename.
+fn rename_fleet(ctx: &Ctx, db: &Db, quest: &Quest, from: &str, slug: &str) -> anyhow::Result<()> {
+    let old_main = session_name(&ctx.config, from);
+    let worker_prefix = format!("{old_main}{WORKER_SEP}");
+    // Rename the live worker tmux sessions (rowless ones included).
+    let panes = live_panes(ctx.tmux())?;
+    for name in sessions_of_quest(&ctx.config, &panes, from) {
+        if let Some(label) = name.strip_prefix(&worker_prefix) {
+            let _ = ctx
+                .tmux()
+                .rename_session(&name, &worker_session_name(&ctx.config, slug, label));
+        }
+    }
+    // Remap every live row's tmux_session to the new slug.
+    for session in db.list_sessions_by_quest(&quest.id)? {
+        if session.status == crate::model::SessionStatus::Ended {
+            continue;
+        }
+        if let Some(new_name) = remapped(&ctx.config, &session.tmux_session, from, slug) {
+            db.update_session_tmux_session(&session.id, &new_name)?;
+        }
+    }
+    Ok(())
+}
+
+/// A live row's tmux session name under the new slug, or `None` when it does not
+/// belong to `from`. `q-<from>` → `q-<slug>`; `q-<from>+<label>` →
+/// `q-<slug>+<label>`; the `+`-split keeps a slug that itself contains `-` whole.
+fn remapped(
+    config: &crate::config::Config,
+    tmux_session: &str,
+    from: &str,
+    slug: &str,
+) -> Option<String> {
+    let rest = tmux_session.strip_prefix(config.tmux.session_prefix.as_str())?;
+    let (quest_part, suffix) = match rest.split_once(WORKER_SEP) {
+        Some((q, s)) => (q, Some(s)),
+        None => (rest, None),
+    };
+    if quest_part != from {
+        return None;
+    }
+    Some(match suffix {
+        Some(label) => worker_session_name(config, slug, label),
+        None => session_name(config, slug),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn remapped_moves_main_and_workers_but_not_a_sibling() {
+        let config = Config::default();
+        assert_eq!(
+            remapped(&config, "q-foo", "foo", "bar").as_deref(),
+            Some("q-bar")
+        );
+        assert_eq!(
+            remapped(&config, "q-foo+review", "foo", "bar").as_deref(),
+            Some("q-bar+review")
+        );
+        // A sibling Quest's session is not ours.
+        assert_eq!(remapped(&config, "q-foo-2", "foo", "bar"), None);
+        assert_eq!(remapped(&config, "irssi", "foo", "bar"), None);
+    }
 }
