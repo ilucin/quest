@@ -66,6 +66,14 @@ pub fn apply(ctx: &Ctx, found: &target::Target, force: bool) -> anyhow::Result<S
         .into());
     }
 
+    // `/exit` is a slash-command only when it starts the input line; appended
+    // to text the user already typed it becomes an ordinary `foo/exit` message
+    // and Claude never leaves (correctness review #4). Clear the line first.
+    // `C-u` (kill-to-start) over Escape: Claude Code's input binds it to a plain
+    // line-kill, whereas Escape is mode-sensitive (interrupts a turn, dismisses
+    // a dialog). The common case — a stray prompt typed then left — has the
+    // cursor at the end, which C-u clears whole.
+    ctx.tmux().send_key(&session.tmux_pane, "C-u")?;
     ctx.tmux().send_keys(&session.tmux_pane, "/exit", true)?;
     ctx.db()?.append_event(
         &found.quest.id,

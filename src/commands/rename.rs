@@ -154,18 +154,31 @@ pub fn apply(
 fn rename_fleet(ctx: &Ctx, db: &Db, quest: &Quest, from: &str, slug: &str) -> anyhow::Result<()> {
     let old_main = session_name(&ctx.config, from);
     let worker_prefix = format!("{old_main}{WORKER_SEP}");
-    // Rename the live worker tmux sessions (rowless ones included).
+    // Rename the live worker tmux sessions (rowless ones included). A worker
+    // whose target name is already taken, or whose rename errors, is left where
+    // it is — and its old name is remembered so the row remap below does **not**
+    // follow it. Remapping a row onto a name another session owns would make the
+    // next sweep key orphan detection on a `(tmux_session, pane)` pair that no
+    // longer exists, ending a live worker (correctness review #1).
     let panes = live_panes(ctx.tmux())?;
+    let mut stranded: std::collections::HashSet<String> = std::collections::HashSet::new();
     for name in sessions_of_quest(&ctx.config, &panes, from) {
         if let Some(label) = name.strip_prefix(&worker_prefix) {
-            let _ = ctx
-                .tmux()
-                .rename_session(&name, &worker_session_name(&ctx.config, slug, label));
+            let target = worker_session_name(&ctx.config, slug, label);
+            let collision = ctx.tmux().has_session(&target).unwrap_or(false);
+            if collision || ctx.tmux().rename_session(&name, &target).is_err() {
+                stranded.insert(name.clone());
+            }
         }
     }
-    // Remap every live row's tmux_session to the new slug.
+    // Remap every live row's tmux_session to the new slug, except the workers
+    // whose tmux rename did not land — those keep their old name so q doctor
+    // reports the mismatch and the live pane stays reachable.
     for session in db.list_sessions_by_quest(&quest.id)? {
         if session.status == crate::model::SessionStatus::Ended {
+            continue;
+        }
+        if stranded.contains(&session.tmux_session) {
             continue;
         }
         if let Some(new_name) = remapped(&ctx.config, &session.tmux_session, from, slug) {

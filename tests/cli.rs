@@ -3378,6 +3378,88 @@ fn rename_works_without_a_tmux_session() {
 }
 
 #[test]
+fn rename_moves_the_whole_fleet_of_tmux_sessions_and_rows() {
+    let env = Env::new();
+    env.new_quest("foo");
+    // A worker lives in its own tmux session `q-foo+tests` (SPEC §6 v2).
+    env.json(&["spawn", "foo", "write the tests", "--label", "tests"]);
+    assert!(
+        env.fixture()["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["session_name"] == "q-foo+tests"),
+        "the worker session was not opened"
+    );
+
+    let renamed = env.json(&["rename", "foo", "bar"]);
+    assert_eq!(renamed["tmux_session"], "q-bar");
+
+    // Both tmux sessions followed the slug.
+    let names: Vec<String> = env.fixture()["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["session_name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(names.contains(&"q-bar".to_string()), "{names:?}");
+    assert!(names.contains(&"q-bar+tests".to_string()), "{names:?}");
+    assert!(!names.iter().any(|n| n.starts_with("q-foo")), "{names:?}");
+
+    // Both rows were remapped.
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE tmux_session = 'q-bar'"),
+        1
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE tmux_session = 'q-bar+tests'"),
+        1
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE tmux_session LIKE 'q-foo%'"),
+        0
+    );
+}
+
+#[test]
+fn rename_leaves_a_worker_whose_target_name_is_already_taken() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let spawned = env.json(&["spawn", "foo", "go", "--label", "tests"]);
+    let worker_pane = spawned["session"]["tmux_pane"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A hand-made `q-bar+tests` already exists: the worker's rename target
+    // collides, so its tmux session must be left where it is and its row must
+    // NOT be remapped — remapping onto a name another session owns would make
+    // the next sweep orphan the live worker (correctness review #1).
+    let mut fixture = env.fixture();
+    let mut clash = fixture["panes"].as_array().unwrap()[0].clone();
+    clash["pane_id"] = serde_json::json!("%900");
+    clash["session_name"] = serde_json::json!("q-bar+tests");
+    fixture["panes"].as_array_mut().unwrap().push(clash);
+    env.write_fixture(fixture);
+
+    let renamed = env.json(&["rename", "foo", "bar"]);
+    assert_eq!(renamed["tmux_session"], "q-bar");
+
+    // The master still moved; the colliding worker row kept its old name.
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE tmux_session = 'q-bar'"),
+        1
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE tmux_session = 'q-foo+tests'"),
+        1
+    );
+    // The live worker pane still lives under its old session name, reachable.
+    let worker = pane_of(&env.fixture(), "q-foo+tests");
+    assert_eq!(worker["pane_id"], worker_pane.as_str());
+}
+
+#[test]
 fn renaming_to_the_same_slug_is_a_no_op_of_the_same_shape() {
     let env = Env::new();
     env.new_quest("foo");
@@ -5361,6 +5443,42 @@ fn enter_reaches_a_worker_by_label_through_its_own_session() {
 }
 
 #[test]
+fn enter_reaches_a_live_worker_when_the_main_session_is_gone() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let spawned = env.json(&["spawn", "foo", "write the tests", "--label", "tests"]);
+    let worker_pane = spawned["session"]["tmux_pane"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Drop the main tmux session `q-foo`, keeping the worker's own alive: this
+    // is exactly the state `q resume` re-adopts a live worker in. `q enter` must
+    // gate on the worker's own session, not the (now absent) main (SPEC §6 v2).
+    let mut fixture = env.fixture();
+    fixture["panes"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|p| p["session_name"] != "q-foo");
+    env.write_fixture(fixture);
+
+    let entered = env.json(&["enter", "foo", "--session", "tests"]);
+    assert_eq!(entered["tmux_session"], "q-foo+tests");
+    assert_eq!(entered["session"]["id"], spawned["session"]["id"]);
+    assert_eq!(
+        env.fixture()["attached"],
+        serde_json::json!(["q-foo+tests", worker_pane.as_str()])
+    );
+
+    // The master, whose session is gone, points at `q resume`.
+    env.cmd()
+        .args(["enter", "foo"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("q resume foo"));
+}
+
+#[test]
 fn a_spawn_whose_session_never_opens_leaves_no_session_behind() {
     let env = Env::new();
     env.new_quest("foo");
@@ -5602,13 +5720,42 @@ fn start_launches_claude_in_a_shell_pane_and_refuses_a_non_shell_one() {
         "starting"
     );
 
-    // The pane now runs Claude (a non-shell command); starting again is refused.
+    // The row is already `starting`, so a second `q start` is refused on status
+    // before it can double-type `claude` into the boot window (correctness #2).
+    env.cmd()
+        .args(["start", "alpha/w1"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("already up or starting"));
+    // …unless forced.
+    env.cmd()
+        .args(["start", "alpha/w1", "--force"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn start_refuses_a_non_shell_pane_on_an_off_row() {
+    let env = Env::new();
+    env.new_quest("alpha");
+    let w = env.json(&["spawn", "alpha", "--label", "w1", "--shell"]);
+    let pane = w["session"]["tmux_pane"].as_str().unwrap().to_string();
+
+    // The row is `off`, so the status gate passes; but the pane is running
+    // something that is not a shell (a vim, a build), so `launch` refuses.
+    let mut fixture = env.fixture();
+    for p in fixture["panes"].as_array_mut().unwrap() {
+        if p["pane_id"] == pane.as_str() {
+            p["current_command"] = serde_json::json!("vim");
+        }
+    }
+    env.write_fixture(fixture);
+
     env.cmd()
         .args(["start", "alpha/w1"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("not a shell"));
-    // …unless forced.
     env.cmd()
         .args(["start", "alpha/w1", "--force"])
         .assert()
@@ -5676,6 +5823,28 @@ fn stop_types_exit_and_is_idle_gated() {
     // Idle: `/exit` goes in.
     env.set_status(&fleet.worker_id, "idle", None);
     env.json(&["stop", "alpha/tests"]);
+    assert_eq!(env.buffer(&fleet.worker_pane), "/exit\n");
+}
+
+#[test]
+fn stop_clears_a_stray_input_line_before_typing_exit() {
+    let fleet = Fleet::new();
+    let env = &fleet.env;
+    env.set_status(&fleet.worker_id, "idle", None);
+
+    // The user typed a few chars into Claude and walked away (no Enter, so no
+    // trailing newline). `/exit` appended to it would submit `half typed/exit`
+    // as an ordinary message and Claude would never leave (correctness #4).
+    let mut fixture = env.fixture();
+    for pane in fixture["panes"].as_array_mut().unwrap() {
+        if pane["pane_id"] == fleet.worker_pane.as_str() {
+            pane["buffer"] = serde_json::json!("half typed");
+        }
+    }
+    env.write_fixture(fixture);
+
+    env.json(&["stop", "alpha/tests"]);
+    // The `C-u` killed the stray line, so `/exit` lands alone at column 0.
     assert_eq!(env.buffer(&fleet.worker_pane), "/exit\n");
 }
 

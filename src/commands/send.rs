@@ -76,8 +76,11 @@ pub fn apply(
         .into());
     }
     // Typing into the shell has no turn to be mid-way through, so it skips the
-    // idle gate; the registry is still consulted for the payload.
-    let (verdict, refusal) = if shell {
+    // idle gate — but only when the row is genuinely `off`. A non-`off` row has
+    // Claude up despite `--shell`, and skipping the gate there would inject text
+    // mid-turn, the very thing the gate exists to prevent (review nit #7); the
+    // registry is still consulted for the payload.
+    let (verdict, refusal) = if shell && session.status == SessionStatus::Off {
         (found.idle_gate(ctx).0, None)
     } else {
         found.idle_gate(ctx)

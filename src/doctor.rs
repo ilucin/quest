@@ -1851,4 +1851,36 @@ mod tests {
         assert!(broken.detail.contains("reset_strategy"), "{broken:?}");
         assert!(broken.fix_hint.is_some());
     }
+
+    #[test]
+    fn evaluate_wrapper_passes_a_binary_and_an_execing_wrapper() {
+        // No shebang: a real binary, not a wrapper.
+        let binary = evaluate_wrapper("\u{7f}ELF\u{1}\u{1}\u{1}", "/usr/bin/claude");
+        assert_eq!(binary.status, Status::Ok);
+        assert!(binary.detail.contains("binary"), "{binary:?}");
+
+        // A shebang that is not a shell (e.g. a Node launcher) is left alone.
+        let node = evaluate_wrapper("#!/usr/bin/env node\nrequire('x')\n", "/x/claude");
+        assert_eq!(node.status, Status::Ok);
+
+        // A shell wrapper that already execs is fine.
+        let execing = evaluate_wrapper("#!/bin/bash\nexec claude \"$@\"\n", "/opt/claude");
+        assert_eq!(execing.status, Status::Ok);
+        assert!(execing.detail.contains("execs"), "{execing:?}");
+    }
+
+    #[test]
+    fn evaluate_wrapper_warns_a_shell_wrapper_that_does_not_exec() {
+        let bare = evaluate_wrapper("#!/bin/bash\nclaude \"$@\"\n", "/opt/claude");
+        assert_eq!(bare.status, Status::Warn);
+        assert!(bare.detail.contains("does not `exec`"), "{bare:?}");
+        assert!(bare.fix_hint.is_some());
+
+        // The same shape via `node`, and a leading comment is not a launch.
+        let via_node = evaluate_wrapper(
+            "#!/bin/sh\n# launches claude\nnode /app/cli.js \"$@\"\n",
+            "/opt/claude",
+        );
+        assert_eq!(via_node.status, Status::Warn);
+    }
 }
