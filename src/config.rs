@@ -66,8 +66,10 @@ pub struct Tmux {
     pub session_prefix: String,
     pub iterm_cc: bool,
     /// tmux prefix key that spawns a fresh worker in the current Quest's
-    /// session (`q spawn-here`). Bound server-wide when a master comes up; an
-    /// empty string turns the auto-binding off.
+    /// session (`q spawn-here`). Bound server-wide when a master comes up, but
+    /// only if the key is free or already ours — a binding you set yourself is
+    /// left alone (and prefix+key then won't spawn). An empty string turns the
+    /// auto-binding off.
     pub spawn_key: String,
 }
 

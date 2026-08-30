@@ -62,10 +62,11 @@ pub fn spawn_bare(ctx: &Ctx, quest_ref: &str) -> anyhow::Result<Session> {
 pub fn run_here(ctx: &Ctx, pane: &str) -> anyhow::Result<()> {
     sweep_quiet(ctx)?;
     let Some(slug) = quest_slug_of_pane(ctx, pane)? else {
-        if !ctx.quiet {
-            println!("q: this tmux pane is not in a Quest");
-        }
-        return Ok(());
+        return output::emit(
+            ctx.json,
+            &serde_json::json!({ "spawned": false, "pane": pane }),
+            || "q: this tmux pane is not in a Quest".to_string(),
+        );
     };
     let quest = ctx.db()?.resolve_quest(&slug)?;
     let spawned = spawn_core(ctx, &quest, None, None, None, None)?;
@@ -73,10 +74,23 @@ pub fn run_here(ctx: &Ctx, pane: &str) -> anyhow::Result<()> {
     // fresh worker. `run_here` runs detached from the pane's environment, so the
     // `in_tmux_session` heuristic cannot see it — select unconditionally.
     ctx.tmux().select_window(&spawned.session.tmux_pane)?;
-    if !ctx.quiet {
-        println!("spawned {} in {}", spawned.session.label, quest.slug);
-    }
-    Ok(())
+    let Spawned {
+        quest,
+        session,
+        tmux_session,
+        window,
+    } = &spawned;
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "spawned": true,
+            "quest": quest,
+            "session": session,
+            "tmux_session": tmux_session,
+            "window": window,
+        }),
+        || format!("spawned {} in {}", session.label, quest.slug),
+    )
 }
 
 /// The Quest slug owning `pane`, read off its tmux session name

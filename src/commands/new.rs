@@ -741,6 +741,11 @@ pub fn git_branch(cwd: &Path) -> Option<String> {
 /// is a tmux server setting, not a session one, so setting it whenever a master
 /// comes up is idempotent; an empty `spawn_key` turns it off.
 ///
+/// The bind is server-wide, so it would clobber a user's own prefix+key: only
+/// take the key when it is unbound, or already bound to *our* `q spawn-here`.
+/// Anything else the user set stays put and we skip — prefix+N then just isn't
+/// wired to spawning here.
+///
 /// Best-effort throughout: a tmux that refuses the bind, or a `q` whose own path
 /// cannot be resolved, must not sink the master that has just come up.
 fn bind_spawn_key(ctx: &Ctx) {
@@ -757,6 +762,13 @@ fn bind_spawn_key(ctx: &Ctx) {
         "{} spawn-here '#{{pane_id}}'",
         shell_quote(&exe.to_string_lossy())
     );
+    // Don't overwrite a binding the user set for themselves; only claim the key
+    // when nothing holds it, or our own spawn-here already does.
+    if let Ok(Some(existing)) = ctx.tmux().prefix_binding(key)
+        && !existing.contains("spawn-here")
+    {
+        return;
+    }
     let _ = ctx.tmux().bind_key(key, &command);
 }
 

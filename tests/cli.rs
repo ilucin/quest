@@ -5128,6 +5128,49 @@ fn spawn_here_reads_the_quest_from_the_pane_and_spawns_a_bare_worker() {
 }
 
 #[test]
+fn spawn_here_honors_json() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let master_pane = window_of(&env.fixture(), "q-foo", "master")["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let out = env.json(&["spawn-here", &master_pane]);
+    assert_eq!(out["spawned"], true);
+    assert_eq!(out["quest"]["slug"], "foo");
+    assert_eq!(out["session"]["label"], "w1");
+
+    // The no-op case is JSON too, not a bare println.
+    let out = env.json(&["spawn-here", "%999"]);
+    assert_eq!(out["spawned"], false);
+}
+
+#[test]
+fn a_master_leaves_a_user_prefix_binding_alone() {
+    let env = Env::new();
+    // The user has bound prefix+N to something of their own.
+    env.write_fixture(serde_json::json!({
+        "prefix_keys": { "N": "next-window" }
+    }));
+    env.new_quest("foo");
+    // The master did not clobber it, so prefix+N is not wired to spawn-here.
+    assert_eq!(env.fixture()["prefix_keys"]["N"], "next-window");
+}
+
+#[test]
+fn a_master_claims_a_free_prefix_key() {
+    let env = Env::new();
+    env.new_quest("foo");
+    // Nothing held prefix+N, so the master took it for spawn-here.
+    let bound = env.fixture()["prefix_keys"]["N"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(bound.contains("spawn-here"), "{bound}");
+}
+
+#[test]
 fn spawn_needs_an_active_quest_with_a_live_tmux_session() {
     let env = Env::new();
     env.new_quest("foo");

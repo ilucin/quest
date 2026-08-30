@@ -288,20 +288,6 @@ impl Form {
         })
     }
 
-    /// The same two-button row, but focus starts on the **verb** — so the
-    /// prompt is confirmed the moment it opens and a single Enter runs it.
-    ///
-    /// This deliberately trades away the buffered-Enter guard [`action`](Form::action)
-    /// keeps, so it is only for a prompt whose own opening keystroke is the
-    /// deliberate one: `Backspace` opens the remove box already on `[ Remove ]`,
-    /// so remove is Backspace-then-Enter. `←` is one key to Cancel.
-    pub fn action_armed(self, verb: &str) -> Form {
-        self.push(Field::Action {
-            verb: verb.to_string(),
-            at: 1,
-        })
-    }
-
     /// The verb an [`action`](Form::action) row offers.
     fn verb(&self) -> Option<&str> {
         match self.find(ACTION) {

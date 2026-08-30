@@ -954,8 +954,10 @@ fn open_close(app: &mut App) -> Action {
 }
 
 /// Backspace — SPEC §5's `q rm`: delete the Quest and its whole tmux session,
-/// master and every worker window with it. The box opens already on
-/// `[ Remove ]`, so removing is Backspace-then-Enter; `←` steps to Cancel.
+/// master and every worker window with it. This is the most destructive,
+/// irreversible prompt, so it opens on Cancel like every other action box:
+/// removing means `→` to the verb, then Enter. A bare Enter — including one a
+/// stall left buffered in the queue — cancels.
 fn open_remove(app: &mut App) -> Action {
     let Some(row) = app.quests.selected_row() else {
         return Action::None;
@@ -966,8 +968,8 @@ fn open_remove(app: &mut App) -> Action {
     let tmux = format!("{}{}", app.tmux_prefix, target.slug);
 
     let mut form = Form::new(format!("remove {}?", target.slug))
-        .hint("\u{23ce} removes \u{b7} \u{2190} cancels \u{b7} Esc cancels")
-        .action_armed("remove")
+        .hint("\u{2190}\u{2192} chooses \u{b7} \u{23ce} press \u{b7} Esc cancels")
+        .action("remove")
         .note(format!(
             "deletes the Quest and all its history · kills tmux {tmux} \
              ({live} live session(s))"
@@ -2672,20 +2674,21 @@ mod tests {
         assert!(app.modal.is_some());
     }
 
-    /// Backspace opens a confirm already on `[ Remove ]`, so removing is
-    /// Backspace-then-Enter; `←` steps to Cancel and disarms it.
+    /// Backspace opens a confirm on Cancel, like every other action box — the
+    /// irreversible `q rm` is no weaker than `q close`. Removing means `→` to
+    /// the verb, then Enter; a bare Enter cancels.
     #[test]
-    fn backspace_opens_a_confirm_armed_on_remove() {
+    fn backspace_opens_a_confirm_on_cancel_for_remove() {
         let mut app = grouped();
         let slug = app.quests.selected_row().unwrap().view.quest.slug.clone();
         assert_eq!(handle(&mut app, Input::Backspace), Action::None);
         let modal = app.modal.as_ref().expect("no form");
         assert_eq!(modal.form.title, format!("remove {slug}?"));
-        // Armed: Remove is the focused button, so Enter would run it.
-        assert!(modal.form.confirmed());
-        // `←` steps to Cancel, disarming it (through the modal's own handler).
-        app.handle(Input::Left);
-        assert!(!app.modal.as_ref().unwrap().form.confirmed());
+        // Starts on Cancel, so a buffered/bare Enter cannot fire Remove.
+        assert!(!modal.form.confirmed());
+        // `→` steps to Remove, arming it (through the modal's own handler).
+        app.handle(Input::Right);
+        assert!(app.modal.as_ref().unwrap().form.confirmed());
     }
 
     #[test]
