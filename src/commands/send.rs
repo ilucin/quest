@@ -11,7 +11,7 @@ use crate::Ctx;
 use crate::commands::fmt::{EVENT_PROMPT_CHARS, truncate};
 use crate::commands::{sweep_quiet, target};
 use crate::error::QError;
-use crate::model::Session;
+use crate::model::{Session, SessionStatus};
 use crate::output;
 use crate::registry::Verdict;
 
@@ -19,6 +19,10 @@ pub struct Args<'a> {
     pub session: &'a str,
     pub text: &'a str,
     pub force: bool,
+    /// Type into the session's shell rather than into Claude. The only way to
+    /// send to an `off` session, and it skips the idle gate (a shell has no
+    /// turns to be mid-way through).
+    pub shell: bool,
 }
 
 /// What a send did, for the caller to report however it reports.
@@ -49,14 +53,35 @@ impl Sent {
 /// Split out of [`run`] so the TUI's `t` (SPEC §17) goes through the same gate
 /// and the same send-keys/paste decision, and so nothing writes to a terminal
 /// the TUI still owns.
-pub fn apply(ctx: &Ctx, found: &target::Target, text: &str, force: bool) -> anyhow::Result<Sent> {
+pub fn apply(
+    ctx: &Ctx,
+    found: &target::Target,
+    text: &str,
+    force: bool,
+    shell: bool,
+) -> anyhow::Result<Sent> {
     let text = text.trim_end_matches(['\r', '\n']);
     check_text(text)?;
     found.require_live()?;
 
-    let (verdict, refusal) = found.idle_gate(ctx);
     let session = found.session.clone();
     let name = found.name();
+    // An `off` session has no Claude — a prompt would land in its shell. Refuse
+    // unless the caller says `--shell` and means to type into the shell (SPEC §6).
+    if session.status == SessionStatus::Off && !shell {
+        return Err(QError::Conflict(format!(
+            "{name} is off (no Claude running); pass --shell to type into its shell, \
+             or `q start {name}` first"
+        ))
+        .into());
+    }
+    // Typing into the shell has no turn to be mid-way through, so it skips the
+    // idle gate; the registry is still consulted for the payload.
+    let (verdict, refusal) = if shell {
+        (found.idle_gate(ctx).0, None)
+    } else {
+        found.idle_gate(ctx)
+    };
     if let Some(reason) = &refusal
         && !force
     {
@@ -116,7 +141,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     check_text(text)?;
     sweep_quiet(ctx)?;
     let found = target::resolve(ctx, args.session)?;
-    let sent = apply(ctx, &found, text, args.force)?;
+    let sent = apply(ctx, &found, text, args.force, args.shell)?;
 
     if ctx.json || !ctx.quiet {
         output::emit(
@@ -128,6 +153,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
                 "pane": sent.session.tmux_pane,
                 "text": text,
                 "forced": args.force,
+                "shell": args.shell,
                 "pasted": sent.pasted,
                 "status": sent.session.status,
                 "registry": sent.verdict,

@@ -84,13 +84,11 @@ pub fn run(ctx: &Ctx, target: &str, force: bool) -> anyhow::Result<()> {
 /// stands in for it. Shared so `q rm -f` and the TUI cannot drift apart.
 pub fn apply(ctx: &Ctx, quest: &Quest) -> anyhow::Result<Removed> {
     let db = ctx.db()?;
-    let tmux_session = session_name(&ctx.config, &quest.slug);
     let epic = beads::epic_of(quest).map(str::to_string);
 
-    let tmux_killed = ctx.tmux().has_session(&tmux_session)?;
-    if tmux_killed {
-        ctx.tmux().kill_session(&tmux_session)?;
-    }
+    // The whole fleet (SPEC §6 v2): main and every `q-<slug>+*`, rowless panes
+    // included. Works when the main is already gone but a worker lingers.
+    let tmux_killed = crate::commands::kill_quest_fleet(ctx, &quest.slug)? > 0;
     db.delete_quest(&quest.id)?;
     beads::forget(&quest.id);
     Ok(Removed {

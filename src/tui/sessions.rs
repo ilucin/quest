@@ -770,7 +770,13 @@ fn send_text(ctx: &Ctx, app: &mut App, target: &SessionTarget, form: &Form) -> a
         return send_remote(app, target, machine, form);
     }
     let found = session_for(ctx, target)?;
-    let sent = send::apply(ctx, &found, form.trimmed(F_TEXT), form.is_on(F_FORCE))?;
+    let sent = send::apply(
+        ctx,
+        &found,
+        form.trimmed(F_TEXT),
+        form.is_on(F_FORCE),
+        false,
+    )?;
     app.say(sent.describe());
     Ok(())
 }

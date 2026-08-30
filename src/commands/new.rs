@@ -537,7 +537,10 @@ pub fn spawn_master(ctx: &Ctx, quest: &Quest, prompt: Option<String>) -> anyhow:
             db_override().as_deref(),
             config_override().as_deref(),
         ),
-        command: Some(claude_command(&quest.slug, MASTER, prompt.as_deref())),
+        // The pane command is the login shell (SPEC §6 v2): Claude is a child
+        // launched into it below, so `/exit` lands back in a shell rather than
+        // killing the session.
+        command: None,
     };
     let pane = ctx.tmux().new_session(&spec)?;
     // The Quest now has a tmux session, so the spawn-a-worker key can be live.
@@ -564,24 +567,37 @@ pub fn spawn_master(ctx: &Ctx, quest: &Quest, prompt: Option<String>) -> anyhow:
     // something true to compare against before any rename (SPEC §6).
     row.claude_name = Some(crate::naming::claude_name(&quest.slug, MASTER));
     // `session.start` is the hook's to append once Claude comes up (M1).
-    match db.insert_session(&row) {
+    let session = match db.insert_session(&row) {
         // A regenerated id would no longer match `Q_SESSION` in the window.
         Ok(session) if session.id != session_id => {
             let _ = ctx.tmux().kill_session(&tmux_session);
-            Err(QError::Db(format!(
+            return Err(QError::Db(format!(
                 "session id `{session_id}` was taken between allocating and inserting it"
             ))
-            .into())
+            .into());
         }
-        Ok(session) => Ok(Master {
-            session,
-            tmux_session,
-        }),
+        Ok(session) => session,
         Err(e) => {
             let _ = ctx.tmux().kill_session(&tmux_session);
-            Err(e)
+            return Err(e);
         }
-    }
+    };
+    // The pane is a shell; launch Claude into it (SPEC §6 v2). The prompt is
+    // already on the row (`first_prompt`), so `launch` reuses it. A launch that
+    // will not go takes the tmux session down with it, exactly as an insert
+    // failure does — a shell with no Claude and no row is nobody's.
+    let started = match crate::commands::start::launch(ctx, quest, &session, None, false, false) {
+        Ok(started) => started,
+        Err(e) => {
+            let _ = ctx.tmux().kill_session(&tmux_session);
+            let _ = db.delete_session(&session.id);
+            return Err(e);
+        }
+    };
+    Ok(Master {
+        session: started.session,
+        tmux_session,
+    })
 }
 
 /// An existing directory, canonicalized. `None` is the current one.
@@ -772,18 +788,9 @@ fn bind_spawn_key(ctx: &Ctx) {
     let _ = ctx.tmux().bind_key(key, &command);
 }
 
-pub fn claude_command(slug: &str, label: &str, prompt: Option<&str>) -> String {
-    let mut cmd = format!("claude -n {}", shell_quote(&format!("{slug}/{label}")));
-    if let Some(prompt) = prompt {
-        cmd.push_str(" -- ");
-        cmd.push_str(&shell_quote(prompt));
-    }
-    cmd
-}
-
 /// Single-quoted unless the word is plainly safe; `'` is closed, escaped and
 /// reopened, which is the only way out of single quotes in sh.
-fn shell_quote(word: &str) -> String {
+pub fn shell_quote(word: &str) -> String {
     let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
     if !word.is_empty() && word.chars().all(safe) {
         return word.to_string();
@@ -871,30 +878,6 @@ mod tests {
         // Trimming must not leave a dangling separator behind.
         let dashed = format!("{}-a", "y".repeat(SLUG_MAX - 2));
         assert!(validate_slug(&numbered(&dashed, 7)).is_ok());
-    }
-
-    #[test]
-    fn claude_command_without_a_prompt_is_bare() {
-        assert_eq!(
-            claude_command("foo", "master", None),
-            "claude -n foo/master"
-        );
-    }
-
-    #[test]
-    fn claude_command_quotes_the_prompt() {
-        assert_eq!(
-            claude_command("foo", "master", Some("fix the bug")),
-            "claude -n foo/master -- 'fix the bug'"
-        );
-        assert_eq!(
-            claude_command("foo", "w1-tests", Some("it's \"broken\"; rm -rf $HOME")),
-            r#"claude -n foo/w1-tests -- 'it'\''s "broken"; rm -rf $HOME'"#
-        );
-        assert_eq!(
-            claude_command("foo", "master", Some("two\nlines")),
-            "claude -n foo/master -- 'two\nlines'"
-        );
     }
 
     #[test]

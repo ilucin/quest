@@ -5151,7 +5151,8 @@ mod form_tests {
         let quest = &rig.quests()[0];
         assert_eq!(quest.template_id.as_deref(), Some(template.id.as_str()));
         assert_eq!(quest.goal.as_deref(), Some("tidy up"));
-        // The prompt went to the master, which is what the note now promises.
+        // The prompt went to the master (SPEC §6 v2): the pane runs a shell and
+        // the launch command — carrying the prompt — was typed into its buffer.
         let pane = rig
             .fixture()
             .load()
@@ -5160,12 +5161,11 @@ mod form_tests {
             .into_iter()
             .find(|p| p.session_name == "q-from-template")
             .unwrap();
+        assert_eq!(pane.command, None, "the pane command is the login shell");
         assert!(
-            pane.command
-                .as_deref()
-                .is_some_and(|c| c.contains("start with the backlog")),
+            pane.buffer.contains("start with the backlog"),
             "{:?}",
-            pane.command
+            pane.buffer
         );
     }
 

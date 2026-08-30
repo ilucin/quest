@@ -2726,19 +2726,19 @@ mod tests {
 
         quests::spawn_worker(&ctx, &mut app);
 
-        // A bare `w1` window is in the Quest's session…
+        // A bare `w1` worker has its own tmux session (SPEC §6 v2)…
         let state = fixture(&dir);
         assert!(
             state
                 .panes
                 .iter()
-                .any(|p| p.session_name == "q-needs-me" && p.window_name == "w1"),
-            "no w1 window: {state:?}"
+                .any(|p| p.session_name == "q-needs-me+w1"),
+            "no q-needs-me+w1 session: {state:?}"
         );
         // …and the loop is told to hand the terminal straight to it.
         let landing = app.templates.take_landing().expect("a landing was queued");
         assert_eq!(landing.name, "needs-me/w1");
-        assert_eq!(landing.tmux_session, "q-needs-me");
+        assert_eq!(landing.tmux_session, "q-needs-me+w1");
     }
 
     // ------------------------------------------------------------- attaching

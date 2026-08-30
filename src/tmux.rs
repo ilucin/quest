@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::QError;
-use crate::model::{Session, SessionRole, now};
+use crate::model::{Session, SessionRole, SessionStatus, now};
 
 /// Tab-separated so session and window names may contain spaces.
 ///
@@ -782,10 +782,20 @@ const FIXTURE_SHELL: &str = "zsh";
 const FIXTURE_CLAUDE_COMMAND: &str = "2.1.0";
 
 /// A `send-keys`/launch line that starts Claude. The real command is
-/// `claude -n …` or `claude --resume …`; the fixture only needs the leading
-/// token.
+/// `claude -n …`, `claude --resume …` or `claude -n … -- "$(q prompt …)"` —
+/// always `claude` followed by a flag (or nothing). A plain-text line that
+/// merely begins with the word "claude" ("claude keeps crashing") is not a
+/// launch, so a prompt typed with `q send` cannot masquerade as one. `q start`
+/// always injects a flag first, so its command is always detected.
 fn is_claude_launch(line: &str) -> bool {
-    line.split_whitespace().next() == Some("claude")
+    let mut tokens = line.split_whitespace();
+    if tokens.next() != Some("claude") {
+        return false;
+    }
+    match tokens.next() {
+        None => true,
+        Some(next) => next.starts_with('-'),
+    }
 }
 
 /// The `current_command` a fixture pane reports right after it is opened with
@@ -1323,8 +1333,31 @@ pub fn window_of(tmux: &dyn Tmux, pane_id: &str) -> Option<String> {
         .find_map(|p| (p.pane_id == pane_id && !p.window_name.is_empty()).then_some(p.window_name))
 }
 
-/// Liveness (SPEC §6): a live session whose pane is gone has ended. Returns the
-/// sessions it marked, having appended a `session.end` event for each.
+/// Whether a row's status still claims Claude is up, so a shell in its pane is
+/// news (a demotion to `off`). `off` is already there; `ended` is terminal.
+fn claims_claude(status: SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Starting
+            | SessionStatus::Busy
+            | SessionStatus::Idle
+            | SessionStatus::Waiting
+    )
+}
+
+/// Liveness + presence (SPEC §6). Two one-way transitions, applied in this
+/// order to the live rows:
+///
+/// * pane gone → `ended` (an orphan), with a `session.end` event;
+/// * pane alive but reporting a shell while the row still claims Claude → `off`
+///   (Ctrl-C, `/exit`, a crash), with a `session.off` event. Never the reverse:
+///   a non-shell pane is not proof Claude is up — that comes only from hooks.
+///   A `starting` row is left alone until `START_GRACE_SECS` after `q start`
+///   typed its command (`claude_started_at`, else the row's own age), because
+///   tmux execs the login shell before Claude, so the pane reads as a shell for
+///   the blink between the send-keys and Claude taking over.
+///
+/// Returns every row it changed, ended or demoted.
 pub fn sweep(db: &Db, tmux: &dyn Tmux) -> anyhow::Result<Vec<Session>> {
     let live = db.list_live_sessions()?;
     if live.is_empty() {
@@ -1333,8 +1366,11 @@ pub fn sweep(db: &Db, tmux: &dyn Tmux) -> anyhow::Result<Vec<Session>> {
     let panes = live_panes(tmux)?;
 
     let ts = now();
-    let mut ended = Vec::new();
-    for orphan in find_orphans(live, &panes, ts) {
+    let mut changed = Vec::new();
+
+    let orphans = find_orphans(live.clone(), &panes, ts);
+    let orphaned: HashSet<&str> = orphans.iter().map(|o| o.session.id.as_str()).collect();
+    for orphan in &orphans {
         let row = db.mark_session_ended(&orphan.session.id, ts)?;
         db.append_event(
             &row.quest_id,
@@ -1342,9 +1378,52 @@ pub fn sweep(db: &Db, tmux: &dyn Tmux) -> anyhow::Result<Vec<Session>> {
             "session.end",
             &serde_json::json!({ "reason": orphan.reason }),
         )?;
-        ended.push(row);
+        changed.push(row);
     }
-    Ok(ended)
+
+    // Presence off-detection over the rows the orphan pass did not end.
+    let command_of: BTreeMap<(&str, &str), &str> = panes
+        .iter()
+        .map(|p| {
+            (
+                (p.session_name.as_str(), p.pane_id.as_str()),
+                p.current_command.as_str(),
+            )
+        })
+        .collect();
+    for session in &live {
+        if orphaned.contains(session.id.as_str()) || !claims_claude(session.status) {
+            continue;
+        }
+        if session.tmux_pane.is_empty() {
+            continue;
+        }
+        let Some(command) =
+            command_of.get(&(session.tmux_session.as_str(), session.tmux_pane.as_str()))
+        else {
+            continue;
+        };
+        // An empty `current_command` is an old 5-field pane line (a pre-v2 or
+        // remote tmux, SPEC §6): unknown, not a shell — leave the row be.
+        if command.is_empty() || !is_shell(command) {
+            continue;
+        }
+        if session.status == SessionStatus::Starting {
+            let anchor = session.claude_started_at.unwrap_or(session.updated_at);
+            if ts - anchor <= START_GRACE_SECS {
+                continue;
+            }
+        }
+        let row = db.update_session_status(&session.id, SessionStatus::Off, None)?;
+        db.append_event(
+            &row.quest_id,
+            Some(&row.id),
+            "session.off",
+            &serde_json::json!({ "reason": "shell_detected", "command": command }),
+        )?;
+        changed.push(row);
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -2397,6 +2476,118 @@ mod tests {
     fn an_empty_database_needs_no_tmux_at_all() {
         let (db, _quest) = seeded_db();
         assert!(sweep(&db, &Stub::Never).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_sweep_demotes_a_live_row_whose_pane_went_back_to_a_shell() {
+        let (_dir, t) = fixture();
+        let (db, quest) = seeded_db();
+        // A login-shell pane (`command: None`), so `current_command` is a shell.
+        let pane = t
+            .new_session(&NewSession {
+                name: "q-alpha".to_string(),
+                window_name: "master".to_string(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        let row = db
+            .insert_session(&Session::new(
+                &quest.id,
+                SessionRole::Master,
+                "master",
+                "q-alpha",
+                &pane.pane_id,
+            ))
+            .unwrap();
+        // The row still claims Claude is up (idle = between turns).
+        db.update_session_status(&row.id, SessionStatus::Idle, None)
+            .unwrap();
+
+        let changed = sweep(&db, &t).unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].status, SessionStatus::Off);
+        assert_eq!(
+            db.get_session(&row.id).unwrap().unwrap().status,
+            SessionStatus::Off
+        );
+        let events = db.list_events_by_quest(&quest.id, 10).unwrap();
+        assert!(events.iter().any(|e| e.kind == "session.off"));
+        // One-way: an `off` row is not swept again, and never promoted.
+        assert!(sweep(&db, &t).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_starting_row_is_spared_within_the_off_grace_and_demoted_after() {
+        let (_dir, t) = fixture();
+        let (db, quest) = seeded_db();
+        let pane = t
+            .new_session(&NewSession {
+                name: "q-alpha".to_string(),
+                window_name: "master".to_string(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        let row = db
+            .insert_session(&Session::new(
+                &quest.id,
+                SessionRole::Master,
+                "master",
+                "q-alpha",
+                &pane.pane_id,
+            ))
+            .unwrap();
+
+        // `q start` just typed the command; the pane still reads as a shell for
+        // the blink before Claude execs. Within the grace the row is spared.
+        db.record_claude_launch(&row.id, "alpha/master", None, now())
+            .unwrap();
+        assert!(
+            sweep(&db, &t).unwrap().is_empty(),
+            "a fresh `starting` row must not be demoted within the grace"
+        );
+        assert_eq!(
+            db.get_session(&row.id).unwrap().unwrap().status,
+            SessionStatus::Starting
+        );
+
+        // Past the grace, a pane still on a shell means Claude never came up.
+        db.record_claude_launch(&row.id, "alpha/master", None, now() - START_GRACE_SECS - 1)
+            .unwrap();
+        let changed = sweep(&db, &t).unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].status, SessionStatus::Off);
+    }
+
+    #[test]
+    fn the_sweep_leaves_a_live_claude_pane_alone() {
+        let (_dir, t) = fixture();
+        let (db, quest) = seeded_db();
+        let pane = t
+            .new_session(&NewSession {
+                name: "q-alpha".to_string(),
+                window_name: "master".to_string(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        let row = db
+            .insert_session(&Session::new(
+                &quest.id,
+                SessionRole::Master,
+                "master",
+                "q-alpha",
+                &pane.pane_id,
+            ))
+            .unwrap();
+        db.update_session_status(&row.id, SessionStatus::Idle, None)
+            .unwrap();
+        // Claude is running: the pane reports its version string, not a shell.
+        t.send_keys(&pane.pane_id, "claude -n alpha/master", true)
+            .unwrap();
+        assert!(sweep(&db, &t).unwrap().is_empty());
+        assert_eq!(
+            db.get_session(&row.id).unwrap().unwrap().status,
+            SessionStatus::Idle
+        );
     }
 
     /// A `Tmux` for `sweep`: only `list_panes` is ever reachable.

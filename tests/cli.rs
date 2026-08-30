@@ -736,7 +736,9 @@ fn new_creates_the_quest_the_tmux_session_and_the_master_window() {
     // The test environment sets both overrides, so the window inherits them.
     assert!(pane["env"]["Q_DB"].is_string());
     assert!(pane["env"]["Q_CONFIG"].is_string());
-    assert_eq!(pane["command"], "claude -n foo/master");
+    // The pane runs the login shell (SPEC §6 v2); Claude is typed into it.
+    assert_eq!(pane["command"], serde_json::Value::Null);
+    assert_eq!(pane["buffer"], "claude -n foo/master\n");
     assert_eq!(out["session"]["tmux_pane"], pane["pane_id"]);
 
     let conn = env.conn();
@@ -1154,8 +1156,11 @@ fn new_passes_the_prompt_to_claude() {
         .assert()
         .success();
     assert_eq!(
-        pane_of(&env.fixture(), "q-foo")["command"],
-        r#"claude -n foo/master -- 'fix it; don'\''t '\''break'\'' it'"#
+        pane_of(&env.fixture(), "q-foo")["buffer"],
+        format!(
+            "{}\n",
+            r#"claude -n foo/master -- 'fix it; don'\''t '\''break'\'' it'"#
+        )
     );
     let first: String = env
         .conn()
@@ -1182,8 +1187,8 @@ fn new_reads_the_prompt_file_from_stdin() {
         .assert()
         .success();
     assert_eq!(
-        pane_of(&env.fixture(), "q-foo")["command"],
-        "claude -n foo/master -- 'from stdin'"
+        pane_of(&env.fixture(), "q-foo")["buffer"],
+        "claude -n foo/master -- 'from stdin'\n"
     );
 }
 
@@ -1206,8 +1211,8 @@ fn new_reads_the_prompt_from_a_file() {
         .assert()
         .success();
     assert_eq!(
-        pane_of(&env.fixture(), "q-foo")["command"],
-        "claude -n foo/master -- 'from a file'"
+        pane_of(&env.fixture(), "q-foo")["buffer"],
+        "claude -n foo/master -- 'from a file'\n"
     );
 }
 
@@ -1412,6 +1417,7 @@ fn doctor_json_reports_every_check() {
             "config",
             "tmux",
             "claude",
+            "claude wrapper",
             "claude login",
             "db",
             "q on PATH",
@@ -4871,7 +4877,7 @@ fn last_payload(env: &Env, quest_id: &str, kind: &str) -> serde_json::Value {
 }
 
 #[test]
-fn spawn_opens_a_worker_window_and_records_the_session() {
+fn spawn_opens_a_worker_session_and_records_the_session() {
     let env = Env::new();
     let created = env.new_quest("foo");
     let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
@@ -4879,22 +4885,23 @@ fn spawn_opens_a_worker_window_and_records_the_session() {
 
     let out = env.json(&["spawn", "foo", "write the tests", "--label", "tests"]);
     assert_eq!(out["quest"]["id"], quest_id.as_str());
-    assert_eq!(out["tmux_session"], "q-foo");
-    assert_eq!(out["window"], "w1-tests");
+    // The worker has its own tmux session `q-<slug>+<label>` (SPEC §6 v2).
+    assert_eq!(out["tmux_session"], "q-foo+tests");
     assert_eq!(out["attach"], "none");
+    assert_eq!(out["launched"], true);
     assert_eq!(out["session"]["role"], "worker");
     assert_eq!(out["session"]["label"], "tests");
     assert_eq!(out["session"]["status"], "starting");
     assert_eq!(out["session"]["first_prompt"], "write the tests");
-    assert_eq!(out["session"]["tmux_session"], "q-foo");
+    assert_eq!(out["session"]["tmux_session"], "q-foo+tests");
     let session_id = out["session"]["id"].as_str().unwrap().to_string();
 
-    // The window lives in the Quest's session, next to the master.
+    // The worker's own session holds one pane; the main session is untouched.
     let fixture = env.fixture();
     assert_eq!(fixture["attached"], serde_json::Value::Null);
-    let pane = window_of(&fixture, "q-foo", "w1-tests");
-    assert_eq!(pane["window_index"], 1);
-    assert_eq!(window_of(&fixture, "q-foo", "master")["window_index"], 0);
+    let pane = pane_of(&fixture, "q-foo+tests");
+    assert_eq!(pane["window_index"], 0);
+    assert_eq!(pane_of(&fixture, "q-foo")["window_index"], 0);
     assert_eq!(out["session"]["tmux_pane"], pane["pane_id"]);
     assert_ne!(pane["pane_id"], created["session"]["tmux_pane"]);
 
@@ -4904,12 +4911,14 @@ fn spawn_opens_a_worker_window_and_records_the_session() {
     assert_eq!(pane["env"]["Q_ROLE"], "worker");
     assert_eq!(
         pane["env"]["Q_MACHINE"],
-        window_of(&fixture, "q-foo", "master")["env"]["Q_MACHINE"]
+        pane_of(&fixture, "q-foo")["env"]["Q_MACHINE"]
     );
     assert!(pane["env"]["Q_DB"].is_string());
     assert!(pane["env"]["Q_CONFIG"].is_string());
-    // Claude is named after the label, not the window.
-    assert_eq!(pane["command"], "claude -n foo/tests -- 'write the tests'");
+    // The pane runs the login shell; Claude is typed into it, named after the
+    // label (SPEC §6 v2).
+    assert_eq!(pane["command"], serde_json::Value::Null);
+    assert_eq!(pane["buffer"], "claude -n foo/tests -- 'write the tests'\n");
     // No `--dir`, so the worker starts in the Quest's own directory.
     assert_eq!(pane["cwd"], cwd.as_str());
 
@@ -4942,7 +4951,7 @@ fn spawn_opens_a_worker_window_and_records_the_session() {
     assert_eq!(kinds, vec!["quest.created", "session.spawn"]);
     let payload = last_payload(&env, &quest_id, "session.spawn");
     assert_eq!(payload["label"], "tests");
-    assert_eq!(payload["window"], "w1-tests");
+    assert_eq!(payload["tmux_session"], "q-foo+tests");
     assert_eq!(payload["role"], "worker");
     assert_eq!(payload["cwd"], cwd.as_str());
     assert_eq!(payload["prompt"], "write the tests");
@@ -4979,7 +4988,7 @@ fn spawn_prints_a_human_one_liner() {
         .assert()
         .success()
         .stdout(predicate::str::contains("spawned s-"))
-        .stdout(predicate::str::contains("tmux q-foo:w1-tests"))
+        .stdout(predicate::str::contains("tmux q-foo+tests"))
         .stdout(predicate::str::contains("q enter foo --session tests"));
     env.cmd()
         .args(["spawn", "foo", "go", "--label", "other", "-q"])
@@ -4992,34 +5001,27 @@ fn spawn_prints_a_human_one_liner() {
 fn workers_are_numbered_in_order_and_a_number_is_never_reused() {
     let env = Env::new();
     env.new_quest("foo");
-    assert_eq!(
-        env.json(&["spawn", "foo", "a", "--label", "tests"])["window"],
-        "w1-tests"
-    );
-    let second = env.json(&["spawn", "foo", "b", "--label", "migration"]);
-    assert_eq!(second["window"], "w2-migration");
-    assert_eq!(
-        window_of(&env.fixture(), "q-foo", "w2-migration")["window_index"],
-        2
-    );
+    // Auto workers carry the number in their label now (SPEC §6 v2 — no windows).
+    assert_eq!(env.json(&["spawn", "foo"])["session"]["label"], "w1");
+    assert_eq!(env.json(&["spawn", "foo"])["session"]["label"], "w2");
 
-    // The first worker's pane disappears; the sweep ends its session, which
-    // frees the label — but not the number.
+    // The first worker's whole tmux session disappears; the sweep ends its row,
+    // which frees the label — but not the number.
     let mut fixture = env.fixture();
     let panes: Vec<serde_json::Value> = fixture["panes"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|p| p["window_name"] != "w1-tests")
+        .filter(|p| p["session_name"] != "q-foo+w1")
         .cloned()
         .collect();
     fixture["panes"] = serde_json::json!(panes);
     env.write_fixture(fixture);
 
-    let third = env.json(&["spawn", "foo", "c", "--label", "tests"]);
-    assert_eq!(third["window"], "w3-tests");
+    let third = env.json(&["spawn", "foo"]);
+    assert_eq!(third["session"]["label"], "w3");
     assert_eq!(
-        env.count("SELECT count(*) FROM session WHERE label = 'tests' AND status = 'ended'"),
+        env.count("SELECT count(*) FROM session WHERE label = 'w1' AND status = 'ended'"),
         1
     );
 }
@@ -5079,18 +5081,18 @@ fn spawn_validates_the_label_and_a_blank_prompt_is_a_bare_worker() {
 fn spawn_without_a_label_or_prompt_makes_an_auto_bare_worker() {
     let env = Env::new();
     env.new_quest("foo");
-    // No `--label`, no prompt: the label is `w<n>` and the window carries it
-    // whole (no `w1-w1`), and Claude gets no `--` prompt.
+    // No `--label`, no prompt: the label is `w<n>`, the worker gets its own
+    // `q-foo+w1` session, and Claude is typed in with no `--` prompt.
     let out = env.json(&["spawn", "foo"]);
     assert_eq!(out["session"]["label"], "w1");
-    assert_eq!(out["window"], "w1");
+    assert_eq!(out["tmux_session"], "q-foo+w1");
     assert!(out["session"]["first_prompt"].is_null());
-    let command = window_of(&env.fixture(), "q-foo", "w1")["command"]
+    let buffer = pane_of(&env.fixture(), "q-foo+w1")["buffer"]
         .as_str()
         .unwrap()
         .to_string();
-    assert!(command.contains("claude -n foo/w1"), "{command}");
-    assert!(!command.contains(" -- "), "{command}");
+    assert!(buffer.contains("claude -n foo/w1"), "{buffer}");
+    assert!(!buffer.contains(" -- "), "{buffer}");
 
     // The next auto worker is `w2`.
     let out = env.json(&["spawn", "foo"]);
@@ -5106,7 +5108,7 @@ fn spawn_here_reads_the_quest_from_the_pane_and_spawns_a_bare_worker() {
         .unwrap()
         .to_string();
 
-    // A pane in the Quest's session opens a bare worker there and selects it.
+    // A pane in the Quest opens a bare worker in its own session and lands on it.
     env.cmd()
         .args(["spawn-here", &master_pane])
         .assert()
@@ -5115,7 +5117,7 @@ fn spawn_here_reads_the_quest_from_the_pane_and_spawns_a_bare_worker() {
     assert_eq!(env.count("SELECT count(*) FROM session"), 2);
     assert_eq!(
         env.fixture()["selected"],
-        window_of(&env.fixture(), "q-foo", "w1")["pane_id"]
+        pane_of(&env.fixture(), "q-foo+w1")["pane_id"]
     );
 
     // A pane that is not any Quest's is a friendly no-op — nothing spawned.
@@ -5220,7 +5222,7 @@ fn spawn_takes_a_directory_and_a_workflow_of_its_own() {
         work.to_str().unwrap()
     );
     assert_eq!(
-        window_of(&env.fixture(), "q-foo", "w1-tests")["cwd"],
+        pane_of(&env.fixture(), "q-foo+tests")["cwd"],
         work.to_str().unwrap()
     );
 
@@ -5241,7 +5243,7 @@ fn spawn_takes_a_directory_and_a_workflow_of_its_own() {
         other.to_str().unwrap()
     );
     assert_eq!(
-        window_of(&env.fixture(), "q-foo", "w2-migration")["cwd"],
+        pane_of(&env.fixture(), "q-foo+migration")["cwd"],
         other.to_str().unwrap()
     );
     // The Quest's own cwd is untouched by `--dir`.
@@ -5263,91 +5265,59 @@ fn spawn_takes_a_directory_and_a_workflow_of_its_own() {
 }
 
 #[test]
-fn spawn_selects_the_new_window_only_from_inside_the_quests_session() {
+fn spawn_enters_the_worker_session_only_with_enter() {
     let env = Env::new();
-    let created = env.new_quest("foo");
-    let master_pane = created["session"]["tmux_pane"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    // A second Quest is a second real tmux session to stand in.
-    let elsewhere = env.new_quest("bar");
-    let elsewhere_pane = elsewhere["session"]["tmux_pane"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    env.new_quest("foo");
 
-    // Outside tmux: the window is opened, but no client is moved.
+    // Default: the worker session is opened, but no client is moved — a worker
+    // is its own tmux session (SPEC §6 v2), so there is no window to select.
     assert_eq!(
-        env.json(&["spawn", "foo", "a", "--label", "outside"])["attach"],
+        env.json(&["spawn", "foo", "a", "--label", "plain"])["attach"],
         "none"
     );
     assert_eq!(env.fixture()["selected"], serde_json::Value::Null);
+    assert_eq!(env.fixture()["attached"], serde_json::Value::Null);
 
-    // Inside another tmux session: still not ours to switch.
+    // `--enter` inside tmux switches the client to the worker's own session.
     let mut cmd = env.cmd();
     let assert = cmd
         .env("TMUX", "/tmp/tmux-0/default,1,0")
-        .env("TMUX_PANE", &elsewhere_pane)
-        .args(["spawn", "foo", "b", "--label", "elsewhere", "--json"])
-        .assert()
-        .success();
-    assert_eq!(json_of(&assert)["attach"], "none");
-    assert_eq!(env.fixture()["selected"], serde_json::Value::Null);
-
-    // From the master's own pane: the client follows the worker. `new-window -d`
-    // never moves it on its own, so the selection is this step's alone.
-    let mut cmd = env.cmd();
-    let assert = cmd
-        .env("TMUX", "/tmp/tmux-0/default,1,0")
-        .env("TMUX_PANE", &master_pane)
-        .args(["spawn", "foo", "c", "--label", "inside", "--json"])
+        .args(["spawn", "foo", "b", "--label", "here", "--enter", "--json"])
         .assert()
         .success();
     let out = json_of(&assert);
-    // `select`, not `switch`: the client stays in the session it is already in
-    // and only the active window changes.
-    assert_eq!(out["attach"], "select");
-    assert_eq!(out["window"], "w3-inside");
+    assert_eq!(out["attach"], "switch");
     let worker_pane = out["session"]["tmux_pane"].as_str().unwrap().to_string();
-    assert_eq!(env.fixture()["selected"], worker_pane.as_str());
-    // Selecting a window is not attaching: no client changed sessions.
-    assert_eq!(env.fixture()["attached"], serde_json::Value::Null);
-
-    // ... unless told not to.
-    let mut cmd = env.cmd();
-    let assert = cmd
-        .env("TMUX", "/tmp/tmux-0/default,1,0")
-        .env("TMUX_PANE", &master_pane)
-        .args(["spawn", "foo", "d", "--label", "quiet", "--no-attach"])
-        .arg("--json")
-        .assert()
-        .success();
-    assert_eq!(json_of(&assert)["attach"], "none");
     assert_eq!(
-        env.fixture()["selected"],
-        worker_pane.as_str(),
-        "--no-attach moved the client anyway"
+        env.fixture()["attached"],
+        serde_json::json!(["q-foo+here", worker_pane.as_str()])
     );
+    assert_eq!(env.fixture()["selected"], worker_pane.as_str());
 }
 
 #[test]
-fn spawn_falls_back_to_q_quest_when_the_pane_id_is_missing() {
+fn spawn_shell_opens_a_bare_shell_off_without_claude() {
     let env = Env::new();
-    let created = env.new_quest("foo");
-    let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
-    let mut cmd = env.cmd();
-    let assert = cmd
-        .env("TMUX", "/tmp/tmux-0/default,1,0")
-        .env("Q_QUEST", &quest_id)
-        .args(["spawn", "foo", "a", "--label", "tests", "--json"])
+    env.new_quest("foo");
+    let out = env.json(&["spawn", "foo", "--label", "review", "--shell"]);
+    assert_eq!(out["tmux_session"], "q-foo+review");
+    assert_eq!(out["launched"], false);
+    assert_eq!(out["session"]["status"], "off");
+    // The pane is a login shell and nothing was typed into it — no Claude.
+    let pane = pane_of(&env.fixture(), "q-foo+review");
+    assert_eq!(pane["command"], serde_json::Value::Null);
+    assert_eq!(pane["buffer"], "");
+    assert_eq!(pane["current_command"], "zsh");
+    // The one-liner says it is a shell only.
+    env.cmd()
+        .args(["spawn", "foo", "--label", "other", "--shell"])
         .assert()
-        .success();
-    assert_eq!(json_of(&assert)["attach"], "select");
+        .success()
+        .stdout(predicate::str::contains("shell only"));
 }
 
 #[test]
-fn enter_reaches_a_worker_by_label_through_its_pane() {
+fn enter_reaches_a_worker_by_label_through_its_own_session() {
     let env = Env::new();
     env.new_quest("foo");
     let spawned = env.json(&["spawn", "foo", "write the tests", "--label", "tests"]);
@@ -5356,16 +5326,16 @@ fn enter_reaches_a_worker_by_label_through_its_pane() {
         .unwrap()
         .to_string();
 
-    // The command `q spawn` printed has to work: the worker's window is
-    // `w1-tests`, but it is addressed by pane id, so the label is enough.
+    // The command `q spawn` printed has to work: the worker lives in its own
+    // tmux session `q-foo+tests`, addressed by pane id.
     let entered = env.json(&["enter", "foo", "--session", "tests"]);
-    assert_eq!(entered["tmux_session"], "q-foo");
-    assert_eq!(entered["window"], "w1-tests");
+    assert_eq!(entered["tmux_session"], "q-foo+tests");
+    assert_eq!(entered["window"], "tests");
     assert_eq!(entered["session"]["id"], spawned["session"]["id"]);
     assert_eq!(entered["attach"], "exec");
     assert_eq!(
         env.fixture()["attached"],
-        serde_json::json!(["q-foo", worker_pane.as_str()])
+        serde_json::json!(["q-foo+tests", worker_pane.as_str()])
     );
     assert_eq!(env.fixture()["selected"], worker_pane.as_str());
 
@@ -5381,29 +5351,30 @@ fn enter_reaches_a_worker_by_label_through_its_pane() {
     assert_eq!(again["window"], "renamed");
     assert_eq!(
         env.fixture()["attached"],
-        serde_json::json!(["q-foo", worker_pane.as_str()])
+        serde_json::json!(["q-foo+tests", worker_pane.as_str()])
     );
 
     // Without `--session` it is still the master.
     let master = env.json(&["enter", "foo"]);
     assert_eq!(master["window"], "master");
+    assert_eq!(master["tmux_session"], "q-foo");
 }
 
 #[test]
-fn a_spawn_whose_window_never_opens_leaves_no_session_behind() {
+fn a_spawn_whose_session_never_opens_leaves_no_session_behind() {
     let env = Env::new();
     env.new_quest("foo");
     let mut fixture = env.fixture();
-    fixture["fail_new_window"] = serde_json::json!("no space left for windows");
+    fixture["fail_new_session"] = serde_json::json!("no space left for sessions");
     env.write_fixture(fixture);
 
     env.cmd()
         .args(["spawn", "foo", "go", "--label", "tests"])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("no space left for windows"));
+        .stderr(predicate::str::contains("no space left for sessions"));
 
-    // The row is inserted before the window (the `SessionStart` hook resolves
+    // The row is inserted before the session (the `SessionStart` hook resolves
     // `$Q_SESSION` the moment Claude starts), so it has to be taken back.
     assert_eq!(env.count("SELECT count(*) FROM session"), 1);
     assert_eq!(
@@ -5419,12 +5390,10 @@ fn a_spawn_whose_window_never_opens_leaves_no_session_behind() {
 
     // The next spawn works, and the failed one did not consume a number.
     let mut fixture = env.fixture();
-    fixture.as_object_mut().unwrap().remove("fail_new_window");
+    fixture.as_object_mut().unwrap().remove("fail_new_session");
     env.write_fixture(fixture);
-    assert_eq!(
-        env.json(&["spawn", "foo", "go", "--label", "tests"])["window"],
-        "w1-tests"
-    );
+    let out = env.json(&["spawn", "foo", "go", "--label", "tests"]);
+    assert_eq!(out["tmux_session"], "q-foo+tests");
 }
 
 /// A worker row inserted but never given a pane — a `q spawn` killed between
@@ -5604,12 +5573,232 @@ fn peek_and_send_reject_a_bad_argument_before_they_resolve_the_target() {
 fn spawn_help_only_lists_the_implemented_flags() {
     let assert = q().args(["spawn", "--help"]).assert().success();
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    for flag in ["--label", "--workflow", "--dir", "--no-attach"] {
+    for flag in ["--label", "--workflow", "--dir", "--shell", "--enter"] {
         assert!(
             out.contains(flag),
             "`{flag}` missing from `q spawn --help`:\n{out}"
         );
     }
+}
+
+// ------------------------------- q start / stop / prompt (bd-v1d.3, SPEC §6 v2)
+
+#[test]
+fn start_launches_claude_in_a_shell_pane_and_refuses_a_non_shell_one() {
+    let env = Env::new();
+    env.new_quest("alpha");
+    let w = env.json(&["spawn", "alpha", "--label", "w1", "--shell"]);
+    assert_eq!(w["session"]["status"], "off");
+
+    let started = env.json(&["start", "alpha/w1"]);
+    assert_eq!(started["status"], "starting");
+    let buffer = pane_of(&env.fixture(), "q-alpha+w1")["buffer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(buffer.contains("claude -n alpha/w1"), "{buffer}");
+    assert_eq!(
+        env.status_of(w["session"]["id"].as_str().unwrap()),
+        "starting"
+    );
+
+    // The pane now runs Claude (a non-shell command); starting again is refused.
+    env.cmd()
+        .args(["start", "alpha/w1"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not a shell"));
+    // …unless forced.
+    env.cmd()
+        .args(["start", "alpha/w1", "--force"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn start_uses_the_stored_prompt_and_an_override_updates_it() {
+    let env = Env::new();
+    env.new_quest("alpha");
+    env.json(&["spawn", "alpha", "do the thing", "--label", "w1", "--shell"]);
+
+    // No prompt arg: the stored first prompt is embedded.
+    let started = env.json(&["start", "alpha/w1"]);
+    assert!(
+        started["command"]
+            .as_str()
+            .unwrap()
+            .contains("-- 'do the thing'"),
+        "{started}"
+    );
+
+    // Stop, then re-start with an override: the stored prompt is replaced.
+    let out = env.json(&["start", "alpha/w1", "other thing", "--force"]);
+    assert!(
+        out["command"]
+            .as_str()
+            .unwrap()
+            .contains("-- 'other thing'")
+    );
+    assert_eq!(env.json(&["prompt", "alpha/w1"])["prompt"], "other thing");
+}
+
+#[test]
+fn prompt_prints_the_stored_first_prompt() {
+    let env = Env::new();
+    env.new_quest("alpha");
+    env.json(&["spawn", "alpha", "write the tests", "--label", "tests"]);
+    env.cmd()
+        .args(["prompt", "alpha/tests"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("write the tests"));
+    assert_eq!(
+        env.json(&["prompt", "alpha/tests"])["prompt"],
+        "write the tests"
+    );
+}
+
+#[test]
+fn stop_types_exit_and_is_idle_gated() {
+    let fleet = Fleet::new();
+    let env = &fleet.env;
+
+    // Busy: refused (nothing typed). The pane is still running Claude, so the
+    // sweep does not touch the row.
+    env.set_status(&fleet.worker_id, "busy", None);
+    env.cmd()
+        .args(["stop", "alpha/tests"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not idle"));
+    assert_eq!(env.buffer(&fleet.worker_pane), "");
+
+    // Idle: `/exit` goes in.
+    env.set_status(&fleet.worker_id, "idle", None);
+    env.json(&["stop", "alpha/tests"]);
+    assert_eq!(env.buffer(&fleet.worker_pane), "/exit\n");
+}
+
+#[test]
+fn send_refuses_an_off_session_unless_shell() {
+    let env = Env::new();
+    env.new_quest("alpha");
+    let w = env.json(&["spawn", "alpha", "--label", "w1", "--shell"]);
+    let pane = w["session"]["tmux_pane"].as_str().unwrap().to_string();
+
+    // Off: a plain send would land in zsh, so it is refused.
+    env.cmd()
+        .args(["send", "alpha/w1", "ls -la"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("off"));
+    assert_eq!(env.buffer(&pane), "");
+
+    // `--shell` types into the shell.
+    env.json(&["send", "alpha/w1", "ls -la", "--shell"]);
+    assert_eq!(env.buffer(&pane), "ls -la\n");
+}
+
+#[test]
+fn close_kills_the_whole_fleet_including_a_rowless_pane() {
+    let env = Env::new();
+    env.new_quest("alpha");
+    env.json(&["spawn", "alpha", "go", "--label", "tests"]);
+    // A worker pane with no session row — a crash between insert and pane.
+    let mut fixture = env.fixture();
+    fixture["panes"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "pane_id": "%99",
+            "session_name": "q-alpha+ghost",
+            "window_name": "ghost",
+            "window_index": 0,
+            "current_command": "zsh",
+        }));
+    env.write_fixture(fixture);
+
+    env.json(&["close", "alpha", "-f"]);
+    // Every `q-alpha*` session is gone, the ghost included; a sibling is safe.
+    let sessions: Vec<String> = env.fixture()["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["session_name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !sessions.iter().any(|s| s.starts_with("q-alpha")),
+        "{sessions:?}"
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE status != 'ended'"),
+        0
+    );
+}
+
+#[test]
+fn rm_force_kills_the_fleet_when_the_main_is_already_gone() {
+    let env = Env::new();
+    env.new_quest("alpha");
+    env.json(&["spawn", "alpha", "go", "--label", "tests"]);
+    // The main tmux session vanished; only the worker's own session is left.
+    let mut fixture = env.fixture();
+    let panes: Vec<serde_json::Value> = fixture["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["session_name"] != "q-alpha")
+        .cloned()
+        .collect();
+    fixture["panes"] = serde_json::json!(panes);
+    env.write_fixture(fixture);
+
+    env.json(&["rm", "alpha", "-f"]);
+    // The worker session was killed too, and the Quest is gone.
+    assert!(
+        env.fixture()["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| !p["session_name"].as_str().unwrap().starts_with("q-alpha")),
+        "{:?}",
+        env.fixture()["panes"]
+    );
+    assert_eq!(env.count("SELECT count(*) FROM quest"), 0);
+}
+
+#[test]
+fn resume_readopts_a_worker_when_the_main_is_gone() {
+    let env = Env::new();
+    env.new_quest("alpha");
+    let worker = env.json(&["spawn", "alpha", "go", "--label", "tests"]);
+    let worker_id = worker["session"]["id"].as_str().unwrap().to_string();
+
+    // The main tmux session is gone; the worker's own session lives on.
+    let mut fixture = env.fixture();
+    let panes: Vec<serde_json::Value> = fixture["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["session_name"] != "q-alpha")
+        .cloned()
+        .collect();
+    fixture["panes"] = serde_json::json!(panes);
+    env.write_fixture(fixture);
+
+    // Resume brings up a fresh master; the worker row is re-adopted, not ended.
+    let out = env.json(&["resume", "alpha", "-d"]);
+    assert_eq!(out["tmux_session"], "q-alpha");
+    assert_ne!(
+        env.status_of(&worker_id),
+        "ended",
+        "the worker was re-adopted"
+    );
+    // A fresh master session exists again, plus the surviving worker.
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE role = 'master' AND status != 'ended'"),
+        1
+    );
 }
 
 // ------------------------------- q sessions / peek / send / kill (bd-8lz.3.2)
@@ -5662,6 +5851,19 @@ impl Env {
         std::fs::write(dir.join(format!("{pid}.json")), json).unwrap();
     }
 
+    /// Empty a pane's send-keys buffer in the fixture. `q new`/`q spawn` now
+    /// type the `claude …` launch command into the pane (SPEC §6 v2); a test
+    /// about a *later* send starts from the fresh pane Claude left behind.
+    fn clear_buffer(&self, pane_id: &str) {
+        let mut fixture = self.fixture();
+        for pane in fixture["panes"].as_array_mut().unwrap() {
+            if pane["pane_id"] == pane_id {
+                pane["buffer"] = serde_json::json!("");
+            }
+        }
+        self.write_fixture(fixture);
+    }
+
     /// What `send_keys` has written into a pane, per the tmux fixture.
     fn buffer(&self, pane_id: &str) -> String {
         self.fixture()["panes"]
@@ -5711,12 +5913,20 @@ impl Fleet {
         let created = env.new_quest("alpha");
         let quest_id = created["quest"]["id"].as_str().unwrap().to_string();
         let master_id = created["session"]["id"].as_str().unwrap().to_string();
+        let master_pane = created["session"]["tmux_pane"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let worker = env.json(&["spawn", "alpha", "write the tests", "--label", "tests"]);
         let worker_id = worker["session"]["id"].as_str().unwrap().to_string();
         let worker_pane = worker["session"]["tmux_pane"].as_str().unwrap().to_string();
-        // Claude came up in both windows: `SessionStart` would say idle.
+        // Claude came up in both sessions: `SessionStart` would say idle, and it
+        // took over the pane — so the launch command it was typed with is behind
+        // it; a test about a later send starts from a fresh buffer.
         env.set_status(&master_id, "idle", Some(1001));
         env.set_status(&worker_id, "idle", Some(1002));
+        env.clear_buffer(&master_pane);
+        env.clear_buffer(&worker_pane);
         Fleet {
             env,
             quest_id,
@@ -7893,17 +8103,29 @@ fn name_apply_renames_the_quest_and_tells_every_idle_claude_session() {
         out["proposal"]["input_hash"]
     );
 
-    // The tmux session followed, and so did the session rows.
+    // The whole fleet followed (SPEC §6 v2): the main row to `q-cdc-backfill`
+    // and the worker row to its own `q-cdc-backfill+tests`.
     assert_eq!(
         env.count("SELECT count(*) FROM session WHERE tmux_session = 'q-cdc-backfill'"),
-        2
+        1
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM session WHERE tmux_session = 'q-cdc-backfill+tests'"),
+        1
+    );
+    let sessions: Vec<String> = env.fixture()["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["session_name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        sessions.contains(&"q-cdc-backfill".to_string()),
+        "{sessions:?}"
     );
     assert!(
-        env.fixture()["panes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|p| { p["session_name"] == "q-cdc-backfill" })
+        sessions.contains(&"q-cdc-backfill+tests".to_string()),
+        "{sessions:?}"
     );
     assert!(event_kinds(env, &fleet.quest_id).contains(&"name.changed".to_string()));
 
@@ -12908,7 +13130,7 @@ fn every_command_that_takes_a_workflow_checks_it_against_the_registry() {
     let assert = env
         .cmd()
         .args(["spawn", "a", "go", "--label", "w", "--workflow", "nope"])
-        .args(["--no-attach", "--json"])
+        .args(["--json"])
         .assert()
         .code(1);
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
@@ -12920,16 +13142,7 @@ fn every_command_that_takes_a_workflow_checks_it_against_the_registry() {
         "no worker row"
     );
 
-    let out = env.json(&[
-        "spawn",
-        "a",
-        "go",
-        "--label",
-        "w",
-        "--workflow",
-        "review",
-        "--no-attach",
-    ]);
+    let out = env.json(&["spawn", "a", "go", "--label", "w", "--workflow", "review"]);
     assert_eq!(out["session"]["workflow"], "review");
 }
 

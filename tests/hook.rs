@@ -889,18 +889,29 @@ fn session_start_records_identity_and_injects_the_brief() {
     );
 }
 
+/// SPEC §6 v2: an `ended` row is terminal. A late or stray `SessionStart` on it
+/// — a leftover `$Q_SESSION` in a pane whose tmux session was torn down — is a
+/// no-op, not a resurrection. The supported ways back are `q start` (on a live
+/// pane) and `q resume`. The stray start is logged, not swallowed.
 #[test]
-fn session_start_resumes_an_ended_session() {
+fn session_start_on_an_ended_session_is_a_no_op() {
     let env = Env::new();
     env.seed("ended");
     env.conn()
         .execute("UPDATE session SET ended_at = 99 WHERE id = 's-0001'", [])
         .unwrap();
+    // No brief is injected — the row is not being revived.
     env.hook("session-start", &json!({ "source": "resume" }))
-        .success();
+        .success()
+        .stdout("");
     let s = env.session();
-    assert_eq!(s["status"], "idle");
-    assert_eq!(s["ended_at"], Value::Null);
+    assert_eq!(s["status"], "ended");
+    assert_eq!(s["ended_at"], 99);
+    // The stray start is recorded.
+    let events = env.events();
+    let last = events.last().unwrap();
+    assert_eq!(last.0, "session.start");
+    assert_eq!(last.1["ignored"], "ended");
 }
 
 #[test]

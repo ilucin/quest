@@ -7,7 +7,7 @@ use crate::Ctx;
 use crate::commands::new::spawn_master;
 use crate::commands::{AttachMode, attach_mode, live, sweep_quiet};
 use crate::error::QError;
-use crate::model::{Quest, QuestState, Session};
+use crate::model::{Quest, QuestState, Session, SessionRole};
 use crate::output;
 use crate::tmux::session_name;
 
@@ -79,10 +79,15 @@ pub fn apply(ctx: &Ctx, quest: &Quest, prompt: Option<&str>) -> anyhow::Result<R
         }
         .into());
     }
-    // An active Quest whose master is gone is as resumable as a finished one.
+    // An active Quest whose **main** is gone is as resumable as a finished one
+    // (SPEC §6 v2): only a live master blocks a resume. Workers live in their
+    // own tmux sessions (`q-<slug>+*`) and are re-adopted — their rows are kept,
+    // and the fresh master's brief lists them. `sweep_quiet` (run first) has
+    // already ended any master row whose pane vanished, so a live master here
+    // means the main tmux session is genuinely up.
     if !finished {
         let sessions = db.list_sessions_by_quest(&quest.id)?;
-        if live(&sessions).next().is_some() {
+        if live(&sessions).any(|s| s.role == SessionRole::Master) {
             return Err(QError::Other(format!(
                 "quest {} is still active; run `q enter {}`",
                 quest.slug, quest.slug

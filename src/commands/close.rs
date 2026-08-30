@@ -111,7 +111,6 @@ pub fn confirmation(ctx: &Ctx, quest: &Quest, close_epic: bool) -> anyhow::Resul
 /// caller's — [`confirmation`] above builds the question.
 pub fn apply(ctx: &Ctx, quest: &Quest, close_epic: bool) -> anyhow::Result<Closed> {
     let db = ctx.db()?;
-    let tmux_session = session_name(&ctx.config, &quest.slug);
 
     // Closing twice is not an error; there is nothing left to do but the epic,
     // which is worth a second run when the first one did not ask for it.
@@ -125,9 +124,10 @@ pub fn apply(ctx: &Ctx, quest: &Quest, close_epic: bool) -> anyhow::Result<Close
         });
     }
 
-    if ctx.tmux().has_session(&tmux_session)? {
-        ctx.tmux().kill_session(&tmux_session)?;
-    }
+    // Kill the whole fleet (SPEC §6 v2): the main `q-<slug>` and every worker
+    // `q-<slug>+*`, including a pane that has no row — best effort, so one that
+    // is already gone does not fail the close.
+    crate::commands::kill_quest_fleet(ctx, &quest.slug)?;
 
     let sessions = db.list_sessions_by_quest(&quest.id)?;
     let ending: Vec<&crate::model::Session> = live(&sessions).collect();

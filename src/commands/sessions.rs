@@ -145,7 +145,9 @@ fn human(views: &[SessionView], across_quests: bool) -> String {
     if views.is_empty() {
         return "no sessions".to_string();
     }
-    let mut header = vec!["LABEL", "ROLE", "STATUS", "PHASE", "CTX", "PANE", "AGE"];
+    let mut header = vec![
+        "LABEL", "ROLE", "TMUX", "STATUS", "PHASE", "CTX", "PANE", "AGE",
+    ];
     let mut rows: Vec<Vec<String>> = views
         .iter()
         .map(|v| {
@@ -153,6 +155,7 @@ fn human(views: &[SessionView], across_quests: bool) -> String {
             vec![
                 s.label.clone(),
                 s.role.to_string(),
+                s.tmux_session.clone(),
                 status_cell(s),
                 fmt::or_dash(s.phase.as_deref()),
                 s.ctx_pct

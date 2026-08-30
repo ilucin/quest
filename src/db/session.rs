@@ -169,20 +169,44 @@ impl Db {
         self.require_session(id)
     }
 
-    /// Follows a `q rename`: the tmux session was renamed under these rows.
-    /// Ended sessions are history and keep the name they actually ran under.
-    pub fn update_sessions_tmux_session(
+    /// `q start` typed the launch command into this pane (SPEC §6): back to
+    /// `starting`, `claude_started_at` set so the sweep's off-grace can bound
+    /// the wait, `claude_name` recorded for the registry's identity check, and
+    /// `first_prompt` overwritten only when a prompt was given (so a re-start
+    /// with no prompt keeps the one `q prompt` reads).
+    pub fn record_claude_launch(
         &self,
-        quest_id: &str,
-        tmux_session: &str,
-    ) -> anyhow::Result<usize> {
+        id: &str,
+        name: &str,
+        prompt: Option<&str>,
+        started_at: i64,
+    ) -> anyhow::Result<Session> {
         self.conn
             .execute(
-                "UPDATE session SET tmux_session = ?1, updated_at = ?2 \
-                 WHERE quest_id = ?3 AND status != 'ended'",
-                params![tmux_session, now(), quest_id],
+                "UPDATE session SET status = 'starting', waiting_for = NULL, \
+                 claude_name = ?1, claude_started_at = ?2, \
+                 first_prompt = COALESCE(?3, first_prompt), updated_at = ?4 WHERE id = ?5",
+                params![name, started_at, prompt, now(), id],
             )
-            .map_err(db_err)
+            .map_err(db_err)?;
+        self.require_session(id)
+    }
+
+    /// One live row's tmux session name (SPEC §6): a `q rename` moves each fleet
+    /// session — main and every `q-<slug>+<label>` worker — under its own new
+    /// name, which a single blanket update could not do.
+    pub fn update_session_tmux_session(
+        &self,
+        id: &str,
+        tmux_session: &str,
+    ) -> anyhow::Result<Session> {
+        self.conn
+            .execute(
+                "UPDATE session SET tmux_session = ?1, updated_at = ?2 WHERE id = ?3",
+                params![tmux_session, now(), id],
+            )
+            .map_err(db_err)?;
+        self.require_session(id)
     }
 
     /// The live session in that pane. Ended rows stay behind as history, and a
@@ -506,23 +530,45 @@ mod tests {
     }
 
     #[test]
-    fn a_rename_moves_only_the_live_sessions() {
+    fn a_rename_moves_one_rows_tmux_session() {
         let db = db();
         let a = quest(&db, "alpha");
-        let b = quest(&db, "beta");
-        let live = session(&db, &a.id, "master", "%1");
-        let ended = session(&db, &a.id, "w1", "%2");
-        let other = session(&db, &b.id, "master", "%3");
-        db.mark_session_ended(&ended.id, 1).unwrap();
+        let master = session(&db, &a.id, "master", "%1");
+        let worker = session(&db, &a.id, "w1", "%2");
 
-        assert_eq!(
-            db.update_sessions_tmux_session(&a.id, "q-omega").unwrap(),
-            1
-        );
+        // Each fleet row is moved under its own new name (SPEC §6 v2).
+        db.update_session_tmux_session(&master.id, "q-omega")
+            .unwrap();
+        db.update_session_tmux_session(&worker.id, "q-omega+w1")
+            .unwrap();
         let name = |id: &str| db.get_session(id).unwrap().unwrap().tmux_session;
-        assert_eq!(name(&live.id), "q-omega");
-        assert_eq!(name(&ended.id), "q-alpha");
-        assert_eq!(name(&other.id), "q-alpha");
+        assert_eq!(name(&master.id), "q-omega");
+        assert_eq!(name(&worker.id), "q-omega+w1");
+        assert!(db.update_session_tmux_session("s-nope", "q-x").is_err());
+    }
+
+    #[test]
+    fn record_claude_launch_marks_starting_and_keeps_a_prompt() {
+        let db = db();
+        let q = quest(&db, "alpha");
+        let s = session(&db, &q.id, "w1", "%1");
+        db.record_session_prompt(&s.id, Some("original")).unwrap();
+
+        // No prompt given: `starting`, `claude_started_at` set, prompt kept.
+        let started = db
+            .record_claude_launch(&s.id, "alpha/w1", None, 4242)
+            .unwrap();
+        assert_eq!(started.status, SessionStatus::Starting);
+        assert_eq!(started.claude_started_at, Some(4242));
+        assert_eq!(started.claude_name.as_deref(), Some("alpha/w1"));
+        assert_eq!(started.first_prompt.as_deref(), Some("original"));
+
+        // A prompt given overwrites the stored one.
+        let again = db
+            .record_claude_launch(&s.id, "alpha/w1", Some("fresh"), 4300)
+            .unwrap();
+        assert_eq!(again.first_prompt.as_deref(), Some("fresh"));
+        assert_eq!(again.claude_started_at, Some(4300));
     }
 
     #[test]
