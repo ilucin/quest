@@ -459,11 +459,13 @@ fn section_how(
                  - Move the Quest's cwd: `q cd <quest> <path>`. The cwd follows the main \
                  shell's `cd`, but only after you `/exit` Claude to the shell — while Claude \
                  runs in main, use `q cd` to move it.\n\
-                 - States in `q sessions` / section 5: `running`, `idle`, `idle · your turn` \
-                 (finished its turn, over to you), `off` (no Claude), and `waiting: \
-                 permission/input/question` when a worker is blocked on the human. Tell \
-                 workers to raise blocking questions with the **AskUserQuestion** tool so they \
-                 show as `waiting: question` rather than a silent `idle`.\n\
+                 - States: **section 5** of this brief shows `running` (Claude working or \
+                 booting), `idle`, `off` (no Claude), and `waiting: permission/input/question` \
+                 when a worker is blocked on the human. `q sessions` and the TUI split \
+                 `running` into `busy`/`starting` and soften a just-finished turn to `idle · \
+                 your turn` (over to you) — section 5 renders that same turn as plain `idle`. \
+                 Tell workers to raise blocking questions with the **AskUserQuestion** tool so \
+                 they show as `waiting: question` rather than a silent `idle`.\n\
                  - Report where you are: `q phase \"<text>\"`.\n\
                  - Link everything you produce: `q link add <ref>` / `q artifact add <path>`.\n\
                  - Record decisions and open questions: `q note \"<text>\"` \
@@ -1305,6 +1307,17 @@ mod tests {
                 "master brief missing {needle:?}:\n{master}"
             );
         }
+        // The state vocabulary must name the right surface: `running` is a
+        // section-5 rendering, while `q sessions`/TUI split it into
+        // `busy`/`starting` and soften a finished turn to `idle · your turn`.
+        assert!(
+            master.contains("split `running` into `busy`/`starting`"),
+            "section 2 must attribute `busy`/`starting` to q sessions, not `running`:\n{master}"
+        );
+        assert!(
+            master.contains("section 5 renders that same turn as plain `idle`"),
+            "section 2 must keep `idle · your turn` off section 5:\n{master}"
+        );
 
         let opts = Opts {
             role: SessionRole::Worker,
