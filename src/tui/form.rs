@@ -95,6 +95,11 @@ pub enum Field {
     },
     /// Flipped with `←`/`→`/space.
     Toggle { label: String, on: bool },
+    /// A classic two-button dialog footer: `[ Cancel ] [ Verb ]`. `←`/`→` move
+    /// the focus between the buttons, Enter presses the focused one. `at` is
+    /// which button holds it — `0` is `cancel` (where it starts, so a stray or
+    /// buffered Enter presses Cancel, never the verb), `1` is the verb.
+    Action { verb: String, at: usize },
     /// Something the form has to say. Never focused, so it can never swallow a
     /// keystroke.
     Note(String),
@@ -106,6 +111,7 @@ impl Field {
             Field::Text { label, .. }
             | Field::Select { label, .. }
             | Field::Toggle { label, .. } => label,
+            Field::Action { .. } => ACTION,
             Field::Note(_) => "",
         }
     }
@@ -150,9 +156,51 @@ impl Field {
                 None => String::new(),
             },
             Field::Toggle { on, .. } => if *on { "[x] yes" } else { "[ ] no" }.to_string(),
+            // The cramped, one-line fallback; the bordered box draws real
+            // buttons (see [`button_spans`]). The focused button is bracketed.
+            Field::Action { verb, at } => {
+                let cell = |label: &str, idx: usize| {
+                    if focused && *at == idx {
+                        format!("[ {label} ]")
+                    } else {
+                        format!("  {label}  ")
+                    }
+                };
+                format!("{}{}", cell(CANCEL, 0), cell(verb, 1))
+            }
             Field::Note(text) => text.clone(),
         }
     }
+}
+
+/// A button label with its first character upper-cased, for the dialog look.
+fn button_label(verb: &str) -> String {
+    let mut chars = verb.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// The two buttons as styled spans: the focused one reversed, so it reads as
+/// the one Enter will press. `row_focused` is whether the action row itself
+/// holds the form's focus — an unfocused row draws both buttons plain.
+fn button_spans(verb: &str, at: usize, row_focused: bool) -> Vec<Span<'static>> {
+    let button = |label: &str, idx: usize| {
+        let selected = row_focused && at == idx;
+        let style = if selected {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        Span::styled(format!("[ {} ]", button_label(label)), style)
+    };
+    vec![
+        Span::raw("  "),
+        button(CANCEL, 0),
+        Span::raw("   "),
+        button(verb, 1),
+    ]
 }
 
 /// A modal form: fields, focus, and whatever the last submission complained
@@ -234,32 +282,30 @@ impl Form {
     /// been typed at the box. So the affirmative is never the default, and
     /// never reachable by a key a paste can carry.
     pub fn action(self, verb: &str) -> Form {
-        self.push(Field::Select {
-            label: ACTION.to_string(),
-            options: vec![CANCEL.to_string(), verb.to_string()],
+        self.push(Field::Action {
+            verb: verb.to_string(),
             at: 0,
-            guarded: true,
         })
     }
 
     /// The verb an [`action`](Form::action) row offers.
     fn verb(&self) -> Option<&str> {
         match self.find(ACTION) {
-            Some(Field::Select { options, .. }) => options.last().map(String::as_str),
+            Some(Field::Action { verb, .. }) => Some(verb),
             _ => None,
         }
     }
 
-    /// Whether a submit means anything: for a form with an action row, that
-    /// the row has been moved off `cancel`; without one, that the form was
-    /// declared [`harmless`](Form::harmless).
+    /// Whether a submit means anything: for a form with an action row, that its
+    /// focus is on the verb button rather than `cancel`; without one, that the
+    /// form was declared [`harmless`](Form::harmless).
     ///
     /// Fails closed. A prompt that is neither is a programming error, and one
     /// that runs a bare Enter is the hazard this whole row exists to close.
     pub fn confirmed(&self) -> bool {
         match self.find(ACTION) {
-            Some(_) => self.choice(ACTION) != CANCEL,
-            None => self.commit == Commit::Harmless,
+            Some(Field::Action { at, .. }) => *at >= 1,
+            _ => self.commit == Commit::Harmless,
         }
     }
 
@@ -361,13 +407,25 @@ impl Form {
             // Dismissing would throw away everything typed and would look, to
             // someone whose Enter arrived from a buffer, exactly like the
             // action having run.
+            // On the button row, Enter presses the focused button: the verb
+            // submits, `cancel` dismisses — a classic two-button dialog. It is
+            // the one place Enter can dismiss, and it is safe: the row starts
+            // on `cancel`, so a buffered Enter presses Cancel, never the verb.
+            Input::Enter if matches!(self.focused(), Some(Field::Action { .. })) => {
+                if self.confirmed() {
+                    Outcome::Submit
+                } else {
+                    Outcome::Cancel
+                }
+            }
             Input::Enter => {
                 if self.confirmed() {
                     Outcome::Submit
                 } else {
                     self.set_error(match self.verb() {
                         Some(verb) => format!(
-                            "nothing done \u{b7} choose \u{2039} {verb} \u{203a} on the {ACTION} row (\u{2190}\u{2192}), or Esc"
+                            "nothing done \u{b7} move to the [ {} ] button (\u{2190}\u{2192}) and press it, or Esc",
+                            button_label(verb)
                         ),
                         // Neither an action row nor `harmless()`: a prompt
                         // built wrong. Refused rather than run, and said so
@@ -529,6 +587,21 @@ impl Form {
                 }
                 _ => false,
             },
+            // Two buttons: the arrows move focus between them. Space is inert —
+            // a paste can carry it, and it must never reach the verb button.
+            Field::Action { at, .. } => match input {
+                Input::Left => {
+                    let moved = *at != 0;
+                    *at = 0;
+                    moved
+                }
+                Input::Right => {
+                    let moved = *at != 1;
+                    *at = 1;
+                    moved
+                }
+                _ => false,
+            },
             Field::Note(_) => false,
         }
     }
@@ -599,11 +672,21 @@ fn window(s: &str, caret: usize, budget: usize) -> String {
 /// its content used to drop from the bottom, which threw away the error line
 /// and the hint — the reason a submit failed and the only way out — and kept
 /// the fields, which are already on screen.
-fn rows(form: &Form, budget: Option<usize>) -> Vec<(String, Style)> {
+/// One rendered form row: its plain text (for sizing and the cramped
+/// fallback), the style that text takes, and — for the button row — what the
+/// bordered box draws as real buttons instead of that text.
+struct Row {
+    text: String,
+    style: Style,
+    /// `Some((verb, at, focused))` for the action row.
+    buttons: Option<(String, usize, bool)>,
+}
+
+fn rows(form: &Form, budget: Option<usize>) -> Vec<Row> {
     let label_w = form
         .fields()
         .iter()
-        .filter(|f| f.focusable())
+        .filter(|f| f.focusable() && !matches!(f, Field::Action { .. }))
         .map(|f| layout::width(f.label()))
         .max()
         .unwrap_or(0);
@@ -615,6 +698,14 @@ fn rows(form: &Form, budget: Option<usize>) -> Vec<(String, Style)> {
         .enumerate()
         .map(|(i, field)| {
             let focused = i == form.focus;
+            if let Field::Action { verb, at } = field {
+                // The button row spans the whole width, not the label column.
+                return Row {
+                    text: action_text(verb),
+                    style: Style::default(),
+                    buttons: Some((verb.clone(), *at, focused)),
+                };
+            }
             let style = if focused {
                 Style::default().add_modifier(Modifier::BOLD)
             } else if matches!(field, Field::Note(_)) {
@@ -631,26 +722,42 @@ fn rows(form: &Form, budget: Option<usize>) -> Vec<(String, Style)> {
                     field.shown(focused, value_budget)
                 ),
             };
-            (text, style)
+            Row {
+                text,
+                style,
+                buttons: None,
+            }
         })
         .collect()
+}
+
+/// The plain width of the two-button row: the styling in [`button_spans`] does
+/// not change its width, so one spelling serves both sizing and the fallback.
+fn action_text(verb: &str) -> String {
+    format!(
+        "  [ {} ]   [ {} ]",
+        button_label(CANCEL),
+        button_label(verb)
+    )
 }
 
 /// The error, then the hint — in that order, and that is also the order they
 /// survive in: with room for one line the reason a submit failed beats the way
 /// out, because the box covers the status bar and the hint is repeated there.
-fn footer(form: &Form) -> Vec<(String, Style)> {
+fn footer(form: &Form) -> Vec<Row> {
     let mut out = Vec::new();
     if let Some(error) = form.error() {
-        out.push((
-            format!("  {error}"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        out.push(Row {
+            text: format!("  {error}"),
+            style: Style::default().add_modifier(Modifier::BOLD),
+            buttons: None,
+        });
     }
-    out.push((
-        format!("  {}", form.hint),
-        Style::default().add_modifier(Modifier::DIM),
-    ));
+    out.push(Row {
+        text: format!("  {}", form.hint),
+        style: Style::default().add_modifier(Modifier::DIM),
+        buttons: None,
+    });
     out
 }
 
@@ -667,7 +774,7 @@ pub fn render(frame: &mut Frame, area: Rect, form: &Form) {
     let inner = rows
         .iter()
         .chain(footer.iter())
-        .map(|(text, _)| layout::width(text))
+        .map(|row| layout::width(&row.text))
         .chain(std::iter::once(layout::width(&form.title) + 2))
         .max()
         .unwrap_or(0);
@@ -690,16 +797,25 @@ pub fn render(frame: &mut Frame, area: Rect, form: &Form) {
     // fields are already on screen, the error and the hint are not.
     let kept = footer.len().min(height);
     let room = height - kept;
-    let mut shown: Vec<(String, Style)> = Vec::with_capacity(height);
+    let mut shown: Vec<Row> = Vec::with_capacity(height);
     shown.extend(rows.into_iter().take(room));
     if shown.len() < room {
-        shown.push((String::new(), Style::default()));
+        shown.push(Row {
+            text: String::new(),
+            style: Style::default(),
+            buttons: None,
+        });
     }
     shown.extend(footer.into_iter().take(kept));
 
     let lines: Vec<Line> = shown
         .into_iter()
-        .map(|(text, style)| Line::from(Span::styled(layout::truncate(&text, budget), style)))
+        .map(|row| match row.buttons {
+            // Real buttons, drawn as their own spans so only the focused one is
+            // reversed; short enough that the budget never cuts them.
+            Some((verb, at, focused)) => Line::from(button_spans(&verb, at, focused)),
+            None => Line::from(Span::styled(layout::truncate(&row.text, budget), row.style)),
+        })
         .collect();
 
     frame.render_widget(Clear, box_area);
@@ -1040,15 +1156,12 @@ mod tests {
     #[test]
     fn a_form_with_an_action_row_does_not_submit_on_a_bare_enter() {
         let mut f = Form::new("close x?").action("close").note("kills tmux q-x");
+        // Focus starts on the button row, on `cancel`. A bare (or buffered)
+        // Enter presses Cancel — it dismisses, and never submits.
         assert!(!f.confirmed());
-        for _ in 0..3 {
-            assert_eq!(f.handle(Input::Enter), Outcome::Editing);
-        }
-        // And it says what is missing, rather than looking broken.
-        let error = f.error().unwrap();
-        assert!(error.contains("nothing done"), "{error}");
-        assert!(error.contains("close"), "{error}");
+        assert_eq!(f.handle(Input::Enter), Outcome::Cancel);
 
+        // Move to the verb button, and only then does Enter submit.
         f.handle(Input::Right);
         assert!(f.confirmed());
         assert_eq!(f.handle(Input::Enter), Outcome::Submit);
@@ -1057,9 +1170,8 @@ mod tests {
     }
 
     /// Bracketed paste is off, so pasted text arrives as ordinary keys. Space
-    /// cycles an ordinary select; on the action row it must not, or a space in
-    /// a paste arms the very thing the row guards and the newline after it
-    /// fires.
+    /// cycles an ordinary select; on the button row it must not, or a space in
+    /// a paste moves focus to the verb button and the newline after it fires.
     #[test]
     fn space_cycles_an_ordinary_select_but_never_the_action_row() {
         let mut f = Form::new("t")
@@ -1073,13 +1185,26 @@ mod tests {
         for c in "fix the thing".chars() {
             f.handle(Input::Char(c));
         }
-        assert!(!f.confirmed(), "a pasted space armed the action");
-        assert_eq!(f.handle(Input::Enter), Outcome::Editing);
-        // The arrows, which no paste carries as text, still work both ways.
+        assert!(!f.confirmed(), "a pasted space moved focus to the verb");
+        // Focus is still on Cancel, so a following newline dismisses at worst.
+        assert_eq!(f.handle(Input::Enter), Outcome::Cancel);
+        // The arrows, which no paste carries as text, still move both ways.
         f.handle(Input::Right);
         assert!(f.confirmed());
         f.handle(Input::Left);
         assert!(!f.confirmed());
+    }
+
+    /// The action row draws as two labelled buttons, first-letter capitalised,
+    /// with `cancel` on the left where the focus starts.
+    #[test]
+    fn the_action_row_draws_as_two_buttons() {
+        let f = Form::new("remove x?")
+            .action("remove")
+            .note("gone for good");
+        let drawn = draw(&f, 60, 12).join("\n");
+        assert!(drawn.contains("[ Cancel ]"), "{drawn}");
+        assert!(drawn.contains("[ Remove ]"), "{drawn}");
     }
 
     /// N-2. A form with no action row submits on Enter **only** once it has

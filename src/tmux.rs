@@ -105,6 +105,15 @@ pub trait Tmux {
     fn has_session(&self, name: &str) -> anyhow::Result<bool>;
     fn in_tmux(&self) -> bool;
     fn version(&self) -> anyhow::Result<String>;
+    /// Bind `key` (in the prefix table) server-wide to `run-shell <command>`.
+    /// `q` sets it whenever a master comes up (the bind is idempotent), so any
+    /// pane in a Quest can spawn a fresh worker (SPEC §6; `[tmux] spawn_key`).
+    fn bind_key(&self, key: &str, command: &str) -> anyhow::Result<()>;
+
+    /// The command `key` is currently bound to in the prefix table, or `None`
+    /// when it is unbound. Used before [`bind_key`](Tmux::bind_key) so a master
+    /// never silently clobbers the user's own prefix+key binding.
+    fn prefix_binding(&self, key: &str) -> anyhow::Result<Option<String>>;
 }
 
 /// `FixtureTmux` when `$Q_FIXTURE` names a file, else the real thing.
@@ -138,6 +147,18 @@ fn args_list_panes() -> Vec<String> {
 
 fn args_display_pane(target: &str) -> Vec<String> {
     args(&["display-message", "-p", "-t", &exact(target), PANE_FORMAT])
+}
+
+fn args_bind_key(key: &str, command: &str) -> Vec<String> {
+    // `-b` runs the shell command in the background: tmux is single-threaded,
+    // so a foreground `run-shell` freezes the whole server (every session and
+    // client) for the spawn's duration. `q spawn-here` selects its own window,
+    // so nothing is lost by backgrounding it.
+    args(&["bind-key", key, "run-shell", "-b", command])
+}
+
+fn args_list_keys(key: &str) -> Vec<String> {
+    args(&["list-keys", "-T", "prefix", key])
 }
 
 fn args_new_session(spec: &NewSession) -> Vec<String> {
@@ -541,6 +562,35 @@ impl Tmux for RealTmux {
     fn version(&self) -> anyhow::Result<String> {
         Ok(run(&args(&["-V"]))?.trim().to_string())
     }
+
+    fn bind_key(&self, key: &str, command: &str) -> anyhow::Result<()> {
+        run(&args_bind_key(key, command)).map(|_| ())
+    }
+
+    fn prefix_binding(&self, key: &str) -> anyhow::Result<Option<String>> {
+        // An unbound key makes `list-keys` exit non-zero ("unknown key"); that
+        // is not a failure worth surfacing — treat it as simply unbound.
+        match run(&args_list_keys(key)) {
+            Ok(out) => Ok(parse_prefix_binding(&out)),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+/// The command half of a `list-keys -T prefix <key>` line, e.g.
+/// `bind-key -T prefix N run-shell -b "…"` → `run-shell -b "…"`. tmux prints
+/// one line; anything we cannot split past the key token counts as unbound.
+fn parse_prefix_binding(out: &str) -> Option<String> {
+    let line = out.lines().next()?.trim();
+    // `bind-key [-r] [-N note] -T prefix <key> <command…>` — the command is
+    // whatever follows the `-T prefix <key>` triple.
+    let rest = line.split(" -T ").nth(1)?; // "prefix N <command…>"
+    let mut it = rest.splitn(3, ' '); // "prefix", key, command
+    it.next()?; // table
+    it.next()?; // key
+    it.next()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
 }
 
 // ------------------------------------------------------------------ fixture
@@ -589,6 +639,11 @@ pub struct FixtureState {
     /// slug itself has been checked (SPEC §10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fail_rename_session: Option<String>,
+    /// Prefix-table key bindings, so a test can pre-seed a user's own binding
+    /// and assert that a master leaves it alone (SPEC §6). `bind_key` records
+    /// here; `prefix_binding` reads it back.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prefix_keys: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -981,6 +1036,19 @@ impl Tmux for FixtureTmux {
             .load()?
             .version
             .unwrap_or_else(|| FIXTURE_VERSION.to_string()))
+    }
+
+    fn bind_key(&self, key: &str, command: &str) -> anyhow::Result<()> {
+        self.edit(|state| {
+            state
+                .prefix_keys
+                .insert(key.to_string(), command.to_string());
+            Ok(())
+        })
+    }
+
+    fn prefix_binding(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.load()?.prefix_keys.get(key).cloned())
     }
 }
 
@@ -1564,6 +1632,37 @@ mod tests {
     }
 
     #[test]
+    fn bind_key_binds_run_shell_in_the_prefix_table() {
+        assert_eq!(
+            args_bind_key("N", "/usr/local/bin/q spawn-here '#{pane_id}'"),
+            vec![
+                "bind-key",
+                "N",
+                "run-shell",
+                "-b",
+                "/usr/local/bin/q spawn-here '#{pane_id}'",
+            ],
+        );
+    }
+
+    #[test]
+    fn prefix_binding_parses_the_command_out_of_list_keys() {
+        // A user's own binding.
+        assert_eq!(
+            parse_prefix_binding("bind-key -T prefix N next-window\n").as_deref(),
+            Some("next-window"),
+        );
+        // Ours, with the extra flags tmux may print, still recognised by the
+        // `spawn-here` marker `bind_spawn_key` checks for.
+        let ours =
+            parse_prefix_binding("bind-key -r -T prefix N run-shell -b \"/q spawn-here '%1'\"\n")
+                .unwrap();
+        assert!(ours.contains("spawn-here"), "{ours}");
+        // Unbound: tmux prints nothing.
+        assert_eq!(parse_prefix_binding(""), None);
+    }
+
+    #[test]
     fn the_pane_line_is_the_last_line_of_stdout() {
         // tmux can warn ahead of the `-P -F` output; the format line is last.
         assert_eq!(last_line("%42\t1\tq-a\tw\t0\n"), "%42\t1\tq-a\tw\t0");
@@ -2073,6 +2172,12 @@ mod tests {
             false
         }
         fn version(&self) -> anyhow::Result<String> {
+            unreachable!()
+        }
+        fn bind_key(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn prefix_binding(&self, _: &str) -> anyhow::Result<Option<String>> {
             unreachable!()
         }
     }

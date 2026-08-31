@@ -200,6 +200,13 @@ impl State {
     pub(super) fn take_landing(&mut self) -> Option<Landing> {
         self.landing.take()
     }
+
+    /// Queue a window for the loop to hand the terminal to on its next turn —
+    /// the same channel a template run uses, reused by the Quests tab's `w` so a
+    /// freshly spawned worker is entered at once (SPEC §17).
+    pub(super) fn set_landing(&mut self, landing: Landing) {
+        self.landing = Some(landing);
+    }
 }
 
 // ------------------------------------------------------------------ loading
@@ -290,9 +297,8 @@ fn run_selection(app: &mut App) -> Action {
         return Action::Run;
     }
     let target = target_of(template);
-    let mut form = Form::new(format!("run {}", target.name)).hint(
-        "Tab field \u{b7} \u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels",
-    );
+    let mut form = Form::new(format!("run {}", target.name))
+        .hint("Tab field \u{b7} \u{2190}\u{2192} chooses \u{b7} \u{23ce} press \u{b7} Esc cancels");
     for key in &wanted {
         form = form.text(&arg_label(key), "", "(empty)");
     }
@@ -346,24 +352,22 @@ fn open_edit(app: &mut App) -> Action {
 
 /// The nine definition fields, in the order `q tpl show` prints them.
 fn fields(form: Form, d: &Definition) -> Form {
-    form.hint(
-        "Tab field \u{b7} \u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels",
-    )
-    .text(F_NAME, &d.name, "")
-    .text(F_DESCRIPTION, &d.description, "(none)")
-    .text(F_CWD, &d.cwd, "(the directory the run starts in)")
-    // Free text, unlike the new-Quest form's select (`crate::tui::quests`): a
-    // stored definition may name a workflow whose file is not here — it can
-    // travel ahead of its files, and `q tpl edit` only re-checks the field when
-    // it *changes* (`tpl::check_workflow`). A select cannot hold a value that
-    // is not in its list, so opening this form over such a template would
-    // silently rewrite its workflow on the way to editing something else.
-    .text(F_WORKFLOW, &d.workflow, "(default)")
-    .text(F_GOAL, &d.goal, "(none)")
-    .text(F_PROMPT, &d.master_prompt, "(none)")
-    .text(F_REPO, &d.beads_repo, "(none)")
-    .toggle(F_BRAIN, d.create_brain)
-    .text(F_TAGS, &d.tags.join(", "), "(none)")
+    form.hint("Tab field \u{b7} \u{2190}\u{2192} chooses \u{b7} \u{23ce} press \u{b7} Esc cancels")
+        .text(F_NAME, &d.name, "")
+        .text(F_DESCRIPTION, &d.description, "(none)")
+        .text(F_CWD, &d.cwd, "(the directory the run starts in)")
+        // Free text, unlike the new-Quest form's select (`crate::tui::quests`): a
+        // stored definition may name a workflow whose file is not here — it can
+        // travel ahead of its files, and `q tpl edit` only re-checks the field when
+        // it *changes* (`tpl::check_workflow`). A select cannot hold a value that
+        // is not in its list, so opening this form over such a template would
+        // silently rewrite its workflow on the way to editing something else.
+        .text(F_WORKFLOW, &d.workflow, "(default)")
+        .text(F_GOAL, &d.goal, "(none)")
+        .text(F_PROMPT, &d.master_prompt, "(none)")
+        .text(F_REPO, &d.beads_repo, "(none)")
+        .toggle(F_BRAIN, d.create_brain)
+        .text(F_TAGS, &d.tags.join(", "), "(none)")
 }
 
 /// The form read back as a definition. Tags are comma-separated because a form
@@ -402,7 +406,7 @@ fn open_delete(app: &mut App) -> Action {
     // there is nothing to type here, so the affirmative is one arrow key away
     // and a keystroke that merely arrived is never it.
     let form = Form::new(format!("delete {}?", target.name))
-        .hint("\u{2190}\u{2192} chooses \u{b7} \u{23ce} runs the action \u{b7} Esc cancels")
+        .hint("\u{2190}\u{2192} chooses \u{b7} \u{23ce} press \u{b7} Esc cancels")
         .action("delete")
         .note(match linked {
             0 => "no quest was made from it".to_string(),
@@ -493,6 +497,7 @@ pub fn submit(ctx: &Ctx, app: &mut App, prompt: &Prompt, form: &Form) -> anyhow:
         | Prompt::Edit(_)
         | Prompt::Close(_)
         | Prompt::Resume(_)
+        | Prompt::Remove(_)
         | Prompt::Send(_)
         | Prompt::Kill(_)
         | Prompt::Reset(_) => Ok(()),
@@ -1535,18 +1540,13 @@ mod tests {
         assert!(app.modal.is_none());
         assert_eq!(rig.names(), ["weekly-hygiene"]);
 
-        // A bare Enter is not the affirmative either (the action row starts
-        // on `cancel`), which is the guard `Form::action` exists for: the box
-        // stays up saying what is missing rather than deleting anything.
+        // A bare Enter is not the affirmative either: focus starts on the
+        // `[ Cancel ]` button, so Enter presses Cancel and dismisses without
+        // deleting — the guard `Form::action` exists for.
         app.handle(Input::Char('d'));
         assert_eq!(app.handle(Input::Enter), Action::None);
-        let error = app.modal.as_ref().expect("the box went away").form.error();
-        assert!(
-            error.unwrap_or_default().contains("nothing done"),
-            "{error:?}"
-        );
+        assert!(app.modal.is_none(), "Enter on Cancel dismisses");
         assert_eq!(rig.names(), ["weekly-hygiene"], "a bare Enter deleted it");
-        app.handle(Input::Esc);
 
         // Confirm: gone, and the Quest survives with its link cleared.
         app.handle(Input::Char('d'));
