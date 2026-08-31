@@ -1502,10 +1502,26 @@ fn follow_cwd(db: &Db, panes: &[Pane]) -> anyhow::Result<()> {
             )
         })
         .collect();
-    for session in db.list_live_sessions()? {
-        if session.role != SessionRole::Master || session.tmux_pane.is_empty() {
+    // One Quest can momentarily carry more than one live master (a resume or a
+    // crash-recovery overlap). Follow only the newest per Quest — the same
+    // `max_by_key(started_at)` the reseed in `q set cwd` protects — so the edge
+    // and the reseed never disagree about which master owns the cwd.
+    let live = db.list_live_sessions()?;
+    let mut newest: BTreeMap<&str, &Session> = BTreeMap::new();
+    for s in &live {
+        if s.role != SessionRole::Master || s.tmux_pane.is_empty() {
             continue;
         }
+        newest
+            .entry(s.quest_id.as_str())
+            .and_modify(|cur| {
+                if s.started_at > cur.started_at {
+                    *cur = s;
+                }
+            })
+            .or_insert(s);
+    }
+    for session in newest.into_values() {
         let Some(&(command, path)) =
             pane_of.get(&(session.tmux_session.as_str(), session.tmux_pane.as_str()))
         else {
@@ -1516,7 +1532,15 @@ fn follow_cwd(db: &Db, panes: &[Pane]) -> anyhow::Result<()> {
         if command.is_empty() || !is_shell(command) || path.is_empty() {
             continue;
         }
-        let canonical = canonical_path(path);
+        // A vanished/unreadable path (rmdir'd under the shell between the `cd`
+        // and this sweep) is no directory `spawn`/`enter` could open; skip the
+        // edge rather than write a dead path — the same rejection `q set cwd`
+        // makes for a nonexistent dir. `canonical_path`'s raw-string fallback
+        // is fine for the reseed baseline but must not become a stored cwd.
+        let Ok(canonical) = std::fs::canonicalize(path) else {
+            continue;
+        };
+        let canonical = canonical.to_string_lossy().into_owned();
         // No edge: the shell has not moved since we last saw it.
         if session.last_pane_path.as_deref() == Some(canonical.as_str()) {
             continue;

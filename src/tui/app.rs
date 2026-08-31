@@ -388,6 +388,10 @@ pub struct App {
     /// `[tmux] session_prefix`, so a prompt can name the tmux session it is
     /// about to kill exactly as `q close` does.
     pub tmux_prefix: String,
+    /// `[quest] follow_main_cwd`: only when on does a Quest's cwd track the
+    /// main shell, so the detail panel labels the cwd "(from main shell)" only
+    /// under this flag.
+    pub follow_main_cwd: bool,
     pub quests: quests::State,
     pub sessions: sessions::State,
     pub templates: templates::State,
@@ -419,6 +423,7 @@ impl App {
             modal: None,
             machines: machines(config, machine),
             tmux_prefix: config.tmux.session_prefix.clone(),
+            follow_main_cwd: config.quest.follow_main_cwd,
             quests: quests::State::default(),
             sessions: sessions::State::new(config, machine),
             templates: templates::State::default(),

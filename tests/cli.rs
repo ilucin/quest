@@ -14105,3 +14105,23 @@ fn cwd_follow_can_be_turned_off() {
     assert_eq!(swept_cwd(&env, "foo"), a.to_str().unwrap());
     assert_eq!(cwd_changed_count(&env), 0);
 }
+
+#[test]
+fn cwd_follow_skips_a_vanished_shell_path() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let a = env.work("foo");
+
+    // Master at a shell in `a`; baseline seeded.
+    set_main_pane(&env, "foo", "zsh", &a);
+    assert_eq!(swept_cwd(&env, "foo"), a.to_str().unwrap());
+
+    // The shell's cwd was rmdir'd under it: tmux still reports the now-dead
+    // path. The follow must not write a nonexistent dir into the Quest cwd —
+    // `q set cwd`/`spawn`/`enter` would then open a dead directory.
+    let gone = a.parent().unwrap().join("gone");
+    assert!(!gone.exists());
+    set_main_pane(&env, "foo", "zsh", &gone);
+    assert_eq!(swept_cwd(&env, "foo"), a.to_str().unwrap());
+    assert_eq!(cwd_changed_count(&env), 0);
+}
