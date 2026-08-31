@@ -17,8 +17,12 @@ use crate::error::QError;
 use crate::model::{Session, SessionRole, now};
 
 /// Tab-separated so session and window names may contain spaces.
-const PANE_FORMAT: &str =
-    "#{pane_id}\t#{pane_pid}\t#{session_name}\t#{window_name}\t#{window_index}";
+///
+/// `pane_current_command` and `pane_current_path` are appended last so an older
+/// `q`/tmux emitting only the first five fields still parses (SPEC §6): the
+/// parser fills the two new fields with empty strings when they are absent.
+const PANE_FORMAT: &str = "#{pane_id}\t#{pane_pid}\t#{session_name}\t#{window_name}\t\
+     #{window_index}\t#{pane_current_command}\t#{pane_current_path}";
 
 const TMUX_MISSING: &str = "tmux not found on PATH";
 
@@ -54,6 +58,15 @@ pub struct Pane {
     pub session_name: String,
     pub window_name: String,
     pub window_index: i32,
+    /// The process running in the pane right now (`#{pane_current_command}`):
+    /// a shell when no Claude is up, else Claude's own reported command — which
+    /// is never literally `claude` (the native binary reports its version, npm
+    /// reports `node`), so presence is judged with [`is_shell`], never `==`.
+    /// Empty when read from an older 5-field pane line.
+    pub current_command: String,
+    /// The shell's cwd (`#{pane_current_path}`); the Quest cwd follows the
+    /// main session's (SPEC §6). Empty when read from an older 5-field line.
+    pub current_path: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -308,6 +321,9 @@ fn parse_pane(line: &str) -> Option<Pane> {
         session_name: f.next()?.to_string(),
         window_name: f.next()?.to_string(),
         window_index: f.next()?.parse().ok()?,
+        // Absent on an old 5-field line — empty, not a parse failure.
+        current_command: f.next().unwrap_or("").to_string(),
+        current_path: f.next().unwrap_or("").to_string(),
     };
     if pane.pane_id.is_empty() {
         return None;
@@ -665,6 +681,16 @@ pub struct FixturePane {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub command: Option<String>,
+    /// `#{pane_current_command}` — what is running in the pane now. `add` seeds
+    /// it from the launch command (a login shell reports `zsh`, a `claude …`
+    /// launch reports a version string); `send_keys` of `claude …` / `/exit`
+    /// flips it. `#[serde(default)]` keeps a pre-v5 fixture JSON (no such field)
+    /// loading — it just reports an empty command until something sets one.
+    #[serde(default)]
+    pub current_command: String,
+    /// `#{pane_current_path}` — the pane's cwd. Seeded from `-c <cwd>`.
+    #[serde(default)]
+    pub current_path: String,
     /// What `send_keys` wrote and `capture_pane` reads back.
     #[serde(default)]
     pub buffer: String,
@@ -682,6 +708,8 @@ impl FixturePane {
             session_name: self.session_name.clone(),
             window_name: self.window_name.clone(),
             window_index: self.window_index,
+            current_command: self.current_command.clone(),
+            current_path: self.current_path.clone(),
         }
     }
 }
@@ -706,6 +734,8 @@ impl FixtureState {
             cwd: cwd.to_string(),
             env: spec_env.iter().cloned().collect(),
             command: command.map(str::to_string),
+            current_command: launched_command(command),
+            current_path: cwd.to_string(),
             buffer: String::new(),
             pastes: Vec::new(),
         };
@@ -740,6 +770,39 @@ impl FixtureState {
 
 /// Shaped like a real `tmux -V` so the version check parses it as any other.
 const FIXTURE_VERSION: &str = "tmux 3.6 (fixture)";
+
+/// The `current_command` the fixture reports for a pane whose login shell is
+/// idle. A real macOS pane reports `zsh`; `-zsh` (a login shell) is handled by
+/// [`is_shell`] stripping the leading `-`.
+const FIXTURE_SHELL: &str = "zsh";
+
+/// What the fixture reports while Claude runs in a pane: an opaque, non-shell
+/// version string, mimicking the native macOS binary — deliberately *not*
+/// `claude`, so nothing may test presence with `current_command == "claude"`.
+const FIXTURE_CLAUDE_COMMAND: &str = "2.1.0";
+
+/// A `send-keys`/launch line that starts Claude. The real command is
+/// `claude -n …` or `claude --resume …`; the fixture only needs the leading
+/// token.
+fn is_claude_launch(line: &str) -> bool {
+    line.split_whitespace().next() == Some("claude")
+}
+
+/// The `current_command` a fixture pane reports right after it is opened with
+/// `command`. A login shell (or `None`) reports a shell; a `claude …` launch
+/// reports the opaque version string; anything else reports its own leading
+/// token (a non-shell, e.g. `vim`).
+fn launched_command(command: Option<&str>) -> String {
+    match command {
+        None => FIXTURE_SHELL.to_string(),
+        Some(line) if is_claude_launch(line) => FIXTURE_CLAUDE_COMMAND.to_string(),
+        Some(line) => line
+            .split_whitespace()
+            .next()
+            .unwrap_or(FIXTURE_SHELL)
+            .to_string(),
+    }
+}
 
 pub struct FixtureTmux {
     path: PathBuf,
@@ -947,6 +1010,14 @@ impl Tmux for FixtureTmux {
             if enter {
                 pane.buffer.push('\n');
             }
+            // `q start` types `claude …`, `q stop` types `/exit`: the fixture
+            // reflects the running process so a sweep can read presence off it.
+            let line = text.trim();
+            if is_claude_launch(line) {
+                pane.current_command = FIXTURE_CLAUDE_COMMAND.to_string();
+            } else if line == "/exit" {
+                pane.current_command = FIXTURE_SHELL.to_string();
+            }
             Ok(())
         })
     }
@@ -1068,9 +1139,71 @@ fn tail(buffer: &str, lines: usize) -> String {
 
 // ------------------------------------------------------------------ helpers
 
-/// `q-<slug>` — one tmux session per Quest (SPEC §6).
+/// `q-<slug>` — the main tmux session of a Quest (SPEC §6).
 pub fn session_name(config: &Config, slug: &str) -> String {
     format!("{}{slug}", config.tmux.session_prefix)
+}
+
+/// Separates a Quest slug from a worker label in a tmux session name. Never a
+/// kebab character, so the split back to `(slug, label)` is unambiguous even
+/// for a slug that itself contains `-` (SPEC §6).
+pub const WORKER_SEP: char = '+';
+
+/// The shells a login pane may report as `pane_current_command`. A leading `-`
+/// (a login shell, e.g. `-zsh`) is stripped before the lookup, so it is not
+/// listed twice. Presence is one-way: a shell means no Claude (`off`); a
+/// non-shell is never proof Claude *is* up — that comes only from hooks.
+pub const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "nu", "tcsh", "csh",
+];
+
+/// Whether `command` is a login shell — the pane is idle, no Claude running.
+/// Never test `command == "claude"`: the native binary reports its version and
+/// npm reports `node`, so presence is the *absence* of a shell, plus a hook.
+pub fn is_shell(command: &str) -> bool {
+    let name = command.trim().strip_prefix('-').unwrap_or(command.trim());
+    // A shell may report a path (`/bin/zsh`); take the final component.
+    let name = name.rsplit('/').next().unwrap_or(name);
+    SHELLS.contains(&name)
+}
+
+/// `q-<slug>+<label>` — a worker's own tmux session (SPEC §6).
+pub fn worker_session_name(config: &Config, slug: &str, label: &str) -> String {
+    format!("{}{WORKER_SEP}{label}", session_name(config, slug))
+}
+
+/// The distinct tmux session names belonging to Quest `slug`, in first-seen
+/// order: the main `q-<slug>` and every worker `q-<slug>+<label>`. An exact
+/// match or a `+`-prefixed one only — never a bare `starts_with`, so `q-foo`
+/// never claims a sibling Quest `q-foo-bar`'s sessions (SPEC §6).
+pub fn sessions_of_quest(config: &Config, panes: &[Pane], slug: &str) -> Vec<String> {
+    let main = session_name(config, slug);
+    let worker_prefix = format!("{main}{WORKER_SEP}");
+    let mut out: Vec<String> = Vec::new();
+    for pane in panes {
+        let name = &pane.session_name;
+        let ours = *name == main || name.starts_with(&worker_prefix);
+        if ours && !out.iter().any(|n| n == name) {
+            out.push(name.clone());
+        }
+    }
+    out
+}
+
+/// The Quest slug owning a tmux session name: strip the configured prefix, then
+/// keep everything before the first `+` (SPEC §6). `None` when the name does
+/// not carry the prefix, or nothing is left of the slug. The `+`-split is what
+/// keeps a worker `q-foo+review` reporting `foo`, and `q-foo-bar` reporting
+/// `foo-bar` rather than being mistaken for `foo`.
+pub fn quest_slug_of_name(config: &Config, session_name: &str) -> Option<String> {
+    let rest = session_name.strip_prefix(config.tmux.session_prefix.as_str())?;
+    let slug = rest.split_once(WORKER_SEP).map_or(rest, |(slug, _)| slug);
+    (!slug.is_empty()).then(|| slug.to_string())
+}
+
+/// The Quest slug owning `pane`, read off its tmux session name (SPEC §6).
+pub fn quest_slug_of_pane(config: &Config, pane: &Pane) -> Option<String> {
+    quest_slug_of_name(config, &pane.session_name)
 }
 
 /// The environment `q` sets on a window; Claude and its hooks inherit it
@@ -1390,7 +1523,11 @@ mod tests {
 
     #[test]
     fn panes_parse_from_the_tab_separated_format() {
-        let out = "%42\t1234\tq-alpha\tmaster\t0\n%43\t1235\tq alpha\tw1 tests\t1\nrubbish\n";
+        // A 7-field line (current tmux) and, on the second row, an old 5-field
+        // line: both parse, the shorter one leaving the two trailing fields
+        // empty (back-compat with a remote `q` on the old format, SPEC §6).
+        let out = "%42\t1234\tq-alpha\tmaster\t0\tzsh\t/tmp/repo\n\
+                   %43\t1235\tq alpha\tw1 tests\t1\nrubbish\n";
         let panes = parse_panes(out);
         assert_eq!(
             panes[0],
@@ -1400,9 +1537,13 @@ mod tests {
                 session_name: "q-alpha".to_string(),
                 window_name: "master".to_string(),
                 window_index: 0,
+                current_command: "zsh".to_string(),
+                current_path: "/tmp/repo".to_string(),
             }
         );
         assert_eq!(panes[1].window_name, "w1 tests");
+        assert_eq!(panes[1].current_command, "", "old 5-field line: no command");
+        assert_eq!(panes[1].current_path, "", "old 5-field line: no path");
         assert_eq!(panes.len(), 2, "malformed lines are skipped");
     }
 
@@ -1863,6 +2004,148 @@ mod tests {
         assert_eq!(pane.pane_id, "%8");
     }
 
+    #[test]
+    fn is_shell_ignores_login_dashes_paths_and_claude_version_strings() {
+        for shell in [
+            "zsh", "-zsh", "bash", "-bash", "/bin/zsh", "fish", "sh", "nu",
+        ] {
+            assert!(is_shell(shell), "{shell} should read as a shell");
+        }
+        // Claude never reports `claude`: the native binary reports a version,
+        // npm reports `node`. Neither, nor an editor, is a shell.
+        for busy in ["2.1.0", "2.1.251", "node", "vim", "less", "cargo", "claude"] {
+            assert!(!is_shell(busy), "{busy} must not read as a shell");
+        }
+    }
+
+    #[test]
+    fn worker_and_main_session_names_split_back_without_confusing_siblings() {
+        let config = Config::default();
+        assert_eq!(session_name(&config, "foo"), "q-foo");
+        assert_eq!(
+            worker_session_name(&config, "foo", "review"),
+            "q-foo+review"
+        );
+
+        // The slug comes back off both the main and the worker name…
+        assert_eq!(quest_slug_of_name(&config, "q-foo").as_deref(), Some("foo"));
+        assert_eq!(
+            quest_slug_of_name(&config, "q-foo+review").as_deref(),
+            Some("foo"),
+        );
+        // …and a sibling Quest whose slug merely starts with `foo` is its own
+        // Quest, never a worker of `foo` (the bug a bare `starts_with` invites).
+        assert_eq!(
+            quest_slug_of_name(&config, "q-foo-bar").as_deref(),
+            Some("foo-bar"),
+        );
+        assert_eq!(
+            quest_slug_of_name(&config, "q-foo-bar+w1").as_deref(),
+            Some("foo-bar"),
+        );
+        // Not a Quest session at all, or nothing left of the slug.
+        assert_eq!(quest_slug_of_name(&config, "irssi"), None);
+        assert_eq!(quest_slug_of_name(&config, "q-"), None);
+    }
+
+    #[test]
+    fn sessions_of_quest_gathers_main_and_workers_but_not_a_sibling() {
+        let config = Config::default();
+        let panes = [
+            pane("q-foo", "%1"),
+            pane("q-foo+review", "%2"),
+            pane("q-foo+tests", "%3"),
+            // A sibling Quest and an unrelated session must be left out.
+            pane("q-foo-bar", "%4"),
+            pane("q-foo-bar+w1", "%5"),
+            pane("irssi", "%6"),
+            // A second pane in the main session does not duplicate the name.
+            pane("q-foo", "%7"),
+        ];
+        assert_eq!(
+            sessions_of_quest(&config, &panes, "foo"),
+            ["q-foo", "q-foo+review", "q-foo+tests"],
+        );
+        assert_eq!(
+            sessions_of_quest(&config, &panes, "foo-bar"),
+            ["q-foo-bar", "q-foo-bar+w1"],
+        );
+        assert!(sessions_of_quest(&config, &panes, "nope").is_empty());
+    }
+
+    #[test]
+    fn a_fixture_pane_reports_a_shell_until_claude_launches_and_after_exit() {
+        let (_dir, t) = fixture();
+        // A login-shell pane (`command: None`) reports a shell in its cwd.
+        let main = t
+            .new_session(&NewSession {
+                name: "q-foo".to_string(),
+                window_name: "master".to_string(),
+                cwd: "/tmp/repo".to_string(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        assert_eq!(main.current_command, FIXTURE_SHELL);
+        assert_eq!(main.current_path, "/tmp/repo");
+
+        // `q start` types `claude …`: the pane now reports the opaque version
+        // string, never the literal `claude`.
+        t.send_keys(&main.pane_id, "claude -n foo/master", true)
+            .unwrap();
+        let running = current_command(&t, &main.pane_id);
+        assert_eq!(running, FIXTURE_CLAUDE_COMMAND);
+        assert!(!is_shell(&running));
+
+        // `/exit` (or `q stop`) drops back to the shell.
+        t.send_keys(&main.pane_id, "/exit", true).unwrap();
+        assert_eq!(current_command(&t, &main.pane_id), FIXTURE_SHELL);
+    }
+
+    #[test]
+    fn a_pane_launched_straight_into_claude_reports_the_version_string() {
+        // The M1a topology still launches Claude as the pane command; the
+        // fixture reflects that as a non-shell current_command.
+        let (_dir, t) = fixture();
+        let pane = t
+            .new_session(&NewSession {
+                name: "q-foo".to_string(),
+                window_name: "master".to_string(),
+                cwd: "/tmp/repo".to_string(),
+                command: Some("claude -n foo/master".to_string()),
+                ..NewSession::default()
+            })
+            .unwrap();
+        assert_eq!(pane.current_command, FIXTURE_CLAUDE_COMMAND);
+        assert_eq!(pane.current_path, "/tmp/repo");
+    }
+
+    #[test]
+    fn a_pre_v5_fixture_without_the_new_fields_still_loads() {
+        // A fixture JSON written before v5 carries neither current_command nor
+        // current_path; `#[serde(default)]` fills them with empty strings.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tmux.json");
+        std::fs::write(
+            &path,
+            r#"{"next_pane":1,"panes":[{"pane_id":"%1","session_name":"q-foo","window_name":"master","window_index":0}]}"#,
+        )
+        .unwrap();
+        let t = FixtureTmux::new(&path);
+        let panes = t.list_panes().unwrap();
+        assert_eq!(panes[0].current_command, "");
+        assert_eq!(panes[0].current_path, "");
+    }
+
+    /// The `current_command` a fixture pane reports now.
+    fn current_command(t: &FixtureTmux, pane_id: &str) -> String {
+        t.list_panes()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.pane_id == pane_id)
+            .unwrap()
+            .current_command
+    }
+
     fn seeded_db() -> (Db, Quest) {
         let db = Db::open_in_memory().unwrap();
         let quest = db
@@ -1878,6 +2161,8 @@ mod tests {
             session_name: session.to_string(),
             window_name: "w".to_string(),
             window_index: 0,
+            current_command: FIXTURE_SHELL.to_string(),
+            current_path: String::new(),
         }
     }
 
