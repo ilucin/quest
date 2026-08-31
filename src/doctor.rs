@@ -777,6 +777,70 @@ fn check_orphans(db: Option<&Db>, tmux: &dyn Tmux, fix: bool, fixed: &mut Vec<St
     )
 }
 
+/// Live session rows whose `tmux_session` names a slug other than their Quest's
+/// current one (SPEC §6 v2): a fleet rename could not move the worker's tmux
+/// session (its target name was taken, or the rename errored), so the row was
+/// left pointing at the old name. The pane is still alive under that name — the
+/// worker is reachable — but the fleet is inconsistent. There is nothing safe to
+/// auto-fix (renaming again could collide the same way), so it only warns; `q
+/// rename` re-syncs it and `q close`/`q rm` tear it down (R7).
+fn check_fleet_names(db: Option<&Db>, tmux: &dyn Tmux, config: &Config) -> Check {
+    const NAME: &str = "fleet names";
+
+    let Some(db) = db else {
+        return check(NAME, Status::Warn, "skipped: the database is unreadable");
+    };
+    let live = match db.list_live_sessions() {
+        Ok(live) => live,
+        Err(e) => return check(NAME, Status::Fail, format!("{e:#}")),
+    };
+    if live.is_empty() {
+        return check(NAME, Status::Ok, "none");
+    }
+    let panes = match tmux::live_panes(tmux) {
+        Ok(panes) => panes,
+        Err(e) => return check(NAME, Status::Warn, format!("skipped: {e:#}")),
+    };
+    let alive: std::collections::HashSet<(&str, &str)> = panes
+        .iter()
+        .map(|p| (p.session_name.as_str(), p.pane_id.as_str()))
+        .collect();
+
+    let mut stranded: Vec<String> = Vec::new();
+    for session in &live {
+        // A reachable pane under the recorded name — a gone pane is the orphan
+        // check's business, not a naming mismatch.
+        if !alive.contains(&(session.tmux_session.as_str(), session.tmux_pane.as_str())) {
+            continue;
+        }
+        let Some(quest) = db.get_quest(&session.quest_id).ok().flatten() else {
+            continue;
+        };
+        let recorded = tmux::quest_slug_of_name(config, &session.tmux_session);
+        if recorded.as_deref() != Some(quest.slug.as_str()) {
+            stranded.push(format!(
+                "{}/{} on {}",
+                quest.slug, session.label, session.tmux_session
+            ));
+        }
+    }
+    if stranded.is_empty() {
+        return check(NAME, Status::Ok, "in sync");
+    }
+    with_hint(
+        check(
+            NAME,
+            Status::Warn,
+            format!(
+                "{} stranded by a rename: {}",
+                stranded.len(),
+                stranded.join(", ")
+            ),
+        ),
+        "q rename to re-sync, or q close/q rm to tear the fleet down",
+    )
+}
+
 /// `quest-slug/label`, falling back to the quest id when the row is unreadable.
 fn describe(db: &Db, session: &Session) -> String {
     let quest = db
@@ -1221,6 +1285,7 @@ fn report(ctx: &Ctx, fix: bool) -> Report {
     // SPEC §19's order: the remotes, then the orphans.
     checks.extend(check_remotes(ctx));
     checks.push(check_orphans(db.as_ref(), ctx.tmux(), fix, &mut fixed));
+    checks.push(check_fleet_names(db.as_ref(), ctx.tmux(), &ctx.config));
     Report::new(checks, fixed)
 }
 

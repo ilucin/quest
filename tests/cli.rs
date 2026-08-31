@@ -1433,6 +1433,7 @@ fn doctor_json_reports_every_check() {
             "skill",
             "statusline chain",
             "orphan sessions",
+            "fleet names",
         ]
     );
     assert_eq!(parsed["ok"], true);
@@ -3457,6 +3458,57 @@ fn rename_leaves_a_worker_whose_target_name_is_already_taken() {
     // The live worker pane still lives under its old session name, reachable.
     let worker = pane_of(&env.fixture(), "q-foo+tests");
     assert_eq!(worker["pane_id"], worker_pane.as_str());
+
+    // F1: the stranded worker is reported on the rename itself, not silently
+    // left behind — a `stranded` entry with the tmux session, the reason, and
+    // the owning session row id.
+    let stranded = renamed["stranded"].as_array().expect("stranded array");
+    assert_eq!(stranded.len(), 1, "{renamed}");
+    assert_eq!(stranded[0]["tmux_session"], "q-foo+tests");
+    assert_eq!(stranded[0]["reason"], "target tmux session already exists");
+    let session_id = env
+        .conn()
+        .query_row(
+            "SELECT id FROM session WHERE tmux_session = 'q-foo+tests'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap();
+    assert_eq!(stranded[0]["session"], session_id);
+
+    // F1 (doctor): the mismatch the rename left behind is what `q doctor`'s
+    // fleet-names check now flags — the worker's row names slug `foo` while its
+    // Quest is `bar`, and its pane is still alive under the old name. (The
+    // environment checks fail under this bare `Env`, so the report is read
+    // without asserting the exit code.)
+    let mut doctor_cmd = env.cmd();
+    let assert = doctor_cmd.args(["doctor", "--json"]).assert();
+    let report = json_of(&assert);
+    let fleet = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "fleet names")
+        .unwrap_or_else(|| panic!("no fleet-names check: {report}"));
+    assert_eq!(fleet["status"], "warn", "{report}");
+    assert!(
+        fleet["detail"].as_str().unwrap().contains("bar/tests"),
+        "{report}"
+    );
+
+    // F2: closing the Quest tears the stranded worker down too — the R7 union
+    // of the prefix scan and every row's recorded tmux_session, so it does not
+    // leak under the old slug.
+    env.json(&["close", "bar", "-f"]);
+    assert!(
+        !env.fixture()["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["session_name"] == "q-foo+tests"),
+        "the stranded worker leaked: {:?}",
+        env.fixture()["panes"]
+    );
 }
 
 #[test]

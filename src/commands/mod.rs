@@ -321,13 +321,22 @@ pub fn sweep_quiet(ctx: &Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Kill every tmux session of a Quest (SPEC §6 v2): the main `q-<slug>` and
-/// every worker `q-<slug>+<label>`, including a pane with no session row.
-/// Best effort — a session already gone is not an error — so `q close`/`q rm`
-/// tear a crashed fleet down all the same. Returns how many it killed.
-pub fn kill_quest_fleet(ctx: &Ctx, slug: &str) -> anyhow::Result<usize> {
+/// Kill every tmux session of a Quest (SPEC §6 v2, R7): the union of (a) the
+/// prefix scan — the main `q-<slug>` and every worker `q-<slug>+<label>`,
+/// including a pane with no session row — and (b) every session row's recorded
+/// `tmux_session`, so a rename-stranded worker still under an old slug does not
+/// leak. Deduped, best effort — a session already gone is not an error — so
+/// `q close`/`q rm` tear a crashed or half-renamed fleet down all the same.
+/// Returns how many it killed.
+pub fn kill_quest_fleet(ctx: &Ctx, quest: &Quest) -> anyhow::Result<usize> {
     let panes = tmux::live_panes(ctx.tmux())?;
-    let names = tmux::sessions_of_quest(&ctx.config, &panes, slug);
+    let mut names = tmux::sessions_of_quest(&ctx.config, &panes, &quest.slug);
+    for session in ctx.db()?.list_sessions_by_quest(&quest.id)? {
+        let recorded = &session.tmux_session;
+        if !recorded.is_empty() && !names.iter().any(|n| n == recorded) {
+            names.push(recorded.clone());
+        }
+    }
     let mut killed = 0;
     for name in &names {
         if ctx.tmux().kill_session(name).is_ok() {
