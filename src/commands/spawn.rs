@@ -66,6 +66,16 @@ pub fn spawn_bare(ctx: &Ctx, quest_ref: &str) -> anyhow::Result<Session> {
     Ok(spawn_core(ctx, &quest, None, None, None, None, false)?.session)
 }
 
+/// Spawn a shell-only worker (auto `w<n>` label, no prompt, Claude **not**
+/// launched — the pane is a bare login shell, row `off`). The TUI's `W`
+/// (SPEC §17): a workspace to run commands in, or to `q start` Claude into
+/// later. Like [`spawn_bare`], it reports nothing itself.
+pub fn spawn_bare_shell(ctx: &Ctx, quest_ref: &str) -> anyhow::Result<Session> {
+    sweep_quiet(ctx)?;
+    let quest = ctx.db()?.resolve_quest(quest_ref)?;
+    Ok(spawn_core(ctx, &quest, None, None, None, None, true)?.session)
+}
+
 /// `q spawn-here <pane>` — the `[tmux] spawn_key` binding. Resolves the Quest
 /// from the tmux pane the key was pressed in, spawns a bare worker (its own
 /// session), and attaches to it. A pane that is not one of ours is a no-op.

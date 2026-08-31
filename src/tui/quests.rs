@@ -38,6 +38,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("e", "this Quest's events, in the tail"),
     ("n", "new Quest at once, every default (N: the form)"),
     ("w", "spawn a bare worker and enter it"),
+    ("W", "spawn a shell-only worker (no Claude)"),
     ("E", "edit goal · workflow · beads epic"),
     ("r / c / R", "rename · close · resume (each prompts)"),
     (
@@ -563,6 +564,7 @@ pub fn handle(app: &mut App, input: Input) -> Action {
         // itself via `q set`). The form is one shift away.
         Input::Char('n') => Action::QuickNew,
         Input::Char('w') => spawn_worker_selection(app),
+        Input::Char('W') => spawn_shell_worker_selection(app),
         Input::Char('N') => open_new(app),
         Input::Char('E') => open_edit(app),
         Input::Char('r') => open_rename(app),
@@ -1273,21 +1275,47 @@ fn spawn_worker_selection(app: &mut App) -> Action {
     Action::SpawnWorker
 }
 
+/// `W` on the Quests tab: the shell-only sibling of `w`.
+fn spawn_shell_worker_selection(app: &mut App) -> Action {
+    if selected_quest(app).is_none() {
+        app.say("no quest selected");
+        return Action::None;
+    }
+    Action::SpawnShellWorker
+}
+
 /// `w` on the Quests tab: a bare worker in the selected Quest — an auto `w<n>`
 /// label and no prompt (SPEC §6). A local Quest spawns in-process (quiet: the
 /// TUI owns the screen); a remote row proxies `q spawn` to the owning machine
 /// (bd-8lz.5.8). Either way the TUI stays put — enter the new worker from the
 /// Sessions tab (`s`).
+/// `w` on the Quests tab: a worker with Claude launched.
 pub fn spawn_worker(ctx: &Ctx, app: &mut App) {
+    spawn_worker_inner(ctx, app, false);
+}
+
+/// `W` on the Quests tab: a shell-only worker (`q spawn --shell`) — a bare
+/// login shell, no Claude, row `off` (SPEC §6). `q start` (Sessions tab `S`)
+/// brings Claude up in it later.
+pub fn spawn_shell_worker(ctx: &Ctx, app: &mut App) {
+    spawn_worker_inner(ctx, app, true);
+}
+
+fn spawn_worker_inner(ctx: &Ctx, app: &mut App, shell: bool) {
     let Some(quest) = selected_quest(app) else {
         app.say("no quest selected");
         return;
     };
     if let Some(machine) = selected_remote(app) {
-        spawn_worker_remote(app, &quest.slug, &machine);
+        spawn_worker_remote(app, &quest.slug, &machine, shell);
         return;
     }
-    match spawn::spawn_bare(ctx, &quest.id) {
+    let spawned = if shell {
+        spawn::spawn_bare_shell(ctx, &quest.id)
+    } else {
+        spawn::spawn_bare(ctx, &quest.id)
+    };
+    match spawned {
         Ok(session) => {
             app.quests.focus_on(Anchor::local(&quest));
             // Land on the fresh worker at once, the way a template run lands on
@@ -1307,11 +1335,21 @@ pub fn spawn_worker(ctx: &Ctx, app: &mut App) {
 /// resolves, pins and sends it over ssh. `q spawn` is detached by default now,
 /// so no flag is needed. The far side picks the `w<n>` label, so nothing here
 /// needs the remote's session count.
-fn spawn_worker_remote(app: &mut App, slug: &str, machine: &str) {
-    match super::spawn_q(&["spawn", slug, "--machine", machine]) {
+fn spawn_worker_remote(app: &mut App, slug: &str, machine: &str, shell: bool) {
+    let mut args = vec!["spawn", slug];
+    if shell {
+        args.push("--shell");
+    }
+    args.extend(["--machine", machine]);
+    match super::spawn_q(&args) {
         Ok(out) if out.status.success() => {
+            let kind = if shell {
+                "a shell-only worker"
+            } else {
+                "a worker"
+            };
             app.say(format!(
-                "{slug} \u{b7} spawned a worker on {machine} \u{b7} it appears at the next remote tick"
+                "{slug} \u{b7} spawned {kind} on {machine} \u{b7} it appears at the next remote tick"
             ));
         }
         Ok(out) => app.say(format!(
@@ -1640,15 +1678,55 @@ fn right_facts(row: &QuestRow) -> String {
     if let Some(ctx) = row.view.master_ctx_pct {
         parts.push(format!("master ctx {ctx}%"));
     }
-    let live = row.view.live_sessions;
-    if live > 0 {
-        parts.push(format!("{live} sess"));
+    if let Some(summary) = fleet_summary(row) {
+        parts.push(summary);
     }
     let tail = urgency(row);
     if !tail.is_empty() {
         parts.push(tail);
     }
     parts.join("  ")
+}
+
+/// SPEC §17's per-quest fleet line: how many tmux sessions the Quest has, how
+/// many have Claude in them, and how many are blocked on the human — e.g.
+/// `3 tmux \u{b7} 2 claude \u{b7} 1 waiting`. The `waiting` clause is dropped
+/// when there are none, so a busy fleet carries no `0 waiting`.
+///
+/// A remote row carries no session rows (they live on the owning machine, SPEC
+/// §15) — only the `live_sessions` count and `needs_you` reach here — so its
+/// line is the honest subset: `N tmux`, plus `waiting` when the machine
+/// reported a blocked session.
+fn fleet_summary(row: &QuestRow) -> Option<String> {
+    if row.origin.is_remote() {
+        let tmux = row.view.live_sessions;
+        if tmux == 0 {
+            return None;
+        }
+        let mut out = format!("{tmux} tmux");
+        if row.view.needs_you {
+            out.push_str(" \u{b7} waiting");
+        }
+        return Some(out);
+    }
+    let live = || {
+        row.sessions
+            .iter()
+            .filter(|s| s.status != SessionStatus::Ended)
+    };
+    let tmux = live().count();
+    if tmux == 0 {
+        return None;
+    }
+    let claude = live().filter(|s| s.status != SessionStatus::Off).count();
+    let waiting = live()
+        .filter(|s| s.status == SessionStatus::Waiting)
+        .count();
+    let mut out = format!("{tmux} tmux \u{b7} {claude} claude");
+    if waiting > 0 {
+        out.push_str(&format!(" \u{b7} {waiting} waiting"));
+    }
+    Some(out)
 }
 
 /// SPEC §17's machine column, marked when the row is the cache standing in for
@@ -2258,7 +2336,50 @@ mod tests {
         let at = line_of(&lines, "shipping").unwrap();
         assert!(lines[at].contains("3/7 ▓▓▓░░░░"), "{:?}", lines[at]);
         assert!(lines[at].contains("master ctx 41%"), "{:?}", lines[at]);
-        assert!(lines[at].contains("1 sess"), "{:?}", lines[at]);
+        // One live session with Claude in it, none waiting.
+        assert!(
+            lines[at].contains("1 tmux \u{b7} 1 claude"),
+            "{:?}",
+            lines[at]
+        );
+    }
+
+    /// SPEC §17's per-quest fleet line: tmux (live) sessions, how many hold
+    /// Claude (not `off`), and how many are waiting on the human.
+    #[test]
+    fn the_fleet_summary_counts_tmux_claude_and_waiting() {
+        let q = quest("shipping", QuestState::Active, 5);
+        let master = session(&q.id, SessionRole::Master, SessionStatus::Busy);
+        let w1 = session(&q.id, SessionRole::Worker, SessionStatus::Waiting);
+        let w2 = session(&q.id, SessionRole::Worker, SessionStatus::Off);
+        let ended = session(&q.id, SessionRole::Worker, SessionStatus::Ended);
+        let mut app = app_with(vec![row(q, vec![master, w1, w2, ended])]);
+        let lines = draw(&mut app, 120, 30);
+        let at = line_of(&lines, "shipping").unwrap();
+        // The ended row is not a live tmux session and is not counted.
+        assert!(
+            lines[at].contains("3 tmux \u{b7} 2 claude \u{b7} 1 waiting"),
+            "{:?}",
+            lines[at]
+        );
+    }
+
+    /// With nothing waiting, the `waiting` clause is dropped rather than shown
+    /// as `0 waiting`.
+    #[test]
+    fn the_fleet_summary_drops_a_zero_waiting_clause() {
+        let q = quest("shipping", QuestState::Active, 5);
+        let master = session(&q.id, SessionRole::Master, SessionStatus::Busy);
+        let w1 = session(&q.id, SessionRole::Worker, SessionStatus::Idle);
+        let mut app = app_with(vec![row(q, vec![master, w1])]);
+        let lines = draw(&mut app, 120, 30);
+        let at = line_of(&lines, "shipping").unwrap();
+        assert!(
+            lines[at].contains("2 tmux \u{b7} 2 claude"),
+            "{:?}",
+            lines[at]
+        );
+        assert!(!lines[at].contains("waiting"), "{:?}", lines[at]);
     }
 
     #[test]

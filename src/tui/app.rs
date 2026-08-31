@@ -90,6 +90,16 @@ pub enum Action {
     /// Spawn a bare worker in the selected Quest (`w`) — an auto `w<n>` label,
     /// no prompt. The loop runs `q spawn` and reloads.
     SpawnWorker,
+    /// Spawn a shell-only worker in the selected Quest (`W`) — like
+    /// [`Action::SpawnWorker`] but `--shell`: a bare login shell, no Claude
+    /// (SPEC §6). The loop runs `q spawn --shell` and reloads.
+    SpawnShellWorker,
+    /// Start Claude in the selected `off` session (`S`, SPEC §17): type
+    /// `claude …` into its shell. The loop runs it and reloads.
+    StartSession,
+    /// Stop Claude in the selected session (`X`, SPEC §17): type `/exit`,
+    /// idle-gated. The loop runs it and reloads.
+    StopSession,
     /// Proxy an acting key against the machine the selection lives on (SPEC §15;
     /// bd-8lz.5.8 Quests, bd-8lz.10 Sessions): a read pages a captured `q`, a
     /// write hands over the terminal. The loop reads the selection and tab.

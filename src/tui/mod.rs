@@ -1180,6 +1180,25 @@ fn event_loop(
                     land(ctx, &mut Stdio, terminal, app, poller)?;
                     refresh_due = true;
                 }
+                // `W`: like `w` but a bare shell — no Claude launched. Lands on
+                // the fresh shell the same way, and the reload moves the count.
+                Action::SpawnShellWorker => {
+                    quests::spawn_shell_worker(ctx, app);
+                    land(ctx, &mut Stdio, terminal, app, poller)?;
+                    refresh_due = true;
+                }
+                // `S`/`X` on the Sessions tab (SPEC §17): start Claude in an
+                // `off` session, or stop it (idle-gated). Both type into a pane
+                // in-process — no terminal hand-over — and the reload afterward
+                // moves the row's state.
+                Action::StartSession => {
+                    sessions::start_session(ctx, app);
+                    refresh_due = true;
+                }
+                Action::StopSession => {
+                    sessions::stop_session(ctx, app);
+                    refresh_due = true;
+                }
                 Action::Submit => {
                     submit(ctx, app);
                     // A template run submitted through its argument form
@@ -2484,8 +2503,9 @@ mod tests {
     fn the_help_overlay_covers_the_body_and_lists_the_bindings() {
         let mut app = app();
         app.handle(Input::Char('?'));
-        // Wide enough for the widest row, so the overlay spans the body.
-        let rendered = draw(&mut app, 68, 26).join("\n");
+        // Wide enough for the widest row and tall enough for the whole binding
+        // list, so the overlay spans the body.
+        let rendered = draw(&mut app, 68, 28).join("\n");
         assert!(rendered.contains("Keys"), "{rendered}");
         for (key, desc) in app::help_rows(app.tab) {
             assert!(rendered.contains(key), "missing key {key}: {rendered}");
@@ -2496,7 +2516,7 @@ mod tests {
 
         // Dismissing it brings the body back.
         app.handle(Input::Esc);
-        let rendered = draw(&mut app, 68, 26).join("\n");
+        let rendered = draw(&mut app, 68, 28).join("\n");
         assert!(rendered.contains("n starts one"), "{rendered}");
         assert!(!rendered.contains("Keys"), "{rendered}");
     }
@@ -2739,6 +2759,48 @@ mod tests {
         let landing = app.templates.take_landing().expect("a landing was queued");
         assert_eq!(landing.name, "needs-me/w1");
         assert_eq!(landing.tmux_session, "q-needs-me+w1");
+    }
+
+    /// `W` (SPEC §17) spawns the same worker but shell-only: `q spawn --shell`,
+    /// so no `claude` is typed, the pane stays a shell and the row lands `off`.
+    #[test]
+    fn shift_w_spawns_a_shell_only_worker() {
+        let (ctx, dir) = quest_ctx(
+            "needs-me",
+            crate::model::QuestState::Active,
+            true,
+            &[("q-needs-me", "%1")],
+        );
+        let mut app = loaded(&ctx);
+        assert_eq!(app.handle(Input::Char('W')), Action::SpawnShellWorker);
+
+        quests::spawn_shell_worker(&ctx, &mut app);
+
+        let state = fixture(&dir);
+        let pane = state
+            .panes
+            .iter()
+            .find(|p| p.session_name == "q-needs-me+w1")
+            .expect("no q-needs-me+w1 session");
+        // Shell-only: the pane never had `claude` typed into it and stays a shell.
+        assert!(
+            !pane.buffer.contains("claude"),
+            "claude was launched: {:?}",
+            pane.buffer
+        );
+        assert_eq!(pane.current_command, "zsh");
+
+        // The row is `off` — a live shell with no Claude (SPEC §6).
+        let quest = ctx.db().unwrap().resolve_quest("needs-me").unwrap();
+        let worker = ctx
+            .db()
+            .unwrap()
+            .list_sessions_by_quest(&quest.id)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.label == "w1")
+            .expect("the w1 row");
+        assert_eq!(worker.status, crate::model::SessionStatus::Off);
     }
 
     // ------------------------------------------------------------- attaching

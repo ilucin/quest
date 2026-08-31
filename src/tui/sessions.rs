@@ -22,7 +22,9 @@ use ratatui::widgets::Paragraph;
 use crate::Ctx;
 use crate::commands::new::MASTER;
 use crate::commands::sessions::SessionView;
-use crate::commands::{fmt, kill, reset, send, sessions as listing, target as resolve_target};
+use crate::commands::{
+    fmt, kill, reset, send, sessions as listing, start, stop, target as resolve_target,
+};
 use crate::config::Config;
 use crate::error::QError;
 use crate::model::{SessionRole, SessionStatus};
@@ -34,9 +36,11 @@ use super::layout;
 
 /// The tab's own half of the `?` overlay.
 pub const HELP: &[(&str, &str)] = &[
-    ("Enter / o", "attach to exactly this window"),
+    ("Enter / o", "attach to exactly this window (off rows too)"),
     ("p", "peek at the pane (a pager)"),
     ("t", "send text (a form; idle-gated)"),
+    ("S", "start Claude in an off session"),
+    ("X", "stop Claude (types /exit; idle-gated)"),
     ("k", "kill this worker (prompts) — so j/k do not move here"),
     ("Z", "reset its context window (prompts)"),
     ("a", "show ended sessions"),
@@ -44,14 +48,18 @@ pub const HELP: &[(&str, &str)] = &[
     ("g / G", "first / last row"),
 ];
 
-/// Groups a listing can be split into: waiting, busy, starting, idle, ended.
-const GROUPS: usize = 5;
+/// Groups a listing can be split into: waiting, busy, starting, idle, off,
+/// ended.
+const GROUPS: usize = 6;
 /// Columns a phase line may occupy before it is cut.
 const PHASE_COLS: usize = 28;
 /// The same for a status cell, which carries `waiting: <what for>`.
 const STATUS_COLS: usize = 22;
 /// And for the Quest slug, which is only bounded by SPEC §10's 40.
 const QUEST_COLS: usize = 20;
+/// The tmux-session column (`q-<slug>+<label>`); bounded so a long label does
+/// not push the state and phase off a narrow terminal.
+const TMUX_COLS: usize = 24;
 
 // The form field labels. Constants because the openers write them and
 // [`submit`] reads them back; a typo in either would silently mean "blank".
@@ -323,12 +331,12 @@ pub fn rank(view: &SessionView) -> u8 {
         SessionStatus::Waiting => 0,
         SessionStatus::Busy => 1,
         SessionStatus::Starting => 2,
-        // `off` (a live shell, no Claude) rides in the idle group for now — a
-        // between-turns row and a no-Claude row are both "nothing running".
-        // M5 gives `off` its own glyph and group; M1a only needs it to sort and
-        // render without disturbing the existing Sessions-tab layout.
-        SessionStatus::Idle | SessionStatus::Off => 3,
-        SessionStatus::Ended => 4,
+        SessionStatus::Idle => 3,
+        // `off` (a live shell, no Claude) gets its own group and glyph now
+        // (M5). It sits below `idle` — a between-turns row still has Claude in
+        // it, an `off` row has only a shell — and above `ended`.
+        SessionStatus::Off => 4,
+        SessionStatus::Ended => 5,
     }
 }
 
@@ -338,6 +346,7 @@ fn group_title(rank: u8) -> &'static str {
         1 => "busy",
         2 => "starting",
         3 => "idle",
+        4 => "off",
         _ => "ended",
     }
 }
@@ -409,6 +418,8 @@ pub fn handle(app: &mut App, input: Input) -> Action {
         Input::Enter | Input::Char('o') => act_on_selection(app, Action::Attach),
         Input::Char('p') => act_on_selection(app, Action::Peek),
         Input::Char('t') => open_send(app),
+        Input::Char('S') => start_selection(app),
+        Input::Char('X') => stop_selection(app),
         Input::Char('k') => open_kill(app),
         Input::Char('Z') => open_reset(app),
         Input::Char('a') => {
@@ -443,6 +454,8 @@ pub fn handle(app: &mut App, input: Input) -> Action {
 pub fn proxied(key: char) -> Option<(&'static str, bool)> {
     Some(match key {
         'p' => ("peek", true),
+        'S' => ("start", false),
+        'X' => ("stop", false),
         'k' => ("kill", false),
         'Z' => ("reset", false),
         _ => return None,
@@ -589,6 +602,64 @@ fn open_send(app: &mut App) -> Action {
             .action("send"),
     );
     Action::None
+}
+
+/// `S` — SPEC §17. Bring Claude up in an `off` session's shell. Refused up
+/// front on a row that is not `off` (Claude is already up or coming up), on an
+/// ended row and on a row with no pane: the status bar says why, and no work
+/// leaves through an `Action`. The launch itself runs in the loop, since it
+/// types into a pane.
+fn start_selection(app: &mut App) -> Action {
+    let Some(view) = app.sessions.selected_row() else {
+        return Action::None;
+    };
+    let name = name_of(view);
+    if view.session.status == SessionStatus::Ended {
+        app.say(format!("{name} has ended; there is nothing to start"));
+        return Action::None;
+    }
+    if no_pane(view) {
+        app.say(format!(
+            "{name} has no pane yet; it never finished starting"
+        ));
+        return Action::None;
+    }
+    if view.session.status != SessionStatus::Off {
+        app.say(format!(
+            "{name} is {} (Claude is already up or starting); nothing to start",
+            view.session.status
+        ));
+        return Action::None;
+    }
+    Action::StartSession
+}
+
+/// `X` — SPEC §17. Type `/exit` into a live session, idle-gated. An `off` row
+/// has no Claude to stop and an ended row none either, so both are refused
+/// here; the idle gate (refuse while busy) runs in the loop, where the pane is
+/// typed into, and its refusal lands on the status bar.
+fn stop_selection(app: &mut App) -> Action {
+    let Some(view) = app.sessions.selected_row() else {
+        return Action::None;
+    };
+    let name = name_of(view);
+    if view.session.status == SessionStatus::Ended {
+        app.say(format!("{name} has ended; there is nothing to stop"));
+        return Action::None;
+    }
+    if view.session.status == SessionStatus::Off {
+        app.say(format!(
+            "{name} is off (no Claude running); nothing to stop"
+        ));
+        return Action::None;
+    }
+    if no_pane(view) {
+        app.say(format!(
+            "{name} has no pane yet; it never finished starting"
+        ));
+        return Action::None;
+    }
+    Action::StopSession
 }
 
 /// `k` — SPEC §17. The master is refused up front rather than at submit: the
@@ -837,6 +908,59 @@ fn reset_session(ctx: &Ctx, app: &mut App, target: &SessionTarget) -> anyhow::Re
     Ok(())
 }
 
+/// `S` (SPEC §17): bring Claude up in the selected `off` session. Called by the
+/// event loop, never `handle`: it types `claude …` into the pane. Re-resolves
+/// the row and re-checks it is still `off`, then launches through the same
+/// `start::launch` `q start` uses; a refusal or a vanished row lands on the
+/// status bar rather than raising.
+pub fn start_session(ctx: &Ctx, app: &mut App) {
+    let Some(selection) = selected(app) else {
+        return;
+    };
+    let _ = crate::commands::sweep_quiet(ctx);
+    let outcome = (|| -> anyhow::Result<start::Started> {
+        let found = resolve_target::resolve(ctx, &selection.session)?;
+        found.require_live()?;
+        if found.session.status != SessionStatus::Off {
+            return Err(QError::Conflict(format!(
+                "{} is {} (Claude is already up or starting)",
+                found.name(),
+                found.session.status
+            ))
+            .into());
+        }
+        let started = start::launch(ctx, &found.quest, &found.session, None, false, false)?;
+        ctx.db()?.append_event(
+            &found.quest.id,
+            Some(&started.session.id),
+            "session.start_requested",
+            &serde_json::json!({ "resume": false, "forced": false }),
+        )?;
+        Ok(started)
+    })();
+    match outcome {
+        Ok(started) => app.say(started.describe()),
+        Err(e) => app.say(format!("cannot start {}: {e:#}", selection.name)),
+    }
+}
+
+/// `X` (SPEC §17): type `/exit` into the selected session, through the same
+/// idle-gated `stop::apply` `q stop` uses. The gate's refusal (a busy or
+/// waiting session) surfaces here on the status bar; nothing is typed when it
+/// refuses.
+pub fn stop_session(ctx: &Ctx, app: &mut App) {
+    let Some(selection) = selected(app) else {
+        return;
+    };
+    let _ = crate::commands::sweep_quiet(ctx);
+    let outcome = resolve_target::resolve(ctx, &selection.session)
+        .and_then(|found| stop::apply(ctx, &found, false));
+    match outcome {
+        Ok(stopped) => app.say(stopped.describe()),
+        Err(e) => app.say(format!("cannot stop {}: {e:#}", selection.name)),
+    }
+}
+
 // -------------------------------------------------------------------- render
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -934,12 +1058,27 @@ fn inset(area: Rect) -> Rect {
     }
 }
 
-/// SPEC §17's columns: quest / label / role / status / phase / ctx bar / age.
+/// The glyph SPEC §17 gives each session state — a shape a glance can read
+/// before the word beside it (`● busy`, `○ off`). Idle and `idle · your turn`
+/// share `◑` (the word carries the turn); every `waiting: <what>` shares `◆`.
+fn state_glyph(status: SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Waiting => "\u{25c6}",  // ◆
+        SessionStatus::Busy => "\u{25cf}",     // ●
+        SessionStatus::Starting => "\u{25d0}", // ◐
+        SessionStatus::Idle => "\u{25d1}",     // ◑
+        SessionStatus::Off => "\u{25cb}",      // ○
+        SessionStatus::Ended => "\u{00d7}",    // ×
+    }
+}
+
+/// SPEC §17's columns: quest / label / tmux session / state / phase / ctx bar /
+/// age. `state` is the glyph plus the same text `q sessions` prints.
 struct Cells {
     quest: String,
     label: String,
-    role: String,
-    status: String,
+    tmux: String,
+    state: String,
     phase: String,
     ctx: String,
     age: String,
@@ -950,11 +1089,16 @@ struct Cells {
 
 fn cells_of(view: &SessionView, warn_pct: u8, remote: Option<&str>) -> Cells {
     let s = &view.session;
+    let state = format!(
+        "{} {}",
+        state_glyph(s.status),
+        fmt::truncate(&listing::status_cell(s, view.your_turn), STATUS_COLS),
+    );
     Cells {
         quest: fmt::truncate(&view.quest_slug, QUEST_COLS),
         label: s.label.clone(),
-        role: s.role.to_string(),
-        status: fmt::truncate(&listing::status_cell(s, view.your_turn), STATUS_COLS),
+        tmux: fmt::truncate(&s.tmux_session, TMUX_COLS),
+        state,
         phase: fmt::truncate(
             &fmt::or_dash(s.phase.as_deref().filter(|p| !p.trim().is_empty())),
             PHASE_COLS,
@@ -987,8 +1131,8 @@ fn widths_of(cells: &[Cells], across: bool) -> [usize; 6] {
         let each = [
             if across { layout::width(&c.quest) } else { 0 },
             layout::width(&c.label),
-            layout::width(&c.role),
-            layout::width(&c.status),
+            layout::width(&c.tmux),
+            layout::width(&c.state),
             layout::width(&c.phase),
             layout::width(&c.ctx),
         ];
@@ -1007,8 +1151,8 @@ fn row_line<'a>(c: &Cells, w: &[usize; 6], across: bool, selected: bool, width: 
     }
     for (text, want) in [
         (&c.label, w[1]),
-        (&c.role, w[2]),
-        (&c.status, w[3]),
+        (&c.tmux, w[2]),
+        (&c.state, w[3]),
         (&c.phase, w[4]),
         (&c.ctx, w[5]),
     ] {
@@ -1121,7 +1265,13 @@ mod tests {
         /// A session row plus the tmux pane that keeps the sweep from ending
         /// it. `pane` is explicit so a test can leave a row with no pane.
         fn session(&self, quest: &Quest, pane: &str, spec: Spec) -> Session {
-            let tmux_session = format!("q-{}", quest.slug);
+            // The v2 topology: the master owns `q-<slug>`, each worker its own
+            // `q-<slug>+<label>` session (SPEC §6).
+            let tmux_session = if spec.role == SessionRole::Master {
+                format!("q-{}", quest.slug)
+            } else {
+                format!("q-{}+{}", quest.slug, spec.label)
+            };
             let mut row = Session::new(
                 quest.id.as_str(),
                 spec.role,
@@ -1309,19 +1459,33 @@ mod tests {
         assert!(lines[idle - 1].trim() == "idle", "{text}");
     }
 
-    /// SPEC §17's columns, and the reason a session is waiting alongside them.
+    /// SPEC §17's columns — quest / label / tmux session / state / phase / ctx
+    /// / age — and the reason a session is waiting alongside them.
     #[test]
-    fn a_row_carries_quest_label_role_status_phase_ctx_and_age() {
+    fn a_row_carries_quest_label_tmux_state_phase_ctx_and_age() {
         let (_rig, mut app) = fleet();
         let lines = draw(&mut app, 120, 30);
-        let master = &lines[line_of(&lines, "master").unwrap()];
-        for cell in ["alpha", "master", "wiring the loader", "41%"] {
+        let master = &lines[line_of(&lines, "wiring the loader").unwrap()];
+        // quest, label, the master's own tmux session, the busy glyph+text,
+        // the phase, and the ctx reading.
+        for cell in [
+            "alpha",
+            "master",
+            "q-alpha",
+            "\u{25cf} busy",
+            "wiring the loader",
+            "41%",
+        ] {
             assert!(master.contains(cell), "{cell} missing from {master:?}");
         }
         assert!(master.contains(&fmt::ctx_bar(41)), "{master:?}");
         let waiting = &lines[line_of(&lines, "tests").unwrap()];
-        assert!(waiting.contains("waiting: permission"), "{waiting:?}");
-        assert!(waiting.contains("worker"), "{waiting:?}");
+        // A worker's own tmux session, the waiting glyph and its reason.
+        assert!(waiting.contains("q-alpha+tests"), "{waiting:?}");
+        assert!(
+            waiting.contains("\u{25c6} waiting: permission"),
+            "{waiting:?}"
+        );
     }
 
     /// SPEC §8's `[context] worker_warn_pct`, which is only about workers: the
@@ -1530,24 +1694,25 @@ mod tests {
     #[test]
     fn no_row_ever_renders_under_another_group_s_header() {
         const SHAPES: [[usize; GROUPS]; 9] = [
-            [1, 1, 1, 9, 0],
-            [1, 1, 1, 1, 1],
-            [3, 0, 0, 3, 0],
-            [0, 1, 0, 1, 0],
-            [2, 2, 2, 2, 2],
-            [1, 0, 1, 0, 1],
-            [0, 0, 0, 5, 0],
-            [4, 1, 0, 0, 1],
-            [1, 2, 3, 4, 1],
+            [1, 1, 1, 9, 1, 0],
+            [1, 1, 1, 1, 1, 1],
+            [3, 0, 0, 3, 2, 0],
+            [0, 1, 0, 1, 0, 0],
+            [2, 2, 2, 2, 2, 2],
+            [1, 0, 1, 0, 1, 1],
+            [0, 0, 0, 5, 3, 0],
+            [4, 1, 0, 0, 0, 1],
+            [1, 2, 3, 4, 2, 1],
         ];
         const STATUSES: [SessionStatus; GROUPS] = [
             SessionStatus::Waiting,
             SessionStatus::Busy,
             SessionStatus::Starting,
             SessionStatus::Idle,
+            SessionStatus::Off,
             SessionStatus::Ended,
         ];
-        const HEADERS: [&str; GROUPS] = ["waiting", "busy", "starting", "idle", "ended"];
+        const HEADERS: [&str; GROUPS] = ["waiting", "busy", "starting", "idle", "off", "ended"];
 
         // The label carries its own group, so a row can be checked against the
         // heading it actually ended up under.
@@ -1672,7 +1837,10 @@ mod tests {
         // The Quest column goes away with the filter — one Quest, one answer —
         // and the chip in the status bar is what says which Quest it is.
         let row = &lines[line_of(&lines, "theirs").unwrap()];
-        assert!(!row.contains("beta"), "{row:?}");
+        // The standalone Quest-slug column is gone with the filter; the slug
+        // now shows only inside this row's own tmux name (`q-beta+theirs`),
+        // and the chip in the status bar is what names the Quest.
+        assert!(row.contains("q-beta+theirs"), "{row:?}");
         assert!(
             lines.last().unwrap().contains("[quest beta]"),
             "{:?}",
@@ -2385,11 +2553,14 @@ mod tests {
         app.sessions.resync();
         assert_eq!(sessions_label(&app), "build");
 
-        // The four keyboard-free keys proxy straight to the loop.
+        // The keyboard-free acting keys proxy straight to the loop — `S`/`X`
+        // (start/stop, SPEC §17) among them (bd-v1d.7).
         for (key, want) in [
             (Input::Enter, 'o'),
             (Input::Char('o'), 'o'),
             (Input::Char('p'), 'p'),
+            (Input::Char('S'), 'S'),
+            (Input::Char('X'), 'X'),
             (Input::Char('k'), 'k'),
             (Input::Char('Z'), 'Z'),
         ] {
@@ -2471,5 +2642,184 @@ mod tests {
         );
         refresh(&rig.ctx, &mut app).unwrap();
         assert_eq!(app.sessions.rows.len(), before);
+    }
+
+    // ----------------------------------------------------- M5: fleet states
+
+    /// SPEC §17: each session state reads as its own glyph, so a glance sorts
+    /// the fleet before the words do.
+    #[test]
+    fn each_session_state_carries_its_own_glyph() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        // Labels that share no substring with a group header, so `line_of`
+        // lands on the row and not on the header above it.
+        let cases = [
+            ("zwait", SessionStatus::Waiting, "\u{25c6}"),
+            ("zbusy", SessionStatus::Busy, "\u{25cf}"),
+            ("zboot", SessionStatus::Starting, "\u{25d0}"),
+            ("zidle", SessionStatus::Idle, "\u{25d1}"),
+            ("zshell", SessionStatus::Off, "\u{25cb}"),
+            ("zgone", SessionStatus::Ended, "\u{00d7}"),
+        ];
+        for (n, (label, status, _)) in cases.iter().enumerate() {
+            let mut s = spec(label, *status);
+            if *status == SessionStatus::Waiting {
+                s.waiting_for = Some("permission");
+            }
+            rig.session(&quest, &format!("%{}", n + 1), s);
+        }
+        let mut app = rig.app();
+        app.sessions.show_ended = true;
+        refresh(&rig.ctx, &mut app).unwrap();
+        let lines = draw(&mut app, 120, 40);
+        for (label, _status, glyph) in cases {
+            let row = &lines[line_of(&lines, label).unwrap()];
+            assert!(row.contains(glyph), "{label}: {glyph} missing from {row:?}");
+        }
+    }
+
+    /// `off` is its own group now (M5), below `idle` — a between-turns row still
+    /// has Claude, an `off` row only a shell.
+    #[test]
+    fn off_sits_in_its_own_group_below_idle() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        rig.session(&quest, "%1", spec("idler", SessionStatus::Idle));
+        rig.session(&quest, "%2", spec("sheller", SessionStatus::Off));
+        let mut app = rig.app();
+        let lines = draw(&mut app, 120, 30);
+        let idle = line_of(&lines, "idler").unwrap();
+        let off_header = lines.iter().position(|l| l.trim() == "off").unwrap();
+        let off_row = line_of(&lines, "sheller").unwrap();
+        assert!(idle < off_header, "idle should lead off\n{lines:?}");
+        assert!(off_header < off_row, "the off header sits above its row");
+    }
+
+    /// `S` on an `off` row types `claude …` into that session's own pane
+    /// (SPEC §17), so Claude comes up where the shell was.
+    #[test]
+    fn s_starts_claude_in_an_off_session() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        rig.session(&quest, "%1", spec("shellonly", SessionStatus::Off));
+        let mut app = rig.app();
+        assert_eq!(sessions_label(&app), "shellonly");
+        assert_eq!(handle(&mut app, Input::Char('S')), Action::StartSession);
+        start_session(&rig.ctx, &mut app);
+        let state = rig.fixture().load().unwrap();
+        let pane = state
+            .panes
+            .iter()
+            .find(|p| p.session_name == "q-alpha+shellonly")
+            .expect("the worker's own session");
+        assert!(
+            pane.buffer.contains("claude -n alpha/shellonly"),
+            "{:?}",
+            pane.buffer
+        );
+        assert_eq!(
+            pane.current_command, "2.1.0",
+            "claude did not take the pane"
+        );
+        assert!(app.status.contains("started"), "{}", app.status);
+    }
+
+    /// `S` on a row that already has Claude is refused on the status bar, no
+    /// action leaving `handle` (SPEC §17).
+    #[test]
+    fn s_refuses_a_row_that_is_not_off() {
+        let (_rig, mut app) = fleet();
+        let at = app
+            .sessions
+            .visible()
+            .iter()
+            .position(|i| app.sessions.rows[*i].session.label == "master")
+            .unwrap();
+        app.sessions.move_to(at, 20);
+        assert_eq!(handle(&mut app, Input::Char('S')), Action::None);
+        assert!(app.status.contains("nothing to start"), "{}", app.status);
+    }
+
+    /// `X` on a busy session is refused by the idle gate — the same gate
+    /// `q stop` takes — and nothing is typed into the pane (SPEC §17).
+    #[test]
+    fn x_refuses_a_busy_session() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        let session = rig.session(&quest, "%1", spec("tests", SessionStatus::Busy));
+        rig.say_registry(&session, &quest, "busy");
+        let mut app = rig.app();
+        assert_eq!(sessions_label(&app), "tests");
+        assert_eq!(handle(&mut app, Input::Char('X')), Action::StopSession);
+        stop_session(&rig.ctx, &mut app);
+        assert!(app.status.contains("not idle"), "{}", app.status);
+        let state = rig.fixture().load().unwrap();
+        let pane = state
+            .panes
+            .iter()
+            .find(|p| p.session_name == "q-alpha+tests")
+            .unwrap();
+        assert!(
+            !pane.buffer.contains("/exit"),
+            "typed anyway: {:?}",
+            pane.buffer
+        );
+    }
+
+    /// `X` on an `off` row is refused up front — there is no Claude to stop.
+    #[test]
+    fn x_refuses_an_off_row() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        rig.session(&quest, "%1", spec("shellonly", SessionStatus::Off));
+        let mut app = rig.app();
+        assert_eq!(handle(&mut app, Input::Char('X')), Action::None);
+        assert!(app.status.contains("nothing to stop"), "{}", app.status);
+    }
+
+    /// `⏎` attaches to exactly the selected row's own tmux session — a worker's
+    /// `q-<slug>+<label>`, not the quest's master session (SPEC §17).
+    #[test]
+    fn enter_targets_the_rows_own_worker_session() {
+        let (rig, mut app) = fleet();
+        let at = app
+            .sessions
+            .visible()
+            .iter()
+            .position(|i| app.sessions.rows[*i].session.label == "tests")
+            .unwrap();
+        app.sessions.move_to(at, 20);
+        let sel = selected(&app).expect("a selection");
+        assert_eq!(sel.name, "alpha/tests");
+        // The same resolve the loop's attach makes.
+        let quest = rig
+            .ctx
+            .db()
+            .unwrap()
+            .get_quest(&sel.quest)
+            .unwrap()
+            .unwrap();
+        let target = crate::commands::enter::resolve(&rig.ctx, &quest, Some("tests")).unwrap();
+        assert_eq!(target.tmux_session, "q-alpha+tests");
+    }
+
+    /// `⏎` enters an `off` row too — it is a live shell (SPEC §6), so its own
+    /// tmux session resolves like any other.
+    #[test]
+    fn enter_resolves_an_off_row() {
+        let rig = Rig::new();
+        let quest = rig.quest("alpha");
+        rig.session(&quest, "%1", spec("shellonly", SessionStatus::Off));
+        let target = crate::commands::enter::resolve(&rig.ctx, &quest, Some("shellonly")).unwrap();
+        assert_eq!(target.tmux_session, "q-alpha+shellonly");
+    }
+
+    /// The `q` subcommand each proxied acting key stands for — `S`/`X` join the
+    /// table so a remote row's start/stop reach the owning machine (bd-v1d.7).
+    #[test]
+    fn start_and_stop_are_proxied_subcommands() {
+        assert_eq!(proxied('S'), Some(("start", false)));
+        assert_eq!(proxied('X'), Some(("stop", false)));
     }
 }
