@@ -667,6 +667,9 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
         Command::Set { quest, key, value } => {
             commands::set::run(ctx, quest, *key, value).map(|()| 0)
         }
+        Command::Cd { quest, path } => {
+            commands::set::run(ctx, quest, cli::SetKey::Cwd, path).map(|()| 0)
+        }
         Command::Brief {
             quest,
             r#for,

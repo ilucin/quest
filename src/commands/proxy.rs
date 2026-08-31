@@ -268,6 +268,9 @@ pub fn route(command: &Command) -> Option<(Aim<'_>, Passage)> {
         Command::Rename { quest, .. } => (Aim::Quest(quest), Proxy),
         Command::Name { quest, .. } => (Aim::Quest(quest), Proxy),
         Command::Set { quest, .. } => (Aim::Quest(quest), Proxy),
+        // `q cd` is the same write as `q set <quest> cwd`, so it travels the
+        // same way (SPEC §6 v2).
+        Command::Cd { quest, .. } => (Aim::Quest(quest), Proxy),
         // The one `q workflow` subcommand that names a Quest rather than a
         // file. It is the same write as `q set <quest> workflow`, so it
         // travels the same way — and the far end validates the name against

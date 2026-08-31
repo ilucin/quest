@@ -1761,6 +1761,7 @@ fn render_panel(frame: &mut Frame, area: Rect, app: &App) {
         row,
         app.quests.selected_links(),
         app.quests.selected_events(),
+        app.follow_main_cwd,
     );
     let width = inner.width as usize;
     let shown: Vec<Line> = lines
@@ -1779,7 +1780,12 @@ fn clip(line: Line<'_>, width: usize) -> Line<'static> {
 
 /// SPEC §17: goal, sessions with status/phase/ctx, links, the last 10 events,
 /// the beads breakdown.
-fn panel_lines<'a>(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<Line<'a>> {
+fn panel_lines<'a>(
+    row: &QuestRow,
+    links: &[Link],
+    events: &[Event],
+    follow_main_cwd: bool,
+) -> Vec<Line<'a>> {
     let view = &row.view;
     let mut out: Vec<Line> = Vec::new();
     let head = |out: &mut Vec<Line>, title: &str| {
@@ -1800,11 +1806,20 @@ fn panel_lines<'a>(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<Line
             .map(|g| fmt::oneline(g, 200))
             .unwrap_or_else(|| "no goal".to_string()),
     )));
+    // The cwd only tracks the main shell when `[quest] follow_main_cwd` is on;
+    // otherwise it is whatever `q new`/`q set cwd` last wrote, so the "(from
+    // main shell)" hint would be a lie — drop it.
+    let cwd_source = if follow_main_cwd {
+        " (from main shell)"
+    } else {
+        ""
+    };
     out.push(Line::from(
         Span::raw(format!(
-            "{} · {} · {} ago",
+            "{} · {}{} · {} ago",
             machine_cell(row),
             fmt::tilde(&view.quest.cwd),
+            cwd_source,
             fmt::age(view.quest.updated_at)
         ))
         .dim(),
@@ -3221,7 +3236,16 @@ mod tests {
     }
 
     fn panel_text(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<String> {
-        panel_lines(row, links, events)
+        panel_text_cwd(row, links, events, true)
+    }
+
+    fn panel_text_cwd(
+        row: &QuestRow,
+        links: &[Link],
+        events: &[Event],
+        follow_main_cwd: bool,
+    ) -> Vec<String> {
+        panel_lines(row, links, events, follow_main_cwd)
             .iter()
             .map(|l| {
                 l.spans
@@ -3275,6 +3299,23 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains("not fetched")),
             "{lines:#?}"
+        );
+    }
+
+    /// The cwd line labels its source "(from main shell)" only when the follow
+    /// is enabled; with it off the cwd is a plain field and the hint would lie.
+    #[test]
+    fn the_cwd_hint_names_the_main_shell_only_when_follow_is_on() {
+        let here = row(quest("here", QuestState::Active, 9), Vec::new());
+        let on = panel_text_cwd(&here, &[], &[], true);
+        assert!(
+            on.iter().any(|l| l.contains("(from main shell)")),
+            "{on:#?}"
+        );
+        let off = panel_text_cwd(&here, &[], &[], false);
+        assert!(
+            !off.iter().any(|l| l.contains("from main shell")),
+            "{off:#?}"
         );
     }
 }

@@ -25,6 +25,7 @@ pub struct Config {
     pub ui: Ui,
     pub brain: Brain,
     pub beads: Beads,
+    pub quest: Quest,
     /// Array-of-tables; declared last so plain values never fall into it.
     /// toml hoists `remotes = []` above the preceding tables on its own, so
     /// the round-trip stays valid without skipping serialization.
@@ -110,6 +111,15 @@ pub struct Beads {
     pub default_repo_label: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Quest {
+    /// Whether the Quest cwd follows its main session's *shell* cwd,
+    /// edge-triggered on `pane_current_path` changing (SPEC §6 v2, decision 4).
+    /// Off leaves the cwd exactly where `q new`/`q set cwd` put it.
+    pub follow_main_cwd: bool,
+}
+
 impl Default for Machine {
     fn default() -> Self {
         Machine {
@@ -184,6 +194,14 @@ impl Default for Beads {
     fn default() -> Self {
         Beads {
             default_repo_label: "global".to_string(),
+        }
+    }
+}
+
+impl Default for Quest {
+    fn default() -> Self {
+        Quest {
+            follow_main_cwd: true,
         }
     }
 }
@@ -648,6 +666,7 @@ mod tests {
         assert!(c.ui.return_after_detach);
         assert!(c.brain.sync_links);
         assert_eq!(c.beads.default_repo_label, "global");
+        assert!(c.quest.follow_main_cwd);
         assert!(c.remotes.is_empty());
         c.validate().unwrap();
     }

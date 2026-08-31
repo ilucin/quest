@@ -8,7 +8,7 @@ use crate::commands::new::resolve_dir;
 use crate::commands::sweep_quiet;
 use crate::db::quest::QuestPatch;
 use crate::error::QError;
-use crate::model::Quest;
+use crate::model::{Quest, SessionRole, SessionStatus};
 use crate::output;
 
 /// Spellings that clear `ctx_reset_pct` back to the configured default.
@@ -132,6 +132,12 @@ pub fn apply(ctx: &Ctx, quest: &Quest, key: SetKey, value: &str) -> anyhow::Resu
         }
         _ => false,
     };
+    // An explicit cwd reseeds the main session's `last_pane_path`, so a shell
+    // edge already pending (a `cd` the sweep has not yet consumed) cannot later
+    // revert this value on the next sweep (SPEC §6, plan-review-2 #1).
+    if key == SetKey::Cwd {
+        reseed_main_pane_path(ctx, &quest);
+    }
     let key = key_name(key);
     db.append_event(
         &quest.id,
@@ -232,6 +238,42 @@ fn relabel_epic(ctx: &Ctx, quest: &Quest, old: Option<&str>, new: &str) -> bool 
             false
         }
     }
+}
+
+/// Reseed the main session's `last_pane_path` to whatever its pane reports now,
+/// so the next sweep sees no edge against the cwd we just set (SPEC §6). Best
+/// effort: a tmux we cannot read, or a Quest with no live main pane, just leaves
+/// the baseline — the next real edge is judged against it.
+fn reseed_main_pane_path(ctx: &Ctx, quest: &Quest) {
+    let Ok(db) = ctx.db() else { return };
+    let Ok(sessions) = db.list_sessions_by_quest(&quest.id) else {
+        return;
+    };
+    let Some(main) = sessions
+        .iter()
+        .filter(|s| {
+            s.role == SessionRole::Master
+                && s.status != SessionStatus::Ended
+                && !s.tmux_pane.is_empty()
+        })
+        .max_by_key(|s| s.started_at)
+    else {
+        return;
+    };
+    let Ok(panes) = ctx.tmux().list_panes() else {
+        return;
+    };
+    let Some(pane) = panes
+        .iter()
+        .find(|p| p.session_name == main.tmux_session && p.pane_id == main.tmux_pane)
+    else {
+        return;
+    };
+    if pane.current_path.is_empty() {
+        return;
+    }
+    let canonical = crate::tmux::canonical_path(&pane.current_path);
+    let _ = db.update_session_last_pane_path(&main.id, &canonical);
 }
 
 /// An empty value clears the column rather than storing `""`.
