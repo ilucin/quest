@@ -29,6 +29,9 @@ pub enum Kind {
     Waiting,
     Reset,
     Ended,
+    /// A session went `off` — Claude left an otherwise-live pane (SPEC §6, §20).
+    /// Not in the default `[notify] on`, so it is silent unless opted into.
+    Off,
 }
 
 impl Kind {
@@ -37,6 +40,7 @@ impl Kind {
             Kind::Waiting => "waiting",
             Kind::Reset => "reset",
             Kind::Ended => "ended",
+            Kind::Off => "off",
         }
     }
 }
@@ -359,6 +363,21 @@ mod tests {
         notify_if_entering(SessionStatus::Busy); // enters -> fires
         notify_if_entering(SessionStatus::Waiting); // already there -> skipped
         assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[test]
+    fn off_is_a_channel_that_defaults_silent() {
+        // The tag matches the config token.
+        assert_eq!(Kind::Off.tag(), "off");
+        // Not in the shipped default `on`, so a default config stays quiet.
+        let default = Notify::default();
+        assert!(!default.on.iter().any(|k| k == "off"));
+        assert!(!plan(&default, Kind::Off).fires());
+        // Opting in fires the configured channels.
+        let c = cfg(true, "mytopic", &["off"]);
+        let ch = plan(&c, Kind::Off);
+        assert!(ch.macos);
+        assert_eq!(ch.ntfy_topic.as_deref(), Some("mytopic"));
     }
 
     #[test]

@@ -726,18 +726,17 @@ fn section_sessions(out: &mut String, sessions: &[Session]) {
         out.push_str("No sessions yet.\n\n");
         return;
     }
-    out.push_str("| label | role | status | phase | ctx | last prompt |\n");
-    out.push_str("|---|---|---|---|---|---|\n");
+    // A tmux column so the master can `q enter`/`q peek` the right session;
+    // R5's manual test found it missing. `state` is the honest §6 vocabulary.
+    out.push_str("| label | role | tmux | state | phase | ctx | last prompt |\n");
+    out.push_str("|---|---|---|---|---|---|---|\n");
     for s in live.iter().chain(ended.iter()) {
-        let status = match s.waiting_for.as_deref() {
-            Some(w) if s.status == SessionStatus::Waiting => format!("waiting ({w})"),
-            _ => s.status.to_string(),
-        };
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
             cell(&s.label),
             s.role,
-            status,
+            cell(&s.tmux_session),
+            cell(&session_state(s)),
             cell(&fmt::or_dash(s.phase.as_deref())),
             s.ctx_pct.map_or("-".to_string(), |p| format!("{p}%")),
             cell(&fmt::oneline(
@@ -747,6 +746,19 @@ fn section_sessions(out: &mut String, sessions: &[Session]) {
         ));
     }
     out.push('\n');
+}
+
+/// The §5 state vocabulary (SPEC §6): `running` while Claude works or boots,
+/// `idle`, `waiting: <what>` when honestly blocked on the human, `off` when the
+/// pane is a bare shell — plus `ended` for the wound-down rows.
+fn session_state(s: &Session) -> String {
+    match s.status {
+        SessionStatus::Waiting => {
+            format!("waiting: {}", s.waiting_for.as_deref().unwrap_or("input"))
+        }
+        SessionStatus::Busy | SessionStatus::Starting => "running".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn cell(text: &str) -> String {
@@ -1110,8 +1122,8 @@ mod tests {
         );
         assert!(md.contains("`/tmp/out/report.html` — the report"));
         assert!(md.contains("brain body"));
-        assert!(md.contains("| w1-tests | worker | waiting (permission) | testing | 42% | run the suite and report |"));
-        assert!(md.contains("| w0-old | worker | ended |"));
+        assert!(md.contains("| w1-tests | worker | q-alpha | waiting: permission | testing | 42% | run the suite and report |"), "{md}");
+        assert!(md.contains("| w0-old | worker | q-alpha | ended |"), "{md}");
         assert!(!md.contains("noise"), "prompt events are noise:\n{md}");
         assert!(md.contains("- BLOCKER"));
         assert!(md.contains("DB is locked"));

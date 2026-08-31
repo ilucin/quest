@@ -1428,7 +1428,9 @@ fn doctor_json_reports_every_check() {
             "hook Notification",
             "hook PreCompact",
             "hook SessionEnd",
-            "hook PostToolUse",
+            "hook PostToolUse[Bash|Write]",
+            "hook PreToolUse[AskUserQuestion]",
+            "hook PostToolUse[AskUserQuestion]",
             "hook statusLine",
             "skill",
             "statusline chain",
@@ -2527,7 +2529,7 @@ fn doctor_fails_when_the_hooks_are_not_installed() {
     assert_eq!(parsed["ok"], false);
 
     let hooks = hook_checks(&parsed);
-    assert_eq!(hooks.len(), 8, "{parsed}");
+    assert_eq!(hooks.len(), 10, "{parsed}");
     for (name, status) in &hooks {
         assert_eq!(*status, "fail", "hook {name} in {parsed}");
     }
@@ -4814,6 +4816,99 @@ fn post_tool_use(cmd: &mut Command, payload: &str) {
         .assert()
         .success()
         .stdout("");
+}
+
+// ---------------------------------------- honest waiting: AskUserQuestion (M2)
+
+/// A Claude Code `Pre`/`PostToolUse` payload for an `AskUserQuestion` call.
+fn ask_payload(event: &str) -> String {
+    serde_json::json!({
+        "session_id": "claude-1",
+        "hook_event_name": event,
+        "tool_name": "AskUserQuestion",
+        "tool_input": { "questions": [{ "question": "which?" }] },
+    })
+    .to_string()
+}
+
+/// `(status, waiting_for)` of the pane's session, straight from the row.
+fn session_state(pane: &Pane) -> (String, Option<String>) {
+    pane.env
+        .conn()
+        .query_row(
+            "SELECT status, waiting_for FROM session WHERE id = ?1",
+            [&pane.session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+fn run_hook(pane: &Pane, sub: &str, payload: &str) {
+    pane.cmd()
+        .args(["hook", sub])
+        .write_stdin(payload.to_string())
+        .assert()
+        .success();
+}
+
+#[test]
+fn pre_tool_use_marks_the_session_waiting_for_a_question() {
+    let pane = Pane::new();
+    run_hook(&pane, "pre-tool-use", &ask_payload("PreToolUse"));
+
+    let (status, waiting_for) = session_state(&pane);
+    assert_eq!(status, "waiting");
+    assert_eq!(waiting_for.as_deref(), Some("question"));
+    let (kind, session, payload) = pane.last_event();
+    assert_eq!(kind, "session.waiting");
+    assert_eq!(session.as_deref(), Some(pane.session_id.as_str()));
+    assert_eq!(payload["waiting_for"], "question");
+}
+
+#[test]
+fn post_tool_use_ask_clears_the_waiting_question_back_to_busy() {
+    let pane = Pane::new();
+    run_hook(&pane, "pre-tool-use", &ask_payload("PreToolUse"));
+    assert_eq!(session_state(&pane).0, "waiting");
+
+    run_hook(&pane, "post-tool-use-ask", &ask_payload("PostToolUse"));
+    let (status, waiting_for) = session_state(&pane);
+    assert_eq!(status, "busy");
+    assert_eq!(waiting_for, None);
+    let (kind, _, payload) = pane.last_event();
+    assert_eq!(kind, "session.answered");
+    assert_eq!(payload["cleared"], true);
+}
+
+#[test]
+fn user_prompt_submit_clears_a_waiting_session() {
+    let pane = Pane::new();
+    run_hook(&pane, "pre-tool-use", &ask_payload("PreToolUse"));
+    assert_eq!(session_state(&pane).0, "waiting");
+
+    // The human answered by typing a prompt: back to work, nothing pending.
+    run_hook(
+        &pane,
+        "user-prompt-submit",
+        &serde_json::json!({ "prompt": "go on" }).to_string(),
+    );
+    let (status, waiting_for) = session_state(&pane);
+    assert_eq!(status, "busy");
+    assert_eq!(waiting_for, None);
+}
+
+#[test]
+fn the_ask_hooks_leave_an_ended_session_untouched() {
+    let pane = Pane::new();
+    pane.env
+        .conn()
+        .execute(
+            "UPDATE session SET status = 'ended' WHERE id = ?1",
+            [&pane.session_id],
+        )
+        .unwrap();
+    run_hook(&pane, "pre-tool-use", &ask_payload("PreToolUse"));
+    assert_eq!(session_state(&pane), ("ended".to_string(), None));
 }
 
 #[test]

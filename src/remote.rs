@@ -1901,6 +1901,7 @@ mod tests {
             quest_slug: slug.to_string(),
             machine: machine.to_string(),
             registry: None,
+            your_turn: false,
         };
         serde_json::to_string(&[view]).unwrap()
     }

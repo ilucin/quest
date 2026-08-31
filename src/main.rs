@@ -440,6 +440,8 @@ fn run(args: &Cli) -> anyhow::Result<u8> {
                 HookAction::SessionEnd => hooks::run(hooks::Event::SessionEnd),
                 // No Ctx: reads `$Q_DB` itself and never creates the database.
                 HookAction::PostToolUse => commands::hook_capture::run(),
+                HookAction::PreToolUse => hooks::run(hooks::Event::PreToolUse),
+                HookAction::PostToolUseAsk => hooks::run(hooks::Event::PostToolUse),
             };
         }
         Command::Completions { shell } => {
