@@ -88,7 +88,7 @@ pub fn apply(ctx: &Ctx, quest: &Quest) -> anyhow::Result<Removed> {
 
     // The whole fleet (SPEC §6 v2): main and every `q-<slug>+*`, rowless panes
     // included. Works when the main is already gone but a worker lingers.
-    let tmux_killed = crate::commands::kill_quest_fleet(ctx, &quest.slug)? > 0;
+    let tmux_killed = crate::commands::kill_quest_fleet(ctx, quest)? > 0;
     db.delete_quest(&quest.id)?;
     beads::forget(&quest.id);
     Ok(Removed {

@@ -127,7 +127,7 @@ pub fn apply(ctx: &Ctx, quest: &Quest, close_epic: bool) -> anyhow::Result<Close
     // Kill the whole fleet (SPEC §6 v2): the main `q-<slug>` and every worker
     // `q-<slug>+*`, including a pane that has no row — best effort, so one that
     // is already gone does not fail the close.
-    crate::commands::kill_quest_fleet(ctx, &quest.slug)?;
+    crate::commands::kill_quest_fleet(ctx, quest)?;
 
     let sessions = db.list_sessions_by_quest(&quest.id)?;
     let ending: Vec<&crate::model::Session> = live(&sessions).collect();

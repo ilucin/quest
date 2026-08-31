@@ -25,9 +25,26 @@ pub struct Renamed {
     pub to: String,
     pub tmux_session: String,
     pub changed: bool,
+    /// Workers whose tmux session did not follow the rename (SPEC §6 v2): they
+    /// stay reachable under the old name, and `q doctor` reports the mismatch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stranded: Vec<Stranded>,
     /// The live Claude sessions told their new name, and those still owed one.
     #[serde(flatten)]
     pub sync: Sync,
+}
+
+/// A worker whose tmux rename did not land during a fleet rename (SPEC §6 v2).
+/// Its Claude session keeps running under the old tmux name; `q doctor` flags
+/// the mismatch and `q close`/`q rm` still tear it down (R7).
+#[derive(Debug, Clone, Serialize)]
+pub struct Stranded {
+    /// The session row that owns this tmux session, when one does; a rowless,
+    /// hand-made pane carries `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    pub tmux_session: String,
+    pub reason: String,
 }
 
 impl Renamed {
@@ -44,6 +61,18 @@ impl Renamed {
             line.push_str(&format!(
                 " · /rename held for {}",
                 self.sync.pending.join(", ")
+            ));
+        }
+        if !self.stranded.is_empty() {
+            let names: Vec<&str> = self
+                .stranded
+                .iter()
+                .map(|s| s.tmux_session.as_str())
+                .collect();
+            line.push_str(&format!(
+                " · {} worker(s) stranded under the old name (run q doctor): {}",
+                names.len(),
+                names.join(", ")
             ));
         }
         line
@@ -83,6 +112,7 @@ pub fn apply(
             to: slug.to_string(),
             quest: quest.clone(),
             changed: false,
+            stranded: Vec::new(),
             sync: Sync::default(),
         });
     }
@@ -123,7 +153,7 @@ pub fn apply(
             return Err(e);
         }
     };
-    rename_fleet(ctx, db, &quest, &from, slug)?;
+    let stranded = rename_fleet(ctx, db, &quest, &from, slug)?;
     db.append_event(
         &quest.id,
         None,
@@ -141,6 +171,7 @@ pub fn apply(
         to: slug.to_string(),
         tmux_session: new_session,
         changed: true,
+        stranded,
         sync,
     })
 }
@@ -149,9 +180,16 @@ pub fn apply(
 /// worker tmux session `q-<from>+<label>` → `q-<slug>+<label>` best-effort, and
 /// remap every live session row's `tmux_session`. The main was already renamed
 /// by [`apply`]; a pre-v2 worker row still carrying the main name is remapped to
-/// the new main. A worker tmux rename that fails leaves a mismatch `q doctor`
-/// reports rather than failing the whole rename.
-fn rename_fleet(ctx: &Ctx, db: &Db, quest: &Quest, from: &str, slug: &str) -> anyhow::Result<()> {
+/// the new main. A worker tmux rename that fails leaves a mismatch reported both
+/// on the rename itself (as [`Stranded`]) and by `q doctor`, rather than failing
+/// the whole rename.
+fn rename_fleet(
+    ctx: &Ctx,
+    db: &Db,
+    quest: &Quest,
+    from: &str,
+    slug: &str,
+) -> anyhow::Result<Vec<Stranded>> {
     let old_main = session_name(&ctx.config, from);
     let worker_prefix = format!("{old_main}{WORKER_SEP}");
     // Rename the live worker tmux sessions (rowless ones included). A worker
@@ -161,31 +199,45 @@ fn rename_fleet(ctx: &Ctx, db: &Db, quest: &Quest, from: &str, slug: &str) -> an
     // next sweep key orphan detection on a `(tmux_session, pane)` pair that no
     // longer exists, ending a live worker (correctness review #1).
     let panes = live_panes(ctx.tmux())?;
-    let mut stranded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stranded: Vec<(String, &'static str)> = Vec::new();
     for name in sessions_of_quest(&ctx.config, &panes, from) {
         if let Some(label) = name.strip_prefix(&worker_prefix) {
             let target = worker_session_name(&ctx.config, slug, label);
-            let collision = ctx.tmux().has_session(&target).unwrap_or(false);
-            if collision || ctx.tmux().rename_session(&name, &target).is_err() {
-                stranded.insert(name.clone());
+            if ctx.tmux().has_session(&target).unwrap_or(false) {
+                stranded.push((name.clone(), "target tmux session already exists"));
+            } else if ctx.tmux().rename_session(&name, &target).is_err() {
+                stranded.push((name.clone(), "tmux rename failed"));
             }
         }
     }
+    let stranded_names: std::collections::HashSet<&str> =
+        stranded.iter().map(|(n, _)| n.as_str()).collect();
     // Remap every live row's tmux_session to the new slug, except the workers
-    // whose tmux rename did not land — those keep their old name so q doctor
-    // reports the mismatch and the live pane stays reachable.
-    for session in db.list_sessions_by_quest(&quest.id)? {
+    // whose tmux rename did not land — those keep their old name so the live
+    // pane stays reachable and the mismatch is reported instead.
+    let rows = db.list_sessions_by_quest(&quest.id)?;
+    for session in &rows {
         if session.status == crate::model::SessionStatus::Ended {
             continue;
         }
-        if stranded.contains(&session.tmux_session) {
+        if stranded_names.contains(session.tmux_session.as_str()) {
             continue;
         }
         if let Some(new_name) = remapped(&ctx.config, &session.tmux_session, from, slug) {
             db.update_session_tmux_session(&session.id, &new_name)?;
         }
     }
-    Ok(())
+    Ok(stranded
+        .into_iter()
+        .map(|(name, reason)| Stranded {
+            session: rows
+                .iter()
+                .find(|s| s.tmux_session == name)
+                .map(|s| s.id.clone()),
+            tmux_session: name,
+            reason: reason.to_string(),
+        })
+        .collect())
 }
 
 /// A live row's tmux session name under the new slug, or `None` when it does not
