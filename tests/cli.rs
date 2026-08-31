@@ -77,6 +77,22 @@ fn help_lists_subcommands() {
     }
 }
 
+/// M4: every verb the master manual and the two playbooks (PR review, feature
+/// spec) put in front of an agent must actually parse on this build — a
+/// documented command that `q` rejects is a broken playbook.
+#[test]
+fn every_documented_master_verb_parses() {
+    for verb in [
+        "spawn", "start", "stop", "kill", "send", "peek", "cd", "reset", "sessions", "phase",
+        "note", "link", "artifact", "brief", "close", "set", "resume",
+    ] {
+        q().args([verb, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Usage:"));
+    }
+}
+
 #[test]
 fn bare_invocation_succeeds() {
     q().assert()
@@ -3700,6 +3716,11 @@ fn brief_renders_markdown_and_json() {
     }
     assert!(out.contains("| master | master |"), "{out}");
     assert!(out.contains("You are the **master**"));
+    // M4: the master brief teaches the v2 launch verbs, so `q start` is named.
+    assert!(
+        out.contains("q start"),
+        "master brief must document q start:\n{out}"
+    );
 
     let json = env.json(&["brief", "brief", "--for", "worker"]);
     assert_eq!(json["quest_id"], id);
