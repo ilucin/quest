@@ -1938,6 +1938,82 @@ mod tests {
         assert!(fleet.notes[0].contains("incompatible"), "{:?}", fleet.notes);
     }
 
+    /// SPEC §15, plan M6: the fleet wire carries the v2 fields — `tmux_session`,
+    /// the `off` status and `waiting_for` — and a consumer reads them straight
+    /// back out. The forward direction of the tolerant-parse contract.
+    #[test]
+    fn the_fleet_carries_the_v2_session_fields() {
+        use crate::model::{Session, SessionRole, SessionStatus};
+        let mut off = Session::new("q-x", SessionRole::Worker, "w1", "q-alpha+w1", "%1");
+        off.status = SessionStatus::Off;
+        let mut waiting = Session::new("q-x", SessionRole::Worker, "rev", "q-alpha+rev", "%2");
+        waiting.status = SessionStatus::Waiting;
+        waiting.waiting_for = Some("question".to_string());
+        let rows: Vec<_> = [off, waiting]
+            .into_iter()
+            .map(|session| crate::commands::sessions::SessionView {
+                session,
+                quest_slug: "alpha".to_string(),
+                machine: "its-own-name".to_string(),
+                registry: None,
+                your_turn: false,
+            })
+            .collect();
+        let stdout = serde_json::to_string(&rows).unwrap();
+
+        let ssh = StubSsh::new(&[("ws-host", ok(stdout))]);
+        let fleet = fetch_sessions(&ssh, &[remote("ws")]);
+        assert_eq!(fleet.rows.len(), 2, "{:?}", fleet.notes);
+        let off = &fleet.rows[0].session;
+        assert_eq!(off.status, SessionStatus::Off);
+        assert_eq!(off.tmux_session, "q-alpha+w1");
+        let waiting = &fleet.rows[1].session;
+        assert_eq!(waiting.status, SessionStatus::Waiting);
+        assert_eq!(waiting.waiting_for.as_deref(), Some("question"));
+    }
+
+    /// The backward direction: a remote `q` too old to report `tmux_session`,
+    /// `waiting_for` or the v2 columns sends a lean row, and this `q` reads it
+    /// as a graceful default (empty `tmux_session`, rendered `?`) rather than
+    /// failing the whole machine's fleet. `never errors`, per the plan.
+    #[test]
+    fn an_older_remote_missing_the_new_fields_still_parses() {
+        use crate::model::SessionStatus;
+        // Only the columns a pre-v2 `q` had — no `tmux_session`, no
+        // `waiting_for`, no `last_pane_path`/`claude_started_at`.
+        let lean = serde_json::json!([{
+            "id": "s-old",
+            "quest_id": "q-old",
+            "role": "worker",
+            "label": "w1",
+            "tmux_pane": "%7",
+            "status": "idle",
+            "started_at": 1,
+            "updated_at": 2,
+            "quest_slug": "legacy",
+            "machine": "its-own-name",
+        }])
+        .to_string();
+
+        let ssh = StubSsh::new(&[("ws-host", ok(lean))]);
+        let fleet = fetch_sessions(&ssh, &[remote("ws")]);
+        assert!(
+            fleet.notes.is_empty(),
+            "an older remote errored: {:?}",
+            fleet.notes
+        );
+        assert_eq!(fleet.rows.len(), 1);
+        let s = &fleet.rows[0].session;
+        assert_eq!(s.status, SessionStatus::Idle);
+        assert!(
+            s.tmux_session.is_empty(),
+            "missing tmux_session should default"
+        );
+        assert_eq!(s.waiting_for, None);
+        // The cell a `?` stands in for.
+        assert_eq!(crate::commands::sessions::tmux_cell(s), "?");
+    }
+
     #[test]
     fn the_argv_is_the_spec_command_and_never_prompts() {
         let argv = ssh_argv("ws", &LIST_ARGV, TIMEOUT);

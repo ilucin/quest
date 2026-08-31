@@ -322,7 +322,7 @@ impl Verdict {
                 status,
                 waiting_for: Some(what),
                 ..
-            } => Some(format!("{status}: {what}")),
+            } => Some(format!("{status}:{what}")),
             Verdict::Busy { status, .. } => Some(status.clone()),
             Verdict::Unknown { .. } => None,
         }
