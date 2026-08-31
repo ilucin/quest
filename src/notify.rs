@@ -34,6 +34,11 @@ pub enum Kind {
     Off,
 }
 
+/// Every `[notify] on` token q recognises — the tag of each [`Kind`]. The one
+/// source of truth for the channel list, used by `Config::validate` to reject a
+/// typo'd channel (and to tell the user what the valid tokens are).
+pub const KINDS: [&str; 4] = ["waiting", "reset", "ended", "off"];
+
 impl Kind {
     pub fn tag(self) -> &'static str {
         match self {

@@ -751,6 +751,13 @@ fn section_sessions(out: &mut String, sessions: &[Session]) {
 /// The §5 state vocabulary (SPEC §6): `running` while Claude works or boots,
 /// `idle`, `waiting: <what>` when honestly blocked on the human, `off` when the
 /// pane is a bare shell — plus `ended` for the wound-down rows.
+///
+/// Unlike the TUI, this does NOT soften a finished-turn `idle` to `idle · your
+/// turn`: that distinction needs the per-session last-event lookup
+/// (`session.stop`) the TUI does in `mark_your_turn`, and the brief renders from
+/// a pre-fetched `&[Session]` with no DB in reach. The hard `waiting: question`
+/// is shown, so a master triaging from the brief still sees an explicit block;
+/// only the soft "just finished, over to you" hint is absent. Accepted gap.
 fn session_state(s: &Session) -> String {
     match s.status {
         SessionStatus::Waiting => {

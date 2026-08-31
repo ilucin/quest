@@ -238,6 +238,12 @@ fn session_start(db: &Db, session: &Session, payload: &Value) -> Option<String> 
 }
 
 fn user_prompt_submit(db: &Db, session: &Session, payload: &Value) {
+    // `ended` is terminal (SPEC §6): a stray prompt hook on a torn-down pane
+    // must not resurrect the row to `busy` — the same guard `session_end`,
+    // `pre_tool_use` and `post_tool_use` already hold.
+    if session.status == SessionStatus::Ended {
+        return;
+    }
     let prompt = str_field(payload, "prompt");
     let stored = prompt.map(|p| truncate(p, LAST_PROMPT_CHARS));
     let _ = db.transaction(|db| {
@@ -251,7 +257,18 @@ fn user_prompt_submit(db: &Db, session: &Session, payload: &Value) {
     });
 }
 
+/// A turn finished: the session goes `idle`. This is also the safety net for a
+/// stuck `waiting:question` — if `AskUserQuestion` is interrupted (the human
+/// Esc's the dialog) no `PostToolUse` fires, but `Stop` still does, and
+/// `update_session_status(Idle, None)` clears `waiting_for` back to NULL. The
+/// clear-on-Stop path is pinned by `stop_clears_a_waiting_question` in
+/// `tests/cli.rs`, so the row cannot get wedged in `waiting:question`.
 fn stop(db: &Db, session: &Session, payload: &Value) {
+    // `ended` is terminal (SPEC §6): a stray Stop on a torn-down pane must not
+    // resurrect the row to `idle`.
+    if session.status == SessionStatus::Ended {
+        return;
+    }
     let _ = db.transaction(|db| {
         db.update_session_status(&session.id, SessionStatus::Idle, None)?;
         append(
