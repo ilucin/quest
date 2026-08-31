@@ -319,6 +319,15 @@ pub enum Command {
         value: String,
     },
 
+    /// Move a Quest's working directory (alias of `q set <quest> cwd <path>`).
+    /// The master (or you) uses this to move the Quest while Claude is up, since
+    /// the shell's own `cd` is only followed once Claude exits to the shell.
+    Cd {
+        quest: String,
+        /// New working directory
+        path: String,
+    },
+
     /// Delete a Quest
     Rm {
         quest: String,

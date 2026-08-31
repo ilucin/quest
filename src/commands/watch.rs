@@ -44,7 +44,7 @@ pub fn tick(ctx: &Ctx, runner: &dyn Runner) {
     let Ok(db) = ctx.db() else { return };
     // The shared sweep, reused rather than reimplemented: it ends orphaned rows
     // and hands back exactly the sessions it ended.
-    let Ok(ended) = tmux::sweep(db, ctx.tmux()) else {
+    let Ok(ended) = tmux::sweep(db, ctx.tmux(), &ctx.config) else {
         return;
     };
     for session in &ended {

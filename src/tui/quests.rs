@@ -1802,7 +1802,7 @@ fn panel_lines<'a>(row: &QuestRow, links: &[Link], events: &[Event]) -> Vec<Line
     )));
     out.push(Line::from(
         Span::raw(format!(
-            "{} · {} · {} ago",
+            "{} · {} (from main shell) · {} ago",
             machine_cell(row),
             fmt::tilde(&view.quest.cwd),
             fmt::age(view.quest.updated_at)

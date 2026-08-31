@@ -726,7 +726,13 @@ fn check_q_on_path(current: Option<&Path>, found: Option<&Path>) -> Check {
     }
 }
 
-fn check_orphans(db: Option<&Db>, tmux: &dyn Tmux, fix: bool, fixed: &mut Vec<String>) -> Check {
+fn check_orphans(
+    db: Option<&Db>,
+    tmux: &dyn Tmux,
+    config: &Config,
+    fix: bool,
+    fixed: &mut Vec<String>,
+) -> Check {
     const NAME: &str = "orphan sessions";
 
     let Some(db) = db else {
@@ -735,7 +741,7 @@ fn check_orphans(db: Option<&Db>, tmux: &dyn Tmux, fix: bool, fixed: &mut Vec<St
     // `sweep` does the finding and the ending in one pass, so `--fix` reports
     // exactly what it changed rather than recomputing the set.
     if fix {
-        let ended = match tmux::sweep(db, tmux) {
+        let ended = match tmux::sweep(db, tmux, config) {
             Ok(ended) => ended,
             Err(e) => return check(NAME, Status::Fail, format!("{e:#}")),
         };
@@ -1284,7 +1290,13 @@ fn report(ctx: &Ctx, fix: bool) -> Report {
     checks.push(check_statusline(chain));
     // SPEC §19's order: the remotes, then the orphans.
     checks.extend(check_remotes(ctx));
-    checks.push(check_orphans(db.as_ref(), ctx.tmux(), fix, &mut fixed));
+    checks.push(check_orphans(
+        db.as_ref(),
+        ctx.tmux(),
+        &ctx.config,
+        fix,
+        &mut fixed,
+    ));
     checks.push(check_fleet_names(db.as_ref(), ctx.tmux(), &ctx.config));
     Report::new(checks, fixed)
 }

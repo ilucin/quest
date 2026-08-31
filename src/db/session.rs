@@ -192,6 +192,21 @@ impl Db {
         self.require_session(id)
     }
 
+    /// Reseed the main session's last-seen `pane_current_path` (SPEC §6): the
+    /// baseline cwd-follow is edge-triggered against. The sweep seeds it on the
+    /// first shell observation and after every real edge; `q set cwd`/`q cd`
+    /// reseed it too, so a shell edge already pending cannot later overwrite an
+    /// explicit cwd. Bookkeeping only — it does not touch `updated_at`.
+    pub fn update_session_last_pane_path(&self, id: &str, path: &str) -> anyhow::Result<Session> {
+        self.conn
+            .execute(
+                "UPDATE session SET last_pane_path = ?1 WHERE id = ?2",
+                params![path, id],
+            )
+            .map_err(db_err)?;
+        self.require_session(id)
+    }
+
     /// One live row's tmux session name (SPEC §6): a `q rename` moves each fleet
     /// session — main and every `q-<slug>+<label>` worker — under its own new
     /// name, which a single blanket update could not do.

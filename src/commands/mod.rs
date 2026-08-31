@@ -317,7 +317,7 @@ pub fn pane_pid(ctx: &Ctx, pane_id: &str) -> Option<i64> {
 /// The liveness sweep every command that reads Quests runs first (SPEC §6).
 /// Silent: what it changed shows up in the listing it precedes.
 pub fn sweep_quiet(ctx: &Ctx) -> anyhow::Result<()> {
-    tmux::sweep(ctx.db()?, ctx.tmux())?;
+    tmux::sweep(ctx.db()?, ctx.tmux(), &ctx.config)?;
     Ok(())
 }
 

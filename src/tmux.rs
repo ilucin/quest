@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::db::Db;
+use crate::db::quest::QuestPatch;
 use crate::error::QError;
 use crate::model::{Session, SessionRole, SessionStatus, now};
 
@@ -1399,8 +1400,10 @@ fn claims_claude(status: SessionStatus) -> bool {
 ///   tmux execs the login shell before Claude, so the pane reads as a shell
 ///   while a cold `claude`/npm/node boots.
 ///
-/// Returns every row it changed, ended or demoted.
-pub fn sweep(db: &Db, tmux: &dyn Tmux) -> anyhow::Result<Vec<Session>> {
+/// Returns every row it changed, ended or demoted. Rows whose only change is a
+/// reseeded `last_pane_path` (cwd-follow) are *not* returned — that bookkeeping
+/// must not read as an ended session to `q watch`'s notifier.
+pub fn sweep(db: &Db, tmux: &dyn Tmux, config: &Config) -> anyhow::Result<Vec<Session>> {
     let live = db.list_live_sessions()?;
     if live.is_empty() {
         return Ok(Vec::new());
@@ -1465,7 +1468,96 @@ pub fn sweep(db: &Db, tmux: &dyn Tmux) -> anyhow::Result<Vec<Session>> {
         )?;
         changed.push(row);
     }
+
+    // Edge-triggered cwd-follow, gated on the config flag (SPEC §6 v2). It
+    // touches only `quest.cwd`/`last_pane_path`, never a session status, so it
+    // stays out of `changed`.
+    if config.quest.follow_main_cwd {
+        follow_cwd(db, &panes)?;
+    }
     Ok(changed)
+}
+
+/// Quest cwd follows the main session's *shell* cwd, edge-triggered on
+/// `pane_current_path` changing (SPEC §6 v2, decision 4). For each Quest's live
+/// main session:
+///
+/// * a non-shell pane (Claude up) or an empty command/path is skipped — one-way
+///   and shell-gated, so a `q set cwd` while Claude runs is never reverted;
+/// * the first shell observation only seeds `last_pane_path` — it never rewrites
+///   an existing cwd;
+/// * a later change (a real edge) moves `quest.cwd`, emits one
+///   `quest.cwd_changed`, and reseeds `last_pane_path`.
+///
+/// Paths are canonicalised the way `q set cwd` canonicalises its argument, so a
+/// symlinked `cd` and an explicit `set cwd` agree on the same directory and a
+/// cwd already at the target is consumed silently (no event).
+fn follow_cwd(db: &Db, panes: &[Pane]) -> anyhow::Result<()> {
+    let pane_of: BTreeMap<(&str, &str), (&str, &str)> = panes
+        .iter()
+        .map(|p| {
+            (
+                (p.session_name.as_str(), p.pane_id.as_str()),
+                (p.current_command.as_str(), p.current_path.as_str()),
+            )
+        })
+        .collect();
+    for session in db.list_live_sessions()? {
+        if session.role != SessionRole::Master || session.tmux_pane.is_empty() {
+            continue;
+        }
+        let Some(&(command, path)) =
+            pane_of.get(&(session.tmux_session.as_str(), session.tmux_pane.as_str()))
+        else {
+            continue;
+        };
+        // A non-shell pane is not proof Claude is up, but it is never a shell we
+        // can read a `cd` off; an empty command is an old 5-field line.
+        if command.is_empty() || !is_shell(command) || path.is_empty() {
+            continue;
+        }
+        let canonical = canonical_path(path);
+        // No edge: the shell has not moved since we last saw it.
+        if session.last_pane_path.as_deref() == Some(canonical.as_str()) {
+            continue;
+        }
+        // First observation seeds the baseline and stops; a real edge is judged
+        // against it next time.
+        let first = session.last_pane_path.is_none();
+        db.update_session_last_pane_path(&session.id, &canonical)?;
+        if first {
+            continue;
+        }
+        let Some(quest) = db.get_quest(&session.quest_id)? else {
+            continue;
+        };
+        // Already there — e.g. `q set cwd` moved the cwd and reseeded, and this
+        // is the same directory: consume the edge without a spurious event.
+        if quest.cwd == canonical {
+            continue;
+        }
+        let patch = QuestPatch {
+            cwd: Some(canonical.clone()),
+            ..QuestPatch::default()
+        };
+        let updated = db.update_quest(&quest.id, &patch)?;
+        db.append_event(
+            &updated.id,
+            Some(&session.id),
+            "quest.cwd_changed",
+            &serde_json::json!({ "from": quest.cwd, "to": canonical, "source": "main_shell" }),
+        )?;
+    }
+    Ok(())
+}
+
+/// Resolve symlinks the way `q set cwd` (`resolve_dir`) does, so a shell `cd`
+/// and an explicit `set cwd` name the same directory. A path tmux reports may
+/// since have vanished; then the raw value is the best we have.
+pub(crate) fn canonical_path(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
 }
 
 #[cfg(test)]
@@ -2388,12 +2480,12 @@ mod tests {
             .unwrap();
 
         assert!(
-            sweep(&db, &t).unwrap().is_empty(),
+            sweep(&db, &t, &Config::default()).unwrap().is_empty(),
             "both panes are still there"
         );
 
         t.kill_session("q-alpha").unwrap();
-        let ended = sweep(&db, &t).unwrap();
+        let ended = sweep(&db, &t, &Config::default()).unwrap();
         assert_eq!(ended.len(), 2);
         assert!(
             ended
@@ -2419,7 +2511,7 @@ mod tests {
         );
 
         assert!(
-            sweep(&db, &t).unwrap().is_empty(),
+            sweep(&db, &t, &Config::default()).unwrap().is_empty(),
             "already-ended sessions are not swept twice"
         );
     }
@@ -2464,7 +2556,7 @@ mod tests {
             ))
             .unwrap();
 
-        let mut ended: Vec<String> = sweep(&db, &t)
+        let mut ended: Vec<String> = sweep(&db, &t, &Config::default())
             .unwrap()
             .iter()
             .map(|s| s.id.clone())
@@ -2493,6 +2585,7 @@ mod tests {
         let ended = sweep(
             &db,
             &Stub::Fails("`tmux list-panes` failed: no server running on /tmp/tmux-501"),
+            &Config::default(),
         )
         .unwrap();
         assert_eq!(ended.len(), 1);
@@ -2510,14 +2603,18 @@ mod tests {
             "%1",
         ))
         .unwrap();
-        let err = sweep(&db, &Stub::Fails(TMUX_MISSING)).unwrap_err();
+        let err = sweep(&db, &Stub::Fails(TMUX_MISSING), &Config::default()).unwrap_err();
         assert!(format!("{err:#}").contains(TMUX_MISSING));
     }
 
     #[test]
     fn an_empty_database_needs_no_tmux_at_all() {
         let (db, _quest) = seeded_db();
-        assert!(sweep(&db, &Stub::Never).unwrap().is_empty());
+        assert!(
+            sweep(&db, &Stub::Never, &Config::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2545,7 +2642,7 @@ mod tests {
         db.update_session_status(&row.id, SessionStatus::Idle, None)
             .unwrap();
 
-        let changed = sweep(&db, &t).unwrap();
+        let changed = sweep(&db, &t, &Config::default()).unwrap();
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].status, SessionStatus::Off);
         assert_eq!(
@@ -2555,7 +2652,7 @@ mod tests {
         let events = db.list_events_by_quest(&quest.id, 10).unwrap();
         assert!(events.iter().any(|e| e.kind == "session.off"));
         // One-way: an `off` row is not swept again, and never promoted.
-        assert!(sweep(&db, &t).unwrap().is_empty());
+        assert!(sweep(&db, &t, &Config::default()).unwrap().is_empty());
     }
 
     #[test]
@@ -2584,7 +2681,7 @@ mod tests {
         db.record_claude_launch(&row.id, "alpha/master", None, now())
             .unwrap();
         assert!(
-            sweep(&db, &t).unwrap().is_empty(),
+            sweep(&db, &t, &Config::default()).unwrap().is_empty(),
             "a fresh `starting` row must not be demoted within the grace"
         );
         assert_eq!(
@@ -2595,7 +2692,7 @@ mod tests {
         // Past the boot grace, a pane still on a shell means Claude never came up.
         db.record_claude_launch(&row.id, "alpha/master", None, now() - BOOT_GRACE_SECS - 1)
             .unwrap();
-        let changed = sweep(&db, &t).unwrap();
+        let changed = sweep(&db, &t, &Config::default()).unwrap();
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].status, SessionStatus::Off);
     }
@@ -2625,10 +2722,152 @@ mod tests {
         // Claude is running: the pane reports its version string, not a shell.
         t.send_keys(&pane.pane_id, "claude -n alpha/master", true)
             .unwrap();
-        assert!(sweep(&db, &t).unwrap().is_empty());
+        assert!(sweep(&db, &t, &Config::default()).unwrap().is_empty());
         assert_eq!(
             db.get_session(&row.id).unwrap().unwrap().status,
             SessionStatus::Idle
+        );
+    }
+
+    /// Move a fixture pane's shell into `path` — the sweep reads the edge off
+    /// `current_path`, with `current_command` a shell.
+    fn cd_shell(t: &FixtureTmux, pane_id: &str, path: &Path) {
+        let mut state = t.load().unwrap();
+        let pane = state
+            .panes
+            .iter_mut()
+            .find(|p| p.pane_id == pane_id)
+            .unwrap();
+        pane.current_path = path.to_string_lossy().into_owned();
+        pane.current_command = FIXTURE_SHELL.to_string();
+        t.save(&state).unwrap();
+    }
+
+    fn canon(path: &Path) -> String {
+        path.canonicalize().unwrap().to_string_lossy().into_owned()
+    }
+
+    fn main_session(db: &Db, t: &FixtureTmux, quest: &Quest, cwd: &Path) -> Session {
+        let pane = t
+            .new_session(&NewSession {
+                name: "q-alpha".to_string(),
+                window_name: "master".to_string(),
+                cwd: cwd.to_string_lossy().into_owned(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        db.insert_session(&Session::new(
+            &quest.id,
+            SessionRole::Master,
+            "master",
+            "q-alpha",
+            &pane.pane_id,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn follow_cwd_seeds_first_then_moves_on_a_shell_edge() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        let x = dir.path().join("x");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&x).unwrap();
+        let t = FixtureTmux::new(dir.path().join("tmux.json"));
+        let (db, quest) = seeded_db();
+        let row = main_session(&db, &t, &quest, &a);
+
+        // First sweep only seeds the baseline; the cwd is left where it was.
+        sweep(&db, &t, &Config::default()).unwrap();
+        assert_eq!(
+            db.get_session(&row.id).unwrap().unwrap().last_pane_path,
+            Some(canon(&a))
+        );
+        assert_eq!(db.get_quest(&quest.id).unwrap().unwrap().cwd, quest.cwd);
+        assert!(
+            db.list_events_by_quest(&quest.id, 10)
+                .unwrap()
+                .iter()
+                .all(|e| e.kind != "quest.cwd_changed")
+        );
+
+        // A shell `cd` to `x` is a real edge: cwd moves, one event.
+        cd_shell(&t, &row.tmux_pane, &x);
+        sweep(&db, &t, &Config::default()).unwrap();
+        assert_eq!(db.get_quest(&quest.id).unwrap().unwrap().cwd, canon(&x));
+        assert_eq!(
+            db.list_events_by_quest(&quest.id, 10)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == "quest.cwd_changed")
+                .count(),
+            1
+        );
+
+        // Idempotent: another sweep at the same path is not another edge.
+        sweep(&db, &t, &Config::default()).unwrap();
+        assert_eq!(
+            db.list_events_by_quest(&quest.id, 10)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == "quest.cwd_changed")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn follow_cwd_ignores_a_non_shell_main_pane() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        let x = dir.path().join("x");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&x).unwrap();
+        let t = FixtureTmux::new(dir.path().join("tmux.json"));
+        let (db, quest) = seeded_db();
+        let row = main_session(&db, &t, &quest, &a);
+        // Claude is up in the main pane.
+        t.send_keys(&row.tmux_pane, "claude -n alpha/master", true)
+            .unwrap();
+        // Even as the frozen path "moves", a non-shell pane never follows.
+        let mut state = t.load().unwrap();
+        state
+            .panes
+            .iter_mut()
+            .find(|p| p.pane_id == row.tmux_pane)
+            .unwrap()
+            .current_path = x.to_string_lossy().into_owned();
+        t.save(&state).unwrap();
+
+        sweep(&db, &t, &Config::default()).unwrap();
+        sweep(&db, &t, &Config::default()).unwrap();
+        assert_eq!(db.get_quest(&quest.id).unwrap().unwrap().cwd, quest.cwd);
+        assert_eq!(
+            db.get_session(&row.id).unwrap().unwrap().last_pane_path,
+            None
+        );
+    }
+
+    #[test]
+    fn follow_cwd_is_off_when_the_flag_is_off() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        let x = dir.path().join("x");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&x).unwrap();
+        let t = FixtureTmux::new(dir.path().join("tmux.json"));
+        let (db, quest) = seeded_db();
+        let row = main_session(&db, &t, &quest, &a);
+        let mut off = Config::default();
+        off.quest.follow_main_cwd = false;
+
+        sweep(&db, &t, &off).unwrap();
+        cd_shell(&t, &row.tmux_pane, &x);
+        sweep(&db, &t, &off).unwrap();
+        assert_eq!(db.get_quest(&quest.id).unwrap().unwrap().cwd, quest.cwd);
+        assert_eq!(
+            db.get_session(&row.id).unwrap().unwrap().last_pane_path,
+            None
         );
     }
 

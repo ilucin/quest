@@ -13940,3 +13940,168 @@ fn completions_bash_emits_script() {
 fn completions_reject_unknown_shell() {
     q().args(["completions", "tcsh"]).assert().failure();
 }
+
+// ---------------------------------------- M3: cwd follows the main shell (bd-v1d.5)
+
+/// Point the main session's pane at `path`, running `command` (a shell after a
+/// `cd`, or Claude's version string while it is up), the way tmux reports it.
+fn set_main_pane(env: &Env, slug: &str, command: &str, path: &std::path::Path) {
+    let mut fixture = env.fixture();
+    let session = format!("q-{slug}");
+    let pane = fixture["panes"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|p| p["session_name"].as_str() == Some(session.as_str()))
+        .expect("main pane in the fixture");
+    pane["current_command"] = serde_json::json!(command);
+    pane["current_path"] = serde_json::json!(path.to_str().unwrap());
+    env.write_fixture(fixture);
+}
+
+/// Run a read that sweeps (so cwd-follow runs), then read the Quest cwd back.
+fn swept_cwd(env: &Env, slug: &str) -> String {
+    env.cmd().args(["show", slug]).assert().success();
+    env.conn()
+        .query_row("SELECT cwd FROM quest WHERE slug = ?1", [slug], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+fn cwd_changed_count(env: &Env) -> i64 {
+    env.count("SELECT count(*) FROM event WHERE kind = 'quest.cwd_changed'")
+}
+
+#[test]
+fn cwd_follows_the_main_shell_across_a_shell_edge() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let a = env.work("foo");
+    let x = env.work("x");
+
+    // The master exits Claude to a shell in `a`: the first sweep only seeds the
+    // baseline, it does not rewrite the (already `a`) cwd.
+    set_main_pane(&env, "foo", "zsh", &a);
+    assert_eq!(swept_cwd(&env, "foo"), a.to_str().unwrap());
+    assert_eq!(cwd_changed_count(&env), 0);
+
+    // A `cd` to `x` in that shell is a real edge across two sweeps.
+    set_main_pane(&env, "foo", "zsh", &x);
+    assert_eq!(swept_cwd(&env, "foo"), x.to_str().unwrap());
+    assert_eq!(cwd_changed_count(&env), 1);
+
+    // Idempotent: sitting in `x` is not another edge.
+    assert_eq!(swept_cwd(&env, "foo"), x.to_str().unwrap());
+    assert_eq!(cwd_changed_count(&env), 1);
+}
+
+#[test]
+fn cwd_does_not_follow_while_claude_is_up() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let a = env.work("foo");
+    let x = env.work("x");
+
+    // Claude is up in the main pane — a non-shell command, never followed even
+    // as its frozen path drifts a -> x.
+    set_main_pane(&env, "foo", "2.1.0", &a);
+    assert_eq!(swept_cwd(&env, "foo"), a.to_str().unwrap());
+    set_main_pane(&env, "foo", "2.1.0", &x);
+    assert_eq!(swept_cwd(&env, "foo"), a.to_str().unwrap());
+    assert_eq!(cwd_changed_count(&env), 0);
+}
+
+#[test]
+fn q_cd_sticks_across_a_later_sweep() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let a = env.work("foo");
+    let y = env.work("y");
+
+    // Master at a shell in `a`; baseline seeded.
+    set_main_pane(&env, "foo", "zsh", &a);
+    assert_eq!(swept_cwd(&env, "foo"), a.to_str().unwrap());
+
+    // `q cd` is the alias of `q set <quest> cwd`; the explicit move sticks even
+    // though the shell is still sitting in `a`.
+    env.cmd()
+        .args(["cd", "foo", y.to_str().unwrap()])
+        .assert()
+        .success();
+    assert_eq!(swept_cwd(&env, "foo"), y.to_str().unwrap());
+}
+
+#[test]
+fn set_cwd_is_not_reverted_when_claude_exits() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let a = env.work("foo");
+    let x = env.work("x");
+    let y = env.work("y");
+
+    // Master exits to a shell in `a`: baseline seeded to `a`.
+    set_main_pane(&env, "foo", "zsh", &a);
+    assert_eq!(swept_cwd(&env, "foo"), a.to_str().unwrap());
+
+    // The shell `cd`s to `x` and Claude is launched there (a non-shell pane):
+    // cwd-follow does not touch a non-shell pane, so `last_pane_path` stays `a`.
+    set_main_pane(&env, "foo", "2.1.0", &x);
+
+    // The master moves the Quest explicitly to `y` while Claude runs. `q set`
+    // reseeds `last_pane_path` to the pane's current path (`x`), consuming the
+    // otherwise-stale `a` baseline.
+    env.cmd()
+        .args(["set", "foo", "cwd", y.to_str().unwrap()])
+        .assert()
+        .success();
+    assert_eq!(swept_cwd(&env, "foo"), y.to_str().unwrap());
+
+    // Claude exits to a shell still sitting in `x`. Without the reseed the sweep
+    // would read an `a` -> `x` edge and revert the explicit `y`; with it there
+    // is no edge and the cwd stays `y`.
+    set_main_pane(&env, "foo", "zsh", &x);
+    assert_eq!(swept_cwd(&env, "foo"), y.to_str().unwrap());
+    assert_eq!(cwd_changed_count(&env), 0);
+}
+
+#[test]
+fn spawn_after_a_cd_opens_the_worker_in_the_new_cwd() {
+    let env = Env::new();
+    env.new_quest("foo");
+    let a = env.work("foo");
+    let x = env.work("x");
+
+    // Master at a shell in `a`; baseline seeded by this sweep.
+    set_main_pane(&env, "foo", "zsh", &a);
+    swept_cwd(&env, "foo");
+
+    // `cd x` in the shell — no `q show`/TUI/watch in between.
+    set_main_pane(&env, "foo", "zsh", &x);
+
+    // `q spawn` sweeps first, so it picks up the moved cwd and opens the worker
+    // in `x`.
+    let out = env.json(&["spawn", "foo", "--shell"]);
+    let worker = out["tmux_session"].as_str().unwrap().to_string();
+    let pane = pane_of(&env.fixture(), &worker);
+    assert_eq!(pane["cwd"], x.to_str().unwrap());
+    assert_eq!(swept_cwd(&env, "foo"), x.to_str().unwrap());
+}
+
+#[test]
+fn cwd_follow_can_be_turned_off() {
+    let env = Env::new();
+    env.cmd()
+        .args(["config", "set", "quest.follow_main_cwd", "false"])
+        .assert()
+        .success();
+    env.new_quest("foo");
+    let a = env.work("foo");
+    let x = env.work("x");
+
+    set_main_pane(&env, "foo", "zsh", &a);
+    swept_cwd(&env, "foo");
+    set_main_pane(&env, "foo", "zsh", &x);
+    assert_eq!(swept_cwd(&env, "foo"), a.to_str().unwrap());
+    assert_eq!(cwd_changed_count(&env), 0);
+}
