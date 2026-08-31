@@ -373,10 +373,13 @@ mod tests {
     /// that decides whether to show a REG column drops the reason.
     #[test]
     fn the_reason_a_session_waits_is_not_part_of_the_comparison() {
-        assert_eq!(coarse("waiting: permission"), "waiting");
-        assert_eq!(coarse("waiting: permission_prompt"), "waiting");
+        // The canonical spelling both sources now emit: `waiting:<what>`, no space.
+        assert_eq!(coarse("waiting:permission"), "waiting");
+        assert_eq!(coarse("waiting:permission_prompt"), "waiting");
         assert_eq!(coarse("idle"), "idle");
-        assert_ne!(coarse("busy"), coarse("waiting: permission"));
+        assert_ne!(coarse("busy"), coarse("waiting:permission"));
+        // Robust to a stray space too (a pre-v2 registry spelling).
+        assert_eq!(coarse("waiting: permission"), "waiting");
     }
 
     #[test]
