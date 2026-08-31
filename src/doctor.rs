@@ -411,7 +411,7 @@ fn check_hooks(chain: &str) -> Vec<Check> {
     let mut checks: Vec<Check> = status
         .events
         .iter()
-        .map(|e| hook_check(format!("hook {}", e.event), e.state, None))
+        .map(|e| hook_check(format!("hook {}", e.display_name()), e.state, None))
         .collect();
     checks.push(hook_check(
         "hook statusLine".to_string(),

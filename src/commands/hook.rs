@@ -29,7 +29,7 @@ struct Event {
     timeout: u64,
 }
 
-const EVENTS: [Event; 7] = [
+const EVENTS: [Event; 9] = [
     Event {
         name: "SessionStart",
         sub: "session-start",
@@ -70,6 +70,21 @@ const EVENTS: [Event; 7] = [
         name: "PostToolUse",
         sub: "post-tool-use",
         matcher: Some("Bash|Write"),
+        timeout: 10,
+    },
+    // The honest "waiting for input" pair (SPEC §7): `AskUserQuestion` blocks
+    // the turn on the human, so PreToolUse marks the session `waiting:question`
+    // and PostToolUse clears it back to `busy`.
+    Event {
+        name: "PreToolUse",
+        sub: "pre-tool-use",
+        matcher: Some("AskUserQuestion"),
+        timeout: 10,
+    },
+    Event {
+        name: "PostToolUse",
+        sub: "post-tool-use-ask",
+        matcher: Some("AskUserQuestion"),
         timeout: 10,
     },
 ];
@@ -118,7 +133,23 @@ impl State {
 #[derive(Debug, Serialize)]
 pub struct EventStatus {
     pub event: &'static str,
+    /// The matcher this group is scoped to, when it has one. Two groups can
+    /// share an `event` name (e.g. `PostToolUse`), so the matcher is what tells
+    /// them apart in a report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<&'static str>,
     pub state: State,
+}
+
+impl EventStatus {
+    /// `PostToolUse[AskUserQuestion]` when scoped, else just the event name —
+    /// the label `q hook status` and `q doctor` show, distinct per group.
+    pub fn display_name(&self) -> String {
+        match self.matcher {
+            Some(m) => format!("{}[{m}]", self.event),
+            None => self.event.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -205,10 +236,12 @@ fn owned_sub(command: &str) -> Option<&str> {
     known_sub(sub).then_some(sub)
 }
 
-fn is_owned(hook: &Value) -> bool {
-    hook["command"]
-        .as_str()
-        .is_some_and(|c| owned_sub(c).is_some())
+/// Whether one hook entry is q's handler for exactly `sub`. Ownership is keyed
+/// on the sub, not merely on being q's, so two groups under one event name
+/// (e.g. `PostToolUse` for `Bash|Write` and for `AskUserQuestion`) are managed
+/// independently and never clobber each other.
+fn hook_is_sub(hook: &Value, sub: &str) -> bool {
+    hook["command"].as_str().and_then(owned_sub) == Some(sub)
 }
 
 fn expected_group(cmd: &str, ev: &Event) -> Value {
@@ -261,9 +294,11 @@ fn groups_mut<'a>(settings: &'a mut Value, event: &str) -> Option<&'a mut Vec<Va
     settings.get_mut("hooks")?.get_mut(event)?.as_array_mut()
 }
 
-/// The q-owned groups under one event, as `install` would compare them.
-/// A foreign group that also carries a q hook is reduced to just our hook.
-fn owned_groups(settings: &Value, event: &str) -> Vec<Value> {
+/// The q-owned groups under one event for `sub`, as `install` would compare
+/// them. A foreign group that also carries this sub's hook is reduced to just
+/// our hook. Keyed on `sub` so a second q group under the same event name
+/// (e.g. another `PostToolUse` matcher) is not folded in here.
+fn owned_groups(settings: &Value, event: &str, sub: &str) -> Vec<Value> {
     let Some(groups) = settings["hooks"][event].as_array() else {
         return vec![];
     };
@@ -272,7 +307,7 @@ fn owned_groups(settings: &Value, event: &str) -> Vec<Value> {
         .filter_map(|g| {
             let hooks: Vec<Value> = g["hooks"]
                 .as_array()
-                .map(|h| h.iter().filter(|h| is_owned(h)).cloned().collect())
+                .map(|h| h.iter().filter(|h| hook_is_sub(h, sub)).cloned().collect())
                 .unwrap_or_default();
             if hooks.is_empty() {
                 return None;
@@ -287,9 +322,11 @@ fn owned_groups(settings: &Value, event: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Strips q's hooks out of one event. Returns where the first q group sat, so
-/// a reinstall lands in the same place and stays byte-identical.
-fn remove_owned(settings: &mut Value, event: &str) -> Option<usize> {
+/// Strips q's `sub` hooks out of one event. Returns where the first such group
+/// sat, so a reinstall lands in the same place and stays byte-identical. Only
+/// this sub's hooks are removed — a sibling q group under the same event name
+/// is untouched.
+fn remove_owned(settings: &mut Value, event: &str, sub: &str) -> Option<usize> {
     let groups = groups_mut(settings, event)?;
     let mut first = None;
     let mut i = 0;
@@ -300,7 +337,7 @@ fn remove_owned(settings: &mut Value, event: &str) -> Option<usize> {
             continue;
         };
         let before = hooks.len();
-        hooks.retain(|h| !is_owned(h));
+        hooks.retain(|h| !hook_is_sub(h, sub));
         if hooks.len() != before {
             first.get_or_insert(i);
         }
@@ -355,7 +392,7 @@ fn compute_status(settings: &Value, path: PathBuf, cmd: &str, chain: &str) -> St
     let mut events = Vec::new();
     for ev in &EVENTS {
         let want = expected_group(cmd, ev);
-        let have = owned_groups(settings, ev.name);
+        let have = owned_groups(settings, ev.name, ev.sub);
         let state = if have.is_empty() {
             State::Missing
         } else if have.len() == 1 && have[0] == want {
@@ -365,6 +402,7 @@ fn compute_status(settings: &Value, path: PathBuf, cmd: &str, chain: &str) -> St
         };
         events.push(EventStatus {
             event: ev.name,
+            matcher: ev.matcher,
             state,
         });
         expected.push(want);
@@ -407,9 +445,9 @@ impl Status {
         let mut lines = vec![format!("settings: {}", self.settings.display())];
         for e in &self.events {
             lines.push(format!(
-                "{} {:<18} {}",
+                "{} {:<28} {}",
                 e.state.symbol(),
-                e.event,
+                e.display_name(),
                 e.state.label()
             ));
         }
@@ -450,7 +488,7 @@ pub fn install(ctx: &Ctx, command: Option<&str>) -> anyhow::Result<u8> {
 
     for ev in &EVENTS {
         let want = expected_group(&cmd, ev);
-        let at = remove_owned(&mut settings, ev.name);
+        let at = remove_owned(&mut settings, ev.name, ev.sub);
         let hooks = settings
             .as_object_mut()
             .expect("settings is an object")
@@ -535,7 +573,7 @@ pub fn uninstall(ctx: &Ctx) -> anyhow::Result<u8> {
     let mut settings = before.clone();
 
     for ev in &EVENTS {
-        remove_owned(&mut settings, ev.name);
+        remove_owned(&mut settings, ev.name, ev.sub);
     }
     prune_empty(&mut settings);
 
@@ -835,13 +873,13 @@ mod tests {
             ] },
             { "hooks": [{ "type": "command", "command": "/x/q hook stop" }] }
         ] } });
-        assert_eq!(remove_owned(&mut s, "Stop"), Some(1));
+        assert_eq!(remove_owned(&mut s, "Stop", "stop"), Some(1));
         let groups = s["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0]["hooks"][0]["command"], "echo hi");
         assert_eq!(groups[1]["hooks"][0]["command"], "other");
-        assert_eq!(remove_owned(&mut s, "Stop"), None);
-        assert_eq!(remove_owned(&mut s, "Nope"), None);
+        assert_eq!(remove_owned(&mut s, "Stop", "stop"), None);
+        assert_eq!(remove_owned(&mut s, "Nope", "stop"), None);
     }
 
     #[test]
@@ -853,8 +891,12 @@ mod tests {
         assert!(st.events.iter().all(|e| e.state == State::Missing));
         assert_eq!(st.statusline.state, State::Missing);
 
+        // Append per-ev: two events share the `PostToolUse` name, so each
+        // group is added rather than overwriting the other.
         for ev in &EVENTS {
-            s["hooks"][ev.name] = json!([expected_group(cmd, ev)]);
+            let mut groups = s["hooks"][ev.name].as_array().cloned().unwrap_or_default();
+            groups.push(expected_group(cmd, ev));
+            s["hooks"][ev.name] = Value::Array(groups);
         }
         s["statusLine"] = json!({ "type": "command", "command": statusline_command(cmd) });
         let st = compute_status(&s, PathBuf::new(), cmd, "");
@@ -869,5 +911,50 @@ mod tests {
         assert_eq!(stop.state, State::Drifted);
         assert_eq!(st.statusline.state, State::Drifted);
         assert_ne!(st.expected_hash, st.actual_hash);
+    }
+
+    #[test]
+    fn two_post_tool_use_groups_are_managed_independently() {
+        let cmd = "/bin/q";
+        let mut s = json!({});
+        // Both `PostToolUse` subs, in separate groups, the way `install` writes
+        // them — a Bash|Write capture group and an AskUserQuestion clear group.
+        for ev in EVENTS.iter().filter(|e| e.name == "PostToolUse") {
+            let mut groups = s["hooks"]["PostToolUse"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            groups.push(expected_group(cmd, ev));
+            s["hooks"]["PostToolUse"] = Value::Array(groups);
+        }
+        assert_eq!(s["hooks"]["PostToolUse"].as_array().unwrap().len(), 2);
+        // Each is Installed and reported under its matcher.
+        let st = compute_status(&s, PathBuf::new(), cmd, "");
+        let post: Vec<_> = st
+            .events
+            .iter()
+            .filter(|e| e.event == "PostToolUse")
+            .collect();
+        assert_eq!(post.len(), 2);
+        assert!(post.iter().all(|e| e.state == State::Installed));
+        let names: Vec<String> = post.iter().map(|e| e.display_name()).collect();
+        assert!(
+            names.contains(&"PostToolUse[Bash|Write]".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"PostToolUse[AskUserQuestion]".to_string()),
+            "{names:?}"
+        );
+
+        // Removing one sub leaves the sibling untouched.
+        remove_owned(&mut s, "PostToolUse", "post-tool-use");
+        let groups = s["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["matcher"], "AskUserQuestion");
+        assert_eq!(
+            groups[0]["hooks"][0]["command"],
+            "/bin/q hook post-tool-use-ask"
+        );
     }
 }

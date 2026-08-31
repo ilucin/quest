@@ -41,6 +41,12 @@ pub enum Event {
     Notification,
     PreCompact,
     SessionEnd,
+    /// `PreToolUse` for `AskUserQuestion` (SPEC §7): the turn is honestly
+    /// blocked on the human → `waiting:question`.
+    PreToolUse,
+    /// `PostToolUse` for `AskUserQuestion`: the question was answered, the
+    /// turn resumes → back to `busy`.
+    PostToolUse,
 }
 
 /// Entry point for the dispatcher. Never fails: a hook that errors would
@@ -103,6 +109,14 @@ fn handle(event: Event, payload: &Value) -> Option<String> {
         }
         Event::SessionEnd => {
             session_end(&db, &session, payload);
+            None
+        }
+        Event::PreToolUse => {
+            pre_tool_use(&db, &session, payload);
+            None
+        }
+        Event::PostToolUse => {
+            post_tool_use(&db, &session, payload);
             None
         }
     }
@@ -224,6 +238,12 @@ fn session_start(db: &Db, session: &Session, payload: &Value) -> Option<String> 
 }
 
 fn user_prompt_submit(db: &Db, session: &Session, payload: &Value) {
+    // `ended` is terminal (SPEC §6): a stray prompt hook on a torn-down pane
+    // must not resurrect the row to `busy` — the same guard `session_end`,
+    // `pre_tool_use` and `post_tool_use` already hold.
+    if session.status == SessionStatus::Ended {
+        return;
+    }
     let prompt = str_field(payload, "prompt");
     let stored = prompt.map(|p| truncate(p, LAST_PROMPT_CHARS));
     let _ = db.transaction(|db| {
@@ -237,7 +257,18 @@ fn user_prompt_submit(db: &Db, session: &Session, payload: &Value) {
     });
 }
 
+/// A turn finished: the session goes `idle`. This is also the safety net for a
+/// stuck `waiting:question` — if `AskUserQuestion` is interrupted (the human
+/// Esc's the dialog) no `PostToolUse` fires, but `Stop` still does, and
+/// `update_session_status(Idle, None)` clears `waiting_for` back to NULL. The
+/// clear-on-Stop path is pinned by `stop_clears_a_waiting_question` in
+/// `tests/cli.rs`, so the row cannot get wedged in `waiting:question`.
 fn stop(db: &Db, session: &Session, payload: &Value) {
+    // `ended` is terminal (SPEC §6): a stray Stop on a torn-down pane must not
+    // resurrect the row to `idle`.
+    if session.status == SessionStatus::Ended {
+        return;
+    }
     let _ = db.transaction(|db| {
         db.update_session_status(&session.id, SessionStatus::Idle, None)?;
         append(
@@ -327,6 +358,61 @@ fn waiting_for(kind: Option<&str>, message: Option<&str>) -> Option<&'static str
     }
 }
 
+/// `AskUserQuestion` is about to run: the turn is genuinely blocked on the
+/// human, so the session goes `waiting:question` — the one blocking state a
+/// hook can detect at the tool boundary (SPEC §7). The matcher already scopes
+/// this to `AskUserQuestion`; the `tool_name` check is belt-and-braces so a
+/// mis-installed hook cannot mark the session waiting for anything else.
+fn pre_tool_use(db: &Db, session: &Session, payload: &Value) {
+    // `ended` is terminal: a killed/closed session is never resurrected by a
+    // hook (SPEC §6), and an `off` pane has no live turn to block.
+    if !is_ask_user_question(payload)
+        || matches!(session.status, SessionStatus::Ended | SessionStatus::Off)
+    {
+        return;
+    }
+    // Edge into waiting, same de-dupe the notification path uses.
+    let entering_waiting = session.status != SessionStatus::Waiting;
+    let _ = db.transaction(|db| {
+        db.update_session_status(&session.id, SessionStatus::Waiting, Some("question"))?;
+        append(
+            db,
+            session,
+            "session.waiting",
+            json!({ "waiting_for": "question" }),
+        )
+    });
+    if entering_waiting {
+        notify_waiting(db, session, "question");
+    }
+}
+
+/// `AskUserQuestion` finished: the human answered and the turn resumes, so a
+/// session that was `waiting:question` goes back to `busy`. Only a live,
+/// waiting row is touched — a late `PostToolUse` on an `ended`/`off` row, or
+/// one whose Stop already fired, is left alone (the event is still logged).
+fn post_tool_use(db: &Db, session: &Session, payload: &Value) {
+    if !is_ask_user_question(payload) || session.status == SessionStatus::Ended {
+        return;
+    }
+    let clear = session.status == SessionStatus::Waiting;
+    let _ = db.transaction(|db| {
+        if clear {
+            db.update_session_status(&session.id, SessionStatus::Busy, None)?;
+        }
+        append(db, session, "session.answered", json!({ "cleared": clear }))
+    });
+}
+
+fn is_ask_user_question(payload: &Value) -> bool {
+    match str_field(payload, "tool_name") {
+        Some(name) => name == "AskUserQuestion",
+        // The matcher guarantees the tool; a payload without the field still
+        // came through a matcher-scoped hook, so trust it.
+        None => true,
+    }
+}
+
 fn pre_compact(db: &Db, session: &Session, payload: &Value) {
     let _ = db.transaction(|db| {
         append(
@@ -352,12 +438,38 @@ fn session_end(db: &Db, session: &Session, payload: &Value) {
         return;
     }
     let reason = str_field(payload, "reason");
+    let went_off = reason != Some("clear") && session.status != SessionStatus::Off;
     let _ = db.transaction(|db| {
         if reason != Some("clear") {
             db.update_session_status(&session.id, SessionStatus::Off, None)?;
         }
         append(db, session, "session.end", json!({ "reason": reason }))
     });
+    // Claude left an otherwise-live pane (SPEC §20): tell the human, if they
+    // asked to hear about it. Off by default, so this is silent unless
+    // `[notify] on` lists `off`.
+    if went_off {
+        notify_off(db, session);
+    }
+}
+
+/// An `off` desktop/push notification (SPEC §20), best effort — the same
+/// config-off-`$Q_CONFIG` path `notify_waiting` takes.
+fn notify_off(db: &Db, session: &Session) {
+    let cfg = crate::config::Config::load().unwrap_or_default();
+    let slug = db
+        .get_quest(&session.quest_id)
+        .ok()
+        .flatten()
+        .map(|q| q.slug)
+        .unwrap_or_else(|| session.quest_id.clone());
+    crate::notify::emit(
+        &cfg.notify,
+        crate::notify::runner().as_ref(),
+        crate::notify::Kind::Off,
+        &format!("{slug} · off"),
+        &format!("{} went off (Claude left the pane)", session.label),
+    );
 }
 
 #[cfg(test)]

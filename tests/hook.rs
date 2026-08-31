@@ -162,7 +162,10 @@ fn foreign_settings() -> Value {
     })
 }
 
-const EVENTS: [&str; 7] = [
+/// The distinct Claude Code event names q writes under. `PostToolUse` carries
+/// two q groups (Bash|Write capture + AskUserQuestion clear); every other name
+/// carries one. See `q_group_count`.
+const EVENTS: [&str; 8] = [
     "SessionStart",
     "UserPromptSubmit",
     "Stop",
@@ -170,7 +173,13 @@ const EVENTS: [&str; 7] = [
     "PreCompact",
     "SessionEnd",
     "PostToolUse",
+    "PreToolUse",
 ];
+
+/// How many q groups `install` writes under one event name.
+fn q_group_count(event: &str) -> usize {
+    if event == "PostToolUse" { 2 } else { 1 }
+}
 
 fn q_groups<'a>(settings: &'a Value, event: &str) -> Vec<&'a Value> {
     settings["hooks"][event]
@@ -193,11 +202,12 @@ fn install_merges_around_foreign_entries_and_chains_the_statusline() {
     env.q().args(["hook", "install"]).assert().success();
     let s = env.read();
 
-    // Non-q keys survive untouched.
+    // Non-q keys survive untouched; a foreign hook under an event q also uses
+    // keeps its place, with q's group added alongside.
     assert_eq!(s["permissions"], foreign_settings()["permissions"]);
     assert_eq!(
-        s["hooks"]["PreToolUse"],
-        foreign_settings()["hooks"]["PreToolUse"]
+        s["hooks"]["PreToolUse"][0],
+        foreign_settings()["hooks"]["PreToolUse"][0]
     );
     assert_eq!(s["hooks"]["Stop"][0]["hooks"][0]["command"], "echo stopped");
     assert_eq!(s["hooks"]["PostToolUse"][0]["matcher"], "Edit");
@@ -207,16 +217,22 @@ fn install_merges_around_foreign_entries_and_chains_the_statusline() {
     let bin = env!("CARGO_BIN_EXE_q").to_string();
     for ev in EVENTS {
         let ours = q_groups(&s, ev);
-        assert_eq!(ours.len(), 1, "{ev}: {ours:?}");
-        let hook = &ours[0]["hooks"][0];
-        assert_eq!(hook["type"], "command");
-        assert!(
-            hook["command"].as_str().unwrap().starts_with(&bin),
-            "{ev}: {hook}"
-        );
-        assert!(hook["timeout"].is_number());
+        assert_eq!(ours.len(), q_group_count(ev), "{ev}: {ours:?}");
+        for group in &ours {
+            let hook = &group["hooks"][0];
+            assert_eq!(hook["type"], "command");
+            assert!(
+                hook["command"].as_str().unwrap().starts_with(&bin),
+                "{ev}: {hook}"
+            );
+            assert!(hook["timeout"].is_number());
+        }
     }
+    // The two PostToolUse groups: the Bash|Write capture, then the
+    // AskUserQuestion clear; PreToolUse carries the AskUserQuestion wait.
     assert_eq!(q_groups(&s, "PostToolUse")[0]["matcher"], "Bash|Write");
+    assert_eq!(q_groups(&s, "PostToolUse")[1]["matcher"], "AskUserQuestion");
+    assert_eq!(q_groups(&s, "PreToolUse")[0]["matcher"], "AskUserQuestion");
     assert_eq!(
         q_groups(&s, "SessionStart")[0]["hooks"][0]["command"],
         format!("{bin} hook session-start")
@@ -407,7 +423,7 @@ fn binary_not_named_q_is_still_recognised() {
     }
     let s = env.read();
     for ev in EVENTS {
-        assert_eq!(q_groups(&s, ev).len(), 1, "{ev}");
+        assert_eq!(q_groups(&s, ev).len(), q_group_count(ev), "{ev}");
     }
     assert_eq!(s["statusLine"]["command"], "/opt/quest-bin hook statusline");
     assert_eq!(env.chain(), "npx ccusage statusline");
@@ -477,7 +493,9 @@ fn null_hooks_and_events_count_as_absent() {
     env.q().args(["hook", "install"]).assert().success();
     let s = env.read();
     assert_eq!(q_groups(&s, "Stop").len(), 1);
-    assert_eq!(s["hooks"]["PreToolUse"], Value::Null);
+    // PreToolUse is a q event now (AskUserQuestion), so a null array is filled.
+    assert_eq!(q_groups(&s, "PreToolUse").len(), 1);
+    assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "AskUserQuestion");
 }
 
 #[test]

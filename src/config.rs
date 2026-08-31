@@ -282,6 +282,16 @@ impl Config {
             seen.push(&remote.name);
         }
 
+        for tag in &self.notify.on {
+            if !crate::notify::KINDS.contains(&tag.as_str()) {
+                return Err(bad(&format!(
+                    "notify.on must be a subset of {}, got `{}`",
+                    crate::notify::KINDS.join(" | "),
+                    tag
+                )));
+            }
+        }
+
         if self.tmux.session_prefix.is_empty() {
             return Err(bad("tmux.session_prefix must not be empty"));
         }
@@ -760,6 +770,9 @@ mod tests {
         assert!(invalid(|c| c.context.worker_warn_pct = 0).contains("worker_warn_pct"));
         assert!(invalid(|c| c.context.reset_strategy = "nuke".into()).contains("reset_strategy"));
         assert!(invalid(|c| c.tmux.session_prefix = String::new()).contains("session_prefix"));
+        assert!(
+            invalid(|c| c.notify.on = vec!["waiting".into(), "typo".into()]).contains("notify.on")
+        );
         assert!(
             invalid(|c| c.remotes = vec![
                 Remote {

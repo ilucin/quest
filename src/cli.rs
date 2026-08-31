@@ -776,6 +776,10 @@ pub enum HookAction {
     #[command(hide = true)]
     PostToolUse,
     #[command(hide = true)]
+    PreToolUse,
+    #[command(hide = true)]
+    PostToolUseAsk,
+    #[command(hide = true)]
     Statusline,
 }
 

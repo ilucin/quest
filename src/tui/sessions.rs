@@ -536,7 +536,7 @@ fn not_idle(view: &SessionView) -> Option<String> {
             .map(|said| format!("claude's own registry says {said}")),
         _ => Some(format!(
             "q has it as {}",
-            listing::status_cell(&view.session)
+            listing::status_cell(&view.session, view.your_turn)
         )),
     }
 }
@@ -954,7 +954,7 @@ fn cells_of(view: &SessionView, warn_pct: u8, remote: Option<&str>) -> Cells {
         quest: fmt::truncate(&view.quest_slug, QUEST_COLS),
         label: s.label.clone(),
         role: s.role.to_string(),
-        status: fmt::truncate(&listing::status_cell(s), STATUS_COLS),
+        status: fmt::truncate(&listing::status_cell(s, view.your_turn), STATUS_COLS),
         phase: fmt::truncate(
             &fmt::or_dash(s.phase.as_deref().filter(|p| !p.trim().is_empty())),
             PHASE_COLS,
@@ -2351,6 +2351,7 @@ mod tests {
             quest_slug: slug.to_string(),
             machine: machine.to_string(),
             registry: None,
+            your_turn: false,
         }
     }
 

@@ -190,6 +190,24 @@ impl Db {
             .map_err(db_err)
     }
 
+    /// The kind of the most recent event logged for one session, or `None`
+    /// when it has logged none. Tells an idle session that just ended its turn
+    /// (`session.stop`) from one freshly (re)started (`session.start`), which
+    /// is how the listing decides whether to show `idle · your turn`.
+    pub fn last_session_event_kind(&self, session_id: &str) -> anyhow::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT kind FROM event WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(db_err(other)),
+            })
+    }
+
     /// The last `limit` events matching `filter`, oldest first — the page
     /// `q events` opens with.
     pub fn list_events_latest(

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Ctx;
 use crate::commands::{fmt, sweep_quiet};
+use crate::db::Db;
 use crate::model::{Quest, Session, SessionRole, SessionStatus};
 use crate::output;
 use crate::registry::{self, Ask};
@@ -36,6 +37,12 @@ pub struct SessionView {
     /// shows a row has gone stale (SPEC §6).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub registry: Option<String>,
+    /// An `idle` row whose last event is `Stop`: it finished its turn and the
+    /// human's reply is what moves it (SPEC §6, plan M2). Rendered as
+    /// `idle · your turn`. Carried on the wire so a remote fleet row reads the
+    /// same; defaults false for older remotes and non-idle rows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub your_turn: bool,
 }
 
 pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
@@ -79,8 +86,23 @@ pub fn load(ctx: &Ctx, args: &Args) -> anyhow::Result<Vec<SessionView>> {
         }
     };
 
+    mark_your_turn(db, &mut views)?;
     annotate(&mut views);
     Ok(views)
+}
+
+/// Sets `your_turn` on every local idle row whose last event is the Stop hook
+/// — the honest "finished its turn, over to you" signal (plan M2). One cheap
+/// lookup per idle row; a busy/waiting/off row is never anyone's turn.
+fn mark_your_turn(db: &Db, views: &mut [SessionView]) -> anyhow::Result<()> {
+    for view in views
+        .iter_mut()
+        .filter(|v| v.session.status == SessionStatus::Idle)
+    {
+        view.your_turn =
+            db.last_session_event_kind(&view.session.id)?.as_deref() == Some("session.stop");
+    }
+    Ok(())
 }
 
 /// Fills in `registry` for the live rows Claude has a pid for: one file read
@@ -108,7 +130,7 @@ fn annotate(views: &mut [SessionView]) {
             continue;
         };
         // The row already says this; a second column would only repeat it.
-        if coarse(&said) != coarse(&status_cell(&view.session)) {
+        if coarse(&said) != coarse(&status_cell(&view.session, false)) {
             view.registry = Some(said);
         }
     }
@@ -137,6 +159,7 @@ fn of_quest(quest: &Quest, sessions: Vec<Session>, all: bool) -> Vec<SessionView
             quest_slug: quest.slug.clone(),
             machine: quest.machine.clone(),
             registry: None,
+            your_turn: false,
         })
         .collect()
 }
@@ -156,7 +179,7 @@ fn human(views: &[SessionView], across_quests: bool) -> String {
                 s.label.clone(),
                 s.role.to_string(),
                 s.tmux_session.clone(),
-                status_cell(s),
+                status_cell(s, v.your_turn),
                 fmt::or_dash(s.phase.as_deref()),
                 s.ctx_pct
                     .map(|p| format!("{p}%"))
@@ -199,9 +222,12 @@ fn coarse(cell: &str) -> &str {
 }
 
 /// `waiting` alone says nothing about what for; the hook records it, so show it.
-pub fn status_cell(session: &Session) -> String {
+/// `your_turn` marks an idle row that finished its turn (last event Stop): the
+/// human's reply is what moves it, so it reads `idle · your turn`.
+pub fn status_cell(session: &Session, your_turn: bool) -> String {
     match (&session.status, session.waiting_for.as_deref()) {
         (SessionStatus::Waiting, Some(what)) => format!("waiting: {what}"),
+        (SessionStatus::Idle, _) if your_turn => "idle · your turn".to_string(),
         (status, _) => status.to_string(),
     }
 }
@@ -309,12 +335,27 @@ mod tests {
         let q = quest();
         let mut s = session(&q, "w1", SessionStatus::Waiting, 1);
         s.waiting_for = Some("permission_prompt".to_string());
-        assert_eq!(status_cell(&s), "waiting: permission_prompt");
+        assert_eq!(status_cell(&s, false), "waiting: permission_prompt");
+        s.waiting_for = Some("question".to_string());
+        assert_eq!(status_cell(&s, false), "waiting: question");
         s.waiting_for = None;
-        assert_eq!(status_cell(&s), "waiting");
+        assert_eq!(status_cell(&s, false), "waiting");
         s.status = SessionStatus::Busy;
         s.waiting_for = Some("ignored".to_string());
-        assert_eq!(status_cell(&s), "busy");
+        assert_eq!(status_cell(&s, false), "busy");
+    }
+
+    #[test]
+    fn an_idle_row_that_finished_its_turn_says_your_turn() {
+        let q = quest();
+        let s = session(&q, "w1", SessionStatus::Idle, 1);
+        // Plain idle (freshly started, say) stays plain.
+        assert_eq!(status_cell(&s, false), "idle");
+        // Finished a turn: the human's move.
+        assert_eq!(status_cell(&s, true), "idle · your turn");
+        // `your_turn` never overrides a non-idle status.
+        let busy = session(&q, "w2", SessionStatus::Busy, 1);
+        assert_eq!(status_cell(&busy, true), "busy");
     }
 
     /// The two sources name the same prompt differently, so the comparison
