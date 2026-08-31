@@ -441,12 +441,31 @@ fn section_how(
     match role {
         SessionRole::Master => {
             out.push_str(
-                "You are the **master** of this Quest: you own the goal, split the work and \
-                 keep the picture. Workers are Claude sessions you spawn, each in its own tmux \
-                 session; they report back to you.\n\n\
-                 - See who is running: `q sessions`; look into one: `q peek <session>`.\n\
-                 - Spawn a worker: `q spawn <quest> --label <l> \"<prompt>\"`; talk to it: \
-                 `q send <session> \"<text>\"` or `SendMessage`.\n\
+                "You are the **master** of this Quest: you own the goal, split the work across \
+                 workers, and keep the high-level picture — you rarely touch the code yourself. \
+                 A Quest is a fleet of tmux sessions: you run in the main session `q-<slug>`, \
+                 each worker is a Claude in its own session `q-<slug>+<label>`.\n\n\
+                 - See the fleet: `q sessions`; read a worker's output without interrupting it: \
+                 `q peek <session>`.\n\
+                 - Spawn a worker (Claude + a prompt): `q spawn <quest> --label <l> \
+                 \"<prompt>\"`. Spawn a bare shell instead: `q spawn <quest> --label <l> \
+                 --shell`, then `q start <l>` when ready.\n\
+                 - A session's pane is a login shell; Claude is a child of it. `q start \
+                 <session>` launches Claude, `q stop <session>` types `/exit` so Claude leaves \
+                 and the shell stays, `q kill <session>` removes the tmux session for good. \
+                 **`off` means no Claude, not dead** — the shell is live and `q start` brings \
+                 Claude back.\n\
+                 - Talk to a worker: `q send <session> \"<text>\"` or `SendMessage`.\n\
+                 - Move the Quest's cwd: `q cd <quest> <path>`. The cwd follows the main \
+                 shell's `cd`, but only after you `/exit` Claude to the shell — while Claude \
+                 runs in main, use `q cd` to move it.\n\
+                 - States: **section 5** of this brief shows `running` (Claude working or \
+                 booting), `idle`, `off` (no Claude), and `waiting: permission/input/question` \
+                 when a worker is blocked on the human. `q sessions` and the TUI split \
+                 `running` into `busy`/`starting` and soften a just-finished turn to `idle · \
+                 your turn` (over to you) — section 5 renders that same turn as plain `idle`. \
+                 Tell workers to raise blocking questions with the **AskUserQuestion** tool so \
+                 they show as `waiting: question` rather than a silent `idle`.\n\
                  - Report where you are: `q phase \"<text>\"`.\n\
                  - Link everything you produce: `q link add <ref>` / `q artifact add <path>`.\n\
                  - Record decisions and open questions: `q note \"<text>\"` \
@@ -483,6 +502,9 @@ fn section_how(
                  - Report to the master with `SendMessage` or `q send master \"<text>\"`.\n\
                  - Report where you are: `q phase \"<text>\"`.\n\
                  - Link what you produce: `q link add <ref>` / `q artifact add <path>`.\n\
+                 - Need a decision before you can go on? Raise it with the **AskUserQuestion** \
+                 tool — it shows the fleet `waiting: question`. A plain-text question that ends \
+                 your turn only reads as `idle · your turn`, which is easy to miss.\n\
                  - Stuck? `q note --blocker \"<text>\"` and tell the master.\n",
             ));
         }
@@ -1256,6 +1278,57 @@ mod tests {
         assert!(worker.contains("You are a **worker**"));
         assert!(worker.contains("Your master is `master`"));
         assert!(worker.contains("You are session `w1-tests` (worker"));
+    }
+
+    /// Section 2 carries the v2 operating knowledge (M4): the fleet-of-tmux
+    /// mental model, the launch/stop/kill verbs, `off ≠ dead`, the cwd rule, the
+    /// honest states, and `AskUserQuestion` for blocking questions.
+    #[test]
+    fn section_two_teaches_the_v2_fleet_and_verbs() {
+        let (db, quest) = seeded();
+        let master = render_with(&db, &quest, &Opts::default(), &NoExternal).unwrap();
+        for needle in [
+            "fleet of tmux sessions",
+            "q spawn <quest> --label",
+            "--shell",
+            "q start <session>",
+            "q stop <session>",
+            "q kill <session>",
+            "q peek <session>",
+            "q send <session>",
+            "`off` means no Claude, not dead",
+            "q cd <quest> <path>",
+            "idle · your turn",
+            "waiting: ",
+            "AskUserQuestion",
+        ] {
+            assert!(
+                master.contains(needle),
+                "master brief missing {needle:?}:\n{master}"
+            );
+        }
+        // The state vocabulary must name the right surface: `running` is a
+        // section-5 rendering, while `q sessions`/TUI split it into
+        // `busy`/`starting` and soften a finished turn to `idle · your turn`.
+        assert!(
+            master.contains("split `running` into `busy`/`starting`"),
+            "section 2 must attribute `busy`/`starting` to q sessions, not `running`:\n{master}"
+        );
+        assert!(
+            master.contains("section 5 renders that same turn as plain `idle`"),
+            "section 2 must keep `idle · your turn` off section 5:\n{master}"
+        );
+
+        let opts = Opts {
+            role: SessionRole::Worker,
+            session: Some("w1-tests".to_string()),
+            ..Opts::default()
+        };
+        let worker = render_with(&db, &quest, &opts, &NoExternal).unwrap();
+        assert!(
+            worker.contains("AskUserQuestion"),
+            "workers are told to ask via AskUserQuestion:\n{worker}"
+        );
     }
 
     #[test]

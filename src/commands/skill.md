@@ -17,7 +17,26 @@ are inside its Quest. `master` is the label of the first session.
 
 A session's tmux pane is a login shell; Claude is a child launched inside it. A
 session with no Claude running shows status **off** — its shell is still there, ready
-for `q start`.
+for `q start`. **`off` means no Claude, not dead.**
+
+Session states — `q sessions` and the TUI name them one way, the brief's section 5
+another, for the same session:
+
+- **busy** / **starting** in `q sessions` and the TUI — Claude is working, or booting.
+  The brief's section 5 shows both as **running**.
+- **idle**, softened to **idle · your turn** in `q sessions` and the TUI when Claude
+  just handed a turn back to you. The brief's section 5 shows that same turn as plain
+  **idle**.
+- **waiting: permission / input / question** — honestly blocked on the human. A worker
+  that calls the **AskUserQuestion** tool shows `waiting: question`; a plain-text
+  question that merely ends a turn only reads as `idle · your turn` (plain `idle` in the
+  brief). If you are a worker and need a decision to proceed, ask with **AskUserQuestion**
+  so the fleet sees it.
+- **off** — no Claude in the pane (a bare shell); `ended` — the session is wound down.
+
+The Quest's cwd follows the **main** session's shell — a `cd` there moves the Quest,
+but only once Claude has exited to the shell. While Claude is up in main, move the
+Quest explicitly with `q cd <quest> <path>` (config `[quest] follow_main_cwd`).
 
 ## Read the state — no confirmation needed
 

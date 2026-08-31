@@ -276,7 +276,7 @@ pub enum Command {
         strategy: Option<ResetStrategy>,
     },
 
-    /// Kill a worker session's tmux window and end its row
+    /// Kill a worker session's tmux session and end its row
     Kill {
         /// `<quest>/<label>`, a session id, or `<label>` inside a Quest
         session: String,

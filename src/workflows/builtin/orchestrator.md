@@ -7,7 +7,7 @@ Two ways to run an agent, and the choice is not a matter of taste:
 
 - **Subagent** (the `Agent` tool) — bounded, minutes, you wait for it. Reviews, lookups,
   a single-file fix.
-- **Worker** (`q spawn`) — long, detached, its own Claude in its own tmux window with its
+- **Worker** (`q spawn`) — long, detached, its own Claude in its own tmux session with its
   own context window. Anything that plans a large change, writes code across many files,
   brings up an environment, or would otherwise eat your context. **For long-running steps
   spawn a worker, not a subagent.**
