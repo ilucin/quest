@@ -44,7 +44,7 @@ CREATE TABLE session (
   claude_name   TEXT,
   workflow      TEXT,                      -- when it differs from the quest's
   phase         TEXT,                      -- self-reported: 'planning', 'implementing', …
-  status        TEXT NOT NULL,             -- 'starting'|'busy'|'idle'|'waiting'|'ended'
+  status        TEXT NOT NULL,             -- 'starting'|'busy'|'idle'|'waiting'|'off'|'ended'
   waiting_for   TEXT,                      -- 'permission' | 'input' | …
   ctx_pct       INTEGER,                   -- last known context window %
   ctx_updated_at INTEGER,

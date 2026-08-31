@@ -1303,11 +1303,12 @@ pub fn spawn_worker(ctx: &Ctx, app: &mut App) {
     }
 }
 
-/// `q spawn <slug> --no-attach --machine <m>` as a child of *this* `q` — the CLI
-/// proxy resolves, pins and sends it over ssh. The far side picks the `w<n>`
-/// label, so nothing here needs the remote's session count.
+/// `q spawn <slug> --machine <m>` as a child of *this* `q` — the CLI proxy
+/// resolves, pins and sends it over ssh. `q spawn` is detached by default now,
+/// so no flag is needed. The far side picks the `w<n>` label, so nothing here
+/// needs the remote's session count.
 fn spawn_worker_remote(app: &mut App, slug: &str, machine: &str) {
-    match super::spawn_q(&["spawn", slug, "--no-attach", "--machine", machine]) {
+    match super::spawn_q(&["spawn", slug, "--machine", machine]) {
         Ok(out) if out.status.success() => {
             app.say(format!(
                 "{slug} \u{b7} spawned a worker on {machine} \u{b7} it appears at the next remote tick"
@@ -5151,7 +5152,8 @@ mod form_tests {
         let quest = &rig.quests()[0];
         assert_eq!(quest.template_id.as_deref(), Some(template.id.as_str()));
         assert_eq!(quest.goal.as_deref(), Some("tidy up"));
-        // The prompt went to the master, which is what the note now promises.
+        // The prompt went to the master (SPEC §6 v2): the pane runs a shell and
+        // the launch command — carrying the prompt — was typed into its buffer.
         let pane = rig
             .fixture()
             .load()
@@ -5160,12 +5162,11 @@ mod form_tests {
             .into_iter()
             .find(|p| p.session_name == "q-from-template")
             .unwrap();
+        assert_eq!(pane.command, None, "the pane command is the login shell");
         assert!(
-            pane.command
-                .as_deref()
-                .is_some_and(|c| c.contains("start with the backlog")),
+            pane.buffer.contains("start with the backlog"),
             "{:?}",
-            pane.command
+            pane.buffer
         );
     }
 

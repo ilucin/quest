@@ -11,7 +11,7 @@ use crate::error::QError;
 use crate::model::{Quest, QuestState, Session};
 use crate::output;
 use crate::remote;
-use crate::tmux::{session_name, window_of};
+use crate::tmux::window_of;
 
 /// Where an attach would land. Every error building one is a reason not to
 /// attach at all, which is why the TUI (bd-8lz.4.3) resolves through here
@@ -36,15 +36,6 @@ pub fn resolve(ctx: &Ctx, quest: &Quest, label: Option<&str>) -> anyhow::Result<
         ))
         .into());
     }
-    let tmux_session = session_name(&ctx.config, &quest.slug);
-    if !ctx.tmux().has_session(&tmux_session)? {
-        return Err(QError::Tmux(format!(
-            "no tmux session `{tmux_session}`; run `q resume {}`",
-            quest.slug
-        ))
-        .into());
-    }
-
     let sessions = ctx.db()?.list_sessions_by_quest(&quest.id)?;
     let wanted = label.unwrap_or(MASTER);
     let session = match live(&sessions).find(|s| s.label == wanted) {
@@ -79,6 +70,20 @@ pub fn resolve(ctx: &Ctx, quest: &Quest, label: Option<&str>) -> anyhow::Result<
     if session.tmux_pane.is_empty() {
         return Err(QError::Other(format!(
             "session `{wanted}` of {} has no pane yet; it never finished starting",
+            quest.slug
+        ))
+        .into());
+    }
+    // Gate on the *resolved* session's **own** tmux session (SPEC §6 v2): a
+    // worker lives in `q-<slug>+<label>`, independently enterable when the main
+    // is gone — the same asymmetry `q resume` relies on to re-adopt live
+    // workers. Gating on the main here would bounce `q enter <quest> --session
+    // <live-worker>` off a dead main. A pre-v2 worker row still carries the main
+    // name, so this checks the main for it, which is correct.
+    let tmux_session = session.tmux_session.clone();
+    if !ctx.tmux().has_session(&tmux_session)? {
+        return Err(QError::Tmux(format!(
+            "no tmux session `{tmux_session}`; run `q resume {}`",
             quest.slug
         ))
         .into());

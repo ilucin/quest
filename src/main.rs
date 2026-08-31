@@ -566,7 +566,8 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
             label,
             workflow,
             dir,
-            no_attach,
+            shell,
+            enter,
         } => commands::spawn::run(
             ctx,
             &commands::spawn::Args {
@@ -575,11 +576,36 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
                 prompt: prompt.as_deref(),
                 workflow: workflow.as_deref(),
                 dir: dir.as_deref(),
-                no_attach: *no_attach,
+                shell: *shell,
+                enter: *enter,
             },
         )
         .map(|()| 0),
         Command::SpawnHere { pane } => commands::spawn::run_here(ctx, pane).map(|()| 0),
+        Command::Start {
+            session,
+            prompt,
+            resume,
+            force,
+        } => commands::start::run(
+            ctx,
+            &commands::start::Args {
+                session,
+                prompt: prompt.as_deref(),
+                resume: *resume,
+                force: *force,
+            },
+        )
+        .map(|()| 0),
+        Command::Stop { session, force } => commands::stop::run(
+            ctx,
+            &commands::stop::Args {
+                session,
+                force: *force,
+            },
+        )
+        .map(|()| 0),
+        Command::Prompt { session } => commands::prompt::run(ctx, session).map(|()| 0),
         Command::Sessions { quest, all } => commands::sessions::run(
             ctx,
             &commands::sessions::Args {
@@ -594,12 +620,14 @@ fn local(ctx: &Ctx, command: &Command) -> anyhow::Result<u8> {
             session,
             text,
             force,
+            shell,
         } => commands::send::run(
             ctx,
             &commands::send::Args {
                 session,
                 text,
                 force: *force,
+                shell: *shell,
             },
         )
         .map(|()| 0),

@@ -156,7 +156,7 @@ pub enum Command {
         detach: bool,
     },
 
-    /// Spawn a worker agent in a new window of the Quest's tmux session
+    /// Spawn a worker agent in its own tmux session (`q-<slug>+<label>`)
     Spawn {
         quest: String,
         /// First prompt for the worker; omit for a bare interactive Claude.
@@ -173,10 +173,44 @@ pub enum Command {
         /// Working directory (default: the Quest's)
         #[arg(long, value_name = "PATH")]
         dir: Option<String>,
-        /// Do not select the new window (already the case outside the Quest's
-        /// own tmux session, where there is no client of ours to move)
+        /// Open a bare shell without launching Claude (row `off`); start it
+        /// later with `q start`
         #[arg(long)]
-        no_attach: bool,
+        shell: bool,
+        /// Attach to the new worker's tmux session afterwards
+        #[arg(long)]
+        enter: bool,
+    },
+
+    /// Launch Claude in a session's shell pane
+    Start {
+        /// `<quest>/<label>`, a session id, or `<label>` inside a Quest
+        session: String,
+        /// First prompt; omit to reuse the session's stored one.
+        /// A leading `-` is text, not a flag
+        #[arg(allow_hyphen_values = true)]
+        prompt: Option<String>,
+        /// Re-attach Claude's own last session in this pane (`claude --resume`)
+        #[arg(long)]
+        resume: bool,
+        /// Start even though the pane is running a non-shell command
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Stop Claude in a session by typing `/exit`; the shell remains
+    Stop {
+        /// `<quest>/<label>`, a session id, or `<label>` inside a Quest
+        session: String,
+        /// Stop even though the session is busy, waiting or starting
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Print a session's stored first prompt
+    Prompt {
+        /// `<quest>/<label>`, a session id, or `<label>` inside a Quest
+        session: String,
     },
 
     /// Spawn a bare worker in the Quest that owns a tmux pane, then select it.
@@ -222,6 +256,10 @@ pub enum Command {
         /// Send even though the session is busy, waiting or starting
         #[arg(long)]
         force: bool,
+        /// Type into the session's shell — the only way to send to an `off`
+        /// session (no Claude), where a prompt would otherwise land in zsh
+        #[arg(long)]
+        shell: bool,
     },
 
     /// Hand a session a fresh context window: `/clear` (plus a follow-up

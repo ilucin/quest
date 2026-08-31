@@ -240,6 +240,63 @@ fn check_claude(claude: Option<&Path>) -> Check {
     }
 }
 
+/// A `claude` that is a shell-script wrapper launching the real binary *without*
+/// `exec` shows up in `pane_current_command` as the wrapper's own shell (`bash`),
+/// which the presence sweep reads as "no Claude" and would demote a live row to
+/// `off` (plan §3.2). Warn so the user adds an `exec`. A real binary, or a
+/// script that already execs, is fine.
+fn check_claude_wrapper(claude: Option<&Path>) -> Check {
+    let name = "claude wrapper";
+    let Some(path) = claude else {
+        // The missing-claude failure is check_claude's to report.
+        return check(name, Status::Ok, "n/a (claude not found)");
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => evaluate_wrapper(
+            &String::from_utf8_lossy(&bytes),
+            &path.display().to_string(),
+        ),
+        Err(_) => check(
+            name,
+            Status::Ok,
+            format!("{} is not a readable script", path.display()),
+        ),
+    }
+}
+
+/// The pure half of [`check_claude_wrapper`].
+fn evaluate_wrapper(contents: &str, path: &str) -> Check {
+    let name = "claude wrapper";
+    let first = contents.lines().next().unwrap_or("");
+    let is_shell_script = first.starts_with("#!")
+        && ["sh", "bash", "zsh", "dash", "ksh", "fish"]
+            .iter()
+            .any(|s| first.contains(s));
+    if !is_shell_script {
+        return check(name, Status::Ok, "claude is a binary (no wrapper)");
+    }
+    let launches = contents.lines().any(|l| {
+        let t = l.trim();
+        !t.starts_with('#') && (t.contains("claude") || t.contains("node"))
+    });
+    let execs = contents
+        .lines()
+        .any(|l| l.trim_start().starts_with("exec "));
+    if launches && !execs {
+        with_hint(
+            check(
+                name,
+                Status::Warn,
+                format!("{path} is a shell wrapper that does not `exec` Claude"),
+            ),
+            "prefix the launch with `exec` so tmux sees Claude, not the wrapper shell \
+             (else q reads the pane as `off`)",
+        )
+    } else {
+        check(name, Status::Ok, format!("{path} execs into Claude"))
+    }
+}
+
 /// `None` when the call failed or printed something unrecognisable.
 fn claude_version(claude: &Path) -> Option<String> {
     let mut cmd = Command::new(claude);
@@ -720,6 +777,70 @@ fn check_orphans(db: Option<&Db>, tmux: &dyn Tmux, fix: bool, fixed: &mut Vec<St
     )
 }
 
+/// Live session rows whose `tmux_session` names a slug other than their Quest's
+/// current one (SPEC §6 v2): a fleet rename could not move the worker's tmux
+/// session (its target name was taken, or the rename errored), so the row was
+/// left pointing at the old name. The pane is still alive under that name — the
+/// worker is reachable — but the fleet is inconsistent. There is nothing safe to
+/// auto-fix (renaming again could collide the same way), so it only warns; `q
+/// rename` re-syncs it and `q close`/`q rm` tear it down (R7).
+fn check_fleet_names(db: Option<&Db>, tmux: &dyn Tmux, config: &Config) -> Check {
+    const NAME: &str = "fleet names";
+
+    let Some(db) = db else {
+        return check(NAME, Status::Warn, "skipped: the database is unreadable");
+    };
+    let live = match db.list_live_sessions() {
+        Ok(live) => live,
+        Err(e) => return check(NAME, Status::Fail, format!("{e:#}")),
+    };
+    if live.is_empty() {
+        return check(NAME, Status::Ok, "none");
+    }
+    let panes = match tmux::live_panes(tmux) {
+        Ok(panes) => panes,
+        Err(e) => return check(NAME, Status::Warn, format!("skipped: {e:#}")),
+    };
+    let alive: std::collections::HashSet<(&str, &str)> = panes
+        .iter()
+        .map(|p| (p.session_name.as_str(), p.pane_id.as_str()))
+        .collect();
+
+    let mut stranded: Vec<String> = Vec::new();
+    for session in &live {
+        // A reachable pane under the recorded name — a gone pane is the orphan
+        // check's business, not a naming mismatch.
+        if !alive.contains(&(session.tmux_session.as_str(), session.tmux_pane.as_str())) {
+            continue;
+        }
+        let Some(quest) = db.get_quest(&session.quest_id).ok().flatten() else {
+            continue;
+        };
+        let recorded = tmux::quest_slug_of_name(config, &session.tmux_session);
+        if recorded.as_deref() != Some(quest.slug.as_str()) {
+            stranded.push(format!(
+                "{}/{} on {}",
+                quest.slug, session.label, session.tmux_session
+            ));
+        }
+    }
+    if stranded.is_empty() {
+        return check(NAME, Status::Ok, "in sync");
+    }
+    with_hint(
+        check(
+            NAME,
+            Status::Warn,
+            format!(
+                "{} stranded by a rename: {}",
+                stranded.len(),
+                stranded.join(", ")
+            ),
+        ),
+        "q rename to re-sync, or q close/q rm to tear the fleet down",
+    )
+}
+
 /// `quest-slug/label`, falling back to the quest id when the row is unreadable.
 fn describe(db: &Db, session: &Session) -> String {
     let quest = db
@@ -1145,6 +1266,7 @@ fn report(ctx: &Ctx, fix: bool) -> Report {
         check_config(),
         check_tmux(ctx.tmux()),
         check_claude(claude.as_deref()),
+        check_claude_wrapper(claude.as_deref()),
         check_claude_login(claude.as_deref()),
         db_check,
         // SPEC §23 #8 is only half checkable: which `q` a shell runs is
@@ -1163,6 +1285,7 @@ fn report(ctx: &Ctx, fix: bool) -> Report {
     // SPEC §19's order: the remotes, then the orphans.
     checks.extend(check_remotes(ctx));
     checks.push(check_orphans(db.as_ref(), ctx.tmux(), fix, &mut fixed));
+    checks.push(check_fleet_names(db.as_ref(), ctx.tmux(), &ctx.config));
     Report::new(checks, fixed)
 }
 
@@ -1792,5 +1915,37 @@ mod tests {
         assert_eq!(broken.status, Status::Fail);
         assert!(broken.detail.contains("reset_strategy"), "{broken:?}");
         assert!(broken.fix_hint.is_some());
+    }
+
+    #[test]
+    fn evaluate_wrapper_passes_a_binary_and_an_execing_wrapper() {
+        // No shebang: a real binary, not a wrapper.
+        let binary = evaluate_wrapper("\u{7f}ELF\u{1}\u{1}\u{1}", "/usr/bin/claude");
+        assert_eq!(binary.status, Status::Ok);
+        assert!(binary.detail.contains("binary"), "{binary:?}");
+
+        // A shebang that is not a shell (e.g. a Node launcher) is left alone.
+        let node = evaluate_wrapper("#!/usr/bin/env node\nrequire('x')\n", "/x/claude");
+        assert_eq!(node.status, Status::Ok);
+
+        // A shell wrapper that already execs is fine.
+        let execing = evaluate_wrapper("#!/bin/bash\nexec claude \"$@\"\n", "/opt/claude");
+        assert_eq!(execing.status, Status::Ok);
+        assert!(execing.detail.contains("execs"), "{execing:?}");
+    }
+
+    #[test]
+    fn evaluate_wrapper_warns_a_shell_wrapper_that_does_not_exec() {
+        let bare = evaluate_wrapper("#!/bin/bash\nclaude \"$@\"\n", "/opt/claude");
+        assert_eq!(bare.status, Status::Warn);
+        assert!(bare.detail.contains("does not `exec`"), "{bare:?}");
+        assert!(bare.fix_hint.is_some());
+
+        // The same shape via `node`, and a leading comment is not a launch.
+        let via_node = evaluate_wrapper(
+            "#!/bin/sh\n# launches claude\nnode /app/cli.js \"$@\"\n",
+            "/opt/claude",
+        );
+        assert_eq!(via_node.status, Status::Warn);
     }
 }

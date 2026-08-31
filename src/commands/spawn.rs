@@ -1,15 +1,19 @@
-//! `q spawn` — a worker agent in a new window of the Quest's tmux session
-//! (SPEC §6, §16). Window 0 is the master; workers get `w<n>-<label>`.
+//! `q spawn` — a worker agent in its own tmux session (SPEC §6 v2). The main
+//! session is `q-<slug>`; each worker is `q-<slug>+<label>`, a login shell with
+//! Claude launched into it (`--shell` leaves it a bare shell, row `off`).
 
 use std::io::Write;
 
 use crate::Ctx;
-use crate::commands::new::{MASTER, claude_command, fresh_session_id, resolve_dir, validate_label};
-use crate::commands::{AttachMode, live, sweep_quiet};
+use crate::commands::new::{MASTER, fresh_session_id, resolve_dir, validate_label};
+use crate::commands::{AttachMode, attach_mode, live, sweep_quiet};
 use crate::error::QError;
 use crate::model::{Quest, QuestState, Session, SessionRole, SessionStatus};
 use crate::output;
-use crate::tmux::{NewWindow, Tmux, config_override, db_override, quest_env, session_name};
+use crate::tmux::{
+    NewSession, config_override, db_override, quest_env, quest_slug_of_name, session_name,
+    worker_session_name,
+};
 
 #[derive(Debug)]
 pub struct Args<'a> {
@@ -20,18 +24,24 @@ pub struct Args<'a> {
     pub prompt: Option<&'a str>,
     pub workflow: Option<&'a str>,
     pub dir: Option<&'a str>,
-    pub no_attach: bool,
+    /// A shell only: no Claude launched, the row lands `off` (SPEC §6). Start it
+    /// later with `q start`.
+    pub shell: bool,
+    /// Attach to the new worker's tmux session afterwards.
+    pub enter: bool,
 }
 
 /// What [`spawn_core`] hands back so the caller can report it or land on it.
 struct Spawned {
     quest: Quest,
     session: Session,
+    /// The worker's own tmux session, `q-<slug>+<label>`.
     tmux_session: String,
-    window: String,
+    /// Whether Claude was launched (false under `--shell`).
+    launched: bool,
 }
 
-/// `q spawn <quest> [prompt] [--label …]`.
+/// `q spawn <quest> [prompt] [--label …] [--shell] [--enter]`.
 pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
     sweep_quiet(ctx)?;
     let quest = ctx.db()?.resolve_quest(args.quest)?;
@@ -42,23 +52,23 @@ pub fn run(ctx: &Ctx, args: &Args) -> anyhow::Result<()> {
         args.prompt,
         args.workflow,
         args.dir,
+        args.shell,
     )?;
-    report_and_attach(ctx, &spawned, args.no_attach)
+    report_and_attach(ctx, &spawned, args.enter)
 }
 
-/// Spawn a bare worker (auto `w<n>` label, no prompt) for a caller that reports
-/// the result itself — the TUI, which owns the screen and must not have `q`
-/// print to it. Resolves the Quest fresh, creates the window, returns the row;
-/// no stdout, no window select.
+/// Spawn a bare worker (auto `w<n>` label, no prompt, Claude launched) for a
+/// caller that reports the result itself — the TUI, which owns the screen and
+/// must not have `q` print to it.
 pub fn spawn_bare(ctx: &Ctx, quest_ref: &str) -> anyhow::Result<Session> {
     sweep_quiet(ctx)?;
     let quest = ctx.db()?.resolve_quest(quest_ref)?;
-    Ok(spawn_core(ctx, &quest, None, None, None, None)?.session)
+    Ok(spawn_core(ctx, &quest, None, None, None, None, false)?.session)
 }
 
 /// `q spawn-here <pane>` — the `[tmux] spawn_key` binding. Resolves the Quest
-/// from the tmux pane the key was pressed in, spawns a bare worker there, and
-/// selects it. A pane that is not one of ours is a friendly no-op.
+/// from the tmux pane the key was pressed in, spawns a bare worker (its own
+/// session), and attaches to it. A pane that is not one of ours is a no-op.
 pub fn run_here(ctx: &Ctx, pane: &str) -> anyhow::Result<()> {
     sweep_quiet(ctx)?;
     let Some(slug) = quest_slug_of_pane(ctx, pane)? else {
@@ -69,16 +79,16 @@ pub fn run_here(ctx: &Ctx, pane: &str) -> anyhow::Result<()> {
         );
     };
     let quest = ctx.db()?.resolve_quest(&slug)?;
-    let spawned = spawn_core(ctx, &quest, None, None, None, None)?;
-    // The key was pressed inside this Quest's session, so land the caller on the
-    // fresh worker. `run_here` runs detached from the pane's environment, so the
-    // `in_tmux_session` heuristic cannot see it — select unconditionally.
-    ctx.tmux().select_window(&spawned.session.tmux_pane)?;
+    let spawned = spawn_core(ctx, &quest, None, None, None, None, false)?;
+    // The key was pressed inside this Quest, so land the caller on the fresh
+    // worker's own session (a switch-client inside tmux).
+    ctx.tmux()
+        .attach(&spawned.tmux_session, Some(&spawned.session.tmux_pane))?;
     let Spawned {
         quest,
         session,
         tmux_session,
-        window,
+        launched,
     } = &spawned;
     output::emit(
         ctx.json,
@@ -87,29 +97,29 @@ pub fn run_here(ctx: &Ctx, pane: &str) -> anyhow::Result<()> {
             "quest": quest,
             "session": session,
             "tmux_session": tmux_session,
-            "window": window,
+            "launched": launched,
         }),
         || format!("spawned {} in {}", session.label, quest.slug),
     )
 }
 
-/// The Quest slug owning `pane`, read off its tmux session name
-/// (`<session_prefix><slug>`), or `None` when the pane is not a Quest's.
+/// The Quest slug owning `pane`, read off its tmux session name (SPEC §6): the
+/// prefix is stripped and everything before the first `+` is the slug, so a
+/// worker pane in `q-foo+review` reports `foo` and a sibling `q-foo-bar` reports
+/// `foo-bar` rather than being mistaken for `foo`.
 fn quest_slug_of_pane(ctx: &Ctx, pane: &str) -> anyhow::Result<Option<String>> {
-    let prefix = ctx.config.tmux.session_prefix.as_str();
     Ok(ctx
         .tmux()
         .list_panes()?
         .iter()
         .find(|p| p.pane_id == pane)
-        .and_then(|p| p.session_name.strip_prefix(prefix))
-        .filter(|slug| !slug.is_empty())
-        .map(str::to_string))
+        .and_then(|p| quest_slug_of_name(&ctx.config, &p.session_name)))
 }
 
-/// Create the worker window and its session row (SPEC §6). Shared by the CLI
-/// (`run`) and the tmux binding (`run_here`); neither reports nor attaches —
-/// that is each caller's own.
+/// Create the worker's tmux session and its row (SPEC §6). Shared by the CLI
+/// (`run`), the TUI (`spawn_bare`) and the tmux binding (`run_here`); none of
+/// them reports or attaches here — that is each caller's own.
+#[allow(clippy::too_many_arguments)]
 fn spawn_core(
     ctx: &Ctx,
     quest: &Quest,
@@ -117,6 +127,7 @@ fn spawn_core(
     prompt: Option<&str>,
     workflow: Option<&str>,
     dir: Option<&str>,
+    shell: bool,
 ) -> anyhow::Result<Spawned> {
     let db = ctx.db()?;
     if quest.state == QuestState::Finished {
@@ -130,10 +141,10 @@ fn spawn_core(
     // validated; see `crate::workflows::Registry::check_opt`.
     let workflow = ctx.workflows().check_opt(workflow)?;
 
-    let tmux_session = session_name(&ctx.config, &quest.slug);
-    if !ctx.tmux().has_session(&tmux_session)? {
+    let main_session = session_name(&ctx.config, &quest.slug);
+    if !ctx.tmux().has_session(&main_session)? {
         return Err(QError::Tmux(format!(
-            "no tmux session `{tmux_session}`; run `q resume {}` first",
+            "no tmux session `{main_session}`; run `q resume {}` first",
             quest.slug
         ))
         .into());
@@ -141,14 +152,12 @@ fn spawn_core(
 
     let sessions = db.list_sessions_by_quest(&quest.id)?;
     let idx = next_worker_index(&sessions);
-    // A named worker validates and must be free; an auto one is `w<n>`, and the
-    // window carries that name on its own (no `w<n>-w<n>`).
-    let (label, window) = match label {
+    let label = match label {
         Some(label) => {
             validate_label(label)?;
             if label == MASTER {
                 return Err(QError::Invalid(format!(
-                    "label `{MASTER}` is reserved for window 0 of a Quest"
+                    "label `{MASTER}` is reserved for the main session of a Quest"
                 ))
                 .into());
             }
@@ -159,13 +168,17 @@ fn spawn_core(
                 ))
                 .into());
             }
-            (label.to_string(), window_name(idx, label))
+            label.to_string()
         }
-        None => {
-            let label = auto_label(&sessions, idx);
-            (label.clone(), label)
-        }
+        None => auto_label(&sessions, idx),
     };
+    let worker_session = worker_session_name(&ctx.config, &quest.slug, &label);
+    if ctx.tmux().has_session(&worker_session)? {
+        return Err(
+            QError::Conflict(format!("tmux session `{worker_session}` already exists")).into(),
+        );
+    }
+
     let prompt = prompt.map(str::trim).filter(|p| !p.is_empty());
     // The Quest's cwd is already canonical; `--dir` gets the same treatment.
     let cwd = match dir {
@@ -173,26 +186,25 @@ fn spawn_core(
         None => quest.cwd.clone(),
     };
 
-    // The row goes in before the window: `$Q_SESSION` is in the window's
+    // The row goes in before the session: `$Q_SESSION` is in the session's
     // environment, and Claude's `SessionStart` hook fires against it as soon as
-    // the window exists. The pane — the session's identity — is filled in right
+    // the pane exists. The pane — the session's identity — is filled in right
     // after tmux hands it over.
     let session_id = fresh_session_id(db)?;
-    let mut row = Session::new(&quest.id, SessionRole::Worker, &label, &tmux_session, "");
+    let mut row = Session::new(&quest.id, SessionRole::Worker, &label, &worker_session, "");
     row.id = session_id.clone();
-    row.status = SessionStatus::Starting;
-    // Without `--workflow` a worker runs the Quest's, as the master does. The
-    // Quest's own was checked when it was set, so only the flag is checked
-    // here — see `crate::workflows`.
+    // A `--shell` worker is a bare shell from the start; otherwise the row is
+    // `starting` and `launch` types Claude below.
+    row.status = if shell {
+        SessionStatus::Off
+    } else {
+        SessionStatus::Starting
+    };
     row.workflow = workflow.or_else(|| quest.workflow.clone());
     row.first_prompt = prompt.map(str::to_string);
-    // The name `claude -n` is given below (SPEC §6), recorded so the registry's
-    // identity check has something true to compare against.
     row.claude_name = Some(crate::naming::claude_name(&quest.slug, &label));
-    // `session.start` is the hook's to append once Claude comes up.
     let pending = db.insert_session(&row)?;
     if pending.id != session_id {
-        // A regenerated id would no longer match `Q_SESSION` in the window.
         let _ = db.delete_session(&pending.id);
         return Err(QError::Db(format!(
             "session id `{session_id}` was taken between allocating and inserting it"
@@ -200,9 +212,9 @@ fn spawn_core(
         .into());
     }
 
-    let spec = NewWindow {
-        session: tmux_session.clone(),
-        window_name: window.clone(),
+    let spec = NewSession {
+        name: worker_session.clone(),
+        window_name: label.clone(),
         cwd: cwd.clone(),
         env: quest_env(
             &quest.id,
@@ -212,13 +224,11 @@ fn spawn_core(
             db_override().as_deref(),
             config_override().as_deref(),
         ),
-        // Claude is named after the label, not the window: `<slug>/<label>` is
-        // also how `q send`/`q peek` address the session (SPEC §6, §16).
-        command: Some(claude_command(&quest.slug, &label, prompt)),
+        // The login shell (SPEC §6 v2); Claude is launched into it below.
+        command: None,
     };
-    let pane = match ctx.tmux().new_window(&spec) {
+    let pane = match ctx.tmux().new_session(&spec) {
         Ok(pane) => pane,
-        // Nothing was opened, so the row would only be a session that never ran.
         Err(e) => {
             let _ = db.delete_session(&session_id);
             return Err(e);
@@ -226,10 +236,8 @@ fn spawn_core(
     };
     let session = match db.update_session_pane(&session_id, &pane.pane_id) {
         Ok(session) => session,
-        // Without its pane the row can never be addressed, entered or swept —
-        // and the window would outlive it as a Claude nobody owns.
         Err(e) => {
-            let _ = ctx.tmux().kill_window(&pane.pane_id);
+            let _ = ctx.tmux().kill_session(&worker_session);
             let _ = db.delete_session(&session_id);
             return Err(e);
         }
@@ -240,37 +248,48 @@ fn spawn_core(
         "session.spawn",
         &serde_json::json!({
             "label": session.label,
-            "window": window,
             "role": session.role,
+            "tmux_session": worker_session,
             "cwd": cwd,
             "workflow": session.workflow,
             "prompt": prompt,
+            "shell": shell,
         }),
     )?;
+
+    // Launch Claude unless this is a bare shell. A launch that will not go
+    // takes its own session down — a shell with no Claude the caller did not
+    // ask for is nobody's.
+    let session = if shell {
+        session
+    } else {
+        match crate::commands::start::launch(ctx, quest, &session, None, false, false) {
+            Ok(started) => started.session,
+            Err(e) => {
+                let _ = ctx.tmux().kill_session(&worker_session);
+                let _ = db.delete_session(&session_id);
+                return Err(e);
+            }
+        }
+    };
     Ok(Spawned {
         quest: quest.clone(),
         session,
-        tmux_session,
-        window,
+        tmux_session: worker_session,
+        launched: !shell,
     })
 }
 
-/// Emit the spawn result and, only when the caller sits in the Quest's own tmux
-/// session, select the new window (`Select`, never an attach: no client ever
-/// changes session here — `new-window -d` left it alone).
-fn report_and_attach(ctx: &Ctx, spawned: &Spawned, no_attach: bool) -> anyhow::Result<()> {
+/// Emit the spawn result and, with `--enter`, attach to the worker's own tmux
+/// session (a switch-client inside tmux, an exec outside it).
+fn report_and_attach(ctx: &Ctx, spawned: &Spawned, enter: bool) -> anyhow::Result<()> {
     let Spawned {
         quest,
         session,
         tmux_session,
-        window,
+        launched,
     } = spawned;
-    let attaching = !no_attach && in_tmux_session(ctx, &quest.id, tmux_session);
-    let attach = if attaching {
-        AttachMode::Select
-    } else {
-        AttachMode::None
-    };
+    let attach = attach_mode(ctx, enter);
     if ctx.json || !ctx.quiet {
         output::emit(
             ctx.json,
@@ -278,27 +297,23 @@ fn report_and_attach(ctx: &Ctx, spawned: &Spawned, no_attach: bool) -> anyhow::R
                 "quest": quest,
                 "session": session,
                 "tmux_session": tmux_session,
-                "window": window,
+                "launched": launched,
                 "attach": attach,
             }),
             || {
+                let note = if *launched { "" } else { " (shell only)" };
                 format!(
-                    "spawned {} ({}) · tmux {tmux_session}:{window} · run: q enter {} --session {}",
+                    "spawned {} ({}){note} · tmux {tmux_session} · run: q enter {} --session {}",
                     session.id, session.label, quest.slug, session.label
                 )
             },
         )?;
     }
-    if attaching {
+    if attach != AttachMode::None {
         std::io::stdout().flush()?;
-        ctx.tmux().select_window(&session.tmux_pane)?;
+        ctx.tmux().attach(tmux_session, Some(&session.tmux_pane))?;
     }
     Ok(())
-}
-
-/// `w<n>-<label>` (SPEC §6).
-fn window_name(index: usize, label: &str) -> String {
-    format!("w{index}-{label}")
 }
 
 /// The auto worker's label — `w<n>`, bumped past any number a live session
@@ -314,7 +329,7 @@ fn auto_label(sessions: &[Session], start: usize) -> String {
     }
 }
 
-/// Workers are numbered from 1 for the life of the Quest — an ended window's
+/// Workers are numbered from 1 for the life of the Quest — an ended worker's
 /// number is not reused, so the numbering keeps matching the event log.
 fn next_worker_index(sessions: &[Session]) -> usize {
     sessions
@@ -322,28 +337,6 @@ fn next_worker_index(sessions: &[Session]) -> usize {
         .filter(|s| s.role == SessionRole::Worker)
         .count()
         + 1
-}
-
-/// True when this process runs in a pane of `tmux_session` — the only case
-/// where selecting the new window moves the caller's own client rather than
-/// yanking a client elsewhere. `$TMUX_PANE` is the precise answer; an agent
-/// whose shell lost it still has `$Q_QUEST`.
-fn in_tmux_session(ctx: &Ctx, quest_id: &str, tmux_session: &str) -> bool {
-    if !ctx.tmux().in_tmux() {
-        return false;
-    }
-    match std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty()) {
-        Some(pane) => here(ctx.tmux(), &pane, tmux_session),
-        None => std::env::var("Q_QUEST").is_ok_and(|v| v == quest_id),
-    }
-}
-
-fn here(tmux: &dyn Tmux, pane_id: &str, tmux_session: &str) -> bool {
-    tmux.list_panes().is_ok_and(|panes| {
-        panes
-            .iter()
-            .any(|p| p.pane_id == pane_id && p.session_name == tmux_session)
-    })
 }
 
 #[cfg(test)]
@@ -355,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_windows_are_numbered_from_one_and_never_reused() {
+    fn worker_numbers_are_from_one_and_never_reused() {
         assert_eq!(next_worker_index(&[]), 1);
         let master = session(SessionRole::Master, MASTER);
         assert_eq!(next_worker_index(std::slice::from_ref(&master)), 1);
@@ -376,17 +369,9 @@ mod tests {
             session(SessionRole::Master, MASTER),
             session(SessionRole::Worker, "tests"),
         ];
-        // Next index is 2, and `w2` is free.
         assert_eq!(auto_label(&rows, next_worker_index(&rows)), "w2");
-        // A live `w2` (say a hand-named worker) pushes the auto one to `w3`.
         rows.push(session(SessionRole::Worker, "w2"));
         assert_eq!(auto_label(&rows, 2), "w3");
-    }
-
-    #[test]
-    fn window_names_follow_the_spec() {
-        assert_eq!(window_name(1, "tests"), "w1-tests");
-        assert_eq!(window_name(12, "cdc-backfill"), "w12-cdc-backfill");
     }
 
     #[test]
