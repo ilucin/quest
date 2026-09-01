@@ -1082,9 +1082,11 @@ pub struct FleetSessions {
     pub notes: Vec<String>,
 }
 
-/// One machine's answer to the sessions fan-out.
+/// One machine's answer to the sessions fan-out. `Rows`' trailing count is how
+/// many rows in the array this `q` could not read and skipped — a row a newer
+/// remote emits that this one cannot parse costs its own row, never the machine.
 enum SessionsAnswer {
-    Rows(String, Vec<crate::commands::sessions::SessionView>),
+    Rows(String, Vec<crate::commands::sessions::SessionView>, usize),
     Down(String, RemoteStatus),
 }
 
@@ -1111,7 +1113,7 @@ pub fn fetch_sessions(ssh: &dyn Ssh, targets: &[Remote]) -> FleetSessions {
     let mut fleet = FleetSessions::default();
     for answer in answers {
         match answer {
-            SessionsAnswer::Rows(name, mut rows) => {
+            SessionsAnswer::Rows(name, mut rows, skipped) => {
                 // Stamped with the name this end knows the machine by — what
                 // `--machine` and the remote-vs-local test use — as [`attribute`]
                 // does for a Quest listing.
@@ -1119,6 +1121,14 @@ pub fn fetch_sessions(ssh: &dyn Ssh, targets: &[Remote]) -> FleetSessions {
                     row.machine = name.clone();
                 }
                 fleet.rows.extend(rows);
+                // A row this `q` could not read is a note, not a dropped
+                // machine: the readable rows are already in.
+                if skipped > 0 {
+                    fleet.notes.push(format!(
+                        "{name} {INCOMPATIBLE} (skipped {skipped} unreadable session row{})",
+                        if skipped == 1 { "" } else { "s" }
+                    ));
+                }
             }
             SessionsAnswer::Down(name, status) => {
                 if let Some(note) = down_note(&name, &status) {
@@ -1139,8 +1149,21 @@ fn read_sessions(ssh: &dyn Ssh, remote: &Remote, argv: &[&str]) -> SessionsAnswe
             code: Some(0),
             stdout,
             ..
-        } => match serde_json::from_str(stdout.trim()) {
-            Ok(rows) => SessionsAnswer::Rows(remote.name.clone(), rows),
+        } => match serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim()) {
+            // Row by row on purpose: one row this `q` cannot read (a newer
+            // remote's unknown status, say) drops that row, never the whole
+            // machine — what README/CHANGELOG mean by a tolerant parse.
+            Ok(values) => {
+                let mut rows = Vec::with_capacity(values.len());
+                let mut skipped = 0usize;
+                for value in values {
+                    match serde_json::from_value(value) {
+                        Ok(row) => rows.push(row),
+                        Err(_) => skipped += 1,
+                    }
+                }
+                SessionsAnswer::Rows(remote.name.clone(), rows, skipped)
+            }
             Err(e) => down(RemoteStatus::incompatible(format!(
                 "cannot read `q sessions --json`: {e}"
             ))),
@@ -1936,6 +1959,135 @@ mod tests {
         assert!(fleet.rows.is_empty());
         assert_eq!(fleet.notes.len(), 1);
         assert!(fleet.notes[0].contains("incompatible"), "{:?}", fleet.notes);
+    }
+
+    /// SPEC §15, plan M6: the fleet wire carries the v2 fields — `tmux_session`,
+    /// the `off` status and `waiting_for` — and a consumer reads them straight
+    /// back out. The forward direction of the tolerant-parse contract.
+    #[test]
+    fn the_fleet_carries_the_v2_session_fields() {
+        use crate::model::{Session, SessionRole, SessionStatus};
+        let mut off = Session::new("q-x", SessionRole::Worker, "w1", "q-alpha+w1", "%1");
+        off.status = SessionStatus::Off;
+        let mut waiting = Session::new("q-x", SessionRole::Worker, "rev", "q-alpha+rev", "%2");
+        waiting.status = SessionStatus::Waiting;
+        waiting.waiting_for = Some("question".to_string());
+        let rows: Vec<_> = [off, waiting]
+            .into_iter()
+            .map(|session| crate::commands::sessions::SessionView {
+                session,
+                quest_slug: "alpha".to_string(),
+                machine: "its-own-name".to_string(),
+                registry: None,
+                your_turn: false,
+            })
+            .collect();
+        let stdout = serde_json::to_string(&rows).unwrap();
+
+        let ssh = StubSsh::new(&[("ws-host", ok(stdout))]);
+        let fleet = fetch_sessions(&ssh, &[remote("ws")]);
+        assert_eq!(fleet.rows.len(), 2, "{:?}", fleet.notes);
+        let off = &fleet.rows[0].session;
+        assert_eq!(off.status, SessionStatus::Off);
+        assert_eq!(off.tmux_session, "q-alpha+w1");
+        let waiting = &fleet.rows[1].session;
+        assert_eq!(waiting.status, SessionStatus::Waiting);
+        assert_eq!(waiting.waiting_for.as_deref(), Some("question"));
+    }
+
+    /// The backward direction: a remote `q` too old to report `tmux_session`,
+    /// `waiting_for` or the v2 columns sends a lean row, and this `q` reads it
+    /// as a graceful default (empty `tmux_session`, rendered `?`) rather than
+    /// failing the whole machine's fleet. `never errors`, per the plan.
+    #[test]
+    fn an_older_remote_missing_the_new_fields_still_parses() {
+        use crate::model::SessionStatus;
+        // Only the columns a pre-v2 `q` had — no `tmux_session`, no
+        // `waiting_for`, no `last_pane_path`/`claude_started_at`.
+        let lean = serde_json::json!([{
+            "id": "s-old",
+            "quest_id": "q-old",
+            "role": "worker",
+            "label": "w1",
+            "tmux_pane": "%7",
+            "status": "idle",
+            "started_at": 1,
+            "updated_at": 2,
+            "quest_slug": "legacy",
+            "machine": "its-own-name",
+        }])
+        .to_string();
+
+        let ssh = StubSsh::new(&[("ws-host", ok(lean))]);
+        let fleet = fetch_sessions(&ssh, &[remote("ws")]);
+        assert!(
+            fleet.notes.is_empty(),
+            "an older remote errored: {:?}",
+            fleet.notes
+        );
+        assert_eq!(fleet.rows.len(), 1);
+        let s = &fleet.rows[0].session;
+        assert_eq!(s.status, SessionStatus::Idle);
+        assert!(
+            s.tmux_session.is_empty(),
+            "missing tmux_session should default"
+        );
+        assert_eq!(s.waiting_for, None);
+        // The cell a `?` stands in for.
+        assert_eq!(crate::commands::sessions::tmux_cell(s), "?");
+    }
+
+    /// The per-row half of the tolerant parse: one row this `q` cannot read —
+    /// here a status a newer remote emits and this one has no variant for —
+    /// costs its own row, and the readable rows in the same array still land.
+    /// "never fails the whole machine", row by row and not just field by field.
+    #[test]
+    fn one_unreadable_row_is_skipped_and_the_good_rows_survive() {
+        use crate::model::SessionStatus;
+        let mixed = serde_json::json!([
+            {
+                "id": "s-good",
+                "quest_id": "q-alpha",
+                "role": "worker",
+                "label": "keeper",
+                "tmux_pane": "%1",
+                "status": "idle",
+                "started_at": 1,
+                "updated_at": 2,
+                "quest_slug": "alpha",
+                "machine": "its-own-name",
+            },
+            {
+                // A status this `q` has no variant for — a newer remote.
+                "id": "s-future",
+                "quest_id": "q-alpha",
+                "role": "worker",
+                "label": "from-the-future",
+                "tmux_pane": "%2",
+                "status": "teleporting",
+                "started_at": 1,
+                "updated_at": 2,
+                "quest_slug": "alpha",
+                "machine": "its-own-name",
+            },
+        ])
+        .to_string();
+
+        let ssh = StubSsh::new(&[("ws-host", ok(mixed))]);
+        let fleet = fetch_sessions(&ssh, &[remote("ws")]);
+
+        assert_eq!(fleet.rows.len(), 1, "the good row should survive");
+        assert_eq!(fleet.rows[0].session.label, "keeper");
+        assert_eq!(fleet.rows[0].session.status, SessionStatus::Idle);
+        assert_eq!(fleet.rows[0].machine, "ws", "row not stamped with our name");
+        // The dropped row is surfaced as a note, not silently swallowed.
+        assert_eq!(fleet.notes.len(), 1, "{:?}", fleet.notes);
+        assert!(fleet.notes[0].starts_with("ws "), "{:?}", fleet.notes);
+        assert!(
+            fleet.notes[0].contains("skipped 1 unreadable session row"),
+            "{:?}",
+            fleet.notes
+        );
     }
 
     #[test]

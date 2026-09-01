@@ -27,8 +27,8 @@ another, for the same session:
 - **idle**, softened to **idle · your turn** in `q sessions` and the TUI when Claude
   just handed a turn back to you. The brief's section 5 shows that same turn as plain
   **idle**.
-- **waiting: permission / input / question** — honestly blocked on the human. A worker
-  that calls the **AskUserQuestion** tool shows `waiting: question`; a plain-text
+- **waiting:permission / waiting:input / waiting:question** — honestly blocked on the human. A worker
+  that calls the **AskUserQuestion** tool shows `waiting:question`; a plain-text
   question that merely ends a turn only reads as `idle · your turn` (plain `idle` in the
   brief). If you are a worker and need a decision to proceed, ask with **AskUserQuestion**
   so the fleet sees it.

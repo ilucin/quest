@@ -53,7 +53,7 @@ pub const HELP: &[(&str, &str)] = &[
 const GROUPS: usize = 6;
 /// Columns a phase line may occupy before it is cut.
 const PHASE_COLS: usize = 28;
-/// The same for a status cell, which carries `waiting: <what for>`.
+/// The same for a status cell, which carries `waiting:<what for>`.
 const STATUS_COLS: usize = 22;
 /// And for the Quest slug, which is only bounded by SPEC §10's 40.
 const QUEST_COLS: usize = 20;
@@ -382,8 +382,9 @@ fn viewport(app: &App) -> usize {
 /// none.
 pub fn handle(app: &mut App, input: Input) -> Action {
     // SPEC §15, bd-8lz.10: on a remote fleet row the acting keys are proxied
-    // through the real `q`. `⏎`/`o`/`p`/`k`/`Z` hand off as `Action::Proxy`;
-    // only `t` falls through, to open the send form (its submit proxies).
+    // through the real `q`. `⏎`/`o`/`p`/`S`/`X`/`k`/`Z` hand off as
+    // `Action::Proxy`; only `t` falls through, to open the send form (its
+    // submit proxies).
     if let Some(action) = remote_proxy_key(app, input) {
         return action;
     }
@@ -1060,7 +1061,7 @@ fn inset(area: Rect) -> Rect {
 
 /// The glyph SPEC §17 gives each session state — a shape a glance can read
 /// before the word beside it (`● busy`, `○ off`). Idle and `idle · your turn`
-/// share `◑` (the word carries the turn); every `waiting: <what>` shares `◆`.
+/// share `◑` (the word carries the turn); every `waiting:<what>` shares `◆`.
 fn state_glyph(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Waiting => "\u{25c6}",  // ◆
@@ -1097,7 +1098,7 @@ fn cells_of(view: &SessionView, warn_pct: u8, remote: Option<&str>) -> Cells {
     Cells {
         quest: fmt::truncate(&view.quest_slug, QUEST_COLS),
         label: s.label.clone(),
-        tmux: fmt::truncate(&s.tmux_session, TMUX_COLS),
+        tmux: fmt::truncate(&listing::tmux_cell(s), TMUX_COLS),
         state,
         phase: fmt::truncate(
             &fmt::or_dash(s.phase.as_deref().filter(|p| !p.trim().is_empty())),
@@ -1294,12 +1295,22 @@ mod tests {
             }
             let row = self.db().insert_session(&row).unwrap();
             if !pane.is_empty() && spec.status != SessionStatus::Ended {
-                self.add_pane(&tmux_session, &spec.label, pane);
+                // Seed the pane command the row's status implies (§2.1/M1a): an
+                // `off` row is a bare shell (`zsh`), everything else has Claude
+                // in the pane (an opaque version string, a non-shell). Seeding
+                // a shell under a live row would let the sweep demote it to
+                // `off`; leaving it empty seeds neither.
+                let command = if spec.status == SessionStatus::Off {
+                    "zsh"
+                } else {
+                    "2.1.0"
+                };
+                self.add_pane(&tmux_session, &spec.label, pane, command);
             }
             row
         }
 
-        fn add_pane(&self, tmux_session: &str, window: &str, pane: &str) {
+        fn add_pane(&self, tmux_session: &str, window: &str, pane: &str, command: &str) {
             let fixture = self.fixture();
             let mut state = fixture.load().unwrap();
             state.panes.push(crate::tmux::FixturePane {
@@ -1307,6 +1318,7 @@ mod tests {
                 pane_pid: 90_000,
                 session_name: tmux_session.to_string(),
                 window_name: window.to_string(),
+                current_command: command.to_string(),
                 ..Default::default()
             });
             fixture.save(&state).unwrap();
@@ -1483,7 +1495,7 @@ mod tests {
         // A worker's own tmux session, the waiting glyph and its reason.
         assert!(waiting.contains("q-alpha+tests"), "{waiting:?}");
         assert!(
-            waiting.contains("\u{25c6} waiting: permission"),
+            waiting.contains("\u{25c6} waiting:permission"),
             "{waiting:?}"
         );
     }
@@ -2174,8 +2186,9 @@ mod tests {
         handle(&mut app, Input::Char('t'));
         focus(&mut app, F_TEXT);
         type_text(&mut app, "hello");
-        // Another terminal, while the box is up.
-        rig.add_pane("q-alpha", "tests", "%9");
+        // Another terminal, while the box is up. A live (non-shell) pane, as
+        // an idle row's is.
+        rig.add_pane("q-alpha", "tests", "%9", "2.1.0");
         rig.db().update_session_pane(&session.id, "%9").unwrap();
 
         choose_action(&mut app);

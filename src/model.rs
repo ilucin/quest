@@ -173,6 +173,11 @@ pub struct Session {
     pub quest_id: String,
     pub role: SessionRole,
     pub label: String,
+    /// `q-<slug>` for the main, `q-<slug>+<label>` for a worker (SPEC §6).
+    /// `#[serde(default)]` so a fleet row from a remote `q` too old to report
+    /// it parses to `""` — rendered `?` — rather than failing the whole
+    /// machine's sessions (SPEC §15, tolerant fleet parse).
+    #[serde(default)]
     pub tmux_session: String,
     /// `%42` — the session's identity, stable across rename, `/clear`, restart.
     pub tmux_pane: String,

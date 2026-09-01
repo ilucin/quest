@@ -178,7 +178,7 @@ fn human(views: &[SessionView], across_quests: bool) -> String {
             vec![
                 s.label.clone(),
                 s.role.to_string(),
-                s.tmux_session.clone(),
+                tmux_cell(s),
                 status_cell(s, v.your_turn),
                 fmt::or_dash(s.phase.as_deref()),
                 s.ctx_pct
@@ -226,9 +226,20 @@ fn coarse(cell: &str) -> &str {
 /// human's reply is what moves it, so it reads `idle · your turn`.
 pub fn status_cell(session: &Session, your_turn: bool) -> String {
     match (&session.status, session.waiting_for.as_deref()) {
-        (SessionStatus::Waiting, Some(what)) => format!("waiting: {what}"),
+        (SessionStatus::Waiting, Some(what)) => format!("waiting:{what}"),
         (SessionStatus::Idle, _) if your_turn => "idle · your turn".to_string(),
         (status, _) => status.to_string(),
+    }
+}
+
+/// The tmux-session cell, `?` when a row does not carry one — a fleet row from
+/// a remote `q` too old to report `tmux_session` (SPEC §15). Local rows always
+/// have one, so `?` only ever stands for "the far end did not say".
+pub fn tmux_cell(session: &Session) -> String {
+    if session.tmux_session.is_empty() {
+        "?".to_string()
+    } else {
+        session.tmux_session.clone()
     }
 }
 
@@ -319,7 +330,7 @@ mod tests {
         let q = quest();
         let mut views = of_quest(&q, vec![session(&q, "w1", SessionStatus::Idle, 1)], false);
         assert!(!human(&views, false).contains("REG"));
-        views[0].registry = Some("waiting: permission_prompt".to_string());
+        views[0].registry = Some("waiting:permission_prompt".to_string());
         let text = human(&views, false);
         assert!(text.contains("REG"), "{text}");
         assert!(text.contains("permission_prompt"), "{text}");
@@ -335,9 +346,9 @@ mod tests {
         let q = quest();
         let mut s = session(&q, "w1", SessionStatus::Waiting, 1);
         s.waiting_for = Some("permission_prompt".to_string());
-        assert_eq!(status_cell(&s, false), "waiting: permission_prompt");
+        assert_eq!(status_cell(&s, false), "waiting:permission_prompt");
         s.waiting_for = Some("question".to_string());
-        assert_eq!(status_cell(&s, false), "waiting: question");
+        assert_eq!(status_cell(&s, false), "waiting:question");
         s.waiting_for = None;
         assert_eq!(status_cell(&s, false), "waiting");
         s.status = SessionStatus::Busy;
@@ -362,10 +373,13 @@ mod tests {
     /// that decides whether to show a REG column drops the reason.
     #[test]
     fn the_reason_a_session_waits_is_not_part_of_the_comparison() {
-        assert_eq!(coarse("waiting: permission"), "waiting");
-        assert_eq!(coarse("waiting: permission_prompt"), "waiting");
+        // The canonical spelling both sources now emit: `waiting:<what>`, no space.
+        assert_eq!(coarse("waiting:permission"), "waiting");
+        assert_eq!(coarse("waiting:permission_prompt"), "waiting");
         assert_eq!(coarse("idle"), "idle");
-        assert_ne!(coarse("busy"), coarse("waiting: permission"));
+        assert_ne!(coarse("busy"), coarse("waiting:permission"));
+        // Robust to a stray space too (a pre-v2 registry spelling).
+        assert_eq!(coarse("waiting: permission"), "waiting");
     }
 
     #[test]

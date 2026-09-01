@@ -6904,7 +6904,7 @@ fn sessions_shows_the_registry_when_it_contradicts_the_row() {
         .find(|r| r["label"] == "tests")
         .unwrap();
     assert_eq!(worker["status"], "idle");
-    assert_eq!(worker["registry"], "waiting: permission_prompt");
+    assert_eq!(worker["registry"], "waiting:permission_prompt");
     let text = String::from_utf8(
         fleet
             .env
@@ -10195,6 +10195,12 @@ fn every_command_that_resolves_a_remote_quest_is_proxied_with_the_guard() {
         (vec!["rm", "over-there", "-f"], "q\trm\t{id}\t-f"),
         (vec!["resume", "over-there", "-d"], "q\tresume\t{id}\t-d"),
         (vec!["peek", "over-there/master"], "q\tpeek\t{id}/master"),
+        (vec!["start", "over-there/master"], "q\tstart\t{id}/master"),
+        (
+            vec!["start", "over-there/w1", "pick it up", "--force"],
+            "q\tstart\t{id}/w1\t'pick it up'\t--force",
+        ),
+        (vec!["stop", "over-there/master"], "q\tstop\t{id}/master"),
         (
             vec!["send", "over-there/master", "carry on"],
             "q\tsend\t{id}/master\t'carry on'",
@@ -10226,6 +10232,32 @@ fn every_command_that_resolves_a_remote_quest_is_proxied_with_the_guard() {
                 sent.replace("{id}", &id)
             )],
             "{args:?}"
+        );
+    }
+}
+
+/// SPEC §15, plan M6/R10: `q --machine ws start/stop <session>` names the
+/// machine explicitly rather than letting the target resolve it, and the far
+/// end is still told `q start <id>/<label> … --no-remote` with `--machine`
+/// dropped (it named a machine only *this* `q` knows). The v2 launch verbs
+/// join the proxy table.
+#[test]
+fn start_and_stop_proxy_over_an_explicit_machine_flag() {
+    for (verb, sent) in [("start", "q\tstart\t{id}/w1"), ("stop", "q\tstop\t{id}/w1")] {
+        let env = Env::new();
+        env.with_remotes(&[("ws", "ws-host")]);
+        let hosts = env.two_faced("over-there", ok_reply());
+        let id = far_id(&hosts, "ws-host");
+        let expect = far_expect(&hosts, "ws-host");
+        env.over_ssh(hosts, &["--machine", "ws", verb, "over-there/w1"])
+            .success();
+        assert_eq!(
+            env.proxy_calls(),
+            [format!(
+                "ws-host\t{}\t--expect\t{expect}\t--no-remote",
+                sent.replace("{id}", &id)
+            )],
+            "{verb}"
         );
     }
 }

@@ -460,12 +460,12 @@ fn section_how(
                  shell's `cd`, but only after you `/exit` Claude to the shell — while Claude \
                  runs in main, use `q cd` to move it.\n\
                  - States: **section 5** of this brief shows `running` (Claude working or \
-                 booting), `idle`, `off` (no Claude), and `waiting: permission/input/question` \
+                 booting), `idle`, `off` (no Claude), and `waiting:permission/input/question` \
                  when a worker is blocked on the human. `q sessions` and the TUI split \
                  `running` into `busy`/`starting` and soften a just-finished turn to `idle · \
                  your turn` (over to you) — section 5 renders that same turn as plain `idle`. \
                  Tell workers to raise blocking questions with the **AskUserQuestion** tool so \
-                 they show as `waiting: question` rather than a silent `idle`.\n\
+                 they show as `waiting:question` rather than a silent `idle`.\n\
                  - Report where you are: `q phase \"<text>\"`.\n\
                  - Link everything you produce: `q link add <ref>` / `q artifact add <path>`.\n\
                  - Record decisions and open questions: `q note \"<text>\"` \
@@ -503,7 +503,7 @@ fn section_how(
                  - Report where you are: `q phase \"<text>\"`.\n\
                  - Link what you produce: `q link add <ref>` / `q artifact add <path>`.\n\
                  - Need a decision before you can go on? Raise it with the **AskUserQuestion** \
-                 tool — it shows the fleet `waiting: question`. A plain-text question that ends \
+                 tool — it shows the fleet `waiting:question`. A plain-text question that ends \
                  your turn only reads as `idle · your turn`, which is easy to miss.\n\
                  - Stuck? `q note --blocker \"<text>\"` and tell the master.\n",
             ));
@@ -771,19 +771,19 @@ fn section_sessions(out: &mut String, sessions: &[Session]) {
 }
 
 /// The §5 state vocabulary (SPEC §6): `running` while Claude works or boots,
-/// `idle`, `waiting: <what>` when honestly blocked on the human, `off` when the
+/// `idle`, `waiting:<what>` when honestly blocked on the human, `off` when the
 /// pane is a bare shell — plus `ended` for the wound-down rows.
 ///
 /// Unlike the TUI, this does NOT soften a finished-turn `idle` to `idle · your
 /// turn`: that distinction needs the per-session last-event lookup
 /// (`session.stop`) the TUI does in `mark_your_turn`, and the brief renders from
-/// a pre-fetched `&[Session]` with no DB in reach. The hard `waiting: question`
+/// a pre-fetched `&[Session]` with no DB in reach. The hard `waiting:question`
 /// is shown, so a master triaging from the brief still sees an explicit block;
 /// only the soft "just finished, over to you" hint is absent. Accepted gap.
 fn session_state(s: &Session) -> String {
     match s.status {
         SessionStatus::Waiting => {
-            format!("waiting: {}", s.waiting_for.as_deref().unwrap_or("input"))
+            format!("waiting:{}", s.waiting_for.as_deref().unwrap_or("input"))
         }
         SessionStatus::Busy | SessionStatus::Starting => "running".to_string(),
         other => other.to_string(),
@@ -1151,7 +1151,7 @@ mod tests {
         );
         assert!(md.contains("`/tmp/out/report.html` — the report"));
         assert!(md.contains("brain body"));
-        assert!(md.contains("| w1-tests | worker | q-alpha | waiting: permission | testing | 42% | run the suite and report |"), "{md}");
+        assert!(md.contains("| w1-tests | worker | q-alpha | waiting:permission | testing | 42% | run the suite and report |"), "{md}");
         assert!(md.contains("| w0-old | worker | q-alpha | ended |"), "{md}");
         assert!(!md.contains("noise"), "prompt events are noise:\n{md}");
         assert!(md.contains("- BLOCKER"));
@@ -1299,7 +1299,7 @@ mod tests {
             "`off` means no Claude, not dead",
             "q cd <quest> <path>",
             "idle · your turn",
-            "waiting: ",
+            "waiting:",
             "AskUserQuestion",
         ] {
             assert!(
